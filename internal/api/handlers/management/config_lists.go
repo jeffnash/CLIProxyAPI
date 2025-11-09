@@ -148,7 +148,7 @@ func (h *Handler) applyLegacyKeys(keys []string) {
 	}
 	h.cfg.GeminiKey = newList
 	h.cfg.GlAPIKey = sanitized
-	h.cfg.SyncGeminiKeys()
+	h.cfg.SanitizeGeminiKeys()
 }
 
 // api-keys
@@ -206,7 +206,7 @@ func (h *Handler) PutGeminiKeys(c *gin.Context) {
 		arr = obj.Items
 	}
 	h.cfg.GeminiKey = append([]config.GeminiKey(nil), arr...)
-	h.cfg.SyncGeminiKeys()
+	h.cfg.SanitizeGeminiKeys()
 	h.persist(c)
 }
 func (h *Handler) PatchGeminiKey(c *gin.Context) {
@@ -227,7 +227,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		// Treat empty API key as delete.
 		if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.GeminiKey) {
 			h.cfg.GeminiKey = append(h.cfg.GeminiKey[:*body.Index], h.cfg.GeminiKey[*body.Index+1:]...)
-			h.cfg.SyncGeminiKeys()
+			h.cfg.SanitizeGeminiKeys()
 			h.persist(c)
 			return
 		}
@@ -245,7 +245,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 				}
 				if removed {
 					h.cfg.GeminiKey = out
-					h.cfg.SyncGeminiKeys()
+					h.cfg.SanitizeGeminiKeys()
 					h.persist(c)
 					return
 				}
@@ -257,7 +257,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.GeminiKey) {
 		h.cfg.GeminiKey[*body.Index] = value
-		h.cfg.SyncGeminiKeys()
+		h.cfg.SanitizeGeminiKeys()
 		h.persist(c)
 		return
 	}
@@ -266,7 +266,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		for i := range h.cfg.GeminiKey {
 			if h.cfg.GeminiKey[i].APIKey == match {
 				h.cfg.GeminiKey[i] = value
-				h.cfg.SyncGeminiKeys()
+				h.cfg.SanitizeGeminiKeys()
 				h.persist(c)
 				return
 			}
@@ -284,7 +284,7 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 		}
 		if len(out) != len(h.cfg.GeminiKey) {
 			h.cfg.GeminiKey = out
-			h.cfg.SyncGeminiKeys()
+			h.cfg.SanitizeGeminiKeys()
 			h.persist(c)
 		} else {
 			c.JSON(404, gin.H{"error": "item not found"})
@@ -295,7 +295,7 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 		var idx int
 		if _, err := fmt.Sscanf(idxStr, "%d", &idx); err == nil && idx >= 0 && idx < len(h.cfg.GeminiKey) {
 			h.cfg.GeminiKey = append(h.cfg.GeminiKey[:idx], h.cfg.GeminiKey[idx+1:]...)
-			h.cfg.SyncGeminiKeys()
+			h.cfg.SanitizeGeminiKeys()
 			h.persist(c)
 			return
 		}
