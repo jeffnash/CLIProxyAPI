@@ -283,7 +283,7 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e := cfg.OpenAICompatibility[i]
 		e.Name = strings.TrimSpace(e.Name)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
-		e.Headers = normalizeHeaders(e.Headers)
+		e.Headers = NormalizeHeaders(e.Headers)
 		if e.BaseURL == "" {
 			// Skip providers with no base-url; treated as removed
 			continue
@@ -303,7 +303,7 @@ func (cfg *Config) SanitizeCodexKeys() {
 	for i := range cfg.CodexKey {
 		e := cfg.CodexKey[i]
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
-		e.Headers = normalizeHeaders(e.Headers)
+		e.Headers = NormalizeHeaders(e.Headers)
 		if e.BaseURL == "" {
 			continue
 		}
@@ -319,7 +319,7 @@ func (cfg *Config) SanitizeClaudeKeys() {
 	}
 	for i := range cfg.ClaudeKey {
 		entry := &cfg.ClaudeKey[i]
-		entry.Headers = normalizeHeaders(entry.Headers)
+		entry.Headers = NormalizeHeaders(entry.Headers)
 	}
 }
 
@@ -339,7 +339,7 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		}
 		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
-		entry.Headers = normalizeHeaders(entry.Headers)
+		entry.Headers = NormalizeHeaders(entry.Headers)
 		if _, exists := seen[entry.APIKey]; exists {
 			continue
 		}
@@ -382,7 +382,8 @@ func looksLikeBcrypt(s string) bool {
 	return len(s) > 4 && (s[:4] == "$2a$" || s[:4] == "$2b$" || s[:4] == "$2y$")
 }
 
-func normalizeHeaders(headers map[string]string) map[string]string {
+// NormalizeHeaders trims header keys and values and removes empty pairs.
+func NormalizeHeaders(headers map[string]string) map[string]string {
 	if len(headers) == 0 {
 		return nil
 	}
