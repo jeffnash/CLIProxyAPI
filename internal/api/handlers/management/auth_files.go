@@ -293,6 +293,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 	runtimeOnly := isRuntimeOnlyAuth(auth)
+	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
+		return nil
+	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
 	if path == "" && !runtimeOnly {
 		return nil
