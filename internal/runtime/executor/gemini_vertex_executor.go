@@ -22,6 +22,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
 
@@ -89,7 +90,7 @@ func (e *GeminiVertexExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, errNewReq
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if token, errTok := vertexAccessToken(ctx, saJSON); errTok == nil && token != "" {
+	if token, errTok := vertexAccessToken(ctx, e.cfg, auth, saJSON); errTok == nil && token != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 	} else if errTok != nil {
 		log.Errorf("vertex executor: access token error: %v", errTok)
@@ -184,7 +185,7 @@ func (e *GeminiVertexExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, errNewReq
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if token, errTok := vertexAccessToken(ctx, saJSON); errTok == nil && token != "" {
+	if token, errTok := vertexAccessToken(ctx, e.cfg, auth, saJSON); errTok == nil && token != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 	} else if errTok != nil {
 		log.Errorf("vertex executor: access token error: %v", errTok)
@@ -295,7 +296,7 @@ func (e *GeminiVertexExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 		return cliproxyexecutor.Response{}, errNewReq
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if token, errTok := vertexAccessToken(ctx, saJSON); errTok == nil && token != "" {
+	if token, errTok := vertexAccessToken(ctx, e.cfg, auth, saJSON); errTok == nil && token != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 	} else if errTok != nil {
 		log.Errorf("vertex executor: access token error: %v", errTok)
@@ -407,7 +408,10 @@ func vertexBaseURL(location string) string {
 	return fmt.Sprintf("https://%s-aiplatform.googleapis.com", loc)
 }
 
-func vertexAccessToken(ctx context.Context, saJSON []byte) (string, error) {
+func vertexAccessToken(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, saJSON []byte) (string, error) {
+	if httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0); httpClient != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, httpClient)
+	}
 	// Use cloud-platform scope for Vertex AI.
 	creds, errCreds := google.CredentialsFromJSON(ctx, saJSON, "https://www.googleapis.com/auth/cloud-platform")
 	if errCreds != nil {

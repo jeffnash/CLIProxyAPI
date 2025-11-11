@@ -508,6 +508,10 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 				}
 			}
 			if err = os.Remove(full); err == nil {
+				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
+					c.JSON(500, gin.H{"error": errDel.Error()})
+					return
+				}
 				deleted++
 				h.disableAuth(ctx, full)
 			}
@@ -532,6 +536,10 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		} else {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to remove file: %v", err)})
 		}
+		return
+	}
+	if err := h.deleteTokenRecord(ctx, full); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	h.disableAuth(ctx, full)
@@ -640,9 +648,20 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 	}
 }
 
-func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
-	if record == nil {
-		return "", fmt.Errorf("token record is nil")
+func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("auth path is empty")
+	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return fmt.Errorf("token store unavailable")
+	}
+	return store.Delete(ctx, path)
+}
+
+func (h *Handler) tokenStoreWithBaseDir() coreauth.Store {
+	if h == nil {
+		return nil
 	}
 	store := h.tokenStore
 	if store == nil {
@@ -653,6 +672,17 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(h.cfg.AuthDir)
 		}
+	}
+	return store
+}
+
+func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
+	if record == nil {
+		return "", fmt.Errorf("token record is nil")
+	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return "", fmt.Errorf("token store unavailable")
 	}
 	return store.Save(ctx, record)
 }
