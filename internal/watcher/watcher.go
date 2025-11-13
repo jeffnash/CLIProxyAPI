@@ -477,8 +477,10 @@ func (w *Watcher) processEvents(ctx context.Context) {
 // handleEvent processes individual file system events
 func (w *Watcher) handleEvent(event fsnotify.Event) {
 	// Filter only relevant events: config file or auth-dir JSON files.
-	isConfigEvent := event.Name == w.configPath && (event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create)
-	isAuthJSON := strings.HasPrefix(event.Name, w.authDir) && strings.HasSuffix(event.Name, ".json")
+	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
+	isConfigEvent := event.Name == w.configPath && event.Op&configOps != 0
+	authOps := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename
+	isAuthJSON := strings.HasPrefix(event.Name, w.authDir) && strings.HasSuffix(event.Name, ".json") && event.Op&authOps != 0
 	if !isConfigEvent && !isAuthJSON {
 		// Ignore unrelated files (e.g., cookie snapshots *.cookie) and other noise.
 		return
@@ -496,18 +498,19 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 
 	// Handle auth directory changes incrementally (.json only)
 	fmt.Printf("auth file changed (%s): %s, processing incrementally\n", event.Op.String(), filepath.Base(event.Name))
-	if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
-		w.addOrUpdateClient(event.Name)
-	} else if event.Op&fsnotify.Remove == fsnotify.Remove {
-		// Atomic replace on some platforms may surface as Remove+Create for the target path.
-		// Wait briefly; if the file exists again, treat as update instead of removal.
+	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+		// Atomic replace on some platforms may surface as Rename (or Remove) before the new file is ready.
+		// Wait briefly; if the path exists again, treat as an update instead of removal.
 		time.Sleep(replaceCheckDelay)
 		if _, statErr := os.Stat(event.Name); statErr == nil {
-			// File exists after a short delay; handle as an update.
 			w.addOrUpdateClient(event.Name)
 			return
 		}
 		w.removeClient(event.Name)
+		return
+	}
+	if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
+		w.addOrUpdateClient(event.Name)
 	}
 }
 
