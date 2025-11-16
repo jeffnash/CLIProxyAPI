@@ -691,14 +691,10 @@ func extractReasoningTexts(node gjson.Result) []string {
 
 	switch node.Type {
 	case gjson.String:
-		if text := strings.TrimSpace(node.String()); text != "" {
-			texts = append(texts, text)
-		}
+		texts = append(texts, node.String())
 	case gjson.JSON:
 		if text := node.Get("text"); text.Exists() {
-			if trimmed := strings.TrimSpace(text.String()); trimmed != "" {
-				texts = append(texts, trimmed)
-			}
+			texts = append(texts, text.String())
 		} else if raw := strings.TrimSpace(node.Raw); raw != "" && !strings.HasPrefix(raw, "{") && !strings.HasPrefix(raw, "[") {
 			texts = append(texts, raw)
 		}
