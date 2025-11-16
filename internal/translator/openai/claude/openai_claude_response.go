@@ -284,29 +284,36 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 	// Handle usage information separately (this comes in a later chunk)
 	// Only process if usage has actual values (not null)
-	if usage := root.Get("usage"); usage.Exists() && usage.Type != gjson.Null && param.FinishReason != "" {
-		// Check if usage has actual token counts
-		promptTokens := usage.Get("prompt_tokens")
-		completionTokens := usage.Get("completion_tokens")
+	if param.FinishReason != "" {
+		usage := root.Get("usage")
+		var inputTokens, outputTokens int64
+		if usage.Exists() && usage.Type != gjson.Null {
+			// Check if usage has actual token counts
+			promptTokens := usage.Get("prompt_tokens")
+			completionTokens := usage.Get("completion_tokens")
 
-		if promptTokens.Exists() && completionTokens.Exists() {
-			// Send message_delta with usage
-			messageDelta := map[string]interface{}{
-				"type": "message_delta",
-				"delta": map[string]interface{}{
-					"stop_reason":   mapOpenAIFinishReasonToAnthropic(param.FinishReason),
-					"stop_sequence": nil,
-				},
-				"usage": map[string]interface{}{
-					"input_tokens":  promptTokens.Int(),
-					"output_tokens": completionTokens.Int(),
-				},
+			if promptTokens.Exists() && completionTokens.Exists() {
+				inputTokens = promptTokens.Int()
+				outputTokens = completionTokens.Int()
 			}
-
-			messageDeltaJSON, _ := json.Marshal(messageDelta)
-			results = append(results, "event: message_delta\ndata: "+string(messageDeltaJSON)+"\n\n")
-			param.MessageDeltaSent = true
 		}
+		// Send message_delta with usage
+		messageDelta := map[string]interface{}{
+			"type": "message_delta",
+			"delta": map[string]interface{}{
+				"stop_reason":   mapOpenAIFinishReasonToAnthropic(param.FinishReason),
+				"stop_sequence": nil,
+			},
+			"usage": map[string]interface{}{
+				"input_tokens":  inputTokens,
+				"output_tokens": outputTokens,
+			},
+		}
+
+		messageDeltaJSON, _ := json.Marshal(messageDelta)
+		results = append(results, "event: message_delta\ndata: "+string(messageDeltaJSON)+"\n\n")
+		param.MessageDeltaSent = true
+
 	}
 
 	return results
@@ -412,6 +419,11 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) []string {
 		response["usage"] = map[string]interface{}{
 			"input_tokens":  usage.Get("prompt_tokens").Int(),
 			"output_tokens": usage.Get("completion_tokens").Int(),
+		}
+	} else {
+		response["usage"] = map[string]interface{}{
+			"input_tokens":  0,
+			"output_tokens": 0,
 		}
 	}
 
@@ -601,6 +613,8 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 		usageJSON, _ = sjson.Set(usageJSON, "output_tokens", respUsage.Get("completion_tokens").Int())
 		parsedUsage := gjson.Parse(usageJSON).Value().(map[string]interface{})
 		response["usage"] = parsedUsage
+	} else {
+		response["usage"] = `{"input_tokens":0,"output_tokens":0}`
 	}
 
 	if response["stop_reason"] == nil {
