@@ -201,7 +201,7 @@ func GetAIStudioModels() []*ModelInfo {
 				OwnedBy:                    "google",
 				Type:                       "gemini",
 				Name:                       "models/gemini-3-pro-preview",
-				Version:                    "2.5",
+				Version:                    "3.0",
 				DisplayName:                "Gemini 3 Pro Preview",
 				Description:                "Gemini 3 Pro Preview",
 				InputTokenLimit:            1048576,
