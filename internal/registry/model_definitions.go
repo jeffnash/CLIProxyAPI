@@ -195,6 +195,21 @@ func GetAIStudioModels() []*ModelInfo {
 	return append(base,
 		[]*ModelInfo{
 			{
+				ID:                         "gemini-3-pro-preview",
+				Object:                     "model",
+				Created:                    time.Now().Unix(),
+				OwnedBy:                    "google",
+				Type:                       "gemini",
+				Name:                       "models/gemini-3-pro-preview",
+				Version:                    "2.5",
+				DisplayName:                "Gemini 3 Pro Preview",
+				Description:                "Gemini 3 Pro Preview",
+				InputTokenLimit:            1048576,
+				OutputTokenLimit:           65536,
+				SupportedGenerationMethods: []string{"generateContent", "countTokens", "createCachedContent", "batchGenerateContent"},
+				Thinking:                   &ThinkingSupport{Min: 128, Max: 32768, ZeroAllowed: false, DynamicAllowed: true},
+			},
+			{
 				ID:                         "gemini-pro-latest",
 				Object:                     "model",
 				Created:                    time.Now().Unix(),
