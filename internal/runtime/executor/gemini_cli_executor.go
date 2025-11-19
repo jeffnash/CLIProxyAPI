@@ -392,6 +392,12 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			continue
 		}
 
+		// If we have a failed response (non-2xx), don't attempt streaming
+		// Continue outer loop to try next model or return error
+		if httpResp == nil || httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			continue
+		}
+
 		out := make(chan cliproxyexecutor.StreamChunk)
 		stream = out
 		go func(resp *http.Response, reqBody []byte, attempt string) {
