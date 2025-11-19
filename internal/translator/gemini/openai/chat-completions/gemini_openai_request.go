@@ -15,6 +15,8 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+const geminiFunctionThoughtSignature = "skip_thought_signature_validator"
+
 // ConvertOpenAIRequestToGemini converts an OpenAI Chat Completions request (raw JSON)
 // into a complete Gemini request JSON. All JSON construction uses sjson and lookups use gjson.
 //
@@ -264,6 +266,7 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 							fargs := tc.Get("function.arguments").String()
 							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
 							node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
+							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiFunctionThoughtSignature)
 							p++
 							if fid != "" {
 								fIDs = append(fIDs, fid)
