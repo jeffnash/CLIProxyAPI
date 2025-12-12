@@ -24,4 +24,7 @@ const (
 
 	// Antigravity represents the Antigravity response format identifier.
 	Antigravity = "antigravity"
+
+	// Grok represents the X.AI Grok provider identifier.
+	Grok = "grok"
 )

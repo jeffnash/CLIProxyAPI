@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	grokauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/grok"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -197,6 +198,29 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}
+	// Provider-specific normalization
+	switch strings.ToLower(provider) {
+	case "grok":
+		storage := &grokauth.GrokTokenStorage{
+			SSOToken:              grokauth.NormalizeSSOToken(stringField(metadata, "sso_token")),
+			CFClearance:           stringField(metadata, "cf_clearance"),
+			TokenType:             strings.ToLower(stringField(metadata, "token_type")),
+			Status:                stringField(metadata, "status"),
+			FailedCount:           intField(metadata, "failed_count"),
+			RemainingQueries:      intField(metadata, "remaining_queries"),
+			HeavyRemainingQueries: intField(metadata, "heavy_remaining_queries"),
+			Note:                  stringField(metadata, "note"),
+			Type:                  "grok",
+		}
+		auth.Storage = storage
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string)
+		}
+		auth.Attributes["sso_token"] = storage.SSOToken
+		auth.Attributes["cf_clearance"] = storage.CFClearance
+		auth.Attributes["token_type"] = storage.TokenType
+		auth.Attributes["proxy_url"] = stringField(metadata, "proxy_url")
+	}
 	return auth, nil
 }
 
@@ -209,6 +233,38 @@ func (s *FileTokenStore) idFor(path, baseDir string) string {
 		return path
 	}
 	return rel
+}
+
+func stringField(meta map[string]any, key string) string {
+	if v, ok := meta[key]; ok {
+		switch val := v.(type) {
+		case string:
+			return val
+		case fmt.Stringer:
+			return val.String()
+		case []byte:
+			return string(val)
+		}
+	}
+	return ""
+}
+
+func intField(meta map[string]any, key string) int {
+	if v, ok := meta[key]; ok {
+		switch val := v.(type) {
+		case float64:
+			return int(val)
+		case int64:
+			return int(val)
+		case int:
+			return val
+		case json.Number:
+			if i, err := val.Int64(); err == nil {
+				return int(i)
+			}
+		}
+	}
+	return 0
 }
 
 func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error) {
