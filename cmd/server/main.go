@@ -58,6 +58,7 @@ func main() {
 	var codexLogin bool
 	var copilotLogin bool
 	var claudeLogin bool
+	var grokLogin bool
 	var qwenLogin bool
 	var iflowLogin bool
 	var iflowCookie bool
@@ -73,6 +74,7 @@ func main() {
 	flag.BoolVar(&codexLogin, "codex-login", false, "Login to Codex using OAuth")
 	flag.BoolVar(&copilotLogin, "copilot-login", false, "Login to GitHub Copilot using device code flow")
 	flag.BoolVar(&claudeLogin, "claude-login", false, "Login to Claude using OAuth")
+	flag.BoolVar(&grokLogin, "grok-login", false, "Login to Grok using SSO JWT (browser cookie)")
 	flag.BoolVar(&qwenLogin, "qwen-login", false, "Login to Qwen using OAuth")
 	flag.BoolVar(&iflowLogin, "iflow-login", false, "Login to iFlow using OAuth")
 	flag.BoolVar(&iflowCookie, "iflow-cookie", false, "Login to iFlow using Cookie")
@@ -464,6 +466,9 @@ func main() {
 	} else if claudeLogin {
 		// Handle Claude login
 		cmd.DoClaudeLogin(cfg, options)
+	} else if grokLogin {
+		// Handle Grok SSO login
+		cmd.DoGrokLogin(cfg, options)
 	} else if qwenLogin {
 		cmd.DoQwenLogin(cfg, options)
 	} else if iflowLogin {

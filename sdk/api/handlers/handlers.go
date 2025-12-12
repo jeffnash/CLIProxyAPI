@@ -187,6 +187,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		Alt:             alt,
 		OriginalRequest: cloneBytes(rawJSON),
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         cloneRequestHeaders(ctx),
 	}
 	if cloned := cloneMetadata(metadata); cloned != nil {
 		opts.Metadata = cloned
@@ -229,6 +230,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		Alt:             alt,
 		OriginalRequest: cloneBytes(rawJSON),
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         cloneRequestHeaders(ctx),
 	}
 	if cloned := cloneMetadata(metadata); cloned != nil {
 		opts.Metadata = cloned
@@ -274,6 +276,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		Alt:             alt,
 		OriginalRequest: cloneBytes(rawJSON),
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         cloneRequestHeaders(ctx),
 	}
 	if cloned := cloneMetadata(metadata); cloned != nil {
 		opts.Metadata = cloned
@@ -407,6 +410,14 @@ func cloneBytes(src []byte) []byte {
 
 func normalizeModelMetadata(modelName string) (string, map[string]any) {
 	return util.NormalizeThinkingModel(modelName)
+}
+
+func cloneRequestHeaders(ctx context.Context) http.Header {
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil || ginCtx.Request.Header == nil {
+		return nil
+	}
+	return ginCtx.Request.Header.Clone()
 }
 
 func cloneMetadata(src map[string]any) map[string]any {

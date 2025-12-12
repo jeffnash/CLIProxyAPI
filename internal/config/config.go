@@ -67,13 +67,19 @@ type Config struct {
 
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
- 
+
 	// ScannerBufferSize defines the buffer size for reading response streams (in bytes).
 	// If 0, a default of 20MB is used.
 	ScannerBufferSize int `yaml:"scanner-buffer-size" json:"scanner-buffer-size"`
 
 	// CopilotKey defines GitHub Copilot API configurations.
 	CopilotKey []CopilotKey `yaml:"copilot-api-key" json:"copilot-api-key"`
+
+	// GrokKey defines Grok (X.AI) API configurations using SSO cookies.
+	GrokKey []GrokKey `yaml:"grok-api-key" json:"grok-api-key"`
+
+	// Grok holds Grok-specific behavioral configuration (headers, timeouts, stream hints).
+	Grok GrokConfig `yaml:"grok" json:"grok"`
 
 	// OpenAICompatibility defines OpenAI API compatibility configurations for external providers.
 	OpenAICompatibility []OpenAICompatibility `yaml:"openai-compatibility" json:"openai-compatibility"`
@@ -251,6 +257,69 @@ type CopilotKey struct {
 	AgentInitiatorPersist bool `yaml:"agent-initiator-persist" json:"agent-initiator-persist"`
 }
 
+// GrokKey represents the configuration for Grok (X.AI) API access.
+// Authentication uses SSO cookies from grok.com rather than traditional API keys.
+type GrokKey struct {
+	// SSOToken is the raw JWT value from the grok.com sso cookie (without "sso=" or "sso-rw=" prefixes).
+	SSOToken string `yaml:"sso-token" json:"sso-token"`
+
+	// CFClearance is the optional Cloudflare clearance cookie for bypassing protection.
+	CFClearance string `yaml:"cf-clearance,omitempty" json:"cf-clearance,omitempty"`
+
+	// TokenType indicates the token tier: "normal" or "super" (for grok-4-heavy access).
+	// Defaults to "normal" if not specified.
+	TokenType string `yaml:"token-type" json:"token-type"`
+
+	// Label is an optional user-friendly identifier for this Grok configuration.
+	Label string `yaml:"label,omitempty" json:"label,omitempty"`
+
+	// ProxyURL overrides the global proxy setting for Grok requests if provided.
+	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+}
+
+// GrokConfig exposes behavioral toggles for Grok integration.
+// Values here mirror the reference grok_config options for Statsig headers, cookies, stream handling, and media rendering.
+type GrokConfig struct {
+	// Temporary controls whether Grok creates temporary conversations (defaults to true when unset).
+	Temporary *bool `yaml:"temporary,omitempty" json:"temporary,omitempty"`
+
+	// DynamicStatsig toggles random x-statsig-id generation; when false, FixedStatsigID is used if provided.
+	DynamicStatsig *bool `yaml:"dynamic-statsig,omitempty" json:"dynamic-statsig,omitempty"`
+
+	// FixedStatsigID overrides x-statsig-id when DynamicStatsig is false.
+	FixedStatsigID string `yaml:"x-statsig-id,omitempty" json:"x-statsig-id,omitempty"`
+
+	// CFClearance provides a global Cloudflare clearance cookie appended to Grok requests.
+	CFClearance string `yaml:"cf-clearance,omitempty" json:"cf-clearance,omitempty"`
+
+	// ProxyURL overrides the global proxy for Grok requests when set.
+	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// AcceptLanguage customizes the Accept-Language header sent to Grok.
+	AcceptLanguage string `yaml:"accept-language,omitempty" json:"accept-language,omitempty"`
+
+	// ShowThinking controls whether <think> sections are surfaced in translated responses (default true).
+	ShowThinking *bool `yaml:"show-thinking,omitempty" json:"show-thinking,omitempty"`
+
+	// FilteredTags drops Grok streaming tokens containing any of these substrings.
+	FilteredTags []string `yaml:"filtered-tags,omitempty" json:"filtered-tags,omitempty"`
+
+	// ImageMode chooses how generated images are returned ("url" or "base64"); defaults to "url".
+	ImageMode string `yaml:"image-mode,omitempty" json:"image-mode,omitempty"`
+
+	// StreamChunkTimeoutSeconds caps idle time between Grok stream chunks (0 disables).
+	StreamChunkTimeoutSeconds int `yaml:"stream-chunk-timeout,omitempty" json:"stream-chunk-timeout,omitempty"`
+
+	// StreamFirstChunkTimeoutSeconds caps time to the first Grok stream chunk (0 disables).
+	StreamFirstChunkTimeoutSeconds int `yaml:"stream-first-chunk-timeout,omitempty" json:"stream-first-chunk-timeout,omitempty"`
+
+	// StreamTotalTimeoutSeconds caps total stream duration (0 disables).
+	StreamTotalTimeoutSeconds int `yaml:"stream-total-timeout,omitempty" json:"stream-total-timeout,omitempty"`
+
+	// RequestTimeoutSeconds sets the HTTP client timeout for Grok requests (defaults to 120s when unset/zero).
+	RequestTimeoutSeconds int `yaml:"request-timeout,omitempty" json:"request-timeout,omitempty"`
+}
+
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
@@ -401,6 +470,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Copilot keys: normalize account type
 	cfg.SanitizeCopilotKeys()
 
+	// Sanitize Grok keys: normalize token types and trim whitespace
+	cfg.SanitizeGrokKeys()
+	cfg.SanitizeGrokConfig()
+
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
 
@@ -484,6 +557,84 @@ func (cfg *Config) SanitizeCopilotKeys() {
 		} else {
 			entry.AccountType = string(copilotshared.DefaultAccountType)
 		}
+	}
+}
+
+// SanitizeGrokKeys normalizes Grok configurations.
+// It validates token types, trims whitespace, and sets defaults.
+func (cfg *Config) SanitizeGrokKeys() {
+	if cfg == nil || len(cfg.GrokKey) == 0 {
+		return
+	}
+	out := make([]GrokKey, 0, len(cfg.GrokKey))
+	for i := range cfg.GrokKey {
+		entry := cfg.GrokKey[i]
+		entry.SSOToken = extractBareSSOToken(strings.TrimSpace(entry.SSOToken))
+		if entry.SSOToken == "" {
+			continue
+		}
+		entry.CFClearance = strings.TrimSpace(entry.CFClearance)
+		entry.TokenType = strings.TrimSpace(strings.ToLower(entry.TokenType))
+		entry.Label = strings.TrimSpace(entry.Label)
+		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+
+		// Validate and normalize token type
+		if entry.TokenType != "normal" && entry.TokenType != "super" {
+			entry.TokenType = "normal" // Default to normal
+		}
+		out = append(out, entry)
+	}
+	cfg.GrokKey = out
+}
+
+// SanitizeGrokConfig applies defaults and normalization for Grok-specific settings.
+func (cfg *Config) SanitizeGrokConfig() {
+	if cfg == nil {
+		return
+	}
+
+	// Defaults based on reference client behavior.
+	if cfg.Grok.AcceptLanguage = strings.TrimSpace(cfg.Grok.AcceptLanguage); cfg.Grok.AcceptLanguage == "" {
+		cfg.Grok.AcceptLanguage = "zh-CN,zh;q=0.9"
+	}
+
+	cfg.Grok.CFClearance = strings.TrimSpace(strings.TrimPrefix(cfg.Grok.CFClearance, "cf_clearance="))
+	cfg.Grok.ProxyURL = strings.TrimSpace(cfg.Grok.ProxyURL)
+	cfg.Grok.FixedStatsigID = strings.TrimSpace(cfg.Grok.FixedStatsigID)
+
+	if cfg.Grok.ImageMode = strings.TrimSpace(strings.ToLower(cfg.Grok.ImageMode)); cfg.Grok.ImageMode == "" {
+		cfg.Grok.ImageMode = "url"
+	}
+
+	cfg.Grok.FilteredTags = normalizeList(cfg.Grok.FilteredTags)
+
+	if cfg.Grok.RequestTimeoutSeconds <= 0 {
+		cfg.Grok.RequestTimeoutSeconds = 120
+	}
+	if cfg.Grok.StreamChunkTimeoutSeconds <= 0 {
+		cfg.Grok.StreamChunkTimeoutSeconds = 120
+	}
+	if cfg.Grok.StreamFirstChunkTimeoutSeconds <= 0 {
+		cfg.Grok.StreamFirstChunkTimeoutSeconds = 30
+	}
+	if cfg.Grok.StreamTotalTimeoutSeconds == 0 {
+		cfg.Grok.StreamTotalTimeoutSeconds = 600
+	} else if cfg.Grok.StreamTotalTimeoutSeconds < 0 {
+		cfg.Grok.StreamTotalTimeoutSeconds = 0
+	}
+
+	// Enable dynamic statsig by default to avoid requiring a fixed ID.
+	if cfg.Grok.DynamicStatsig == nil {
+		def := true
+		cfg.Grok.DynamicStatsig = &def
+	}
+	if cfg.Grok.ShowThinking == nil {
+		def := true
+		cfg.Grok.ShowThinking = &def
+	}
+	if cfg.Grok.Temporary == nil {
+		def := true
+		cfg.Grok.Temporary = &def
 	}
 }
 
@@ -586,6 +737,65 @@ func NormalizeExcludedModels(models []string) []string {
 		return nil
 	}
 	return out
+}
+
+func normalizeList(entries []string) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(entries))
+	out := make([]string, 0, len(entries))
+	for _, raw := range entries {
+		for _, part := range strings.Split(raw, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				if _, ok := seen[trimmed]; ok {
+					continue
+				}
+				seen[trimmed] = struct{}{}
+				out = append(out, trimmed)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func extractBareSSOToken(token string) string {
+	if token == "" {
+		return ""
+	}
+	token = strings.TrimSpace(token)
+	if strings.Contains(token, "sso=") {
+		parts := strings.Split(token, "sso=")
+		last := parts[len(parts)-1]
+		if idx := strings.Index(last, ";"); idx >= 0 {
+			return strings.TrimSpace(last[:idx])
+		}
+		return strings.TrimSpace(last)
+	}
+	return token
+}
+
+// Helper accessors avoid leaking pointer handling throughout the codebase.
+func (g GrokConfig) TemporaryValue() bool {
+	return boolOrDefault(g.Temporary, true)
+}
+
+func (g GrokConfig) DynamicStatsigValue() bool {
+	return boolOrDefault(g.DynamicStatsig, true)
+}
+
+func (g GrokConfig) ShowThinkingValue() bool {
+	return boolOrDefault(g.ShowThinking, true)
+}
+
+func boolOrDefault(v *bool, def bool) bool {
+	if v == nil {
+		return def
+	}
+	return *v
 }
 
 // NormalizeOAuthExcludedModels cleans provider -> excluded models mappings by normalizing provider keys
