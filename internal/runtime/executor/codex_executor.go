@@ -54,6 +54,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
+	if aliasModel, effort, ok := resolveCodexAlias(req.Model); ok {
+		upstreamModel = aliasModel
+		body = setReasoningEffortByAlias(body, aliasModel, effort)
+	}
 	body = applyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort")
 	body = normalizeThinkingConfig(body, upstreamModel)
 	if errValidate := validateThinkingConfig(body, upstreamModel); errValidate != nil {
@@ -151,6 +155,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+	if aliasModel, effort, ok := resolveCodexAlias(req.Model); ok {
+		upstreamModel = aliasModel
+		body = setReasoningEffortByAlias(body, aliasModel, effort)
+	}
 
 	body = applyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort")
 	body = normalizeThinkingConfig(body, upstreamModel)
@@ -253,6 +261,10 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 
 	modelForCounting := req.Model
+	if aliasModel, effort, ok := resolveCodexAlias(req.Model); ok {
+		modelForCounting = aliasModel
+		body = setReasoningEffortByAlias(body, aliasModel, effort)
+	}
 
 	body = applyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort")
 	body, _ = sjson.SetBytes(body, "model", upstreamModel)
@@ -272,6 +284,75 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	usageJSON := fmt.Sprintf(`{"response":{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}}`, count, count)
 	translated := sdktranslator.TranslateTokenCount(ctx, to, from, count, []byte(usageJSON))
 	return cliproxyexecutor.Response{Payload: []byte(translated)}, nil
+}
+
+func resolveCodexAlias(modelName string) (baseModel, effort string, ok bool) {
+	switch modelName {
+	case "gpt-5-minimal":
+		return "gpt-5", "minimal", true
+	case "gpt-5-low":
+		return "gpt-5", "low", true
+	case "gpt-5-medium":
+		return "gpt-5", "medium", true
+	case "gpt-5-high":
+		return "gpt-5", "high", true
+	case "gpt-5-codex-low":
+		return "gpt-5-codex", "low", true
+	case "gpt-5-codex-medium":
+		return "gpt-5-codex", "medium", true
+	case "gpt-5-codex-high":
+		return "gpt-5-codex", "high", true
+	case "gpt-5-codex-mini-medium":
+		return "gpt-5-codex-mini", "medium", true
+	case "gpt-5-codex-mini-high":
+		return "gpt-5-codex-mini", "high", true
+	case "gpt-5.1-none":
+		return "gpt-5.1", "none", true
+	case "gpt-5.1-low":
+		return "gpt-5.1", "low", true
+	case "gpt-5.1-medium":
+		return "gpt-5.1", "medium", true
+	case "gpt-5.1-high":
+		return "gpt-5.1", "high", true
+	case "gpt-5.1-codex-low":
+		return "gpt-5.1-codex", "low", true
+	case "gpt-5.1-codex-medium":
+		return "gpt-5.1-codex", "medium", true
+	case "gpt-5.1-codex-high":
+		return "gpt-5.1-codex", "high", true
+	case "gpt-5.1-codex-mini-medium":
+		return "gpt-5.1-codex-mini", "medium", true
+	case "gpt-5.1-codex-mini-high":
+		return "gpt-5.1-codex-mini", "high", true
+	case "gpt-5.1-codex-max-low":
+		return "gpt-5.1-codex-max", "low", true
+	case "gpt-5.1-codex-max-medium":
+		return "gpt-5.1-codex-max", "medium", true
+	case "gpt-5.1-codex-max-high":
+		return "gpt-5.1-codex-max", "high", true
+	case "gpt-5.1-codex-max-xhigh":
+		return "gpt-5.1-codex-max", "xhigh", true
+	case "gpt-5.2-low":
+		return "gpt-5.2", "low", true
+	case "gpt-5.2-medium":
+		return "gpt-5.2", "medium", true
+	case "gpt-5.2-high":
+		return "gpt-5.2", "high", true
+	case "gpt-5.2-xhigh":
+		return "gpt-5.2", "xhigh", true
+	default:
+		return "", "", false
+	}
+}
+
+func setReasoningEffortByAlias(payload []byte, baseModel string, effort string) []byte {
+	if strings.TrimSpace(baseModel) != "" {
+		payload, _ = sjson.SetBytes(payload, "model", baseModel)
+	}
+	if strings.TrimSpace(effort) != "" {
+		payload, _ = sjson.SetBytes(payload, "reasoning.effort", strings.ToLower(strings.TrimSpace(effort)))
+	}
+	return payload
 }
 
 func tokenizerForCodexModel(model string) (tokenizer.Codec, error) {
