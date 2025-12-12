@@ -334,6 +334,8 @@ func resolveCodexAlias(modelName string) (baseModel, effort string, ok bool) {
 		return "gpt-5.1-codex-max", "xhigh", true
 	case "gpt-5.2-low":
 		return "gpt-5.2", "low", true
+	case "gpt-5.2-none":
+		return "gpt-5.2", "none", true
 	case "gpt-5.2-medium":
 		return "gpt-5.2", "medium", true
 	case "gpt-5.2-high":
