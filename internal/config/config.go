@@ -255,6 +255,10 @@ type CopilotKey struct {
 	// AgentInitiatorPersist, when true, forces subsequent Copilot requests sharing the
 	// same prompt_cache_key to send X-Initiator=agent after the first call. Default false.
 	AgentInitiatorPersist bool `yaml:"agent-initiator-persist" json:"agent-initiator-persist"`
+
+	// ForceAgentCall, when true, forces every Copilot request to be treated as an agent call
+	// regardless of request payload (X-Initiator: agent). Default false.
+	ForceAgentCall bool `yaml:"force-agent-call" json:"force-agent-call"`
 }
 
 // GrokKey represents the configuration for Grok (X.AI) API access.

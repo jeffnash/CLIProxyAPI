@@ -105,6 +105,12 @@ ws-auth: false
 #    # to send the header "X-Initiator: agent" instead of "vscode". This mirrors VS Code's behavior for
 #    # long-running agent interactions and helps prevent hitting standard rate limits.
 #    agent-initiator-persist: true
+#
+#    # When set to true, force every Copilot request to send "X-Initiator: agent" regardless of payload.
+#    force-agent-call: true
+#
+#    # You can also force agent initiator per-request via an incoming HTTP header:
+#    #   force-copilot-agent: true
 
 # Claude API keys
 # claude-api-key:

@@ -268,7 +268,7 @@ func TestApplyCopilotHeaders_XInitiator(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			e := NewCopilotExecutor(&config.Config{})
 			req := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
-			e.applyCopilotHeaders(req, "test-token", []byte(tt.payload))
+			e.applyCopilotHeaders(req, "test-token", []byte(tt.payload), nil)
 
 			got := req.Header.Get("X-Initiator")
 			if got != tt.expectedInitiator {
@@ -278,20 +278,34 @@ func TestApplyCopilotHeaders_XInitiator(t *testing.T) {
 	}
 }
 
+func TestApplyCopilotHeaders_XInitiator_ForcedByIncomingHeader(t *testing.T) {
+	e := NewCopilotExecutor(&config.Config{})
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
+	incoming := http.Header{}
+	incoming.Set("force-copilot-agent", "true")
+
+	payload := `{"messages":[{"role":"user","content":"hello"}]}`
+	e.applyCopilotHeaders(req, "test-token", []byte(payload), incoming)
+
+	if got := req.Header.Get("X-Initiator"); got != "agent" {
+		t.Fatalf("X-Initiator = %q, want agent", got)
+	}
+}
+
 func TestApplyCopilotHeaders_XInitiator_PersistAcrossCalls(t *testing.T) {
 	payload := `{"prompt_cache_key":"thread-1","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}`
 
 	t.Run("disabled flag keeps user initiator", func(t *testing.T) {
 		e := NewCopilotExecutor(&config.Config{})
 		req1 := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
-		e.applyCopilotHeaders(req1, "test-token", []byte(payload))
+		e.applyCopilotHeaders(req1, "test-token", []byte(payload), nil)
 
 		if got := req1.Header.Get("X-Initiator"); got != "user" {
 			t.Fatalf("first call initiator = %q, want user", got)
 		}
 
 		req2 := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
-		e.applyCopilotHeaders(req2, "test-token", []byte(payload))
+		e.applyCopilotHeaders(req2, "test-token", []byte(payload), nil)
 
 		if got := req2.Header.Get("X-Initiator"); got != "user" {
 			t.Fatalf("second call initiator = %q, want user when flag disabled", got)
@@ -301,14 +315,14 @@ func TestApplyCopilotHeaders_XInitiator_PersistAcrossCalls(t *testing.T) {
 	t.Run("enabled flag promotes to agent after first", func(t *testing.T) {
 		e := NewCopilotExecutor(&config.Config{CopilotKey: []config.CopilotKey{{AgentInitiatorPersist: true}}})
 		req1 := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
-		e.applyCopilotHeaders(req1, "test-token", []byte(payload))
+		e.applyCopilotHeaders(req1, "test-token", []byte(payload), nil)
 
 		if got := req1.Header.Get("X-Initiator"); got != "user" {
 			t.Fatalf("first call initiator = %q, want user", got)
 		}
 
 		req2 := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
-		e.applyCopilotHeaders(req2, "test-token", []byte(payload))
+		e.applyCopilotHeaders(req2, "test-token", []byte(payload), nil)
 
 		if got := req2.Header.Get("X-Initiator"); got != "agent" {
 			t.Fatalf("second call initiator = %q, want agent when flag enabled", got)
@@ -361,7 +375,7 @@ func TestApplyCopilotHeaders_Vision(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			e := NewCopilotExecutor(&config.Config{})
 			req := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
-			e.applyCopilotHeaders(req, "test-token", []byte(tt.payload))
+			e.applyCopilotHeaders(req, "test-token", []byte(tt.payload), nil)
 
 			got := req.Header.Get("Copilot-Vision-Request")
 			hasVision := got == "true"

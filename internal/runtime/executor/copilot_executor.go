@@ -139,7 +139,7 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 		return resp, err
 	}
 
-	e.applyCopilotHeaders(httpReq, copilotToken, req.Payload)
+	e.applyCopilotHeaders(httpReq, copilotToken, req.Payload, opts.Headers)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -234,7 +234,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 		return nil, err
 	}
 
-	e.applyCopilotHeaders(httpReq, copilotToken, req.Payload)
+	e.applyCopilotHeaders(httpReq, copilotToken, req.Payload, opts.Headers)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
