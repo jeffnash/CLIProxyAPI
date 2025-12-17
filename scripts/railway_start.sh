@@ -9,11 +9,28 @@ require_env() {
   fi
 }
 
+require_any_env() {
+  local name_a="$1"
+  local name_b="$2"
+  if [[ -z "${!name_a:-}" && -z "${!name_b:-}" ]]; then
+    echo "Missing required env var: ${name_a} or ${name_b}" >&2
+    exit 1
+  fi
+}
+
+require_cmd() {
+  local name="$1"
+  if ! command -v "$name" >/dev/null 2>&1; then
+    echo "Need ${name} installed to continue" >&2
+    exit 1
+  fi
+}
+
 info() {
   echo "[railway] $*"
 }
 
-require_env "AUTH_ZIP_URL"
+require_any_env "AUTH_ZIP_URL" "AUTH_BUNDLE"
 require_env "API_KEY_1"
 
 ROOT_DIR="$(pwd)"
@@ -21,31 +38,49 @@ AUTH_DIR_NAME="${AUTH_DIR_NAME:-auths_railway}"
 AUTH_DIR_PATH="${ROOT_DIR}/${AUTH_DIR_NAME}"
 
 ZIP_PATH="${ROOT_DIR}/auths.zip"
+TAR_PATH="${ROOT_DIR}/auths.tar.gz"
 OUT_CONFIG_PATH="${ROOT_DIR}/config.yaml"
 
 info "Preparing auth dir: ${AUTH_DIR_PATH}"
 rm -rf "${AUTH_DIR_PATH}"
 mkdir -p "${AUTH_DIR_PATH}"
 
-info "Downloading auth zip from AUTH_ZIP_URL"
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "${AUTH_ZIP_URL}" -o "${ZIP_PATH}"
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO "${ZIP_PATH}" "${AUTH_ZIP_URL}"
-else
-  echo "Need curl or wget installed to fetch ${AUTH_ZIP_URL}" >&2
-  exit 1
-fi
+decode_base64() {
+  if base64 --help 2>&1 | grep -q -- "-d"; then
+    base64 -d
+  else
+    base64 --decode
+  fi
+}
 
-info "Unzipping auths"
-if command -v unzip >/dev/null 2>&1; then
-  unzip -q "${ZIP_PATH}" -d "${AUTH_DIR_PATH}"
+if [[ -n "${AUTH_BUNDLE:-}" ]]; then
+  info "Restoring auths from AUTH_BUNDLE"
+  require_cmd "tar"
+  require_cmd "base64"
+  printf '%s' "${AUTH_BUNDLE}" | tr -d '\r\n' | decode_base64 > "${TAR_PATH}"
+  tar -xzf "${TAR_PATH}" -C "${AUTH_DIR_PATH}"
+  rm -f "${TAR_PATH}"
 else
-  echo "Need unzip installed to extract auth files" >&2
-  exit 1
-fi
+  info "Downloading auth zip from AUTH_ZIP_URL"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "${AUTH_ZIP_URL}" -o "${ZIP_PATH}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "${ZIP_PATH}" "${AUTH_ZIP_URL}"
+  else
+    echo "Need curl or wget installed to fetch ${AUTH_ZIP_URL}" >&2
+    exit 1
+  fi
 
-rm -f "${ZIP_PATH}"
+  info "Unzipping auths"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "${ZIP_PATH}" -d "${AUTH_DIR_PATH}"
+  else
+    echo "Need unzip installed to extract auth files" >&2
+    exit 1
+  fi
+
+  rm -f "${ZIP_PATH}"
+fi
 
 info "Writing config: ${OUT_CONFIG_PATH}"
 
