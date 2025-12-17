@@ -17,6 +17,14 @@ type GrokModelConfig struct {
 }
 
 var GrokModels = map[string]GrokModelConfig{
+	"grok-3": {
+		GrokModel:      "grok-3",
+		ModelMode:      "MODEL_MODE_FAST",
+		RequiresSuper:  false,
+		ContextWindow:  131072,
+		MaxOutput:      8192,
+		RateLimitModel: "grok-3",
+	},
 	"grok-3-fast": {
 		GrokModel:      "grok-3",
 		ModelMode:      "MODEL_MODE_FAST",
