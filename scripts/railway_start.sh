@@ -48,6 +48,40 @@ fi
 rm -f "${ZIP_PATH}"
 
 info "Writing config: ${OUT_CONFIG_PATH}"
+
+COPILOT_ACCOUNT_TYPE="${COPILOT_ACCOUNT_TYPE:-individual}"
+COPILOT_AGENT_INITIATOR_PERSIST="${COPILOT_AGENT_INITIATOR_PERSIST:-true}"
+COPILOT_FORCE_AGENT_CALL="${COPILOT_FORCE_AGENT_CALL:-false}"
+
+is_truthy() {
+  local v="${1:-}"
+  v="${v,,}"
+  v="${v//[[:space:]]/}"
+  case "$v" in
+    1|true|t|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+COPILOT_BLOCK=""
+if is_truthy "$COPILOT_AGENT_INITIATOR_PERSIST" || is_truthy "$COPILOT_FORCE_AGENT_CALL"; then
+  COPILOT_BLOCK+="# GitHub Copilot account configuration\n"
+  COPILOT_BLOCK+="# Note: Copilot uses OAuth device code authentication, NOT API keys or tokens.\n"
+  COPILOT_BLOCK+="copilot-api-key:\n"
+  COPILOT_BLOCK+="  - account-type: \"${COPILOT_ACCOUNT_TYPE}\"\n"
+  if is_truthy "$COPILOT_AGENT_INITIATOR_PERSIST"; then
+    COPILOT_BLOCK+="    agent-initiator-persist: true\n"
+  else
+    COPILOT_BLOCK+="    agent-initiator-persist: false\n"
+  fi
+  if is_truthy "$COPILOT_FORCE_AGENT_CALL"; then
+    COPILOT_BLOCK+="    force-agent-call: true\n"
+  else
+    COPILOT_BLOCK+="    force-agent-call: false\n"
+  fi
+  COPILOT_BLOCK+="\n"
+fi
+
 cat >"${OUT_CONFIG_PATH}" <<EOF
 # Server port
 # Railway expects the process to listen on $PORT.
@@ -149,6 +183,11 @@ quota-exceeded:
 #    #   - false: disable XML hint and keep <think> separate
 #    code-mode: false
 EOF
+
+# Append dynamic sections that depend on env vars.
+if [[ -n "${COPILOT_BLOCK}" ]]; then
+  printf "%b" "${COPILOT_BLOCK}" >>"${OUT_CONFIG_PATH}"
+fi
 
 BIN_PATH="${ROOT_DIR}/cli-proxy-api"
 FORCE_BUILD="${FORCE_BUILD:-0}"
