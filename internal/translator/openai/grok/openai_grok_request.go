@@ -90,16 +90,7 @@ func extractOpenAIContent(rawJSON []byte) (messageWithRoles string, plainText st
 
 			// Handle tool results from previous tool calls
 			if role == "tool" {
-				toolCallID := msg.Get("tool_call_id").String()
-				toolContent := ""
-				if content.Type == gjson.String {
-					toolContent = content.String()
-				}
-				contentBuilder.WriteString("tool_result: ")
-				if toolCallID != "" {
-					contentBuilder.WriteString(fmt.Sprintf("[call_id=%s] ", toolCallID))
-				}
-				contentBuilder.WriteString(toolContent)
+				contentBuilder.WriteString(formatToolResult(msg.Get("tool_call_id").String(), content))
 				contentBuilder.WriteString("\n")
 				return true
 			}
@@ -112,7 +103,7 @@ func extractOpenAIContent(rawJSON []byte) (messageWithRoles string, plainText st
 						callID := tc.Get("id").String()
 						funcName := tc.Get("function.name").String()
 						funcArgs := tc.Get("function.arguments").String()
-						contentBuilder.WriteString(fmt.Sprintf("<tool_call>{\"tool_name\":\"%s\",\"call_id\":\"%s\",\"arguments\":%s}</tool_call>", funcName, callID, funcArgs))
+						contentBuilder.WriteString(formatToolCall(funcName, callID, funcArgs))
 						return true
 					})
 					contentBuilder.WriteString("\n")
@@ -358,6 +349,27 @@ func buildToolInstruction(tools gjson.Result) string {
 	sb.WriteString("5. Is the ORIGINAL task 100% complete? If NO → make more tool calls\n")
 	sb.WriteString("\nNO CLAIMS WITHOUT PROOF. TOOL OUTPUT FIRST, THEN SUMMARY. NOTHING ELSE.")
 	return sb.String()
+}
+
+func formatToolResult(toolCallID string, content gjson.Result) string {
+	toolContent := ""
+	if content.Type == gjson.String {
+		toolContent = content.String()
+	} else if content.Exists() {
+		toolContent = strings.TrimSpace(content.Raw)
+	}
+	if toolCallID == "" {
+		return fmt.Sprintf("tool_result: %s", toolContent)
+	}
+	return fmt.Sprintf("tool_result: [call_id=%s] %s", toolCallID, toolContent)
+}
+
+func formatToolCall(funcName, callID, funcArgs string) string {
+	args := strings.TrimSpace(funcArgs)
+	if args == "" {
+		args = "{}"
+	}
+	return fmt.Sprintf("<tool_call>{\"tool_name\":\"%s\",\"call_id\":\"%s\",\"arguments\":%s}</tool_call>", funcName, callID, args)
 }
 
 // BuildGrokVideoPayload mirrors the reference client's video handling.

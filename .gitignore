@@ -16,7 +16,7 @@ gitstore/*
 objectstore/*
 static/*
 refs/*
-
+debug/*
 # Authentication data
 auths/*
 !auths/.gitkeep
