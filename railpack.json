@@ -1,6 +1,9 @@
 {
   "$schema": "https://schema.railpack.com",
-  "packages": "go@1.24",
+  "provider": "go",
+  "packages": {
+    "go": "1.24"
+  },
   "deploy": {
     "aptPackages": [
       "bash",
