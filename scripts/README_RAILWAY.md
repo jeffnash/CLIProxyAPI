@@ -1,0 +1,39 @@
+# Railway deployment
+
+## What this does
+
+`scripts/railway_start.sh` bootstraps a Railway container by:
+
+1. Downloading a zip of auth files from `AUTH_ZIP_URL`
+2. Unzipping into a fresh folder at repo root (`auths_railway` by default)
+3. Writing `./config.yaml` with a fixed template, but:
+   - sets `auth-dir: "./auths_railway"` (or `AUTH_DIR_NAME`)
+   - sets `api-keys:` to a single entry from `API_KEY_1`
+4. Ensuring `./cli-proxy-api` exists (builds it with `go mod download` + `go build` if missing, or if `FORCE_BUILD` is set)
+5. Running `./cli-proxy-api --config ./config.yaml`
+
+## Required env vars
+
+- `AUTH_ZIP_URL` - public or signed URL to a zip file containing your auth JSON files
+- `API_KEY_1` - the API key clients will use to access the proxy (goes into `api-keys`)
+
+## Optional env vars
+
+- `AUTH_DIR_NAME` (default `auths_railway`) - folder name created at repo root
+- `FORCE_BUILD` (default `0`) - set to `1` (or any non-`0`) to force `go build` even if `./cli-proxy-api` already exists
+
+## Build vs runtime note
+
+Railway often runs a separate **build phase** and **start/runtime phase**.
+
+- The script checks `[[ -x ./cli-proxy-api ]]`. If it exists, it skips `go mod download`/`go build` to speed up cold starts.
+- If the binary is missing, the script will build it at startup (requires the Go toolchain to be present in the runtime image; Nixpacks Go services typically include it, slim runtime Docker stages often don’t).
+- If you suspect the binary is stale or mismatched, set `FORCE_BUILD=1` (or any non-`0`) to rebuild at startup.
+
+## Railway start command
+
+Use this as your Railway Start Command:
+
+```bash
+bash scripts/railway_start.sh
+```

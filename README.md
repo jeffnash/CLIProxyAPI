@@ -69,6 +69,10 @@ CLIProxyAPI includes integrated support for [Amp CLI](https://ampcode.com) and A
 - Watcher: [docs/sdk-watcher.md](docs/sdk-watcher.md)
 - Custom Provider Example: `examples/custom-provider`
 
+## Railway deployment
+
+See `scripts/README_RAILWAY.md` and use `bash scripts/railway_start.sh` as your Railway start command.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
