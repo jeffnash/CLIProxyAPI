@@ -4,8 +4,8 @@
 
 `scripts/railway_start.sh` bootstraps a Railway container by:
 
-1. Downloading a zip of auth files from `AUTH_ZIP_URL`
-2. Unzipping into a fresh folder at repo root (`auths_railway` by default)
+1. Restoring auth files from `AUTH_BUNDLE` **or** downloading a zip from `AUTH_ZIP_URL`
+2. Unpacking into a fresh folder at repo root (`auths_railway` by default)
 3. Writing `./config.yaml` with a fixed template, but:
    - sets `auth-dir: "./auths_railway"` (or `AUTH_DIR_NAME`)
    - sets `api-keys:` to a single entry from `API_KEY_1`
@@ -14,7 +14,9 @@
 
 ## Required env vars
 
-- `AUTH_ZIP_URL` - public or signed URL to a zip file containing your auth JSON files
+- One of:
+  - `AUTH_BUNDLE` - base64 tarball of your local auth files (see below)
+  - `AUTH_ZIP_URL` - public or signed URL to a zip file containing your auth JSON files
 - `API_KEY_1` - the API key clients will use to access the proxy (goes into `api-keys`)
 
 ## Optional env vars
@@ -23,6 +25,22 @@
 - `FORCE_BUILD` (default `0`) - set to `1` (or any non-`0`) to force `go build` even if `./cli-proxy-api` already exists
 - `COPILOT_AGENT_INITIATOR_PERSIST` (default `true`) - when truthy, writes `copilot-api-key[].agent-initiator-persist: true` into `config.yaml`
 - `COPILOT_FORCE_AGENT_CALL` (default `false`) - when truthy, writes `copilot-api-key[].force-agent-call: true` into `config.yaml`
+
+## Local auth bundle
+
+To turn your local `~/.cli-proxy-api` auth files into a single string:
+
+```bash
+AUTH_BUNDLE="$(bash scripts/auth_bundle.sh)"
+```
+
+To use a different folder:
+
+```bash
+AUTH_BUNDLE="$(AUTH_SOURCE_DIR=/path/to/auths bash scripts/auth_bundle.sh)"
+```
+
+Set that `AUTH_BUNDLE` value in Railway environment variables. If both `AUTH_BUNDLE` and `AUTH_ZIP_URL` are set, the bundle is used.
 
 ## Build vs runtime note
 

@@ -35,3 +35,6 @@ GEMINI.md
 # macOS
 .DS_Store
 ._*
+
+# Go
+.gocache
