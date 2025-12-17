@@ -49,9 +49,29 @@ func isResponsesAPIVisionContent(part gjson.Result) bool {
 }
 
 type copilotHeaderHints struct {
-	hasVision        bool
-	agentFromPayload bool
-	promptCacheKey   string
+	hasVision             bool
+	agentFromPayload      bool
+	forceAgentFromHeaders bool
+	promptCacheKey        string
+}
+
+func forceAgentCallFromHeaders(headers http.Header) bool {
+	if headers == nil {
+		return false
+	}
+	raw := strings.TrimSpace(headers.Get("force-copilot-agent"))
+	if raw == "" {
+		raw = strings.TrimSpace(headers.Get("Force-Copilot-Agent"))
+	}
+	if raw == "" {
+		return false
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "t", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func promptCacheKeyFromPayload(payload []byte) string {
@@ -68,8 +88,11 @@ func promptCacheKeyFromPayload(payload []byte) string {
 	return ""
 }
 
-func collectCopilotHeaderHints(payload []byte) copilotHeaderHints {
-	hints := copilotHeaderHints{promptCacheKey: promptCacheKeyFromPayload(payload)}
+func collectCopilotHeaderHints(payload []byte, headers http.Header) copilotHeaderHints {
+	hints := copilotHeaderHints{
+		promptCacheKey:        promptCacheKeyFromPayload(payload),
+		forceAgentFromHeaders: forceAgentCallFromHeaders(headers),
+	}
 
 	// Chat Completions format (messages array)
 	messages := gjson.GetBytes(payload, "messages")
@@ -111,6 +134,18 @@ func collectCopilotHeaderHints(payload []byte) copilotHeaderHints {
 	return hints
 }
 
+func (e *CopilotExecutor) forceAgentCallEnabled() bool {
+	if e == nil || e.cfg == nil {
+		return false
+	}
+	for i := range e.cfg.CopilotKey {
+		if e.cfg.CopilotKey[i].ForceAgentCall {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *CopilotExecutor) agentInitiatorPersistEnabled() bool {
 	if e == nil || e.cfg == nil {
 		return false
@@ -124,6 +159,12 @@ func (e *CopilotExecutor) agentInitiatorPersistEnabled() bool {
 }
 
 func (e *CopilotExecutor) shouldUseAgentInitiator(h copilotHeaderHints) bool {
+	if h.forceAgentFromHeaders {
+		return true
+	}
+	if e != nil && e.forceAgentCallEnabled() {
+		return true
+	}
 	if e != nil && e.agentInitiatorPersistEnabled() && h.promptCacheKey != "" {
 		e.mu.Lock()
 		count := e.initiatorCount[h.promptCacheKey]
@@ -141,8 +182,8 @@ func (e *CopilotExecutor) shouldUseAgentInitiator(h copilotHeaderHints) bool {
 
 // applyCopilotHeaders applies all necessary headers to the request.
 // It handles both Chat Completions format (messages array) and Responses API format (input array).
-func (e *CopilotExecutor) applyCopilotHeaders(r *http.Request, copilotToken string, payload []byte) {
-	hints := collectCopilotHeaderHints(payload)
+func (e *CopilotExecutor) applyCopilotHeaders(r *http.Request, copilotToken string, payload []byte, incoming http.Header) {
+	hints := collectCopilotHeaderHints(payload, incoming)
 	isAgentCall := e.shouldUseAgentInitiator(hints)
 
 	headers := copilotauth.CopilotHeaders(copilotToken, "", hints.hasVision)
