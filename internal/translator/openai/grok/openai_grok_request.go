@@ -623,6 +623,9 @@ func resolveUploadFileName(mimeType string) string {
 		ext = strings.SplitN(parts[1], "+", 2)[0]
 		ext = strings.TrimSpace(ext)
 	}
+	if ext == "jpeg" {
+		ext = "jpg"
+	}
 	if ext == "" {
 		ext = "jpg"
 	}
