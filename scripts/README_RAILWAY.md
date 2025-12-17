@@ -21,6 +21,8 @@
 
 - `AUTH_DIR_NAME` (default `auths_railway`) - folder name created at repo root
 - `FORCE_BUILD` (default `0`) - set to `1` (or any non-`0`) to force `go build` even if `./cli-proxy-api` already exists
+- `COPILOT_AGENT_INITIATOR_PERSIST` (default `true`) - when truthy, writes `copilot-api-key[].agent-initiator-persist: true` into `config.yaml`
+- `COPILOT_FORCE_AGENT_CALL` (default `false`) - when truthy, writes `copilot-api-key[].force-agent-call: true` into `config.yaml`
 
 ## Build vs runtime note
 
