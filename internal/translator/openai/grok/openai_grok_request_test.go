@@ -116,6 +116,7 @@ func TestConvertOpenAIRequestToGrok_ToolHandling(t *testing.T) {
 		name       string
 		messages   json.RawMessage
 		wantPrefix string
+		wantParts  []string
 	}{
 		{
 			name:       "Tool result message",
@@ -126,6 +127,11 @@ func TestConvertOpenAIRequestToGrok_ToolHandling(t *testing.T) {
 			name:       "Assistant with tool_calls",
 			messages:   json.RawMessage(`[{"role":"assistant","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"London\"}"}}]}]`),
 			wantPrefix: "assistant: <tool_call>{\"tool_name\":\"get_weather\",\"call_id\":\"call_abc\",\"arguments\":{\"location\":\"London\"}}</tool_call>\n",
+		},
+		{
+			name:      "Assistant with multiple tool_calls",
+			messages:  json.RawMessage(`[{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"alpha","arguments":"{}"}},{"id":"call_2","type":"function","function":{"name":"beta","arguments":"{\"x\":1}"}}]}]`),
+			wantParts: []string{`<tool_call>{"tool_name":"alpha","call_id":"call_1","arguments":{}}</tool_call>`, `<tool_call>{"tool_name":"beta","call_id":"call_2","arguments":{"x":1}}</tool_call>`},
 		},
 	}
 
@@ -140,8 +146,13 @@ func TestConvertOpenAIRequestToGrok_ToolHandling(t *testing.T) {
 			got := ConvertOpenAIRequestToGrok(modelName, payload, false)
 
 			msg := gjson.GetBytes(got, "message").String()
-			if !strings.Contains(msg, tt.wantPrefix) {
+			if tt.wantPrefix != "" && !strings.Contains(msg, tt.wantPrefix) {
 				t.Errorf("message missing expected prefix, got %v", msg)
+			}
+			for _, part := range tt.wantParts {
+				if !strings.Contains(msg, part) {
+					t.Errorf("message missing expected tool call %q, got %v", part, msg)
+				}
 			}
 		})
 	}
@@ -180,6 +191,34 @@ func TestExtractOpenAIContent(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestToolFormatting(t *testing.T) {
+	t.Run("tool result without call_id", func(t *testing.T) {
+		msg := formatToolResult("", gjson.Parse(`"ok"`))
+		if msg != "tool_result: ok" {
+			t.Errorf("unexpected tool result: %q", msg)
+		}
+		if strings.Contains(msg, "[]") || strings.Contains(msg, "  ") {
+			t.Errorf("tool result should not include empty call_id or double spaces: %q", msg)
+		}
+	})
+
+	t.Run("tool result non-string content", func(t *testing.T) {
+		msg := formatToolResult("call_9", gjson.Parse(`{"value":1}`))
+		want := `tool_result: [call_id=call_9] {"value":1}`
+		if msg != want {
+			t.Errorf("tool result = %q, want %q", msg, want)
+		}
+	})
+
+	t.Run("tool call empty arguments", func(t *testing.T) {
+		msg := formatToolCall("fn", "call_x", "   ")
+		want := `<tool_call>{"tool_name":"fn","call_id":"call_x","arguments":{}}</tool_call>`
+		if msg != want {
+			t.Errorf("tool call = %q, want %q", msg, want)
+		}
+	})
 }
 
 func TestVideoPayloadHelpers(t *testing.T) {
