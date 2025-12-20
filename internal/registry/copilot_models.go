@@ -26,7 +26,8 @@ func GenerateCopilotAliases(models []*ModelInfo) []*ModelInfo {
 // These are used when dynamic model fetching from the Copilot API fails.
 func GetCopilotModels() []*ModelInfo {
 	now := time.Now().Unix()
-	defaultParams := []string{"temperature", "top_p", "max_tokens", "stream", "tools"}
+	baseParams := []string{"temperature", "top_p", "max_tokens", "stream"}
+	paramsWithTools := append([]string{}, append(baseParams, "tools")...)
 
 	baseModels := []*ModelInfo{
 		{
@@ -39,7 +40,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Azure OpenAI model via GitHub Copilot",
 			ContextLength:       128000,
 			MaxCompletionTokens: 16384,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "gpt-4o",
@@ -51,7 +52,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Azure OpenAI model via GitHub Copilot",
 			ContextLength:       128000,
 			MaxCompletionTokens: 4096,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "gpt-41-copilot",
@@ -63,7 +64,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Azure OpenAI fine-tuned model via GitHub Copilot",
 			ContextLength:       128000,
 			MaxCompletionTokens: 16384,
-			SupportedParameters: defaultParams,
+			SupportedParameters: baseParams,
 		},
 		{
 			ID:                  "gpt-5",
@@ -75,7 +76,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Azure OpenAI model via GitHub Copilot",
 			ContextLength:       400000,
 			MaxCompletionTokens: 128000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "gpt-5-mini",
@@ -87,19 +88,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Azure OpenAI model via GitHub Copilot",
 			ContextLength:       264000,
 			MaxCompletionTokens: 64000,
-			SupportedParameters: defaultParams,
-		},
-		{
-			ID:                  "gpt-5-codex",
-			Object:              "model",
-			Created:             now,
-			OwnedBy:             "copilot",
-			Type:                "copilot",
-			DisplayName:         "GPT-5-Codex (Preview)",
-			Description:         "OpenAI model via GitHub Copilot (Preview)",
-			ContextLength:       400000,
-			MaxCompletionTokens: 128000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "gpt-5.1",
@@ -108,10 +97,10 @@ func GetCopilotModels() []*ModelInfo {
 			OwnedBy:             "copilot",
 			Type:                "copilot",
 			DisplayName:         "GPT-5.1",
-			Description:         "OpenAI model via GitHub Copilot (Preview)",
+			Description:         "OpenAI model via GitHub Copilot",
 			ContextLength:       264000,
 			MaxCompletionTokens: 64000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "gpt-5.1-codex",
@@ -120,10 +109,22 @@ func GetCopilotModels() []*ModelInfo {
 			OwnedBy:             "copilot",
 			Type:                "copilot",
 			DisplayName:         "GPT-5.1-Codex",
-			Description:         "OpenAI model via GitHub Copilot (Preview)",
+			Description:         "OpenAI model via GitHub Copilot",
 			ContextLength:       400000,
 			MaxCompletionTokens: 128000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
+		},
+		{
+			ID:                  "gpt-5.1-codex-max",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "copilot",
+			Type:                "copilot",
+			DisplayName:         "GPT-5.1-Codex-Max",
+			Description:         "OpenAI model via GitHub Copilot",
+			ContextLength:       400000,
+			MaxCompletionTokens: 128000,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "gpt-5.1-codex-mini",
@@ -135,7 +136,19 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "OpenAI model via GitHub Copilot (Preview)",
 			ContextLength:       400000,
 			MaxCompletionTokens: 128000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
+		},
+		{
+			ID:                  "gpt-5.2",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "copilot",
+			Type:                "copilot",
+			DisplayName:         "GPT-5.2",
+			Description:         "OpenAI model via GitHub Copilot",
+			ContextLength:       264000,
+			MaxCompletionTokens: 64000,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "claude-haiku-4.5",
@@ -147,19 +160,19 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Anthropic model via GitHub Copilot",
 			ContextLength:       144000,
 			MaxCompletionTokens: 16000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
-			ID:                  "claude-opus-4.1",
+			ID:                  "claude-opus-41",
 			Object:              "model",
 			Created:             now,
 			OwnedBy:             "copilot",
 			Type:                "copilot",
 			DisplayName:         "Claude Opus 4.1",
 			Description:         "Anthropic model via GitHub Copilot",
-			ContextLength:       200000,
+			ContextLength:       80000,
 			MaxCompletionTokens: 16000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: baseParams,
 		},
 		{
 			ID:                  "claude-sonnet-4",
@@ -171,7 +184,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Anthropic model via GitHub Copilot",
 			ContextLength:       216000,
 			MaxCompletionTokens: 16000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "claude-sonnet-4.5",
@@ -183,7 +196,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Anthropic model via GitHub Copilot",
 			ContextLength:       144000,
 			MaxCompletionTokens: 16000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "claude-opus-4.5",
@@ -191,11 +204,11 @@ func GetCopilotModels() []*ModelInfo {
 			Created:             now,
 			OwnedBy:             "copilot",
 			Type:                "copilot",
-			DisplayName:         "Claude Opus 4.5 (Preview)",
-			Description:         "Anthropic model via GitHub Copilot (Preview)",
+			DisplayName:         "Claude Opus 4.5",
+			Description:         "Anthropic model via GitHub Copilot",
 			ContextLength:       144000,
 			MaxCompletionTokens: 16000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "gemini-2.5-pro",
@@ -207,7 +220,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Google model via GitHub Copilot",
 			ContextLength:       128000,
 			MaxCompletionTokens: 64000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "gemini-3-pro-preview",
@@ -219,7 +232,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "Google model via GitHub Copilot (Preview)",
 			ContextLength:       128000,
 			MaxCompletionTokens: 64000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "grok-code-fast-1",
@@ -231,7 +244,7 @@ func GetCopilotModels() []*ModelInfo {
 			Description:         "xAI model via GitHub Copilot",
 			ContextLength:       128000,
 			MaxCompletionTokens: 64000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "oswe-vscode-prime",
@@ -239,11 +252,11 @@ func GetCopilotModels() []*ModelInfo {
 			Created:             now,
 			OwnedBy:             "copilot",
 			Type:                "copilot",
-			DisplayName:         "Raptor mini (Preview)",
-			Description:         "Azure OpenAI fine-tuned model via GitHub Copilot (Preview)",
+			DisplayName:         "Raptor mini (Legacy)",
+			Description:         "Azure OpenAI fine-tuned model via GitHub Copilot (Legacy)",
 			ContextLength:       264000,
 			MaxCompletionTokens: 64000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 		{
 			ID:                  "raptor-mini",
@@ -251,11 +264,11 @@ func GetCopilotModels() []*ModelInfo {
 			Created:             now,
 			OwnedBy:             "copilot",
 			Type:                "copilot",
-			DisplayName:         "Raptor mini (Preview)",
-			Description:         "Azure OpenAI fine-tuned model via GitHub Copilot (Preview) - alias for oswe-vscode-prime",
+			DisplayName:         "Raptor mini (Legacy)",
+			Description:         "Azure OpenAI fine-tuned model via GitHub Copilot (Legacy) - alias for oswe-vscode-prime",
 			ContextLength:       264000,
 			MaxCompletionTokens: 64000,
-			SupportedParameters: defaultParams,
+			SupportedParameters: paramsWithTools,
 		},
 	}
 

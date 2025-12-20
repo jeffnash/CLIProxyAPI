@@ -17,6 +17,8 @@ objectstore/*
 static/*
 refs/*
 debug/*
+coverage.out
+.cache/
 # Authentication data
 auths/*
 !auths/.gitkeep
