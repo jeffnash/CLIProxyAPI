@@ -14,7 +14,6 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	grokauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/grok"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -24,6 +23,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -809,7 +809,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						if providerKey == "" {
 							providerKey = "openai-compatibility"
 						}
-						GlobalModelRegistry().RegisterClient(a.ID, providerKey, ms)
+						GlobalModelRegistry().RegisterClient(a.ID, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 					} else {
 						// Ensure stale registrations are cleared when model list becomes empty.
 						GlobalModelRegistry().UnregisterClient(a.ID)
@@ -829,7 +829,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		if key == "" {
 			key = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
-		GlobalModelRegistry().RegisterClient(a.ID, key, models)
+		GlobalModelRegistry().RegisterClient(a.ID, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		return
 	}
 
@@ -1007,6 +1007,48 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		}
 	}
 	return filtered
+}
+
+func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
+	trimmedPrefix := strings.TrimSpace(prefix)
+	if trimmedPrefix == "" || len(models) == 0 {
+		return models
+	}
+
+	out := make([]*ModelInfo, 0, len(models)*2)
+	seen := make(map[string]struct{}, len(models)*2)
+
+	addModel := func(model *ModelInfo) {
+		if model == nil {
+			return
+		}
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, model)
+	}
+
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		baseID := strings.TrimSpace(model.ID)
+		if baseID == "" {
+			continue
+		}
+		if !forceModelPrefix || trimmedPrefix == baseID {
+			addModel(model)
+		}
+		clone := *model
+		clone.ID = trimmedPrefix + "/" + baseID
+		addModel(&clone)
+	}
+	return out
 }
 
 // matchWildcard performs case-insensitive wildcard matching where '*' matches any substring.

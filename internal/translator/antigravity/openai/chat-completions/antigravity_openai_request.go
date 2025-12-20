@@ -40,30 +40,27 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	re := gjson.GetBytes(rawJSON, "reasoning_effort")
 	hasOfficialThinking := re.Exists()
 	if hasOfficialThinking && util.ModelSupportsThinking(modelName) {
-		switch re.String() {
-		case "none":
-			out, _ = sjson.DeleteBytes(out, "request.generationConfig.thinkingConfig.include_thoughts")
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", 0)
-		case "auto":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		case "low":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", 1024)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		case "medium":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", 8192)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		case "high":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", 32768)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		default:
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
+		effort := strings.ToLower(strings.TrimSpace(re.String()))
+		if util.IsGemini3Model(modelName) {
+			switch effort {
+			case "none":
+				out, _ = sjson.DeleteBytes(out, "request.generationConfig.thinkingConfig")
+			case "auto":
+				includeThoughts := true
+				out = util.ApplyGeminiCLIThinkingLevel(out, "", &includeThoughts)
+			default:
+				if level, ok := util.ValidateGemini3ThinkingLevel(modelName, effort); ok {
+					out = util.ApplyGeminiCLIThinkingLevel(out, level, nil)
+				}
+			}
+		} else if !util.ModelUsesThinkingLevels(modelName) {
+			out = util.ApplyReasoningEffortToGeminiCLI(out, effort)
 		}
 	}
 
 	// Cherry Studio extension extra_body.google.thinking_config (effective only when official fields are absent)
-	if !hasOfficialThinking && util.ModelSupportsThinking(modelName) {
+	// Only apply for models that use numeric budgets, not discrete levels.
+	if !hasOfficialThinking && util.ModelSupportsThinking(modelName) && !util.ModelUsesThinkingLevels(modelName) {
 		if tc := gjson.GetBytes(rawJSON, "extra_body.google.thinking_config"); tc.Exists() && tc.IsObject() {
 			var setBudget bool
 			var budget int
@@ -240,62 +237,61 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				}
 				out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
 			} else if role == "assistant" {
+				node := []byte(`{"role":"model","parts":[]}`)
+				p := 0
 				if content.Type == gjson.String {
-					// Assistant text -> single model content
-					node := []byte(`{"role":"model","parts":[{"text":""}]}`)
-					node, _ = sjson.SetBytes(node, "parts.0.text", content.String())
+					node, _ = sjson.SetBytes(node, "parts.-1.text", content.String())
 					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
-				} else if !content.Exists() || content.Type == gjson.Null {
-					// Tool calls -> single model content with functionCall parts
-					tcs := m.Get("tool_calls")
-					if tcs.IsArray() {
-						node := []byte(`{"role":"model","parts":[]}`)
-						p := 0
-						fIDs := make([]string, 0)
-						for _, tc := range tcs.Array() {
-							if tc.Get("type").String() != "function" {
-								continue
-							}
-							fid := tc.Get("id").String()
-							fname := tc.Get("function.name").String()
-							fargs := tc.Get("function.arguments").String()
-							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.id", fid)
-							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
-							node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
-							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiCLIFunctionThoughtSignature)
-							p++
-							if fid != "" {
-								fIDs = append(fIDs, fid)
-							}
-						}
-						out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
+					p++
+				}
 
-						// Append a single tool content combining name + response per function
-						toolNode := []byte(`{"role":"user","parts":[]}`)
-						pp := 0
-						for _, fid := range fIDs {
-							if name, ok := tcID2Name[fid]; ok {
-								toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid)
-								toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", name)
-								resp := toolResponses[fid]
-								if resp == "" {
-									resp = "{}"
-								}
-								// Handle non-JSON output gracefully (matches dev branch approach)
-								if resp != "null" {
-									parsed := gjson.Parse(resp)
-									if parsed.Type == gjson.JSON {
-										toolNode, _ = sjson.SetRawBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(parsed.Raw))
-									} else {
-										toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", resp)
-									}
-								}
-								pp++
+				// Tool calls -> single model content with functionCall parts
+				tcs := m.Get("tool_calls")
+				if tcs.IsArray() {
+					fIDs := make([]string, 0)
+					for _, tc := range tcs.Array() {
+						if tc.Get("type").String() != "function" {
+							continue
+						}
+						fid := tc.Get("id").String()
+						fname := tc.Get("function.name").String()
+						fargs := tc.Get("function.arguments").String()
+						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.id", fid)
+						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
+						node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
+						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiCLIFunctionThoughtSignature)
+						p++
+						if fid != "" {
+							fIDs = append(fIDs, fid)
+						}
+					}
+					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
+
+					// Append a single tool content combining name + response per function
+					toolNode := []byte(`{"role":"user","parts":[]}`)
+					pp := 0
+					for _, fid := range fIDs {
+						if name, ok := tcID2Name[fid]; ok {
+							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid)
+							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", name)
+							resp := toolResponses[fid]
+							if resp == "" {
+								resp = "{}"
 							}
+							// Handle non-JSON output gracefully (matches dev branch approach)
+							if resp != "null" {
+								parsed := gjson.Parse(resp)
+								if parsed.Type == gjson.JSON {
+									toolNode, _ = sjson.SetRawBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(parsed.Raw))
+								} else {
+									toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", resp)
+								}
+							}
+							pp++
 						}
-						if pp > 0 {
-							out, _ = sjson.SetRawBytes(out, "request.contents.-1", toolNode)
-						}
+					}
+					if pp > 0 {
+						out, _ = sjson.SetRawBytes(out, "request.contents.-1", toolNode)
 					}
 				}
 			}
@@ -379,18 +375,3 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 
 // itoa converts int to string without strconv import for few usages.
 func itoa(i int) string { return fmt.Sprintf("%d", i) }
-
-// quoteIfNeeded ensures a string is valid JSON value (quotes plain text), pass-through for JSON objects/arrays.
-func quoteIfNeeded(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "\"\""
-	}
-	if len(s) > 0 && (s[0] == '{' || s[0] == '[') {
-		return s
-	}
-	// escape quotes minimally
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "\"", "\\\"")
-	return "\"" + s + "\""
-}

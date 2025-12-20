@@ -30,7 +30,11 @@ GEMINI.md
 # Tooling metadata
 .vscode/*
 .claude/*
+.gemini/*
 .serena/*
+.agent/*
+.bmad/*
+_bmad/*
 
 # macOS
 .DS_Store

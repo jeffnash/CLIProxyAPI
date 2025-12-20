@@ -95,10 +95,25 @@ func (m *AmpModule) managementAvailabilityMiddleware() gin.HandlerFunc {
 	}
 }
 
+// wrapManagementAuth skips auth for selected management paths while keeping authentication elsewhere.
+func wrapManagementAuth(auth gin.HandlerFunc, prefixes ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(path, prefix) && (len(path) == len(prefix) || path[len(prefix)] == '/') {
+				c.Next()
+				return
+			}
+		}
+		auth(c)
+	}
+}
+
 // registerManagementRoutes registers Amp management proxy routes
 // These routes proxy through to the Amp control plane for OAuth, user management, etc.
 // Uses dynamic middleware and proxy getter for hot-reload support.
-func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *handlers.BaseAPIHandler) {
+// The auth middleware validates Authorization header against configured API keys.
+func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *handlers.BaseAPIHandler, auth gin.HandlerFunc) {
 	ampAPI := engine.Group("/api")
 
 	// Always disable CORS for management routes to prevent browser-based attacks
@@ -107,8 +122,11 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	// Apply dynamic localhost-only restriction (hot-reloadable via m.IsRestrictedToLocalhost())
 	ampAPI.Use(m.localhostOnlyMiddleware())
 
-	if !m.IsRestrictedToLocalhost() {
-		log.Warn("amp management routes are NOT restricted to localhost - this is insecure!")
+	// Apply authentication middleware - requires valid API key in Authorization header
+	var authWithBypass gin.HandlerFunc
+	if auth != nil {
+		ampAPI.Use(auth)
+		authWithBypass = wrapManagementAuth(auth, "/threads", "/auth", "/docs")
 	}
 
 	// Dynamic proxy handler that uses m.getProxy() for hot-reload support
@@ -154,7 +172,14 @@ func (m *AmpModule) registerManagementRoutes(engine *gin.Engine, baseHandler *ha
 	// Root-level routes that AMP CLI expects without /api prefix
 	// These need the same security middleware as the /api/* routes (dynamic for hot-reload)
 	rootMiddleware := []gin.HandlerFunc{m.managementAvailabilityMiddleware(), noCORSMiddleware(), m.localhostOnlyMiddleware()}
+	if authWithBypass != nil {
+		rootMiddleware = append(rootMiddleware, authWithBypass)
+	}
+	engine.GET("/threads", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/threads/*path", append(rootMiddleware, proxyHandler)...)
+	engine.GET("/docs", append(rootMiddleware, proxyHandler)...)
+	engine.GET("/docs/*path", append(rootMiddleware, proxyHandler)...)
+
 	engine.GET("/threads.rss", append(rootMiddleware, proxyHandler)...)
 	engine.GET("/news.rss", append(rootMiddleware, proxyHandler)...)
 
@@ -262,7 +287,7 @@ func (m *AmpModule) registerProviderAliases(engine *gin.Engine, baseHandler *han
 	v1betaAmp := provider.Group("/v1beta")
 	{
 		v1betaAmp.GET("/models", geminiHandlers.GeminiModels)
-		v1betaAmp.POST("/models/:action", fallbackHandler.WrapHandler(geminiHandlers.GeminiHandler))
-		v1betaAmp.GET("/models/:action", geminiHandlers.GeminiGetHandler)
+		v1betaAmp.POST("/models/*action", fallbackHandler.WrapHandler(geminiHandlers.GeminiHandler))
+		v1betaAmp.GET("/models/*action", geminiHandlers.GeminiGetHandler)
 	}
 }

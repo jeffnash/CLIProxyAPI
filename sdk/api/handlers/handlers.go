@@ -5,6 +5,7 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -48,9 +49,6 @@ type BaseAPIHandler struct {
 
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
-
-	// OpenAICompatProviders is a list of provider names for OpenAI compatibility.
-	OpenAICompatProviders []string
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -62,11 +60,10 @@ type BaseAPIHandler struct {
 //
 // Returns:
 //   - *BaseAPIHandler: A new API handlers instance
-func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager, openAICompatProviders []string) *BaseAPIHandler {
+func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *BaseAPIHandler {
 	return &BaseAPIHandler{
-		Cfg:                   cfg,
-		AuthManager:           authManager,
-		OpenAICompatProviders: openAICompatProviders,
+		Cfg:         cfg,
+		AuthManager: authManager,
 	}
 }
 
@@ -117,6 +114,16 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	return newCtx, func(params ...interface{}) {
 		if h.Cfg.RequestLog && len(params) == 1 {
+			if existing, exists := c.Get("API_RESPONSE"); exists {
+				if existingBytes, ok := existing.([]byte); ok && len(bytes.TrimSpace(existingBytes)) > 0 {
+					switch params[0].(type) {
+					case error, string:
+						cancel()
+						return
+					}
+				}
+			}
+
 			var payload []byte
 			switch data := params[0].(type) {
 			case []byte:
@@ -334,30 +341,19 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	// Resolve "auto" model to an actual available model first
 	resolvedModelName := util.ResolveAutoModel(modelName)
 
-	providerName, extractedModelName, isDynamic := h.parseDynamicModel(resolvedModelName)
-
-	targetModelName := resolvedModelName
-	if isDynamic {
-		targetModelName = extractedModelName
-	}
-
 	// Normalize the model name to handle dynamic thinking suffixes before determining the provider.
-	normalizedModel, metadata = normalizeModelMetadata(targetModelName)
+	normalizedModel, metadata = normalizeModelMetadata(resolvedModelName)
 
-	if isDynamic {
-		providers = []string{providerName}
-	} else {
-		// For non-dynamic models, use the normalizedModel to get the provider name.
-		providers = util.GetProviderName(normalizedModel)
-		if len(providers) == 0 && metadata != nil {
-			if originalRaw, ok := metadata[util.ThinkingOriginalModelMetadataKey]; ok {
-				if originalModel, okStr := originalRaw.(string); okStr {
-					originalModel = strings.TrimSpace(originalModel)
-					if originalModel != "" && !strings.EqualFold(originalModel, normalizedModel) {
-						if altProviders := util.GetProviderName(originalModel); len(altProviders) > 0 {
-							providers = altProviders
-							normalizedModel = originalModel
-						}
+	// Use the normalizedModel to get the provider name.
+	providers = util.GetProviderName(normalizedModel)
+	if len(providers) == 0 && metadata != nil {
+		if originalRaw, ok := metadata[util.ThinkingOriginalModelMetadataKey]; ok {
+			if originalModel, okStr := originalRaw.(string); okStr {
+				originalModel = strings.TrimSpace(originalModel)
+				if originalModel != "" && !strings.EqualFold(originalModel, normalizedModel) {
+					if altProviders := util.GetProviderName(originalModel); len(altProviders) > 0 {
+						providers = altProviders
+						normalizedModel = originalModel
 					}
 				}
 			}
@@ -373,30 +369,6 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	// So, normalizedModel is already correctly set at this point.
 
 	return providers, normalizedModel, metadata, nil
-}
-
-func (h *BaseAPIHandler) parseDynamicModel(modelName string) (providerName, model string, isDynamic bool) {
-	var providerPart, modelPart string
-	for _, sep := range []string{"://"} {
-		if parts := strings.SplitN(modelName, sep, 2); len(parts) == 2 {
-			providerPart = parts[0]
-			modelPart = parts[1]
-			break
-		}
-	}
-
-	if providerPart == "" {
-		return "", modelName, false
-	}
-
-	// Check if the provider is a configured openai-compatibility provider
-	for _, pName := range h.OpenAICompatProviders {
-		if pName == providerPart {
-			return providerPart, modelPart, true
-		}
-	}
-
-	return "", modelName, false
 }
 
 func cloneBytes(src []byte) []byte {
@@ -448,12 +420,53 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 			}
 		}
 	}
-	c.Status(status)
+
+	errText := http.StatusText(status)
 	if msg != nil && msg.Error != nil {
-		_, _ = c.Writer.Write([]byte(msg.Error.Error()))
-	} else {
-		_, _ = c.Writer.Write([]byte(http.StatusText(status)))
+		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
+			errText = v
+		}
 	}
+
+	// Prefer preserving upstream JSON error bodies when possible.
+	buildJSONBody := func() []byte {
+		trimmed := strings.TrimSpace(errText)
+		if trimmed != "" && json.Valid([]byte(trimmed)) {
+			return []byte(trimmed)
+		}
+		errType := "invalid_request_error"
+		switch status {
+		case http.StatusUnauthorized:
+			errType = "authentication_error"
+		case http.StatusForbidden:
+			errType = "permission_error"
+		case http.StatusTooManyRequests:
+			errType = "rate_limit_error"
+		default:
+			if status >= http.StatusInternalServerError {
+				errType = "server_error"
+			}
+		}
+		payload, err := json.Marshal(ErrorResponse{
+			Error: ErrorDetail{
+				Message: errText,
+				Type:    errType,
+			},
+		})
+		if err != nil {
+			return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"server_error"}}`, errText))
+		}
+		return payload
+	}
+
+	body := buildJSONBody()
+	c.Set("API_RESPONSE", bytes.Clone(body))
+
+	if !c.Writer.Written() {
+		c.Writer.Header().Set("Content-Type", "application/json")
+	}
+	c.Status(status)
+	_, _ = c.Writer.Write(body)
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {

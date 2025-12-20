@@ -58,9 +58,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		upstreamModel = aliasModel
 		body = setReasoningEffortByAlias(body, aliasModel, effort)
 	}
-	body = applyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort")
-	body = normalizeThinkingConfig(body, upstreamModel)
-	if errValidate := validateThinkingConfig(body, upstreamModel); errValidate != nil {
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort", false)
+	body = NormalizeThinkingConfig(body, upstreamModel, false)
+	if errValidate := ValidateThinkingConfig(body, upstreamModel); errValidate != nil {
 		return resp, errValidate
 	}
 	body = applyPayloadConfig(e.cfg, req.Model, body)
@@ -160,9 +160,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		body = setReasoningEffortByAlias(body, aliasModel, effort)
 	}
 
-	body = applyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort")
-	body = normalizeThinkingConfig(body, upstreamModel)
-	if errValidate := validateThinkingConfig(body, upstreamModel); errValidate != nil {
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort", false)
+	body = NormalizeThinkingConfig(body, upstreamModel, false)
+	if errValidate := ValidateThinkingConfig(body, upstreamModel); errValidate != nil {
 		return nil, errValidate
 	}
 	body = applyPayloadConfig(e.cfg, req.Model, body)
@@ -266,7 +266,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 		body = setReasoningEffortByAlias(body, aliasModel, effort)
 	}
 
-	body = applyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort")
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort", false)
 	body, _ = sjson.SetBytes(body, "model", upstreamModel)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.SetBytes(body, "stream", false)
@@ -342,6 +342,14 @@ func resolveCodexAlias(modelName string) (baseModel, effort string, ok bool) {
 		return "gpt-5.2", "high", true
 	case "gpt-5.2-xhigh":
 		return "gpt-5.2", "xhigh", true
+	case "gpt-5.2-codex-low":
+		return "gpt-5.2-codex", "low", true
+	case "gpt-5.2-codex-medium":
+		return "gpt-5.2-codex", "medium", true
+	case "gpt-5.2-codex-high":
+		return "gpt-5.2-codex", "high", true
+	case "gpt-5.2-codex-xhigh":
+		return "gpt-5.2-codex", "xhigh", true
 	default:
 		return "", "", false
 	}
