@@ -2,6 +2,7 @@ package responses
 
 import (
 	"bytes"
+	"strings"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -64,7 +65,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			}
 
 			switch itemType {
-			case "message":
+			case "message", "":
 				// Handle regular message conversion
 				role := item.Get("role").String()
 				message := `{"role":"","content":""}`
@@ -110,6 +111,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					} else if content.Type == gjson.String {
 						message, _ = sjson.Set(message, "content", content.String())
 					}
+				} else if content.Type == gjson.String {
+					message, _ = sjson.Set(message, "content", content.String())
 				}
 
 				out, _ = sjson.SetRaw(out, "messages.-1", message)
@@ -193,23 +196,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	if reasoningEffort := root.Get("reasoning.effort"); reasoningEffort.Exists() {
-		switch reasoningEffort.String() {
-		case "none":
-			out, _ = sjson.Set(out, "reasoning_effort", "none")
-		case "auto":
-			out, _ = sjson.Set(out, "reasoning_effort", "auto")
-		case "minimal":
-			out, _ = sjson.Set(out, "reasoning_effort", "low")
-		case "low":
-			out, _ = sjson.Set(out, "reasoning_effort", "low")
-		case "medium":
-			out, _ = sjson.Set(out, "reasoning_effort", "medium")
-		case "high":
-			out, _ = sjson.Set(out, "reasoning_effort", "high")
-		case "xhigh":
-			out, _ = sjson.Set(out, "reasoning_effort", "xhigh")
-		default:
-			out, _ = sjson.Set(out, "reasoning_effort", "auto")
+		effort := strings.ToLower(strings.TrimSpace(reasoningEffort.String()))
+		if effort != "" {
+			out, _ = sjson.Set(out, "reasoning_effort", effort)
 		}
 	}
 
