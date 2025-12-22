@@ -2206,12 +2206,12 @@ func (h *Handler) startCopilotAuthFlow(ctx context.Context, state string, device
 		copilotAuth := copilot.NewCopilotAuth(h.cfg)
 		result, authErr := copilotAuth.CompleteAuthWithDeviceCode(pollCtx, deviceCode, accountType)
 		if authErr != nil {
-			oauthStatus[state] = fmt.Sprintf("Authentication failed: %v", authErr)
+			SetOAuthSessionError(state, fmt.Sprintf("Authentication failed: %v", authErr))
 			return
 		}
 
 		if result == nil || result.Storage == nil {
-			oauthStatus[state] = "Authentication failed: no result returned"
+			SetOAuthSessionError(state, "Authentication failed: no result returned")
 			return
 		}
 
@@ -2223,19 +2223,19 @@ func (h *Handler) startCopilotAuthFlow(ctx context.Context, state string, device
 		// Ensure auth directory exists before saving
 		authDir, ensureErr := util.EnsureAuthDir(h.cfg.AuthDir)
 		if ensureErr != nil {
-			oauthStatus[state] = fmt.Sprintf("Failed to prepare auth directory: %v", ensureErr)
+			SetOAuthSessionError(state, fmt.Sprintf("Failed to prepare auth directory: %v", ensureErr))
 			return
 		}
 
 		// Save token using the filename from the shared helper
 		tokenPath := filepath.Join(authDir, result.SuggestedFilename)
 		if saveErr := result.Storage.SaveTokenToFile(tokenPath); saveErr != nil {
-			oauthStatus[state] = fmt.Sprintf("Failed to save token: %v", saveErr)
+			SetOAuthSessionError(state, fmt.Sprintf("Failed to save token: %v", saveErr))
 			return
 		}
 
 		log.Infof("copilot_auth_success: state=%s principal=%s", state, principal)
-		delete(oauthStatus, state)
+		CompleteOAuthSession(state)
 	}()
 }
 
@@ -2279,7 +2279,7 @@ func (h *Handler) RequestCopilotToken(c *gin.Context) {
 	}
 
 	// Track this auth flow
-	oauthStatus[state] = ""
+	RegisterOAuthSession(state, "copilot")
 
 	// Start background goroutine to complete auth flow using shared helper
 	h.startCopilotAuthFlow(ctx, state, deviceCode, accountType)
