@@ -13,7 +13,6 @@ import (
 	"syscall"
 
 	copilotshared "github.com/router-for-me/CLIProxyAPI/v6/internal/copilot"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
