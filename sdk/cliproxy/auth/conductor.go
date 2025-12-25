@@ -1191,6 +1191,19 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	candidates := make([]*Auth, 0, len(m.auths))
 	modelKey := strings.TrimSpace(model)
 	registryRef := registry.GetGlobalRegistry()
+
+	// Check if this is a forced provider route (e.g., copilot- prefix).
+	// If so, skip the ClientSupportsModel check since the user explicitly
+	// requested routing to this provider even if the model isn't registered.
+	forcedProvider := false
+	if opts.Metadata != nil {
+		if v, ok := opts.Metadata["forced_provider"]; ok {
+			if b, okBool := v.(bool); okBool && b {
+				forcedProvider = true
+			}
+		}
+	}
+
 	for _, candidate := range m.auths {
 		if candidate.Provider != provider || candidate.Disabled {
 			continue
@@ -1198,7 +1211,8 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		if _, used := tried[candidate.ID]; used {
 			continue
 		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+		// Skip model support check for forced provider routing
+		if !forcedProvider && modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
 			continue
 		}
 		candidates = append(candidates, candidate)

@@ -83,6 +83,57 @@ func stripCopilotPrefix(model string) string {
 	return strings.TrimPrefix(model, registry.CopilotModelPrefix)
 }
 
+// essentialCopilotModels are models that Copilot supports but may not be returned
+// by the /models API (e.g., ModelPickerEnabled=false). These are merged into the
+// dynamic model list to ensure they're always available for explicit routing.
+var essentialCopilotModels = []struct {
+	ID                  string
+	DisplayName         string
+	Description         string
+	ContextLength       int
+	MaxCompletionTokens int
+}{
+	{
+		ID:                  "gemini-3-flash-preview",
+		DisplayName:         "Gemini 3 Flash (Preview)",
+		Description:         "Google model via GitHub Copilot (Preview)",
+		ContextLength:       128000,
+		MaxCompletionTokens: 64000,
+	},
+}
+
+// mergeEssentialCopilotModels adds essential models that may not be returned by /models
+// but are known to work with Copilot. Only adds models that aren't already present.
+func mergeEssentialCopilotModels(models []*registry.ModelInfo, now int64) []*registry.ModelInfo {
+	existing := make(map[string]bool, len(models))
+	for _, m := range models {
+		existing[strings.ToLower(m.ID)] = true
+	}
+
+	paramsWithTools := []string{"temperature", "top_p", "max_tokens", "stream", "tools"}
+
+	for _, em := range essentialCopilotModels {
+		if existing[strings.ToLower(em.ID)] {
+			continue
+		}
+		models = append(models, &registry.ModelInfo{
+			ID:                  em.ID,
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "copilot",
+			Type:                "copilot",
+			DisplayName:         em.DisplayName,
+			Description:         em.Description,
+			ContextLength:       em.ContextLength,
+			MaxCompletionTokens: em.MaxCompletionTokens,
+			SupportedParameters: paramsWithTools,
+		})
+		log.Debugf("copilot executor: added essential model %s", em.ID)
+	}
+
+	return models
+}
+
 // sanitizeCopilotPayload removes fields that Copilot's Chat Completions endpoint
 // rejects (strip max_tokens and parallel_tool_calls).
 func sanitizeCopilotPayload(body []byte, model string) []byte {
@@ -629,6 +680,9 @@ func (e *CopilotExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Au
 		modelInfo.Description = desc
 		models = append(models, modelInfo)
 	}
+
+	// 5. Merge essential models that Copilot supports but may not return in /models
+	models = mergeEssentialCopilotModels(models, now)
 
 	models = registry.GenerateCopilotAliases(models)
 	setCachedCopilotModels(auth.ID, models)

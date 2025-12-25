@@ -73,7 +73,16 @@ If you are using **GitHub Copilot** and want to fine-tune how the proxy behaves 
   - Why you might want it: can reduce user-quota usage by marking everything as agent calls.
   - Warning: **use at your own risk** — it may violate provider expectations/ToS, break accounting, or cause requests to be rejected.
 
+Optional (YAML-only) header emulation knobs (edit `config.yaml` yourself; not currently wired via `scripts/railway_start.sh`):
+
+- `copilot-api-key[].header-profile`: `cli` (default) or `vscode-chat`.
+  - Useful when certain Copilot-backed models behave better with VS Code Copilot Chat headers.
+- `copilot-api-key[].cli-header-models`: list of model IDs that should always use CLI-style headers.
+- `copilot-api-key[].vscode-chat-header-models`: list of model IDs that should always use VS Code Chat-style headers.
+
 Note: by default the proxy detects agent calls by looking for tool/agent activity in the payload; forcing these flags overrides that detection.
+
+Tip: you can explicitly route a request to Copilot by using `model: "copilot-<model>"` (for example, `copilot-gpt-5`) which forces the provider selection to Copilot even if the model isn't registered in the local model registry.
 
 
 ### Option A: Using the Railway Dashboard

@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -544,8 +545,25 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	// Normalize the model name to handle dynamic thinking suffixes before determining the provider.
 	normalizedModel, metadata = normalizeModelMetadata(resolvedModelName)
 
+	// Explicit Copilot routing via "copilot-" model aliases.
+	// Strip prefix and force provider to Copilot so provider resolution doesn't fail
+	// and the request reaches the Copilot executor where headers are applied.
+	forcedCopilot := strings.HasPrefix(strings.ToLower(strings.TrimSpace(normalizedModel)), registry.CopilotModelPrefix)
+	if forcedCopilot {
+		normalizedModel = strings.TrimPrefix(normalizedModel, registry.CopilotModelPrefix)
+		// Mark metadata to skip model support check in conductor - user explicitly
+		// requested Copilot routing, so bypass client model registration filter.
+		if metadata == nil {
+			metadata = make(map[string]any)
+		}
+		metadata["forced_provider"] = true
+	}
+
 	// Use the normalizedModel to get the provider name.
 	providers = util.GetProviderName(normalizedModel)
+	if forcedCopilot {
+		providers = []string{"copilot"}
+	}
 	if len(providers) == 0 && metadata != nil {
 		if originalRaw, ok := metadata[util.ThinkingOriginalModelMetadataKey]; ok {
 			if originalModel, okStr := originalRaw.(string); okStr {
