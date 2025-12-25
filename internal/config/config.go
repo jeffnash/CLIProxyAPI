@@ -281,6 +281,16 @@ type CopilotKey struct {
 	// ProxyURL overrides the global proxy setting for Copilot requests if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 
+	// HeaderProfile selects which Copilot client header profile to emulate.
+	// Supported values: "cli" (default), "vscode-chat".
+	HeaderProfile string `yaml:"header-profile,omitempty" json:"header-profile,omitempty"`
+
+	// CLIHeaderModels lists model IDs that should always use the "cli" header profile.
+	CLIHeaderModels []string `yaml:"cli-header-models,omitempty" json:"cli-header-models,omitempty"`
+
+	// VSCodeChatHeaderModels lists model IDs that should always use the "vscode-chat" header profile.
+	VSCodeChatHeaderModels []string `yaml:"vscode-chat-header-models,omitempty" json:"vscode-chat-header-models,omitempty"`
+
 	// AgentInitiatorPersist, when true, forces subsequent Copilot requests sharing the
 	// same prompt_cache_key to send X-Initiator=agent after the first call. Default false.
 	AgentInitiatorPersist bool `yaml:"agent-initiator-persist" json:"agent-initiator-persist"`
@@ -608,6 +618,20 @@ func (cfg *Config) SanitizeCopilotKeys() {
 			entry.AccountType = string(validation.AccountType)
 		} else {
 			entry.AccountType = string(copilotshared.DefaultAccountType)
+		}
+
+		// Normalize header profile (empty string means use per-model detection)
+		entry.HeaderProfile = strings.TrimSpace(strings.ToLower(entry.HeaderProfile))
+		if entry.HeaderProfile != "" && entry.HeaderProfile != "cli" && entry.HeaderProfile != "vscode-chat" {
+			entry.HeaderProfile = "" // Invalid value, reset to default behavior
+		}
+
+		// Trim whitespace from model lists
+		for j := range entry.CLIHeaderModels {
+			entry.CLIHeaderModels[j] = strings.TrimSpace(entry.CLIHeaderModels[j])
+		}
+		for j := range entry.VSCodeChatHeaderModels {
+			entry.VSCodeChatHeaderModels[j] = strings.TrimSpace(entry.VSCodeChatHeaderModels[j])
 		}
 	}
 }

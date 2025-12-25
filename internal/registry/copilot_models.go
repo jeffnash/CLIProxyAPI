@@ -235,6 +235,18 @@ func GetCopilotModels() []*ModelInfo {
 			SupportedParameters: paramsWithTools,
 		},
 		{
+			ID:                  "gemini-3-flash-preview",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "copilot",
+			Type:                "copilot",
+			DisplayName:         "Gemini 3 Flash (Preview)",
+			Description:         "Google model via GitHub Copilot (Preview)",
+			ContextLength:       128000,
+			MaxCompletionTokens: 64000,
+			SupportedParameters: paramsWithTools,
+		},
+		{
 			ID:                  "grok-code-fast-1",
 			Object:              "model",
 			Created:             now,

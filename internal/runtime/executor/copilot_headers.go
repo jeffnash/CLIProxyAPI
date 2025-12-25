@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -53,6 +54,124 @@ type copilotHeaderHints struct {
 	agentFromPayload      bool
 	forceAgentFromHeaders bool
 	promptCacheKey        string
+}
+
+type copilotHeaderProfile string
+
+const (
+	copilotHeaderProfileCLI        copilotHeaderProfile = "cli"
+	copilotHeaderProfileVSCodeChat copilotHeaderProfile = "vscode-chat"
+)
+
+// defaultCopilotCLIHeaderModels lists models that use the CLI header profile by default.
+// Models not in this list will use the vscode-chat profile.
+var defaultCopilotCLIHeaderModels = map[string]struct{}{
+	"claude-sonnet-4.5":    {},
+	"claude-haiku-4.5":     {},
+	"claude-opus-4.5":      {},
+	"claude-sonnet-4":      {},
+	"gpt-5.1-codex-max":    {},
+	"gpt-5.1-codex":        {},
+	"gpt-5.2":              {},
+	"gpt-5.1":              {},
+	"gpt-5":                {},
+	"gpt-5.1-codex-mini":   {},
+	"gpt-5-mini":           {},
+	"gpt-4o":               {},
+	"gpt-4.1":              {},
+	"gemini-3-pro-preview": {},
+}
+
+func normalizeModelID(model string) string {
+	return strings.TrimSpace(strings.ToLower(model))
+}
+
+// copilotHeaderProfileForModel determines which header profile to use based on model and config.
+// All model comparisons are done against the de-aliased model (copilot- prefix stripped).
+func copilotHeaderProfileForModel(entry *config.CopilotKey, model string) copilotHeaderProfile {
+	m := normalizeModelID(model)
+	if m == "" {
+		return copilotHeaderProfileCLI
+	}
+
+	// De-alias: treat copilot-<id> as <id> for all comparisons
+	mDeAliased := strings.TrimPrefix(m, "copilot-")
+	if mDeAliased == "" {
+		return copilotHeaderProfileCLI
+	}
+
+	// Back-compat: gpt-4 always uses CLI profile
+	if mDeAliased == "gpt-4" {
+		return copilotHeaderProfileCLI
+	}
+
+	if entry != nil {
+		// Config per-model overrides (checked against de-aliased model)
+		if len(entry.CLIHeaderModels) > 0 {
+			for _, v := range entry.CLIHeaderModels {
+				if normalizeModelID(v) == mDeAliased {
+					return copilotHeaderProfileCLI
+				}
+			}
+		}
+		if len(entry.VSCodeChatHeaderModels) > 0 {
+			for _, v := range entry.VSCodeChatHeaderModels {
+				if normalizeModelID(v) == mDeAliased {
+					return copilotHeaderProfileVSCodeChat
+				}
+			}
+		}
+
+		// Config global default profile (overrides allowlist)
+		switch copilotHeaderProfile(strings.ToLower(strings.TrimSpace(entry.HeaderProfile))) {
+		case copilotHeaderProfileCLI:
+			return copilotHeaderProfileCLI
+		case copilotHeaderProfileVSCodeChat:
+			return copilotHeaderProfileVSCodeChat
+		default:
+			// Unknown or empty values fall through to allowlist
+		}
+	}
+
+	// Built-in allowlist (checked against de-aliased model)
+	if _, ok := defaultCopilotCLIHeaderModels[mDeAliased]; ok {
+		return copilotHeaderProfileCLI
+	}
+	return copilotHeaderProfileVSCodeChat
+}
+
+func applyCopilotVSCodeChatHeaderProfile(r *http.Request) {
+	// Matches VS Code Copilot Chat extension behavior
+	r.Header.Set("Copilot-Integration-Id", "vscode-chat")
+	r.Header.Set("Editor-Plugin-Version", "copilot-chat/0.35.2")
+	r.Header.Set("Editor-Version", "vscode/1.108.0-insider")
+	r.Header.Set("VScode-SessionId", "00000000-0000-0000-0000-000000000000")
+	r.Header.Set("VScode-MachineId", "00000000-0000-0000-0000-000000000000")
+	r.Header.Set("OpenAI-Intent", "conversation-agent")
+}
+
+func applyCopilotCLIHeaderProfile(r *http.Request) {
+	// No-op: defaults are already applied via copilotauth.CopilotHeaders + executor extras.
+}
+
+func (e *CopilotExecutor) copilotKeyConfig() *config.CopilotKey {
+	if e == nil || e.cfg == nil || len(e.cfg.CopilotKey) == 0 {
+		return nil
+	}
+	return &e.cfg.CopilotKey[0]
+}
+
+func (e *CopilotExecutor) applyCopilotHeaderProfile(r *http.Request, model string) {
+	entry := e.copilotKeyConfig()
+	profile := copilotHeaderProfileForModel(entry, model)
+	switch profile {
+	case copilotHeaderProfileVSCodeChat:
+		applyCopilotVSCodeChatHeaderProfile(r)
+	case copilotHeaderProfileCLI:
+		applyCopilotCLIHeaderProfile(r)
+	default:
+		applyCopilotCLIHeaderProfile(r)
+	}
 }
 
 func forceAgentCallFromHeaders(headers http.Header) bool {
@@ -209,4 +328,7 @@ func (e *CopilotExecutor) applyCopilotHeaders(r *http.Request, copilotToken stri
 		r.Header.Set("X-Initiator", "user")
 		log.Info("copilot executor: [user call]")
 	}
+
+	// Apply header profile after defaults are set so it can override relevant headers.
+	e.applyCopilotHeaderProfile(r, gjson.GetBytes(payload, "model").String())
 }

@@ -39,6 +39,12 @@
 
 Note: by default the proxy detects agent calls by looking for tool/agent activity in the payload; forcing these flags overrides that detection.
 
+YAML-only Copilot header emulation keys (not set by this script):
+
+- `copilot-api-key[].header-profile`: `cli` (default) or `vscode-chat`
+- `copilot-api-key[].cli-header-models`: list of model IDs forced to CLI-style headers
+- `copilot-api-key[].vscode-chat-header-models`: list of model IDs forced to VS Code Chat-style headers
+
 ## Local auth bundle
 
 To turn your local `~/.cli-proxy-api` auth files into a single string:

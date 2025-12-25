@@ -385,3 +385,209 @@ func TestApplyCopilotHeaders_Vision(t *testing.T) {
 		})
 	}
 }
+
+func TestCopilotHeaderProfileForModel(t *testing.T) {
+	tests := []struct {
+		name            string
+		model           string
+		copilotConfig   *config.CopilotKey
+		expectedProfile copilotHeaderProfile
+	}{
+		// Empty model defaults to CLI
+		{
+			name:            "empty model defaults to cli",
+			model:           "",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		// gpt-4 family defaults to CLI
+		{
+			name:            "gpt-4 defaults to cli",
+			model:           "gpt-4",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		{
+			name:            "gpt-4o defaults to cli",
+			model:           "gpt-4o",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		{
+			name:            "gpt-4.1 defaults to cli",
+			model:           "gpt-4.1",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		// Allowlisted models default to CLI
+		{
+			name:            "gpt-5 in allowlist defaults to cli",
+			model:           "gpt-5",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		{
+			name:            "claude-sonnet-4 in allowlist defaults to cli",
+			model:           "claude-sonnet-4",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		{
+			name:            "claude-opus-4.5 in allowlist defaults to cli",
+			model:           "claude-opus-4.5",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		// Models not in allowlist default to vscode-chat
+		{
+			name:            "gemini-2.5-pro not in allowlist defaults to vscode-chat",
+			model:           "gemini-2.5-pro",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileVSCodeChat,
+		},
+		{
+			name:            "unknown model defaults to vscode-chat",
+			model:           "some-unknown-model",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileVSCodeChat,
+		},
+		// De-aliasing: copilot- prefix should be stripped for matching
+		{
+			name:            "copilot-gpt-5 de-aliased to gpt-5 matches allowlist",
+			model:           "copilot-gpt-5",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		{
+			name:            "copilot-claude-sonnet-4 de-aliased matches allowlist",
+			model:           "copilot-claude-sonnet-4",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		{
+			name:            "copilot-gemini-2.5-pro de-aliased still not in allowlist",
+			model:           "copilot-gemini-2.5-pro",
+			copilotConfig:   nil,
+			expectedProfile: copilotHeaderProfileVSCodeChat,
+		},
+		// Config override: CLIHeaderModels
+		{
+			name:  "config CLIHeaderModels override",
+			model: "gemini-2.5-pro",
+			copilotConfig: &config.CopilotKey{
+				CLIHeaderModels: []string{"gemini-2.5-pro"},
+			},
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		{
+			name:  "config CLIHeaderModels override with copilot prefix",
+			model: "copilot-gemini-2.5-pro",
+			copilotConfig: &config.CopilotKey{
+				CLIHeaderModels: []string{"gemini-2.5-pro"},
+			},
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		// Config override: VSCodeChatHeaderModels
+		{
+			name:  "config VSCodeChatHeaderModels override",
+			model: "gpt-5",
+			copilotConfig: &config.CopilotKey{
+				VSCodeChatHeaderModels: []string{"gpt-5"},
+			},
+			expectedProfile: copilotHeaderProfileVSCodeChat,
+		},
+		{
+			name:  "config VSCodeChatHeaderModels override with copilot prefix",
+			model: "copilot-gpt-5",
+			copilotConfig: &config.CopilotKey{
+				VSCodeChatHeaderModels: []string{"gpt-5"},
+			},
+			expectedProfile: copilotHeaderProfileVSCodeChat,
+		},
+		// Config default HeaderProfile
+		{
+			name:  "config HeaderProfile cli for unknown model",
+			model: "some-unknown-model",
+			copilotConfig: &config.CopilotKey{
+				HeaderProfile: "cli",
+			},
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		{
+			name:  "config HeaderProfile vscode-chat overrides allowlist",
+			model: "gpt-5",
+			copilotConfig: &config.CopilotKey{
+				HeaderProfile: "vscode-chat",
+			},
+			expectedProfile: copilotHeaderProfileVSCodeChat,
+		},
+		// Model-specific config takes precedence over HeaderProfile default
+		{
+			name:  "CLIHeaderModels takes precedence over HeaderProfile vscode-chat",
+			model: "gemini-3-pro",
+			copilotConfig: &config.CopilotKey{
+				HeaderProfile:   "vscode-chat",
+				CLIHeaderModels: []string{"gemini-3-pro"},
+			},
+			expectedProfile: copilotHeaderProfileCLI,
+		},
+		{
+			name:  "VSCodeChatHeaderModels takes precedence over HeaderProfile cli",
+			model: "gpt-5",
+			copilotConfig: &config.CopilotKey{
+				HeaderProfile:          "cli",
+				VSCodeChatHeaderModels: []string{"gpt-5"},
+			},
+			expectedProfile: copilotHeaderProfileVSCodeChat,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := copilotHeaderProfileForModel(tt.copilotConfig, tt.model)
+			if got != tt.expectedProfile {
+				t.Errorf("copilotHeaderProfileForModel(%q) = %v, want %v", tt.model, got, tt.expectedProfile)
+			}
+		})
+	}
+}
+
+func TestApplyCopilotHeaderProfile(t *testing.T) {
+	tests := []struct {
+		name                 string
+		model                string
+		copilotConfig        []config.CopilotKey
+		expectedIntegration  string
+		expectedEditorPlugin string
+	}{
+		{
+			name:                 "cli profile is no-op (headers not overridden)",
+			model:                "gpt-5",
+			copilotConfig:        nil,
+			expectedIntegration:  "", // CLI profile does not set this header
+			expectedEditorPlugin: "", // CLI profile does not set this header
+		},
+		{
+			name:                 "vscode-chat profile sets VS Code headers",
+			model:                "gemini-2.5-pro",
+			copilotConfig:        nil,
+			expectedIntegration:  "vscode-chat",
+			expectedEditorPlugin: "copilot-chat/0.35.2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := NewCopilotExecutor(&config.Config{CopilotKey: tt.copilotConfig})
+			req := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
+			e.applyCopilotHeaderProfile(req, tt.model)
+
+			if got := req.Header.Get("Copilot-Integration-Id"); got != tt.expectedIntegration {
+				t.Errorf("Copilot-Integration-Id = %q, want %q", got, tt.expectedIntegration)
+			}
+			if got := req.Header.Get("Editor-Plugin-Version"); got != tt.expectedEditorPlugin {
+				t.Errorf("Editor-Plugin-Version = %q, want %q", got, tt.expectedEditorPlugin)
+			}
+		})
+	}
+}

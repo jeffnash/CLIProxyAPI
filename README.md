@@ -82,9 +82,10 @@ Provider & config matrix (fork-specific):
 | Copilot support | `docs/RAILWAY_GUIDE.md` | Uses `--copilot-login` (device code flow). |
 | Railway env vars (auth transfer) | `scripts/README_RAILWAY.md` | `AUTH_BUNDLE` or `AUTH_ZIP_URL`, plus `API_KEY_1`, optional `AUTH_DIR_NAME`, `FORCE_BUILD`. |
 | Copilot toggles (env + YAML) | `scripts/README_RAILWAY.md` / `docs/RAILWAY_GUIDE.md` / `internal/config/config.go` | Env vars: `COPILOT_AGENT_INITIATOR_PERSIST`, `COPILOT_FORCE_AGENT_CALL`. YAML keys: `copilot-api-key[].agent-initiator-persist`, `copilot-api-key[].force-agent-call`. These control whether requests are sent as `X-Initiator: user` vs `X-Initiator: agent` (often affects monthly quota attribution). |
-| Copilot config keys (YAML) | `internal/config/config.go` | Look under `CopilotKey` config + related fields for the authoritative schema. |
-| Copilot header behavior | `internal/runtime/executor/copilot_headers.go` | Implementation for request header shaping / agent-call behavior. |
+| Copilot config keys (YAML) | `internal/config/config.go` | Look under `CopilotKey` config + related fields for the authoritative schema (initiator flags + header profile selection). |
+| Copilot header behavior | `internal/runtime/executor/copilot_headers.go` | Implementation for request header shaping / agent-call behavior + optional header profile emulation. |
 | Copilot model registry | `internal/registry/copilot_models.go` | How Copilot models are enumerated/aliased. |
+| Force Copilot routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `copilot-<model>` to explicitly route to Copilot even if the model isn't registered; bypasses client model support filtering. |
 | Grok config schema | `internal/config/config.go` | `GrokKey` and `GrokConfig` sections define available knobs. |
 | OAuth excluded models | `internal/config/config.go` | `oauth-excluded-models` config lets you disable models per provider. |
 | OpenAI-compat upstreams | `internal/config/config.go` | `openai-compatibility` for routing to other OpenAI-compatible providers. |
