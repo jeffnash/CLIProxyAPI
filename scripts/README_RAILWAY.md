@@ -1,5 +1,9 @@
 # Railway deployment
 
+> [!IMPORTANT]
+> **Fork context:** Railway helpers here are fork-specific (auth bundling, restore, Copilot toggles, etc.) and may not exist upstream.
+> **Motivation:** dead-simple personal hosting: log in locally once, bundle creds, deploy, then use the hosted base URL from anywhere.
+
 ## What this does
 
 `scripts/railway_start.sh` bootstraps a Railway container by:
@@ -23,8 +27,17 @@
 
 - `AUTH_DIR_NAME` (default `auths_railway`) - folder name created at repo root
 - `FORCE_BUILD` (default `0`) - set to `1` (or any non-`0`) to force `go build` even if `./cli-proxy-api` already exists
-- `COPILOT_AGENT_INITIATOR_PERSIST` (default `true`) - when truthy, writes `copilot-api-key[].agent-initiator-persist: true` into `config.yaml`
-- `COPILOT_FORCE_AGENT_CALL` (default `false`) - when truthy, writes `copilot-api-key[].force-agent-call: true` into `config.yaml`
+- `COPILOT_AGENT_INITIATOR_PERSIST` (default `true`) - when truthy, writes `copilot-api-key[].agent-initiator-persist: true` into `config.yaml`.
+  - What it is: the **normal/expected agentic behavior** — once a workflow is in an agent loop, keep follow-up calls marked as agent.
+  - What it does: if `prompt_cache_key` is present, once the proxy sees an agent-ish request for that cache key, it will keep setting `X-Initiator: agent` for subsequent requests using the same cache key.
+  - Why you might want it: in many Copilot setups, **user calls count against monthly quota** while **agent calls do not**; this prevents an agent loop from unexpectedly burning user quota mid-workflow.
+- `COPILOT_FORCE_AGENT_CALL` (default `false`) - when truthy, writes `copilot-api-key[].force-agent-call: true` into `config.yaml`.
+  - What it is: a **hacky quota optimization** — force everything to be tagged as an agent call.
+  - What it does: forces `X-Initiator: agent` for Copilot requests regardless of payload.
+  - Why you might want it: can reduce user-quota usage by marking everything as agent calls.
+  - Warning: **use at your own risk** — it may violate provider expectations/ToS, break accounting, or cause requests to be rejected.
+
+Note: by default the proxy detects agent calls by looking for tool/agent activity in the payload; forcing these flags overrides that detection.
 
 ## Local auth bundle
 
