@@ -636,12 +636,19 @@ func TestCleanJSONSchemaForGemini_PropertyNamesRemoval(t *testing.T) {
 		"type": "object",
 		"properties": {
 			"metadata": {
-				"type": "object"
+				"type": "object",
+				"properties": {
+					"reason": {
+						"type": "string",
+						"description": "Brief explanation of why you are calling this tool"
+					}
+				},
+				"required": ["reason"]
 			}
 		}
 	}`
 
-	result := CleanJSONSchemaForGemini(input)
+	result := CleanJSONSchemaForAntigravity(input)
 	compareJSON(t, expected, result)
 
 	// Verify propertyNames is completely removed
@@ -672,7 +679,7 @@ func TestCleanJSONSchemaForGemini_PropertyNamesRemoval_Nested(t *testing.T) {
 		}
 	}`
 
-	result := CleanJSONSchemaForGemini(input)
+	result := CleanJSONSchemaForAntigravity(input)
 
 	if strings.Contains(result, "propertyNames") {
 		t.Errorf("Nested propertyNames should be removed, got: %s", result)
