@@ -4,6 +4,30 @@
 
 一个为 CLI 提供 OpenAI/Gemini/Claude/Codex 兼容 API 接口的代理服务器。
 
+> [!NOTE]
+> 上游参考（用于了解基础行为/原始文档）：https://github.com/luispater/CLIProxyAPI/blob/main/README_CN.md
+
+---
+
+> [!IMPORTANT]
+> ## 这是一个 fork（请先阅读）
+> 当前仓库是 CLIProxyAPI 的 fork/衍生版本。
+>
+> **动机：** 让你能用“已经在付费的订阅/账号”（Claude Code、Codex、Gemini、Copilot 等）通过统一的 OpenAI 兼容接口，给各种 coding CLI / 客户端 / SDK 使用；既可本地跑，也可托管部署。
+>
+> **相对上游的主要差异（以及原因）：**
+>
+> - **更多 Provider 适配与登录方式（Copilot、Grok 等）** —— 方便把请求路由到你已有订阅/账号对应的服务，同时保持一致的 OpenAI 兼容 API 形态。
+> - **面向 Railway 的部署路径**（`scripts/railway_start.sh`、`docs/RAILWAY_GUIDE.md`）—— 目标是让你几乎“零心智负担”搭一个个人常驻的 CLIProxyAPI 实例，随时随地调用。
+>   - 本地先完成交互式登录，然后用 `scripts/auth_bundle.sh` 打包成 `AUTH_BUNDLE`，在远端环境恢复使用。
+> - **更适合托管的凭据迁移**（`AUTH_BUNDLE`/`AUTH_ZIP_URL`）—— 避免手动搬运一堆文件/密钥，部署更顺滑。
+> - **更强调兼容性（含 Responses 风格客户端）** —— 尽量让“只支持 OpenAI 兼容接口”的工具最小改动即可工作。
+> - **一次配置，多处使用** —— 让 Claude Code / Codex CLI / Gemini 兼容客户端 / IDE 扩展都指向同一个 Base URL，由代理负责路由与账号管理。
+>
+> 如果你只需要上游项目的原始行为/功能，请对比原始上游仓库及其文档。
+
+---
+
 现已支持通过 OAuth 登录接入 OpenAI Codex（GPT 系列）和 Claude Code。
 
 您可以使用本地或多账户的CLI方式，通过任何与 OpenAI（包括Responses）/Gemini/Claude 兼容的客户端和SDK进行访问。
@@ -34,27 +58,33 @@ GLM CODING PLAN 是专为AI编码打造的订阅套餐，每月最低仅需20元
 </table>
 
 
-## 功能特性
+## Fork 版快速开始
 
-- 为 CLI 模型提供 OpenAI/Gemini/Claude/Codex 兼容的 API 端点
-- 新增 OpenAI Codex（GPT 系列）支持（OAuth 登录）
-- 新增 Claude Code 支持（OAuth 登录）
-- 新增 Qwen Code 支持（OAuth 登录）
-- 新增 iFlow 支持（OAuth 登录）
-- 支持流式与非流式响应
-- 函数调用/工具支持
-- 多模态输入（文本、图片）
-- 多账户支持与轮询负载均衡（Gemini、OpenAI、Claude、Qwen 与 iFlow）
-- 简单的 CLI 身份验证流程（Gemini、OpenAI、Claude、Qwen 与 iFlow）
-- 支持 Gemini AIStudio API 密钥
-- 支持 AI Studio Build 多账户轮询
-- 支持 Gemini CLI 多账户轮询
-- 支持 Claude Code 多账户轮询
-- 支持 Qwen Code 多账户轮询
-- 支持 iFlow 多账户轮询
-- 支持 OpenAI Codex 多账户轮询
-- 通过配置接入上游 OpenAI 兼容提供商（例如 OpenRouter）
-- 可复用的 Go SDK（见 `docs/sdk-usage_CN.md`）
+本 fork 主要面向：
+
+- 把 **OAuth/订阅账号登录**（Codex / Claude Code / Gemini / Copilot / Grok 等）统一代理成一个 OpenAI 兼容 Base URL
+- **托管一个个人常驻实例**（尤其是 Railway），从任意设备/网络环境都能调用
+
+关键文档：
+
+- 面向最终用户的 Railway 部署指南：`docs/RAILWAY_GUIDE.md`
+- Railway 脚本说明：`scripts/README_RAILWAY.md`
+- SDK 使用（Go 内嵌）：`docs/sdk-usage_CN.md`
+- SDK 高级：`docs/sdk-advanced_CN.md`
+- SDK 认证/访问：`docs/sdk-access_CN.md`
+- 凭据加载/更新：`docs/sdk-watcher_CN.md`
+
+托管实例的核心目标：
+
+- 本地登录一次，然后用 `scripts/auth_bundle.sh` 打包成 `AUTH_BUNDLE`（或用 `AUTH_ZIP_URL`），在托管环境恢复使用。
+- 让各类工具只需要配置同一个 Base URL + API Key。
+
+## 能力概览（Fork）
+
+- OpenAI 兼容接口（chat + tools），支持 Provider 路由
+- 多 Provider 的 OAuth/Cookie 登录与多账户轮询
+- 流式/非流式，多模态输入（按 Provider 能力）
+- 兼容目标：OpenAI 兼容客户端/SDK（含 Responses 风格）+ 各类 coding CLI
 
 ## 新手入门
 
@@ -63,35 +93,6 @@ CLIProxyAPI 用户手册： [https://help.router-for.me/](https://help.router-fo
 ## 管理 API 文档
 
 请参见 [MANAGEMENT_API_CN.md](https://help.router-for.me/cn/management/api)
-
-## Amp CLI 支持
-
-CLIProxyAPI 已内置对 [Amp CLI](https://ampcode.com) 和 Amp IDE 扩展的支持，可让你使用自己的 Google/ChatGPT/Claude OAuth 订阅来配合 Amp 编码工具：
-
-- 提供商路由别名，兼容 Amp 的 API 路径模式（`/api/provider/{provider}/v1...`）
-- 管理代理，处理 OAuth 认证和账号功能
-- 智能模型回退与自动路由
-- 以安全为先的设计，管理端点仅限 localhost
-
-**→ [Amp CLI 完整集成指南](https://help.router-for.me/cn/agent-client/amp-cli.html)**
-
-## SDK 文档
-
-- 使用文档：[docs/sdk-usage_CN.md](docs/sdk-usage_CN.md)
-- 高级（执行器与翻译器）：[docs/sdk-advanced_CN.md](docs/sdk-advanced_CN.md)
-- 认证: [docs/sdk-access_CN.md](docs/sdk-access_CN.md)
-- 凭据加载/更新: [docs/sdk-watcher_CN.md](docs/sdk-watcher_CN.md)
-- 自定义 Provider 示例：`examples/custom-provider`
-
-## 贡献
-
-欢迎贡献！请随时提交 Pull Request。
-
-1. Fork 仓库
-2. 创建您的功能分支（`git checkout -b feature/amazing-feature`）
-3. 提交您的更改（`git commit -m 'Add some amazing feature'`）
-4. 推送到分支（`git push origin feature/amazing-feature`）
-5. 打开 Pull Request
 
 ## 谁与我们在一起？
 
@@ -113,8 +114,18 @@ CLI 封装器，用于通过 CLIProxyAPI OAuth 即时切换多个 Claude 账户�
 
 基于 macOS 平台的原生 CLIProxyAPI GUI：配置供应商、模型映射以及OAuth端点，无需 API 密钥。
 
-> [!NOTE]  
+> [!NOTE]
 > 如果你开发了基于 CLIProxyAPI 的项目，请提交一个 PR（拉取请求）将其添加到此列表中。
+
+## 贡献
+
+欢迎贡献！请随时提交 Pull Request。
+
+1. Fork 仓库
+2. 创建您的功能分支（`git checkout -b feature/amazing-feature`）
+3. 提交您的更改（`git commit -m 'Add some amazing feature'`）
+4. 推送到分支（`git push origin feature/amazing-feature`）
+5. 打开 Pull Request
 
 ## 许可证
 
@@ -127,3 +138,11 @@ QQ 群：188637136
 或
 
 Telegram 群：https://t.me/CLIProxyAPI
+
+## 进阶内容（参考）
+
+`README.md` 已以 fork 为主线做了精简；更完整的功能与集成说明请查看上游文档或本仓库的 `docs/`。
+
+- 上游中文 README：https://github.com/luispater/CLIProxyAPI/blob/main/README_CN.md
+- 本仓库 Railway 部署：`docs/RAILWAY_GUIDE.md`
+- 本仓库 Railway 脚本说明：`scripts/README_RAILWAY.md`
