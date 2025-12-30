@@ -154,6 +154,200 @@ func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_PassthruRoutes_UsesRoutingNameForModelID(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:            "glm-4.7",
+					ModelRoutingName: "zai-glm-4.7",
+					Protocol:         "claude",
+					BaseURL:           "https://api.z.ai/api/anthropic",
+					APIKey:           "za-123",
+					UpstreamModel:    "glm-4.7",
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	a := auths[0]
+	if a.Label != "passthru:zai-glm-4.7" {
+		t.Fatalf("expected label passthru:zai-glm-4.7, got %q", a.Label)
+	}
+	if a.Attributes["passthru_model"] != "glm-4.7" {
+		t.Fatalf("expected passthru_model glm-4.7, got %q", a.Attributes["passthru_model"])
+	}
+	if a.Attributes["passthru_routing_name"] != "zai-glm-4.7" {
+		t.Fatalf("expected passthru_routing_name zai-glm-4.7, got %q", a.Attributes["passthru_routing_name"])
+	}
+	// When routing name differs from model, upstream_model should be set
+	if a.Attributes["upstream_model"] != "glm-4.7" {
+		t.Fatalf("expected upstream_model glm-4.7, got %q", a.Attributes["upstream_model"])
+	}
+}
+
+// TestConfigSynthesizer_PassthruRoutes_AutoUpstreamModel verifies that when ModelRoutingName
+// differs from Model and UpstreamModel is not explicitly set, upstream_model is automatically
+// set to Model so executors know which model to send upstream.
+func TestConfigSynthesizer_PassthruRoutes_AutoUpstreamModel(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:            "glm-4.7",
+					ModelRoutingName: "zai-glm-4.7",
+					Protocol:         "claude",
+					BaseURL:          "https://api.z.ai/api/anthropic",
+					APIKey:           "za-123",
+					// Note: UpstreamModel is NOT set - should auto-populate
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	a := auths[0]
+	// When routing name differs from model, upstream_model should be auto-set to model
+	if a.Attributes["upstream_model"] != "glm-4.7" {
+		t.Fatalf("expected auto-populated upstream_model glm-4.7, got %q", a.Attributes["upstream_model"])
+	}
+}
+
+// TestConfigSynthesizer_PassthruRoutes_NoAutoUpstreamWhenSame verifies that when ModelRoutingName
+// equals Model (or is empty), upstream_model is NOT auto-set.
+func TestConfigSynthesizer_PassthruRoutes_NoAutoUpstreamWhenSame(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:    "glm-4.7",
+					// ModelRoutingName is empty, defaults to Model
+					Protocol: "claude",
+					BaseURL:  "https://api.z.ai/api/anthropic",
+					APIKey:   "za-123",
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	a := auths[0]
+	// When routing name equals model, upstream_model should NOT be set
+	if v := a.Attributes["upstream_model"]; v != "" {
+		t.Fatalf("expected no upstream_model when routing name equals model, got %q", v)
+	}
+}
+
+// TestConfigSynthesizer_PassthruRoutes_ContextWindowAndMaxTokens verifies that
+// context-window and max-tokens from config are passed through to auth attributes.
+func TestConfigSynthesizer_PassthruRoutes_ContextWindowAndMaxTokens(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:            "custom-model",
+					ModelRoutingName: "my-custom-model",
+					Protocol:         "openai",
+					BaseURL:          "https://api.example.com",
+					APIKey:           "test-key",
+					ContextWindow:    256000,
+					MaxTokens:        64000,
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	a := auths[0]
+
+	// Verify context_window is set
+	if v := a.Attributes["context_window"]; v != "256000" {
+		t.Fatalf("expected context_window 256000, got %q", v)
+	}
+
+	// Verify max_tokens is set
+	if v := a.Attributes["max_tokens"]; v != "64000" {
+		t.Fatalf("expected max_tokens 64000, got %q", v)
+	}
+}
+
+// TestConfigSynthesizer_PassthruRoutes_NoContextWindowWhenZero verifies that
+// context_window and max_tokens are NOT set when config values are zero.
+func TestConfigSynthesizer_PassthruRoutes_NoContextWindowWhenZero(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:    "test-model",
+					Protocol: "claude",
+					BaseURL:  "https://api.example.com",
+					APIKey:   "test-key",
+					// ContextWindow and MaxTokens are zero (not set)
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	a := auths[0]
+
+	// Verify context_window is NOT set when zero
+	if v := a.Attributes["context_window"]; v != "" {
+		t.Fatalf("expected no context_window when zero, got %q", v)
+	}
+
+	// Verify max_tokens is NOT set when zero
+	if v := a.Attributes["max_tokens"]; v != "" {
+		t.Fatalf("expected no max_tokens when zero, got %q", v)
+	}
+}
+
 func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{

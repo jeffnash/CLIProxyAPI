@@ -55,6 +55,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	to := sdktranslator.FromString("openai")
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), opts.Stream)
 	modelOverride := e.resolveUpstreamModel(req.Model, auth)
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
+			modelOverride = v
+		}
+	}
 	if modelOverride != "" {
 		translated = e.overrideModel(translated, modelOverride)
 	}
@@ -151,6 +156,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	to := sdktranslator.FromString("openai")
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 	modelOverride := e.resolveUpstreamModel(req.Model, auth)
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
+			modelOverride = v
+		}
+	}
 	if modelOverride != "" {
 		translated = e.overrideModel(translated, modelOverride)
 	}

@@ -6,6 +6,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -99,6 +100,10 @@ type Config struct {
 	// Used for services that use Vertex AI-style paths but with simple API key authentication.
 	VertexCompatAPIKey []VertexCompatKey `yaml:"vertex-api-key" json:"vertex-api-key"`
 
+	// Passthru defines user-configurable model routes that forward requests to external APIs.
+	// Each entry can target a different upstream protocol (openai-compatible, claude, codex, etc.).
+	Passthru []PassthruRoute `yaml:"passthru" json:"passthru"`
+
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
@@ -109,6 +114,50 @@ type Config struct {
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// PassthruRoute maps a local model name to an upstream provider endpoint.
+// These routes synthesize runtime Auth entries (like other config API keys),
+// so they participate in normal selection, retries, proxies, and logging.
+type PassthruRoute struct {
+	// Model is the local model name clients will request (e.g., "glm-4.7").
+	Model string `yaml:"model" json:"model"`
+
+	// ModelRoutingName is an optional unique local model name used ONLY for routing.
+	// When set, clients should request this name (e.g., "zai-glm-4.7") to avoid collisions
+	// with OAuth-backed providers advertising the same model.
+	// If empty, defaults to Model.
+	ModelRoutingName string `yaml:"model-routing-name,omitempty" json:"model-routing-name,omitempty"`
+
+	// Protocol selects the executor/translator protocol used to talk to the upstream.
+	// Supported: "openai" (OpenAI-compatible /chat/completions), "claude" (Anthropic messages API), "codex" (OpenAI Responses).
+	Protocol string `yaml:"protocol" json:"protocol"`
+
+	// UpstreamModel overrides the model identifier sent to the upstream (optional).
+	UpstreamModel string `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
+
+	// BaseURL is the upstream API base URL.
+	// For protocol=openai, the executor calls {base-url}/chat/completions.
+	// For protocol=claude, the executor calls {base-url}/v1/messages.
+	// For protocol=codex, the executor calls {base-url}/responses.
+	BaseURL string `yaml:"base-url" json:"base-url"`
+
+	// APIKey is the upstream credential (optional if Headers provides auth).
+	APIKey string `yaml:"api-key,omitempty" json:"api-key,omitempty"`
+
+	// ProxyURL optionally overrides the global proxy for this passthru route.
+	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// Headers optionally adds extra HTTP headers for upstream requests.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// ContextWindow specifies the model's context window size (optional).
+	// Used for /v1/models metadata. Defaults to 128000 if not set.
+	ContextWindow int `yaml:"context-window,omitempty" json:"context-window,omitempty"`
+
+	// MaxTokens specifies the model's max output tokens (optional).
+	// Used for /v1/models metadata. Defaults to 32000 if not set.
+	MaxTokens int `yaml:"max-tokens,omitempty" json:"max-tokens,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -555,6 +604,27 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()
 
+	// Normalize passthru routes (trim headers, etc.).
+	if len(cfg.Passthru) > 0 {
+		for i := range cfg.Passthru {
+			cfg.Passthru[i].Headers = NormalizeHeaders(cfg.Passthru[i].Headers)
+		}
+	}
+
+	// Load passthru routes from env (useful for Railway deployments).
+	// Env format: JSON array matching []PassthruRoute.
+	if env := strings.TrimSpace(os.Getenv("PASSTHRU_MODELS_JSON")); env != "" {
+		var routes []PassthruRoute
+		if err := json.Unmarshal([]byte(env), &routes); err != nil {
+			if !optional {
+				return nil, fmt.Errorf("failed to parse PASSTHRU_MODELS_JSON: %w", err)
+			}
+		} else {
+			cfg.Passthru = mergePassthruRoutes(cfg.Passthru, routes)
+			cfg.legacyMigrationPending = true
+		}
+	}
+
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
@@ -572,6 +642,38 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+func mergePassthruRoutes(existing, incoming []PassthruRoute) []PassthruRoute {
+	if len(existing) == 0 {
+		return append([]PassthruRoute(nil), incoming...)
+	}
+	if len(incoming) == 0 {
+		return existing
+	}
+	byModel := make(map[string]int, len(existing))
+	out := append([]PassthruRoute(nil), existing...)
+	for i := range out {
+		m := strings.ToLower(strings.TrimSpace(out[i].Model))
+		if m == "" {
+			continue
+		}
+		byModel[m] = i
+	}
+	for _, r := range incoming {
+		r.Headers = NormalizeHeaders(r.Headers)
+		m := strings.ToLower(strings.TrimSpace(r.Model))
+		if m == "" {
+			continue
+		}
+		if idx, ok := byModel[m]; ok {
+			out[idx] = r
+			continue
+		}
+		byModel[m] = len(out)
+		out = append(out, r)
+	}
+	return out
 }
 
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are

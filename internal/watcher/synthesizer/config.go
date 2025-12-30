@@ -34,8 +34,103 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
 	// Vertex-compat
 	out = append(out, s.synthesizeVertexCompat(ctx)...)
+	// Passthru routes
+	out = append(out, s.synthesizePassthru(ctx)...)
 
 	return out, nil
+}
+
+func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	out := make([]*coreauth.Auth, 0, len(cfg.Passthru))
+	for i := range cfg.Passthru {
+		r := cfg.Passthru[i]
+		model := strings.TrimSpace(r.Model)
+		if model == "" {
+			continue
+		}
+		routingModel := strings.TrimSpace(r.ModelRoutingName)
+		if routingModel == "" {
+			routingModel = model
+		}
+		protocol := strings.ToLower(strings.TrimSpace(r.Protocol))
+		if protocol == "" {
+			protocol = "openai"
+		}
+		base := strings.TrimSpace(r.BaseURL)
+		if base == "" {
+			continue
+		}
+		apiKey := strings.TrimSpace(r.APIKey)
+		proxyURL := strings.TrimSpace(r.ProxyURL)
+		upstreamModel := strings.TrimSpace(r.UpstreamModel)
+
+		idKind := fmt.Sprintf("passthru:%s", protocol)
+		id, token := idGen.Next(idKind, routingModel, base, upstreamModel, proxyURL)
+		attrs := map[string]string{
+			"source":              fmt.Sprintf("config:passthru[%s]", token),
+			"base_url":            base,
+			"passthru":            "true",
+			"passthru_model":      model,
+			"passthru_routing_name": routingModel,
+		}
+		if apiKey != "" {
+			attrs["api_key"] = apiKey
+		}
+		// Ensure upstream_model is set so executors know which model to send upstream.
+		// Priority: explicit UpstreamModel > Model (when routing name differs) > unset
+		if upstreamModel != "" {
+			attrs["upstream_model"] = upstreamModel
+		} else if routingModel != model {
+			// When routing name differs from model, use the original model as upstream
+			attrs["upstream_model"] = model
+		}
+		// Add context window and max tokens for /v1/models metadata
+		if r.ContextWindow > 0 {
+			attrs["context_window"] = fmt.Sprintf("%d", r.ContextWindow)
+		}
+		if r.MaxTokens > 0 {
+			attrs["max_tokens"] = fmt.Sprintf("%d", r.MaxTokens)
+		}
+		addConfigHeadersToAttrs(r.Headers, attrs)
+
+		providerName := protocol
+		// Map protocol to existing executor provider identifiers.
+		// - openai -> openai compat executor
+		// - claude -> claude executor
+		// - codex -> codex executor
+		switch protocol {
+		case "openai", "openai-chat", "openai_compat", "openai-compat", "openai-compatibility":
+			providerName = "openai-compatibility"
+			attrs["provider_key"] = "openai-compatibility"
+		case "claude":
+			providerName = "claude"
+		case "codex", "responses":
+			providerName = "codex"
+		default:
+			// Unknown protocol: default to openai-compatible executor.
+			providerName = "openai-compatibility"
+			attrs["provider_key"] = "openai-compatibility"
+		}
+
+		a := &coreauth.Auth{
+			ID:         id,
+			Provider:   providerName,
+			Label:      fmt.Sprintf("passthru:%s", routingModel),
+			Prefix:     "",
+			Status:     coreauth.StatusActive,
+			ProxyURL:   proxyURL,
+			Attributes: attrs,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		ApplyAuthExcludedModelsMeta(a, cfg, nil, "passthru")
+		out = append(out, a)
+	}
+	return out
 }
 
 // synthesizeGeminiKeys creates Auth entries for Gemini API keys.

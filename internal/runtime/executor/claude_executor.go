@@ -58,6 +58,11 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if upstreamModel == "" {
 		upstreamModel = req.Model
 	}
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
+			upstreamModel = v
+		}
+	}
 	if modelOverride := e.resolveUpstreamModel(upstreamModel, auth); modelOverride != "" {
 		upstreamModel = modelOverride
 	} else if !strings.EqualFold(upstreamModel, req.Model) {
@@ -174,6 +179,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	upstreamModel := util.ResolveOriginalModel(req.Model, req.Metadata)
 	if upstreamModel == "" {
 		upstreamModel = req.Model
+	}
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
+			upstreamModel = v
+		}
 	}
 	if modelOverride := e.resolveUpstreamModel(upstreamModel, auth); modelOverride != "" {
 		upstreamModel = modelOverride
