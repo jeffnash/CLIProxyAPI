@@ -757,9 +757,11 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 		}
 		if model.ContextLength > 0 {
 			result["context_length"] = model.ContextLength
+			result["context_window"] = model.ContextLength // Alias for letta-server compatibility
 		}
 		if model.MaxCompletionTokens > 0 {
 			result["max_completion_tokens"] = model.MaxCompletionTokens
+			result["max_tokens"] = model.MaxCompletionTokens // Alias for letta-server compatibility
 		}
 		if len(model.SupportedParameters) > 0 {
 			result["supported_parameters"] = model.SupportedParameters

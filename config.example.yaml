@@ -171,6 +171,18 @@ ws-auth: false
 #     models: # The models supported by the provider.
 #       - name: "moonshotai/kimi-k2:free" # The actual model name.
 #         alias: "kimi-k2" # The alias used in the API.
++
++# Passthrough model routes (map a unique local model id to an upstream API).
++# Useful when multiple providers advertise the same model name (e.g. OAuth + passthru):
++#   - clients request model-routing-name (unique)
++#   - passthru forwards upstream-model/model to the upstream
++#
++# passthru:
++#   - model: "glm-4.7"                # upstream model name (sent to provider)
++#     model-routing-name: "zai-glm-4.7" # optional unique local routing id
++#     protocol: "claude"              # openai|claude|codex
++#     base-url: "https://api.z.ai/api/anthropic"
++#     api-key: "za-..."
 
 # Vertex API keys (Vertex-compatible endpoints, use API key + base URL)
 # vertex-api-key:
@@ -232,6 +244,36 @@ ws-auth: false
 
 # Optional payload configuration
 # payload:
+
+# Passthru model routes
+#
+# Use this to declare local model IDs that should be forwarded to an external API.
+# This generalizes to multiple upstream API styles by choosing the protocol.
+#
+# Supported protocols:
+#   - openai: OpenAI-compatible Chat Completions (/chat/completions)
+#   - claude: Anthropic Messages API (/v1/messages)
+#   - codex:  OpenAI Responses API (/responses)
+#
+# Notes:
+# - model is what your client sends to CLIProxyAPI.
+# - base-url is the upstream base URL (without the endpoint path).
+# - api-key is optional if you provide auth via headers instead.
+# - upstream-model overrides the upstream "model" field.
+# - headers are merged into the upstream request; prefer this for non-Bearer auth schemes.
+#
+# passthru:
+#   - model: "glm-4.7"
+#     protocol: "openai"
+#     base-url: "https://api.z.ai/v1"
+#     api-key: "za-..."
+#     upstream-model: "glm-4.7"
+#     headers:
+#       X-Custom-Header: "custom-value"
+#
+# Railway-friendly env var:
+#   PASSTHRU_MODELS_JSON='[{"model":"glm-4.7","protocol":"openai","base-url":"https://api.z.ai/v1","api-key":"za-...","upstream-model":"glm-4.7","proxy-url":"socks5://proxy.example.com:1080","headers":{"X-Custom-Header":"custom-value"}}]'
+#
 #   default: # Default rules only set parameters when they are missing in the payload.
 #     - models:
 #         - name: "gemini-2.5-pro" # Supports wildcards (e.g., "gemini-*")

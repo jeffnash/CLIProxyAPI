@@ -60,6 +60,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			upstreamModel = modelOverride
 		}
 	}
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
+			upstreamModel = v
+		}
+	}
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")

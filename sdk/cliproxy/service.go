@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -690,6 +691,49 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	authKind := strings.ToLower(strings.TrimSpace(a.Attributes["auth_kind"]))
 	if a.Attributes != nil {
 		if v := strings.TrimSpace(a.Attributes["gemini_virtual_primary"]); strings.EqualFold(v, "true") {
+			GlobalModelRegistry().UnregisterClient(a.ID)
+			return
+		}
+		// Handle passthru routes: register the routing name as a model ID.
+		// This allows clients to request model: "zai-glm-4.7" which routes to the passthru
+		// provider and forwards the upstream model (e.g., glm-4.7) to the remote API.
+		if strings.EqualFold(strings.TrimSpace(a.Attributes["passthru"]), "true") {
+			routingName := strings.TrimSpace(a.Attributes["passthru_routing_name"])
+			if routingName == "" {
+				routingName = strings.TrimSpace(a.Attributes["passthru_model"])
+			}
+			if routingName != "" {
+				provider := strings.ToLower(strings.TrimSpace(a.Provider))
+				if provider == "" {
+					provider = "openai-compatibility"
+				}
+				// Parse context window and max tokens from attributes, use defaults if not set
+				contextWindow := 128000
+				maxTokens := 32000
+				if v := strings.TrimSpace(a.Attributes["context_window"]); v != "" {
+					if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+						contextWindow = parsed
+					}
+				}
+				if v := strings.TrimSpace(a.Attributes["max_tokens"]); v != "" {
+					if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+						maxTokens = parsed
+					}
+				}
+				models := []*ModelInfo{{
+					ID:                  routingName,
+					Object:              "model",
+					Created:             time.Now().Unix(),
+					OwnedBy:             "passthru",
+					Type:                provider,
+					DisplayName:         routingName,
+					ContextLength:       contextWindow,
+					MaxCompletionTokens: maxTokens,
+				}}
+				GlobalModelRegistry().RegisterClient(a.ID, provider, models)
+				return
+			}
+			// No routing name available; unregister any stale entry.
 			GlobalModelRegistry().UnregisterClient(a.ID)
 			return
 		}

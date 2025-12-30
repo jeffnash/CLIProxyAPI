@@ -2,7 +2,7 @@
 cli-proxy-api
 cliproxy
 *.exe
-
+server
 # Configuration
 config.yaml
 .env
@@ -50,3 +50,6 @@ _bmad-output/*
 
 # Go
 .gocache
+
+# Ensure tracked SDK sources are not blocked by ignore rules
+!sdk/**
