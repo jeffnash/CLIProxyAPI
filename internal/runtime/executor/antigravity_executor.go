@@ -868,10 +868,13 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 					OwnedBy:     antigravityAuthType,
 					Type:        antigravityAuthType,
 				}
-				// Look up Thinking support from static config using alias name
+				// Look up Thinking support and static limits from config using alias name
 				if cfg != nil {
 					if cfg.Thinking != nil {
 						modelInfo.Thinking = cfg.Thinking
+					}
+					if cfg.ContextLength > 0 {
+						modelInfo.ContextLength = cfg.ContextLength
 					}
 					if cfg.MaxCompletionTokens > 0 {
 						modelInfo.MaxCompletionTokens = cfg.MaxCompletionTokens
