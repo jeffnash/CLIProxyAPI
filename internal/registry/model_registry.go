@@ -735,55 +735,11 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 
 	switch handlerType {
 	case "openai":
-		result := map[string]any{
-			"id":       model.ID,
-			"object":   "model",
-			"owned_by": model.OwnedBy,
-		}
-		if model.Created > 0 {
-			result["created"] = model.Created
-		}
-		if model.Type != "" {
-			result["type"] = model.Type
-		}
-		if model.DisplayName != "" {
-			result["display_name"] = model.DisplayName
-		}
-		if model.Version != "" {
-			result["version"] = model.Version
-		}
-		if model.Description != "" {
-			result["description"] = model.Description
-		}
-		if model.ContextLength > 0 {
-			result["context_length"] = model.ContextLength
-			result["context_window"] = model.ContextLength // Alias for letta-server compatibility
-		}
-		if model.MaxCompletionTokens > 0 {
-			result["max_completion_tokens"] = model.MaxCompletionTokens
-			result["max_tokens"] = model.MaxCompletionTokens // Alias for letta-server compatibility
-		}
-		if len(model.SupportedParameters) > 0 {
-			result["supported_parameters"] = model.SupportedParameters
-		}
-		return result
+		return ToOpenAIModelMap(model)
 
 	case "claude":
-		result := map[string]any{
-			"id":       model.ID,
-			"object":   "model",
-			"owned_by": model.OwnedBy,
-		}
-		if model.Created > 0 {
-			result["created"] = model.Created
-		}
-		if model.Type != "" {
-			result["type"] = model.Type
-		}
-		if model.DisplayName != "" {
-			result["display_name"] = model.DisplayName
-		}
-		return result
+		// /v1/models responses must always include OpenAI-style limit metadata.
+		return ToOpenAIModelMap(model)
 
 	case "gemini":
 		result := map[string]any{}
