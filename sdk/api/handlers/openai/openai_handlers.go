@@ -62,30 +62,36 @@ func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	// Get all available models
 	allModels := h.Models()
 
-	// Filter to only include the 4 required fields: id, object, created, owned_by
-	filteredModels := make([]map[string]any, len(allModels))
+	// Return OpenAI-compatible models list. We include context_length and
+	// max_completion_tokens when available, since many clients (including Letta)
+	// rely on this metadata to avoid invalid requests.
+	//
+	// Note: These fields are already present on CLIProxyAPI's registry ModelInfo
+	// and are exposed by ModelRegistry.GetAvailableModels("openai").
+	enrichedModels := make([]map[string]any, len(allModels))
 	for i, model := range allModels {
-		filteredModel := map[string]any{
-			"id":     model["id"],
-			"object": model["object"],
+		out := map[string]any{}
+		for _, k := range []string{
+			"id",
+			"object",
+			"created",
+			"owned_by",
+			"context_length",
+			"max_completion_tokens",
+			// Gemini-style fallbacks can appear for some providers.
+			"inputTokenLimit",
+			"outputTokenLimit",
+		} {
+			if v, ok := model[k]; ok {
+				out[k] = v
+			}
 		}
-
-		// Add created field if it exists
-		if created, exists := model["created"]; exists {
-			filteredModel["created"] = created
-		}
-
-		// Add owned_by field if it exists
-		if ownedBy, exists := model["owned_by"]; exists {
-			filteredModel["owned_by"] = ownedBy
-		}
-
-		filteredModels[i] = filteredModel
+		enrichedModels[i] = out
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
-		"data":   filteredModels,
+		"data":   enrichedModels,
 	})
 }
 
