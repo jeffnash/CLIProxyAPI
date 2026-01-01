@@ -49,37 +49,37 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
 	defer reporter.trackFailure(ctx, &err)
 
-	upstreamModel := util.ResolveOriginalModel(req.Model, req.Metadata)
-	if upstreamModel == "" {
-		upstreamModel = req.Model
+	model := req.Model
+	if override := e.resolveUpstreamModel(req.Model, auth); override != "" {
+		model = override
 	}
-	if modelOverride := e.resolveUpstreamModel(upstreamModel, auth); modelOverride != "" {
-		upstreamModel = modelOverride
-	} else if !strings.EqualFold(upstreamModel, req.Model) {
-		if modelOverride := e.resolveUpstreamModel(req.Model, auth); modelOverride != "" {
-			upstreamModel = modelOverride
-		}
-	}
+	// Check auth attributes for passthru route upstream_model override
 	if auth != nil && auth.Attributes != nil {
 		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
-			upstreamModel = v
+			model = v
 		}
+	}
+	// Apply codex alias resolution (gpt-5.* effort aliases)
+	if aliasModel, effort, ok := resolveCodexAlias(model); ok {
+		model = aliasModel
+		// Will set reasoning effort below after translation
+		_ = effort // Used in setReasoningEffortByAlias
 	}
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
+	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), false)
+	// Apply alias reasoning effort if applicable
 	if aliasModel, effort, ok := resolveCodexAlias(req.Model); ok {
-		upstreamModel = aliasModel
 		body = setReasoningEffortByAlias(body, aliasModel, effort)
 	}
-	body = ApplyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort", false)
-	body = NormalizeThinkingConfig(body, upstreamModel, false)
-	if errValidate := ValidateThinkingConfig(body, upstreamModel); errValidate != nil {
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, model, "reasoning.effort", false)
+	body = NormalizeThinkingConfig(body, model, false)
+	if errValidate := ValidateThinkingConfig(body, model); errValidate != nil {
 		return resp, errValidate
 	}
-	body = applyPayloadConfig(e.cfg, req.Model, body)
-	body, _ = sjson.SetBytes(body, "model", upstreamModel)
+	body = applyPayloadConfig(e.cfg, model, body)
+	body, _ = sjson.SetBytes(body, "model", model)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 
@@ -165,34 +165,37 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
 	defer reporter.trackFailure(ctx, &err)
 
-	upstreamModel := util.ResolveOriginalModel(req.Model, req.Metadata)
-	if upstreamModel == "" {
-		upstreamModel = req.Model
+	model := req.Model
+	if override := e.resolveUpstreamModel(req.Model, auth); override != "" {
+		model = override
 	}
-	if modelOverride := e.resolveUpstreamModel(upstreamModel, auth); modelOverride != "" {
-		upstreamModel = modelOverride
-	} else if !strings.EqualFold(upstreamModel, req.Model) {
-		if modelOverride := e.resolveUpstreamModel(req.Model, auth); modelOverride != "" {
-			upstreamModel = modelOverride
+	// Check auth attributes for passthru route upstream_model override
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
+			model = v
 		}
+	}
+	// Apply codex alias resolution (gpt-5.* effort aliases)
+	if aliasModel, _, ok := resolveCodexAlias(model); ok {
+		model = aliasModel
 	}
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), true)
+	// Apply alias reasoning effort if applicable
 	if aliasModel, effort, ok := resolveCodexAlias(req.Model); ok {
-		upstreamModel = aliasModel
 		body = setReasoningEffortByAlias(body, aliasModel, effort)
 	}
 
-	body = ApplyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort", false)
-	body = NormalizeThinkingConfig(body, upstreamModel, false)
-	if errValidate := ValidateThinkingConfig(body, upstreamModel); errValidate != nil {
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, model, "reasoning.effort", false)
+	body = NormalizeThinkingConfig(body, model, false)
+	if errValidate := ValidateThinkingConfig(body, model); errValidate != nil {
 		return nil, errValidate
 	}
-	body = applyPayloadConfig(e.cfg, req.Model, body)
+	body = applyPayloadConfig(e.cfg, model, body)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.SetBytes(body, "model", upstreamModel)
+	body, _ = sjson.SetBytes(body, "model", model)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -279,32 +282,34 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	upstreamModel := util.ResolveOriginalModel(req.Model, req.Metadata)
-	if upstreamModel == "" {
-		upstreamModel = req.Model
+	model := req.Model
+	if override := e.resolveUpstreamModel(req.Model, auth); override != "" {
+		model = override
 	}
-	if modelOverride := e.resolveUpstreamModel(upstreamModel, auth); modelOverride != "" {
-		upstreamModel = modelOverride
-	} else if !strings.EqualFold(upstreamModel, req.Model) {
-		if modelOverride := e.resolveUpstreamModel(req.Model, auth); modelOverride != "" {
-			upstreamModel = modelOverride
+	// Check auth attributes for passthru route upstream_model override
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
+			model = v
 		}
+	}
+	// Apply codex alias resolution for tokenizer selection
+	modelForCounting := model
+	if aliasModel, _, ok := resolveCodexAlias(model); ok {
+		model = aliasModel
+		modelForCounting = aliasModel
 	}
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
+	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), false)
 
-	modelForCounting := upstreamModel
+	// Apply alias reasoning effort if applicable
 	if aliasModel, effort, ok := resolveCodexAlias(req.Model); ok {
-		// For aliases that map to a base model + reasoning.effort, use the base model
-		// for tokenizer selection and ensure the payload reflects the alias mapping.
-		modelForCounting = aliasModel
 		body = setReasoningEffortByAlias(body, aliasModel, effort)
 	}
 
-	body = ApplyReasoningEffortMetadata(body, req.Metadata, req.Model, "reasoning.effort", false)
-	body, _ = sjson.SetBytes(body, "model", upstreamModel)
+	body = ApplyReasoningEffortMetadata(body, req.Metadata, model, "reasoning.effort", false)
+	body, _ = sjson.SetBytes(body, "model", model)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.SetBytes(body, "stream", false)
 
