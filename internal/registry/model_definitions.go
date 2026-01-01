@@ -1208,7 +1208,7 @@ func GetAntigravityModelConfig() map[string]*AntigravityModelConfig {
 	return map[string]*AntigravityModelConfig{
 		"gemini-2.5-flash":                        {Thinking: &ThinkingSupport{Min: 0, Max: 24576, ZeroAllowed: true, DynamicAllowed: true}, Name: "models/gemini-2.5-flash"},
 		"gemini-2.5-flash-lite":                   {Thinking: &ThinkingSupport{Min: 0, Max: 24576, ZeroAllowed: true, DynamicAllowed: true}, Name: "models/gemini-2.5-flash-lite"},
-		"gemini-2.5-computer-use-preview-10-2025": {Name: "models/gemini-2.5-computer-use-preview-10-2025"},
+		"gemini-2.5-computer-use-preview-10-2025": {Thinking: &ThinkingSupport{Min: 128, Max: 32768, ZeroAllowed: false, DynamicAllowed: true}, Name: "models/gemini-2.5-computer-use-preview-10-2025"},
 		"gemini-3-pro-preview":                    {Thinking: &ThinkingSupport{Min: 128, Max: 32768, ZeroAllowed: false, DynamicAllowed: true, Levels: []string{"low", "high"}}, Name: "models/gemini-3-pro-preview"},
 		"gemini-3-pro-image-preview":              {Thinking: &ThinkingSupport{Min: 128, Max: 32768, ZeroAllowed: false, DynamicAllowed: true, Levels: []string{"low", "high"}}, Name: "models/gemini-3-pro-image-preview"},
 		"gemini-3-flash-preview":                  {Thinking: &ThinkingSupport{Min: 128, Max: 32768, ZeroAllowed: false, DynamicAllowed: true, Levels: []string{"minimal", "low", "medium", "high"}}, Name: "models/gemini-3-flash-preview"},
@@ -1216,4 +1216,30 @@ func GetAntigravityModelConfig() map[string]*AntigravityModelConfig {
 		"gemini-claude-sonnet-4-5-thinking":       {Thinking: &ThinkingSupport{Min: 1024, Max: 200000, ZeroAllowed: false, DynamicAllowed: true}, ContextLength: 200000, MaxCompletionTokens: 64000},
 		"gemini-claude-opus-4-5-thinking":         {Thinking: &ThinkingSupport{Min: 1024, Max: 200000, ZeroAllowed: false, DynamicAllowed: true}, ContextLength: 200000, MaxCompletionTokens: 64000},
 	}
+}
+
+// LookupStaticModelInfo searches all static model definitions for a model by ID.
+// Returns nil if no matching model is found.
+func LookupStaticModelInfo(modelID string) *ModelInfo {
+	if modelID == "" {
+		return nil
+	}
+	allModels := [][]*ModelInfo{
+		GetClaudeModels(),
+		GetGeminiModels(),
+		GetGeminiVertexModels(),
+		GetGeminiCLIModels(),
+		GetAIStudioModels(),
+		GetOpenAIModels(),
+		GetQwenModels(),
+		GetIFlowModels(),
+	}
+	for _, models := range allModels {
+		for _, m := range models {
+			if m != nil && m.ID == modelID {
+				return m
+			}
+		}
+	}
+	return nil
 }
