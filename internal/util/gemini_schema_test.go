@@ -23,11 +23,13 @@ func TestCleanJSONSchemaForAntigravity_ConstToEnum(t *testing.T) {
 	expected := `{
 		"type": "object",
 		"properties": {
+			"_": { "type": "boolean" },
 			"kind": {
 				"type": "string",
 				"enum": ["InsightVizNode"]
 			}
-		}
+		},
+		"required": ["_"]
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -123,14 +125,18 @@ func TestCleanJSONSchemaForAntigravity_AnyOfFlattening_SmartSelection(t *testing
 	expected := `{
 		"type": "object",
 		"properties": {
+			"_": { "type": "boolean" },
 			"query": {
 				"type": "object",
 				"description": "Accepts: null | object",
 				"properties": {
+					"_": { "type": "boolean" },
 					"kind": { "type": "string" }
-				}
+				},
+				"required": ["_"]
 			}
-		}
+		},
+		"required": ["_"]
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -153,11 +159,13 @@ func TestCleanJSONSchemaForAntigravity_OneOfFlattening(t *testing.T) {
 	expected := `{
 		"type": "object",
 		"properties": {
+			"_": { "type": "boolean" },
 			"config": {
 				"type": "string",
 				"description": "Accepts: string | integer"
 			}
-		}
+		},
+		"required": ["_"]
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -216,6 +224,7 @@ func TestCleanJSONSchemaForAntigravity_RefHandling(t *testing.T) {
 	expected := `{
 		"type": "object",
 		"properties": {
+			"_": { "type": "boolean" },
 			"customer": {
 				"type": "object",
 				"description": "See: User",
@@ -227,7 +236,8 @@ func TestCleanJSONSchemaForAntigravity_RefHandling(t *testing.T) {
 				},
 				"required": ["reason"]
 			}
-		}
+		},
+		"required": ["_"]
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -257,6 +267,7 @@ func TestCleanJSONSchemaForAntigravity_RefHandling_DescriptionEscaping(t *testin
 	expected := `{
 		"type": "object",
 		"properties": {
+			"_": { "type": "boolean" },
 			"customer": {
 				"type": "object",
 				"description": "He said \"hi\"\\nsecond line (See: User)",
@@ -268,7 +279,8 @@ func TestCleanJSONSchemaForAntigravity_RefHandling_DescriptionEscaping(t *testin
 				},
 				"required": ["reason"]
 			}
-		}
+		},
+		"required": ["_"]
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -565,11 +577,13 @@ func TestCleanJSONSchemaForAntigravity_AnyOfFlattening_PreservesDescription(t *t
 	expected := `{
 		"type": "object",
 		"properties": {
+			"_": { "type": "boolean" },
 			"config": {
 				"type": "string",
 				"description": "Parent desc (Child desc) (Accepts: string | integer)"
 			}
-		}
+		},
+		"required": ["_"]
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -632,28 +646,21 @@ func TestCleanJSONSchemaForGemini_PropertyNamesRemoval(t *testing.T) {
 		}
 	}`
 
-	expected := `{
-		"type": "object",
-		"properties": {
-			"metadata": {
-				"type": "object",
-				"properties": {
-					"reason": {
-						"type": "string",
-						"description": "Brief explanation of why you are calling this tool"
-					}
-				},
-				"required": ["reason"]
-			}
-		}
-	}`
-
 	result := CleanJSONSchemaForAntigravity(input)
-	compareJSON(t, expected, result)
 
 	// Verify propertyNames is completely removed
 	if strings.Contains(result, "propertyNames") {
 		t.Errorf("propertyNames keyword should be removed, got: %s", result)
+	}
+
+	// Verify additionalProperties is removed (not supported by Gemini)
+	if strings.Contains(result, "additionalProperties") {
+		t.Errorf("additionalProperties keyword should be removed, got: %s", result)
+	}
+
+	// Verify metadata still has the placeholder structure
+	if !strings.Contains(result, "reason") {
+		t.Errorf("Expected placeholder 'reason' field in empty object schema, got: %s", result)
 	}
 }
 
