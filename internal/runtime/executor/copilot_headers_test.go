@@ -266,6 +266,47 @@ func TestApplyCopilotHeaders_XInitiator(t *testing.T) {
 			payload:           `{"model":"gpt-4"}`,
 			expectedInitiator: "agent",
 		},
+		// Conservative agent signal detection (always err on side of agent)
+		{
+			name:              "previous_response_id continuation",
+			payload:           `{"previous_response_id":"resp_abc123","input":[{"role":"user","content":[{"type":"input_text","text":"yes proceed"}]}]}`,
+			expectedInitiator: "agent",
+		},
+		{
+			name:              "tools array present",
+			payload:           `{"messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"test"}}]}`,
+			expectedInitiator: "agent",
+		},
+		{
+			name:              "empty tools array is user",
+			payload:           `{"messages":[{"role":"user","content":"hello"}],"tools":[]}`,
+			expectedInitiator: "user",
+		},
+		{
+			name:              "functions array present (legacy)",
+			payload:           `{"messages":[{"role":"user","content":"hello"}],"functions":[{"name":"test"}]}`,
+			expectedInitiator: "agent",
+		},
+		{
+			name:              "tool_choice auto",
+			payload:           `{"messages":[{"role":"user","content":"hello"}],"tool_choice":"auto"}`,
+			expectedInitiator: "agent",
+		},
+		{
+			name:              "tool_choice required",
+			payload:           `{"messages":[{"role":"user","content":"hello"}],"tool_choice":"required"}`,
+			expectedInitiator: "agent",
+		},
+		{
+			name:              "tool_choice none allows user",
+			payload:           `{"messages":[{"role":"user","content":"hello"}],"tool_choice":"none"}`,
+			expectedInitiator: "user",
+		},
+		{
+			name:              "tool_choice object (specific tool)",
+			payload:           `{"messages":[{"role":"user","content":"hello"}],"tool_choice":{"type":"function","function":{"name":"test"}}}`,
+			expectedInitiator: "agent",
+		},
 		// Mixed format tests - both messages[] and input[] present
 		{
 			name:              "mixed format - user messages with agent input",
