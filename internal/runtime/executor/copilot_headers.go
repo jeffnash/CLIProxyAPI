@@ -215,6 +215,25 @@ func collectCopilotHeaderHints(payload []byte, headers http.Header) copilotHeade
 		forceAgentFromHeaders: forceAgentCallFromHeaders(headers),
 	}
 
+	// Conservative checks: any of these fields indicate agent/continuation context.
+	// We ALWAYS err on the side of agent to avoid costly false positives.
+	//
+	// previous_response_id: Responses API continuation (prior response had assistant/tool output)
+	// tools/functions: Tool definitions present means agent context
+	// tool_choice: Explicit tool selection indicates agent loop
+	if gjson.GetBytes(payload, "previous_response_id").Exists() {
+		hints.agentFromPayload = true
+	}
+	if gjson.GetBytes(payload, "tools").IsArray() && len(gjson.GetBytes(payload, "tools").Array()) > 0 {
+		hints.agentFromPayload = true
+	}
+	if gjson.GetBytes(payload, "functions").IsArray() && len(gjson.GetBytes(payload, "functions").Array()) > 0 {
+		hints.agentFromPayload = true
+	}
+	if tc := gjson.GetBytes(payload, "tool_choice"); tc.Exists() && tc.String() != "none" {
+		hints.agentFromPayload = true
+	}
+
 	// Chat Completions format (messages array)
 	messages := gjson.GetBytes(payload, "messages")
 	if messages.IsArray() {
