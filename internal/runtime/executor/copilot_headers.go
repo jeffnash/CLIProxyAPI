@@ -35,8 +35,8 @@ var responsesAPIAgentTypes = map[string]bool{
 // isResponsesAPIAgentItem checks if a single item from the Responses API input array
 // indicates agent/tool activity. This is used to determine the X-Initiator header value.
 func isResponsesAPIAgentItem(item gjson.Result) bool {
-	// Check for assistant role
-	if item.Get("role").String() == "assistant" {
+	role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+	if role == "assistant" || role == "tool" {
 		return true
 	}
 	// Check for agent-related input types
@@ -51,6 +51,8 @@ func isResponsesAPIVisionContent(part gjson.Result) bool {
 
 type copilotHeaderHints struct {
 	hasVision             bool
+	userFromPayload       bool
+	lastUserFromPayload   bool
 	agentFromPayload      bool
 	forceAgentFromHeaders bool
 	promptCacheKey        string
@@ -216,7 +218,8 @@ func collectCopilotHeaderHints(payload []byte, headers http.Header) copilotHeade
 	// Chat Completions format (messages array)
 	messages := gjson.GetBytes(payload, "messages")
 	if messages.IsArray() {
-		for _, msg := range messages.Array() {
+		arr := messages.Array()
+		for i, msg := range arr {
 			content := msg.Get("content")
 			if content.IsArray() {
 				for _, part := range content.Array() {
@@ -225,8 +228,14 @@ func collectCopilotHeaderHints(payload []byte, headers http.Header) copilotHeade
 					}
 				}
 			}
-			role := msg.Get("role").String()
-			if role == "assistant" || role == "tool" {
+			role := strings.ToLower(strings.TrimSpace(msg.Get("role").String()))
+			if role == "user" {
+				hints.userFromPayload = true
+				if i == len(arr)-1 {
+					hints.lastUserFromPayload = true
+				}
+			} else if role != "" {
+				// Any non-user role implies agent/runtime involvement.
 				hints.agentFromPayload = true
 			}
 		}
@@ -235,7 +244,8 @@ func collectCopilotHeaderHints(payload []byte, headers http.Header) copilotHeade
 	// Responses API format (input array)
 	input := gjson.GetBytes(payload, "input")
 	if input.IsArray() {
-		for _, item := range input.Array() {
+		arr := input.Array()
+		for i, item := range arr {
 			content := item.Get("content")
 			if content.IsArray() {
 				for _, part := range content.Array() {
@@ -243,6 +253,17 @@ func collectCopilotHeaderHints(payload []byte, headers http.Header) copilotHeade
 						hints.hasVision = true
 					}
 				}
+			}
+			role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+			if role == "user" {
+				hints.userFromPayload = true
+				if i == len(arr)-1 {
+					hints.lastUserFromPayload = true
+				}
+			}
+			if role != "" && role != "user" {
+				// Any non-user role implies agent/runtime involvement.
+				hints.agentFromPayload = true
 			}
 			if isResponsesAPIAgentItem(item) {
 				hints.agentFromPayload = true
@@ -278,25 +299,47 @@ func (e *CopilotExecutor) agentInitiatorPersistEnabled() bool {
 }
 
 func (e *CopilotExecutor) shouldUseAgentInitiator(h copilotHeaderHints) bool {
+	// Policy: ONLY an outbound payload that is literally just a user message
+	// should be marked as X-Initiator=user. Everything else is agent/runtime.
+	//
+	// Concretely, if we saw any non-user role or any known tool/agent item type,
+	// this is an agent call.
 	if h.forceAgentFromHeaders {
 		return true
 	}
 	if e != nil && e.forceAgentCallEnabled() {
 		return true
 	}
+
+	// If the payload contains any agent/runtime signal, it's agent.
+	if h.agentFromPayload {
+		return true
+	}
+
+	// No user message in payload => not a user-initiated message.
+	if !h.userFromPayload {
+		return true
+	}
+
+	// Structural convention: only treat as a user-initiated turn if the LAST item
+	// in the outbound payload is role:user (otherwise it's likely replay/history).
+	if !h.lastUserFromPayload {
+		return true
+	}
+
+	// At this point, we saw a user message, the last item is user, and we saw no
+	// agent/runtime signals.
+	// If initiator persistence is enabled for this thread, treat subsequent calls
+	// as agent even if the payload is identical.
 	if e != nil && e.agentInitiatorPersistEnabled() && h.promptCacheKey != "" {
 		e.mu.Lock()
 		count := e.initiatorCount[h.promptCacheKey]
 		e.initiatorCount[h.promptCacheKey] = count + 1
 		e.mu.Unlock()
-
-		if h.agentFromPayload {
-			return true
-		}
 		return count > 0
 	}
 
-	return h.agentFromPayload
+	return false
 }
 
 // applyCopilotHeaders applies all necessary headers to the request.
