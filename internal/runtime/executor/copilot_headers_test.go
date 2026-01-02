@@ -26,10 +26,15 @@ func TestIsResponsesAPIAgentItem(t *testing.T) {
 			json:     `{"role": "system", "content": "You are helpful"}`,
 			expected: false,
 		},
-		// Assistant messages - agent
+		// Assistant/tool messages - agent
 		{
 			name:     "assistant message",
 			json:     `{"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}`,
+			expected: true,
+		},
+		{
+			name:     "tool role message",
+			json:     `{"role": "tool", "content": [{"type": "output_text", "text": "tool output"}]}`,
 			expected: true,
 		},
 		// Function/tool types - agent
@@ -190,6 +195,11 @@ func TestApplyCopilotHeaders_XInitiator(t *testing.T) {
 			expectedInitiator: "agent",
 		},
 		{
+			name:              "chat completions - user then user (history + new)",
+			payload:           `{"messages":[{"role":"user","content":"old"},{"role":"user","content":"new"}]}`,
+			expectedInitiator: "user",
+		},
+		{
 			name:              "chat completions - with tool",
 			payload:           `{"messages":[{"role":"user","content":"hello"},{"role":"tool","tool_call_id":"123","content":"result"}]}`,
 			expectedInitiator: "agent",
@@ -197,7 +207,7 @@ func TestApplyCopilotHeaders_XInitiator(t *testing.T) {
 		{
 			name:              "chat completions - system and user only",
 			payload:           `{"messages":[{"role":"system","content":"You are helpful"},{"role":"user","content":"hello"}]}`,
-			expectedInitiator: "user",
+			expectedInitiator: "agent",
 		},
 		// Responses API format tests
 		{
@@ -209,6 +219,11 @@ func TestApplyCopilotHeaders_XInitiator(t *testing.T) {
 			name:              "responses - with function_call",
 			payload:           `{"input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"function_call","call_id":"123","name":"test","arguments":"{}"}]}`,
 			expectedInitiator: "agent",
+		},
+		{
+			name:              "responses - user then user (history + new)",
+			payload:           `{"input":[{"role":"user","content":[{"type":"input_text","text":"old"}]},{"role":"user","content":[{"type":"input_text","text":"new"}]}]}`,
+			expectedInitiator: "user",
 		},
 		{
 			name:              "responses - with function_call_output",
@@ -239,17 +254,17 @@ func TestApplyCopilotHeaders_XInitiator(t *testing.T) {
 		{
 			name:              "empty messages",
 			payload:           `{"messages":[]}`,
-			expectedInitiator: "user",
+			expectedInitiator: "agent",
 		},
 		{
 			name:              "empty input",
 			payload:           `{"input":[]}`,
-			expectedInitiator: "user",
+			expectedInitiator: "agent",
 		},
 		{
 			name:              "no messages or input",
 			payload:           `{"model":"gpt-4"}`,
-			expectedInitiator: "user",
+			expectedInitiator: "agent",
 		},
 		// Mixed format tests - both messages[] and input[] present
 		{
