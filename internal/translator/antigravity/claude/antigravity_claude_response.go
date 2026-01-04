@@ -375,11 +375,32 @@ func ConvertAntigravityResponseToClaudeNonStream(_ context.Context, _ string, or
 	_ = requestRawJSON
 
 	root := gjson.ParseBytes(rawJSON)
-	promptTokens := root.Get("response.usageMetadata.promptTokenCount").Int()
-	candidateTokens := root.Get("response.usageMetadata.candidatesTokenCount").Int()
-	thoughtTokens := root.Get("response.usageMetadata.thoughtsTokenCount").Int()
-	totalTokens := root.Get("response.usageMetadata.totalTokenCount").Int()
-	cachedTokens := root.Get("response.usageMetadata.cachedContentTokenCount").Int()
+	promptTC := root.Get("response.usageMetadata.promptTokenCount")
+	candidateTC := root.Get("response.usageMetadata.candidatesTokenCount")
+	thoughtTC := root.Get("response.usageMetadata.thoughtsTokenCount")
+	totalTC := root.Get("response.usageMetadata.totalTokenCount")
+	cachedTC := root.Get("response.usageMetadata.cachedContentTokenCount")
+
+	promptTokens := int64(0)
+	if promptTC.Exists() && promptTC.Type != gjson.Null {
+		promptTokens = promptTC.Int()
+	}
+	candidateTokens := int64(0)
+	if candidateTC.Exists() && candidateTC.Type != gjson.Null {
+		candidateTokens = candidateTC.Int()
+	}
+	thoughtTokens := int64(0)
+	if thoughtTC.Exists() && thoughtTC.Type != gjson.Null {
+		thoughtTokens = thoughtTC.Int()
+	}
+	totalTokens := int64(0)
+	if totalTC.Exists() && totalTC.Type != gjson.Null {
+		totalTokens = totalTC.Int()
+	}
+	cachedTokens := int64(0)
+	if cachedTC.Exists() && cachedTC.Type != gjson.Null {
+		cachedTokens = cachedTC.Int()
+	}
 	outputTokens := candidateTokens + thoughtTokens
 	if outputTokens == 0 && totalTokens > 0 {
 		outputTokens = totalTokens - promptTokens

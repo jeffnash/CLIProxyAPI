@@ -726,18 +726,28 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 
 	// usage mapping
 	if usage := root.Get("usage"); usage.Exists() {
-		// Map common tokens
-		if usage.Get("prompt_tokens").Exists() || usage.Get("completion_tokens").Exists() || usage.Get("total_tokens").Exists() {
-			resp, _ = sjson.Set(resp, "usage.input_tokens", usage.Get("prompt_tokens").Int())
-			if d := usage.Get("prompt_tokens_details.cached_tokens"); d.Exists() {
+		// Map common tokens, but ignore explicit `null` values.
+		// Some OpenAI-compatible providers include the keys with nulls instead of omitting them.
+		hasPrompt := usage.Get("prompt_tokens").Exists() && usage.Get("prompt_tokens").Type != gjson.Null
+		hasCompletion := usage.Get("completion_tokens").Exists() && usage.Get("completion_tokens").Type != gjson.Null
+		hasTotal := usage.Get("total_tokens").Exists() && usage.Get("total_tokens").Type != gjson.Null
+		if hasPrompt || hasCompletion || hasTotal {
+			if hasPrompt {
+				resp, _ = sjson.Set(resp, "usage.input_tokens", usage.Get("prompt_tokens").Int())
+			}
+			if d := usage.Get("prompt_tokens_details.cached_tokens"); d.Exists() && d.Type != gjson.Null {
 				resp, _ = sjson.Set(resp, "usage.input_tokens_details.cached_tokens", d.Int())
 			}
-			resp, _ = sjson.Set(resp, "usage.output_tokens", usage.Get("completion_tokens").Int())
+			if hasCompletion {
+				resp, _ = sjson.Set(resp, "usage.output_tokens", usage.Get("completion_tokens").Int())
+			}
 			// Reasoning tokens not available in Chat Completions; set only if present under output_tokens_details
-			if d := usage.Get("output_tokens_details.reasoning_tokens"); d.Exists() {
+			if d := usage.Get("output_tokens_details.reasoning_tokens"); d.Exists() && d.Type != gjson.Null {
 				resp, _ = sjson.Set(resp, "usage.output_tokens_details.reasoning_tokens", d.Int())
 			}
-			resp, _ = sjson.Set(resp, "usage.total_tokens", usage.Get("total_tokens").Int())
+			if hasTotal {
+				resp, _ = sjson.Set(resp, "usage.total_tokens", usage.Get("total_tokens").Int())
+			}
 		} else {
 			// Fallback to raw usage object if structure differs
 			resp, _ = sjson.Set(resp, "usage", usage.Value())

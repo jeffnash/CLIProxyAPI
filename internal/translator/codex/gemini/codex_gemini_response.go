@@ -121,10 +121,18 @@ func ConvertCodexResponseToGemini(_ context.Context, modelName string, originalR
 		part, _ = sjson.Set(part, "text", rootResult.Get("delta").String())
 		template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", part)
 	} else if typeStr == "response.completed" { // Handle response completion with usage metadata
-		template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", rootResult.Get("response.usage.input_tokens").Int())
-		template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", rootResult.Get("response.usage.output_tokens").Int())
-		totalTokens := rootResult.Get("response.usage.input_tokens").Int() + rootResult.Get("response.usage.output_tokens").Int()
-		template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", totalTokens)
+		input := rootResult.Get("response.usage.input_tokens")
+		output := rootResult.Get("response.usage.output_tokens")
+		if input.Exists() && input.Type != gjson.Null {
+			template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", input.Int())
+		}
+		if output.Exists() && output.Type != gjson.Null {
+			template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", output.Int())
+		}
+		if input.Exists() && input.Type != gjson.Null && output.Exists() && output.Type != gjson.Null {
+			totalTokens := input.Int() + output.Int()
+			template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", totalTokens)
+		}
 	} else {
 		return []string{}
 	}
@@ -179,13 +187,17 @@ func ConvertCodexResponseToGeminiNonStream(_ context.Context, modelName string, 
 
 		// Set usage metadata
 		if usage := responseData.Get("usage"); usage.Exists() {
-			inputTokens := usage.Get("input_tokens").Int()
-			outputTokens := usage.Get("output_tokens").Int()
-			totalTokens := inputTokens + outputTokens
-
-			template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", inputTokens)
-			template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", outputTokens)
-			template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", totalTokens)
+			input := usage.Get("input_tokens")
+			output := usage.Get("output_tokens")
+			if input.Exists() && input.Type != gjson.Null {
+				template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", input.Int())
+			}
+			if output.Exists() && output.Type != gjson.Null {
+				template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", output.Int())
+			}
+			if input.Exists() && input.Type != gjson.Null && output.Exists() && output.Type != gjson.Null {
+				template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", input.Int()+output.Int())
+			}
 		}
 
 		// Process output content to build parts array
