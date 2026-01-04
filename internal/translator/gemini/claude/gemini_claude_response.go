@@ -238,7 +238,12 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 
 	usageResult := gjson.GetBytes(rawJSON, "usageMetadata")
 	if usageResult.Exists() && bytes.Contains(rawJSON, []byte(`"finishReason"`)) {
-		if candidatesTokenCountResult := usageResult.Get("candidatesTokenCount"); candidatesTokenCountResult.Exists() {
+		promptTC := usageResult.Get("promptTokenCount")
+		candidatesTC := usageResult.Get("candidatesTokenCount")
+		thoughtsTC := usageResult.Get("thoughtsTokenCount")
+
+		hasAnyUsage := (promptTC.Exists() && promptTC.Type != gjson.Null) || (candidatesTC.Exists() && candidatesTC.Type != gjson.Null) || (thoughtsTC.Exists() && thoughtsTC.Type != gjson.Null)
+		if hasAnyUsage {
 			// Only send final events if we have actually output content
 			if (*param).(*Params).HasContent {
 				output = output + "event: content_block_stop\n"
@@ -253,9 +258,21 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 					template = `{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`
 				}
 
-				thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
-				template, _ = sjson.Set(template, "usage.output_tokens", candidatesTokenCountResult.Int()+thoughtsTokenCount)
-				template, _ = sjson.Set(template, "usage.input_tokens", usageResult.Get("promptTokenCount").Int())
+				promptTokens := int64(0)
+				if promptTC.Exists() && promptTC.Type != gjson.Null {
+					promptTokens = promptTC.Int()
+				}
+				thoughtTokens := int64(0)
+				if thoughtsTC.Exists() && thoughtsTC.Type != gjson.Null {
+					thoughtTokens = thoughtsTC.Int()
+				}
+				candidateTokens := int64(0)
+				if candidatesTC.Exists() && candidatesTC.Type != gjson.Null {
+					candidateTokens = candidatesTC.Int()
+				}
+
+				template, _ = sjson.Set(template, "usage.output_tokens", candidateTokens+thoughtTokens)
+				template, _ = sjson.Set(template, "usage.input_tokens", promptTokens)
 
 				output = output + template + "\n\n\n"
 			}
@@ -285,10 +302,27 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 	out, _ = sjson.Set(out, "id", root.Get("responseId").String())
 	out, _ = sjson.Set(out, "model", root.Get("modelVersion").String())
 
-	inputTokens := root.Get("usageMetadata.promptTokenCount").Int()
-	outputTokens := root.Get("usageMetadata.candidatesTokenCount").Int() + root.Get("usageMetadata.thoughtsTokenCount").Int()
-	out, _ = sjson.Set(out, "usage.input_tokens", inputTokens)
-	out, _ = sjson.Set(out, "usage.output_tokens", outputTokens)
+	promptTC := root.Get("usageMetadata.promptTokenCount")
+	candidatesTC := root.Get("usageMetadata.candidatesTokenCount")
+	thoughtsTC := root.Get("usageMetadata.thoughtsTokenCount")
+
+	if (promptTC.Exists() && promptTC.Type != gjson.Null) || (candidatesTC.Exists() && candidatesTC.Type != gjson.Null) || (thoughtsTC.Exists() && thoughtsTC.Type != gjson.Null) {
+		inputTokens := int64(0)
+		if promptTC.Exists() && promptTC.Type != gjson.Null {
+			inputTokens = promptTC.Int()
+		}
+		candidateTokens := int64(0)
+		if candidatesTC.Exists() && candidatesTC.Type != gjson.Null {
+			candidateTokens = candidatesTC.Int()
+		}
+		thoughtTokens := int64(0)
+		if thoughtsTC.Exists() && thoughtsTC.Type != gjson.Null {
+			thoughtTokens = thoughtsTC.Int()
+		}
+		outputTokens := candidateTokens + thoughtTokens
+		out, _ = sjson.Set(out, "usage.input_tokens", inputTokens)
+		out, _ = sjson.Set(out, "usage.output_tokens", outputTokens)
+	}
 
 	parts := root.Get("candidates.0.content.parts")
 	textBuilder := strings.Builder{}
@@ -370,8 +404,11 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 	}
 	out, _ = sjson.Set(out, "stop_reason", stopReason)
 
-	if inputTokens == int64(0) && outputTokens == int64(0) && !root.Get("usageMetadata").Exists() {
-		out, _ = sjson.Delete(out, "usage")
+	if root.Get("usage").Exists() {
+		usage := root.Get("usage")
+		if usage.Get("input_tokens").Int() == int64(0) && usage.Get("output_tokens").Int() == int64(0) && !root.Get("usageMetadata").Exists() {
+			out, _ = sjson.Delete(out, "usage")
+		}
 	}
 
 	return out

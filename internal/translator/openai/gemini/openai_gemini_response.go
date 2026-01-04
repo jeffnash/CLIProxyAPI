@@ -76,6 +76,15 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 		if len(choices.Array()) == 0 {
 			// This is a usage-only chunk, handle usage and return
 			if usage := root.Get("usage"); usage.Exists() {
+				// Only emit usageMetadata if the upstream usage contains actual token values.
+				// Some OpenAI-compatible providers include usage keys with null values.
+				hasPrompt := usage.Get("prompt_tokens").Exists() && usage.Get("prompt_tokens").Type != gjson.Null
+				hasCompletion := usage.Get("completion_tokens").Exists() && usage.Get("completion_tokens").Type != gjson.Null
+				hasTotal := usage.Get("total_tokens").Exists() && usage.Get("total_tokens").Type != gjson.Null
+				if !(hasPrompt || hasCompletion || hasTotal) {
+					return []string{}
+				}
+
 				template := `{"candidates":[],"usageMetadata":{}}`
 
 				// Set model if available
@@ -83,9 +92,15 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 					template, _ = sjson.Set(template, "model", model.String())
 				}
 
-				template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
-				template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
-				template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
+				if hasPrompt {
+					template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
+				}
+				if hasCompletion {
+					template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
+				}
+				if hasTotal {
+					template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
+				}
 				if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
 					template, _ = sjson.Set(template, "usageMetadata.thoughtsTokenCount", reasoningTokens)
 				}
@@ -230,13 +245,26 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 
 			// Handle usage information
 			if usage := root.Get("usage"); usage.Exists() {
-				template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
-				template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
-				template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
-				if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
-					template, _ = sjson.Set(template, "usageMetadata.thoughtsTokenCount", reasoningTokens)
+				// Only emit usageMetadata if the upstream usage contains actual token values.
+				// Some OpenAI-compatible providers include usage keys with null values.
+				hasPrompt := usage.Get("prompt_tokens").Exists() && usage.Get("prompt_tokens").Type != gjson.Null
+				hasCompletion := usage.Get("completion_tokens").Exists() && usage.Get("completion_tokens").Type != gjson.Null
+				hasTotal := usage.Get("total_tokens").Exists() && usage.Get("total_tokens").Type != gjson.Null
+				if hasPrompt || hasCompletion || hasTotal {
+					if hasPrompt {
+						template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
+					}
+					if hasCompletion {
+						template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
+					}
+					if hasTotal {
+						template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
+					}
+					if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
+						template, _ = sjson.Set(template, "usageMetadata.thoughtsTokenCount", reasoningTokens)
+					}
+					results = append(results, template)
 				}
-				results = append(results, template)
 				return true
 			}
 
@@ -609,11 +637,24 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 
 	// Handle usage information
 	if usage := root.Get("usage"); usage.Exists() {
-		out, _ = sjson.Set(out, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
-		out, _ = sjson.Set(out, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
-		out, _ = sjson.Set(out, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
-		if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
-			out, _ = sjson.Set(out, "usageMetadata.thoughtsTokenCount", reasoningTokens)
+		// Only emit usageMetadata if the upstream usage contains actual token values.
+		// Some OpenAI-compatible providers include usage keys with null values.
+		hasPrompt := usage.Get("prompt_tokens").Exists() && usage.Get("prompt_tokens").Type != gjson.Null
+		hasCompletion := usage.Get("completion_tokens").Exists() && usage.Get("completion_tokens").Type != gjson.Null
+		hasTotal := usage.Get("total_tokens").Exists() && usage.Get("total_tokens").Type != gjson.Null
+		if hasPrompt {
+			out, _ = sjson.Set(out, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
+		}
+		if hasCompletion {
+			out, _ = sjson.Set(out, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
+		}
+		if hasTotal {
+			out, _ = sjson.Set(out, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
+		}
+		if hasPrompt || hasCompletion || hasTotal {
+			if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
+				out, _ = sjson.Set(out, "usageMetadata.thoughtsTokenCount", reasoningTokens)
+			}
 		}
 	}
 

@@ -199,6 +199,10 @@ func parseOpenAIUsage(data []byte) usage.Detail {
 	if !usageNode.Exists() {
 		return usage.Detail{}
 	}
+
+	// Some OpenAI-compatible providers report `null` for usage fields.
+	// gjson.Int() returns 0 for null/missing which is fine for reporting,
+	// but we also avoid marking usage "seen" in parseOpenAIStreamUsage when all fields are absent.
 	detail := usage.Detail{
 		InputTokens:  usageNode.Get("prompt_tokens").Int(),
 		OutputTokens: usageNode.Get("completion_tokens").Int(),
@@ -222,6 +226,14 @@ func parseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	if !usageNode.Exists() {
 		return usage.Detail{}, false
 	}
+
+	// Only treat this as a usage-bearing chunk if at least one token field exists.
+	// This prevents "usage": {"prompt_tokens": null, ...} from being treated as real usage.
+	hasAny := usageNode.Get("prompt_tokens").Exists() || usageNode.Get("completion_tokens").Exists() || usageNode.Get("total_tokens").Exists()
+	if !hasAny {
+		return usage.Detail{}, false
+	}
+
 	detail := usage.Detail{
 		InputTokens:  usageNode.Get("prompt_tokens").Int(),
 		OutputTokens: usageNode.Get("completion_tokens").Int(),

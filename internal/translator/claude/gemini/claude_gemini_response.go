@@ -211,33 +211,44 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 		}
 
 		if usage := root.Get("usage"); usage.Exists() {
-			// Basic token counts for prompt and completion
-			inputTokens := usage.Get("input_tokens").Int()
-			outputTokens := usage.Get("output_tokens").Int()
+			// Some providers include usage keys with null values. Only emit usageMetadata if
+			// at least one primary token field is present and non-null.
+			hasInput := usage.Get("input_tokens").Exists() && usage.Get("input_tokens").Type != gjson.Null
+			hasOutput := usage.Get("output_tokens").Exists() && usage.Get("output_tokens").Type != gjson.Null
+			if hasInput || hasOutput {
+				if hasInput {
+					inputTokens := usage.Get("input_tokens").Int()
+					template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", inputTokens)
+				}
+				if hasOutput {
+					outputTokens := usage.Get("output_tokens").Int()
+					template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", outputTokens)
+				}
+				if hasInput && hasOutput {
+					inputTokens := usage.Get("input_tokens").Int()
+					outputTokens := usage.Get("output_tokens").Int()
+					template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", inputTokens+outputTokens)
+				}
 
-			// Set basic usage metadata according to Gemini API specification
-			template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", inputTokens)
-			template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", outputTokens)
-			template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", inputTokens+outputTokens)
+				// Add cache-related token counts if present (Claude Code API cache fields)
+				if cacheCreationTokens := usage.Get("cache_creation_input_tokens"); cacheCreationTokens.Exists() && cacheCreationTokens.Type != gjson.Null {
+					template, _ = sjson.Set(template, "usageMetadata.cachedContentTokenCount", cacheCreationTokens.Int())
+				}
+				if cacheReadTokens := usage.Get("cache_read_input_tokens"); cacheReadTokens.Exists() && cacheReadTokens.Type != gjson.Null {
+					// Add cache read tokens to cached content count
+					existingCacheTokens := usage.Get("cache_creation_input_tokens").Int()
+					totalCacheTokens := existingCacheTokens + cacheReadTokens.Int()
+					template, _ = sjson.Set(template, "usageMetadata.cachedContentTokenCount", totalCacheTokens)
+				}
 
-			// Add cache-related token counts if present (Claude Code API cache fields)
-			if cacheCreationTokens := usage.Get("cache_creation_input_tokens"); cacheCreationTokens.Exists() {
-				template, _ = sjson.Set(template, "usageMetadata.cachedContentTokenCount", cacheCreationTokens.Int())
+				// Add thinking tokens if present (for models with reasoning capabilities)
+				if thinkingTokens := usage.Get("thinking_tokens"); thinkingTokens.Exists() && thinkingTokens.Type != gjson.Null {
+					template, _ = sjson.Set(template, "usageMetadata.thoughtsTokenCount", thinkingTokens.Int())
+				}
+
+				// Set traffic type (required by Gemini API)
+				template, _ = sjson.Set(template, "usageMetadata.trafficType", "PROVISIONED_THROUGHPUT")
 			}
-			if cacheReadTokens := usage.Get("cache_read_input_tokens"); cacheReadTokens.Exists() {
-				// Add cache read tokens to cached content count
-				existingCacheTokens := usage.Get("cache_creation_input_tokens").Int()
-				totalCacheTokens := existingCacheTokens + cacheReadTokens.Int()
-				template, _ = sjson.Set(template, "usageMetadata.cachedContentTokenCount", totalCacheTokens)
-			}
-
-			// Add thinking tokens if present (for models with reasoning capabilities)
-			if thinkingTokens := usage.Get("thinking_tokens"); thinkingTokens.Exists() {
-				template, _ = sjson.Set(template, "usageMetadata.thoughtsTokenCount", thinkingTokens.Int())
-			}
-
-			// Set traffic type (required by Gemini API)
-			template, _ = sjson.Set(template, "usageMetadata.trafficType", "PROVISIONED_THROUGHPUT")
 		}
 		template, _ = sjson.Set(template, "candidates.0.finishReason", "STOP")
 
@@ -428,31 +439,43 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 				inputTokens := usage.Get("input_tokens").Int()
 				outputTokens := usage.Get("output_tokens").Int()
 
-				// Set basic usage metadata according to Gemini API specification
-				usageJSON, _ = sjson.Set(usageJSON, "promptTokenCount", inputTokens)
-				usageJSON, _ = sjson.Set(usageJSON, "candidatesTokenCount", outputTokens)
-				usageJSON, _ = sjson.Set(usageJSON, "totalTokenCount", inputTokens+outputTokens)
+				// Only emit usageMetadata if at least one primary token field is present and non-null.
+				// Some providers include these keys with null values.
+				hasInput := usage.Get("input_tokens").Exists() && usage.Get("input_tokens").Type != gjson.Null
+				hasOutput := usage.Get("output_tokens").Exists() && usage.Get("output_tokens").Type != gjson.Null
+				if hasInput || hasOutput {
+					// Set basic usage metadata according to Gemini API specification
+					if hasInput {
+						usageJSON, _ = sjson.Set(usageJSON, "promptTokenCount", inputTokens)
+					}
+					if hasOutput {
+						usageJSON, _ = sjson.Set(usageJSON, "candidatesTokenCount", outputTokens)
+					}
+					if hasInput && hasOutput {
+						usageJSON, _ = sjson.Set(usageJSON, "totalTokenCount", inputTokens+outputTokens)
+					}
 
-				// Add cache-related token counts if present (Claude Code API cache fields)
-				if cacheCreationTokens := usage.Get("cache_creation_input_tokens"); cacheCreationTokens.Exists() {
-					usageJSON, _ = sjson.Set(usageJSON, "cachedContentTokenCount", cacheCreationTokens.Int())
+					// Add cache-related token counts if present (Claude Code API cache fields)
+					if cacheCreationTokens := usage.Get("cache_creation_input_tokens"); cacheCreationTokens.Exists() && cacheCreationTokens.Type != gjson.Null {
+						usageJSON, _ = sjson.Set(usageJSON, "cachedContentTokenCount", cacheCreationTokens.Int())
+					}
+					if cacheReadTokens := usage.Get("cache_read_input_tokens"); cacheReadTokens.Exists() && cacheReadTokens.Type != gjson.Null {
+						// Add cache read tokens to cached content count
+						existingCacheTokens := usage.Get("cache_creation_input_tokens").Int()
+						totalCacheTokens := existingCacheTokens + cacheReadTokens.Int()
+						usageJSON, _ = sjson.Set(usageJSON, "cachedContentTokenCount", totalCacheTokens)
+					}
+
+					// Add thinking tokens if present (for models with reasoning capabilities)
+					if thinkingTokens := usage.Get("thinking_tokens"); thinkingTokens.Exists() && thinkingTokens.Type != gjson.Null {
+						usageJSON, _ = sjson.Set(usageJSON, "thoughtsTokenCount", thinkingTokens.Int())
+					}
+
+					// Set traffic type (required by Gemini API)
+					usageJSON, _ = sjson.Set(usageJSON, "trafficType", "PROVISIONED_THROUGHPUT")
+
+					finalUsageJSON = usageJSON
 				}
-				if cacheReadTokens := usage.Get("cache_read_input_tokens"); cacheReadTokens.Exists() {
-					// Add cache read tokens to cached content count
-					existingCacheTokens := usage.Get("cache_creation_input_tokens").Int()
-					totalCacheTokens := existingCacheTokens + cacheReadTokens.Int()
-					usageJSON, _ = sjson.Set(usageJSON, "cachedContentTokenCount", totalCacheTokens)
-				}
-
-				// Add thinking tokens if present (for models with reasoning capabilities)
-				if thinkingTokens := usage.Get("thinking_tokens"); thinkingTokens.Exists() {
-					usageJSON, _ = sjson.Set(usageJSON, "thoughtsTokenCount", thinkingTokens.Int())
-				}
-
-				// Set traffic type (required by Gemini API)
-				usageJSON, _ = sjson.Set(usageJSON, "trafficType", "PROVISIONED_THROUGHPUT")
-
-				finalUsageJSON = usageJSON
 			}
 		}
 	}
