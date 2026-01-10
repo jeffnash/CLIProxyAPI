@@ -173,7 +173,7 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	to := sdktranslator.FromString("openai")
 
 	body := sdktranslator.TranslateRequest(from, to, apiModel, bytes.Clone(req.Payload), false)
-	body = applyPayloadConfig(e.cfg, apiModel, body)
+	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil)
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", false)
 
@@ -268,7 +268,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 	to := sdktranslator.FromString("openai")
 
 	body := sdktranslator.TranslateRequest(from, to, apiModel, bytes.Clone(req.Payload), true)
-	body = applyPayloadConfig(e.cfg, apiModel, body)
+	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil)
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 
@@ -406,30 +406,31 @@ func (e *CopilotExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) 
 	authSvc := copilotauth.NewCopilotAuth(e.cfg)
 	tokenResp, err := authSvc.GetCopilotToken(ctx, githubToken)
 	if err != nil {
-		// Classify error: auth issues get 401, transient issues get 503
-		// Use structured HTTPStatusError when available, fall back to sentinel errors
+		// Classify error: auth issues get 401, transient issues get 503.
 		code := 503
 		cause := "copilot_refresh_transient"
 
-		switch {
-		case errors.Is(err, copilotauth.ErrNoCopilotSubscription):
-			code = 401
-			cause = "copilot_no_subscription"
-		case errors.Is(err, copilotauth.ErrAccessDenied):
-			code = 401
-			cause = "copilot_access_denied"
-		case errors.Is(err, copilotauth.ErrNoGitHubToken):
-			code = 401
-			cause = "copilot_no_github_token"
-		default:
-			// Check for structured HTTP status code from HTTPStatusError
-			if httpCode := copilotauth.StatusCode(err); httpCode != 0 {
-				if httpCode == 401 || httpCode == 403 {
-					code = 401
-					cause = "copilot_auth_rejected"
-				} else if httpCode >= 500 {
-					cause = "copilot_upstream_error"
-				}
+		if httpCode := copilotauth.StatusCode(err); httpCode != 0 {
+			if httpCode == 401 || httpCode == 403 {
+				code = 401
+				cause = "copilot_auth_rejected"
+			} else if httpCode >= 500 {
+				cause = "copilot_upstream_error"
+			}
+		}
+
+		var authErr *copilotauth.AuthenticationError
+		if errors.As(err, &authErr) {
+			switch authErr.Type {
+			case copilotauth.ErrNoCopilotSubscription.Type:
+				code = 401
+				cause = "copilot_no_subscription"
+			case copilotauth.ErrAccessDenied.Type:
+				code = 401
+				cause = "copilot_access_denied"
+			case copilotauth.ErrNoGitHubToken.Type:
+				code = 401
+				cause = "copilot_no_github_token"
 			}
 		}
 

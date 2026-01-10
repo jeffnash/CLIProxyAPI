@@ -299,17 +299,16 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				inputTokens = promptTokens.Int()
 				outputTokens = completionTokens.Int()
 			}
+			// Send message_delta with usage
+			messageDeltaJSON := `{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`
+			messageDeltaJSON, _ = sjson.Set(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(param.FinishReason))
+			messageDeltaJSON, _ = sjson.Set(messageDeltaJSON, "usage.input_tokens", inputTokens)
+			messageDeltaJSON, _ = sjson.Set(messageDeltaJSON, "usage.output_tokens", outputTokens)
+			results = append(results, "event: message_delta\ndata: "+messageDeltaJSON+"\n\n")
+			param.MessageDeltaSent = true
+
+			emitMessageStopIfNeeded(param, &results)
 		}
-		// Send message_delta with usage
-		messageDeltaJSON := `{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`
-		messageDeltaJSON, _ = sjson.Set(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(param.FinishReason))
-		messageDeltaJSON, _ = sjson.Set(messageDeltaJSON, "usage.input_tokens", inputTokens)
-		messageDeltaJSON, _ = sjson.Set(messageDeltaJSON, "usage.output_tokens", outputTokens)
-		results = append(results, "event: message_delta\ndata: "+messageDeltaJSON+"\n\n")
-		param.MessageDeltaSent = true
-
-		emitMessageStopIfNeeded(param, &results)
-
 	}
 
 	return results
@@ -480,15 +479,15 @@ func collectOpenAIReasoningTexts(node gjson.Result) []string {
 
 	switch node.Type {
 	case gjson.String:
-		if text := strings.TrimSpace(node.String()); text != "" {
+		if text := node.String(); text != "" {
 			texts = append(texts, text)
 		}
 	case gjson.JSON:
 		if text := node.Get("text"); text.Exists() {
-			if trimmed := strings.TrimSpace(text.String()); trimmed != "" {
-				texts = append(texts, trimmed)
+			if textStr := text.String(); textStr != "" {
+				texts = append(texts, textStr)
 			}
-		} else if raw := strings.TrimSpace(node.Raw); raw != "" && !strings.HasPrefix(raw, "{") && !strings.HasPrefix(raw, "[") {
+		} else if raw := node.Raw; raw != "" && !strings.HasPrefix(raw, "{") && !strings.HasPrefix(raw, "[") {
 			texts = append(texts, raw)
 		}
 	}

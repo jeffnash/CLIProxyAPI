@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,7 +42,7 @@ type RefreshEvaluator interface {
 const (
 	refreshCheckInterval  = 5 * time.Second
 	refreshPendingBackoff = time.Minute
-	refreshFailureBackoff = 5 * time.Minute
+	refreshFailureBackoff = 1 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
 )
@@ -388,22 +389,8 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 			return cliproxyexecutor.Response{}, errPick
 		}
 
-		accountType, accountInfo := auth.AccountInfo()
-		proxyInfo := auth.ProxyInfo()
 		entry := logEntryWithRequestID(ctx)
-		if accountType == "api_key" {
-			if proxyInfo != "" {
-				entry.Debugf("Use API key %s for model %s %s", util.HideAPIKey(accountInfo), req.Model, proxyInfo)
-			} else {
-				entry.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), req.Model)
-			}
-		} else if accountType == "oauth" {
-			if proxyInfo != "" {
-				entry.Debugf("Use OAuth %s for model %s %s", accountInfo, req.Model, proxyInfo)
-			} else {
-				entry.Debugf("Use OAuth %s for model %s", accountInfo, req.Model)
-			}
-		}
+		debugLogAuthSelection(entry, auth, provider, req.Model)
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -450,22 +437,8 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 			return cliproxyexecutor.Response{}, errPick
 		}
 
-		accountType, accountInfo := auth.AccountInfo()
-		proxyInfo := auth.ProxyInfo()
 		entry := logEntryWithRequestID(ctx)
-		if accountType == "api_key" {
-			if proxyInfo != "" {
-				entry.Debugf("Use API key %s for model %s %s", util.HideAPIKey(accountInfo), req.Model, proxyInfo)
-			} else {
-				entry.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), req.Model)
-			}
-		} else if accountType == "oauth" {
-			if proxyInfo != "" {
-				entry.Debugf("Use OAuth %s for model %s %s", accountInfo, req.Model, proxyInfo)
-			} else {
-				entry.Debugf("Use OAuth %s for model %s", accountInfo, req.Model)
-			}
-		}
+		debugLogAuthSelection(entry, auth, provider, req.Model)
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -512,22 +485,8 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 			return nil, errPick
 		}
 
-		accountType, accountInfo := auth.AccountInfo()
-		proxyInfo := auth.ProxyInfo()
 		entry := logEntryWithRequestID(ctx)
-		if accountType == "api_key" {
-			if proxyInfo != "" {
-				entry.Debugf("Use API key %s for model %s %s", util.HideAPIKey(accountInfo), req.Model, proxyInfo)
-			} else {
-				entry.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), req.Model)
-			}
-		} else if accountType == "oauth" {
-			if proxyInfo != "" {
-				entry.Debugf("Use OAuth %s for model %s %s", accountInfo, req.Model, proxyInfo)
-			} else {
-				entry.Debugf("Use OAuth %s for model %s", accountInfo, req.Model)
-			}
-		}
+		debugLogAuthSelection(entry, auth, provider, req.Model)
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -1550,6 +1509,9 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 }
 
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.mu.RLock()
 	auth := m.auths[id]
 	var exec ProviderExecutor
@@ -1562,6 +1524,10 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	}
 	cloned := auth.Clone()
 	updated, err := exec.Refresh(ctx, cloned)
+	if err != nil && errors.Is(err, context.Canceled) {
+		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
+		return
+	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
@@ -1583,7 +1549,9 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		updated.Runtime = auth.Runtime
 	}
 	updated.LastRefreshedAt = now
-	updated.NextRefreshAfter = time.Time{}
+	// Preserve NextRefreshAfter set by the Authenticator
+	// If the Authenticator set a reasonable refresh time, it should not be overwritten
+	// If the Authenticator did not set it (zero value), shouldRefresh will use default logic
 	updated.LastError = nil
 	updated.UpdatedAt = now
 	_, _ = m.Update(ctx, updated)
@@ -1629,6 +1597,59 @@ func logEntryWithRequestID(ctx context.Context) *log.Entry {
 		return log.WithField("request_id", reqID)
 	}
 	return log.NewEntry(log.StandardLogger())
+}
+
+func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model string) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	if entry == nil || auth == nil {
+		return
+	}
+	accountType, accountInfo := auth.AccountInfo()
+	proxyInfo := auth.ProxyInfo()
+	suffix := ""
+	if proxyInfo != "" {
+		suffix = " " + proxyInfo
+	}
+	switch accountType {
+	case "api_key":
+		entry.Debugf("Use API key %s for model %s%s", util.HideAPIKey(accountInfo), model, suffix)
+	case "oauth":
+		ident := formatOauthIdentity(auth, provider, accountInfo)
+		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
+	}
+}
+
+func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string {
+	if auth == nil {
+		return ""
+	}
+	// Prefer the auth's provider when available.
+	providerName := strings.TrimSpace(auth.Provider)
+	if providerName == "" {
+		providerName = strings.TrimSpace(provider)
+	}
+	// Only log the basename to avoid leaking host paths.
+	// FileName may be unset for some auth backends; fall back to ID.
+	authFile := strings.TrimSpace(auth.FileName)
+	if authFile == "" {
+		authFile = strings.TrimSpace(auth.ID)
+	}
+	if authFile != "" {
+		authFile = filepath.Base(authFile)
+	}
+	parts := make([]string, 0, 3)
+	if providerName != "" {
+		parts = append(parts, "provider="+providerName)
+	}
+	if authFile != "" {
+		parts = append(parts, "auth_file="+authFile)
+	}
+	if len(parts) == 0 {
+		return accountInfo
+	}
+	return strings.Join(parts, " ")
 }
 
 // InjectCredentials delegates per-provider HTTP request preparation when supported.
