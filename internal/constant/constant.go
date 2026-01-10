@@ -27,4 +27,7 @@ const (
 
 	// Grok represents the X.AI Grok provider identifier.
 	Grok = "grok"
+
+	// Kiro represents the AWS CodeWhisperer (Kiro) provider identifier.
+	Kiro = "kiro"
 )

@@ -1,10 +1,49 @@
  package util
  
  import (
+ 	"context"
+ 	"encoding/json"
  	"os"
  	"path/filepath"
  	"testing"
  )
+
+ type testAuthStore struct {
+ 	root string
+ }
+
+ type testAuthRecord struct {
+ 	Filename string `json:"filename"`
+ }
+
+ func (s *testAuthStore) List(ctx context.Context) ([]testAuthRecord, error) {
+ 	_ = ctx
+ 	entries, err := os.ReadDir(s.root)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	out := make([]testAuthRecord, 0, len(entries))
+ 	for _, entry := range entries {
+ 		if entry.IsDir() {
+ 			continue
+ 		}
+ 		name := entry.Name()
+ 		if filepath.Ext(name) != ".json" {
+ 			continue
+ 		}
+ 		path := filepath.Join(s.root, name)
+ 		b, err := os.ReadFile(path)
+ 		if err != nil {
+ 			continue
+ 		}
+ 		var v any
+ 		if err := json.Unmarshal(b, &v); err != nil {
+ 			continue
+ 		}
+ 		out = append(out, testAuthRecord{Filename: name})
+ 	}
+ 	return out, nil
+ }
  
  func TestResolveAuthDir(t *testing.T) {
  	tests := []struct {
@@ -127,22 +166,24 @@
  		}
  	}
  
- 	count := CountAuthFiles(tmpDir)
+ 	store := &testAuthStore{root: tmpDir}
+ 	count := CountAuthFiles(context.Background(), store)
  	if count != 2 {
- 		t.Errorf("CountAuthFiles(%q) = %d, want 2", tmpDir, count)
+ 		t.Errorf("CountAuthFiles() = %d, want 2", count)
  	}
  }
  
  func TestCountAuthFiles_EmptyDir(t *testing.T) {
- 	tmpDir := t.TempDir()
- 	count := CountAuthFiles(tmpDir)
+ 	store := &testAuthStore{root: t.TempDir()}
+ 	count := CountAuthFiles(context.Background(), store)
  	if count != 0 {
- 		t.Errorf("CountAuthFiles(%q) = %d, want 0", tmpDir, count)
+ 		t.Errorf("CountAuthFiles() = %d, want 0", count)
  	}
  }
  
  func TestCountAuthFiles_NonExistent(t *testing.T) {
- 	count := CountAuthFiles("/nonexistent/path/that/does/not/exist")
+ 	store := &testAuthStore{root: "/nonexistent/path/that/does/not/exist"}
+ 	count := CountAuthFiles(context.Background(), store)
  	if count != 0 {
  		t.Errorf("CountAuthFiles(nonexistent) = %d, want 0", count)
  	}

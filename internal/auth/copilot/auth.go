@@ -4,15 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	copilotshared "github.com/router-for-me/CLIProxyAPI/v6/internal/copilot"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	log "github.com/sirupsen/logrus"
 	"io"
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	copilotshared "github.com/router-for-me/CLIProxyAPI/v6/internal/copilot"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	log "github.com/sirupsen/logrus"
 )
 
 // Copilot uses a two-step OAuth (GitHub device code -> Copilot token) plus account-type-specific
@@ -75,7 +77,7 @@ func (a *CopilotAuth) GetDeviceCode(ctx context.Context) (*DeviceCodeResponse, e
 
 	req, err := http.NewRequestWithContext(ctx, "POST", GitHubBaseURL+DeviceCodePath, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDeviceCodeFailed, err)
+		return nil, NewAuthenticationError(ErrDeviceCodeFailed, err)
 	}
 
 	for k, v := range StandardHeaders() {
@@ -84,22 +86,22 @@ func (a *CopilotAuth) GetDeviceCode(ctx context.Context) (*DeviceCodeResponse, e
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDeviceCodeFailed, err)
+		return nil, NewAuthenticationError(ErrDeviceCodeFailed, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to read response: %v", ErrDeviceCodeFailed, err)
+		return nil, NewAuthenticationError(ErrDeviceCodeFailed, fmt.Errorf("failed to read response: %w", err))
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: status %d: %s", ErrDeviceCodeFailed, resp.StatusCode, string(body))
+		return nil, NewAuthenticationError(ErrDeviceCodeFailed, fmt.Errorf("status %d: %s", resp.StatusCode, string(body)))
 	}
 
 	var deviceCode DeviceCodeResponse
 	if err = json.Unmarshal(body, &deviceCode); err != nil {
-		return nil, fmt.Errorf("%w: failed to parse response: %v", ErrDeviceCodeFailed, err)
+		return nil, NewAuthenticationError(ErrDeviceCodeFailed, fmt.Errorf("failed to parse response: %w", err))
 	}
 
 	log.Debugf("Device code response: %+v", deviceCode)
@@ -110,7 +112,7 @@ func (a *CopilotAuth) GetDeviceCode(ctx context.Context) (*DeviceCodeResponse, e
 // It implements exponential backoff and handles various error conditions.
 func (a *CopilotAuth) PollAccessToken(ctx context.Context, deviceCode *DeviceCodeResponse) (string, error) {
 	if deviceCode == nil {
-		return "", fmt.Errorf("%w: device code is nil", ErrAccessTokenFailed)
+		return "", NewAuthenticationError(ErrTokenExchangeFailed, fmt.Errorf("device code is nil"))
 	}
 
 	// Add 1 second buffer to the interval
@@ -131,24 +133,28 @@ func (a *CopilotAuth) PollAccessToken(ctx context.Context, deviceCode *DeviceCod
 			return token, nil
 		}
 
-		switch err {
-		case ErrAuthorizationPending:
-			log.Debug("Authorization pending, continuing to poll...")
-			continue
-		case ErrSlowDown:
-			interval += 5 * time.Second
-			log.Debugf("Slowing down, new interval: %v", interval)
-			continue
-		case ErrAccessDenied, ErrExpiredToken:
-			return "", err
-		default:
-			if err != nil {
-				log.Warnf("Error polling access token: %v", err)
+		// Prefer structured AuthenticationError types.
+		var authErr *AuthenticationError
+		if errors.As(err, &authErr) {
+			switch authErr.Type {
+			case ErrAuthorizationPending.Type:
+				log.Debug("Authorization pending, continuing to poll...")
+				continue
+			case ErrSlowDown.Type:
+				interval += 5 * time.Second
+				log.Debugf("Slowing down, new interval: %v", interval)
+				continue
+			case ErrAccessDenied.Type, ErrDeviceCodeExpired.Type:
+				return "", authErr
+			default:
+				log.Warnf("Error polling access token: %v", authErr)
 			}
+		} else if err != nil {
+			log.Warnf("Error polling access token: %v", err)
 		}
 	}
 
-	return "", ErrExpiredToken
+	return "", ErrDeviceCodeExpired
 }
 
 func (a *CopilotAuth) tryGetAccessToken(ctx context.Context, deviceCode string) (string, error) {
@@ -198,16 +204,16 @@ func (a *CopilotAuth) tryGetAccessToken(ctx context.Context, deviceCode string) 
 			return tokenResp.AccessToken, nil
 		}
 		return "", ErrAuthorizationPending
-	case "authorization_pending":
+	case ErrAuthorizationPending.Type:
 		return "", ErrAuthorizationPending
-	case "slow_down":
+	case ErrSlowDown.Type:
 		return "", ErrSlowDown
-	case "access_denied":
+	case ErrAccessDenied.Type:
 		return "", ErrAccessDenied
-	case "expired_token":
-		return "", ErrExpiredToken
+	case ErrDeviceCodeExpired.Type:
+		return "", ErrDeviceCodeExpired
 	default:
-		return "", fmt.Errorf("%w: %s", ErrAccessTokenFailed, tokenResp.Error)
+		return "", NewAuthenticationError(ErrTokenExchangeFailed, fmt.Errorf("oauth error: %s", tokenResp.Error))
 	}
 }
 
@@ -219,7 +225,7 @@ func (a *CopilotAuth) GetCopilotToken(ctx context.Context, githubToken string) (
 
 	req, err := http.NewRequestWithContext(ctx, "GET", GitHubAPIBaseURL+CopilotTokenPath, nil)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrCopilotTokenFailed, err)
+		return nil, NewAuthenticationError(ErrCopilotTokenFailed, err)
 	}
 
 	for k, v := range GitHubHeaders(githubToken, a.vsCodeVersion) {
@@ -228,27 +234,27 @@ func (a *CopilotAuth) GetCopilotToken(ctx context.Context, githubToken string) (
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrCopilotTokenFailed, err)
+		return nil, NewAuthenticationError(ErrCopilotTokenFailed, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("%w: failed to read response: %v", ErrCopilotTokenFailed, err)
+		return nil, NewAuthenticationError(ErrCopilotTokenFailed, fmt.Errorf("failed to read response: %w", err))
 	}
 
-	// Return structured HTTP errors for auth-related status codes
+	// Return structured auth errors for auth-related status codes.
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, NewHTTPStatusError(resp.StatusCode, "no Copilot subscription or access denied", ErrNoCopilotSubscription)
+		return nil, NewAuthenticationError(ErrNoCopilotSubscription, fmt.Errorf("status %d: %s", resp.StatusCode, string(body)))
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, NewHTTPStatusError(resp.StatusCode, string(body), ErrCopilotTokenFailed)
+		return nil, NewAuthenticationError(ErrCopilotTokenFailed, fmt.Errorf("status %d: %s", resp.StatusCode, string(body)))
 	}
 
 	var tokenResp CopilotTokenResponse
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("%w: failed to parse response: %v", ErrCopilotTokenFailed, err)
+		return nil, NewAuthenticationError(ErrCopilotTokenFailed, fmt.Errorf("failed to parse response: %w", err))
 	}
 
 	log.Debug("Copilot token fetched successfully")

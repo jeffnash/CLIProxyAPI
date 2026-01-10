@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -131,24 +133,27 @@ func (te *testCopilotExecutor) refreshWithMock(ctx context.Context, auth *clipro
 		code := 503
 		cause := "copilot_refresh_transient"
 
-		switch {
-		case err == copilotauth.ErrNoCopilotSubscription:
-			code = 401
-			cause = "copilot_no_subscription"
-		case err == copilotauth.ErrAccessDenied:
-			code = 401
-			cause = "copilot_access_denied"
-		case err == copilotauth.ErrNoGitHubToken:
-			code = 401
-			cause = "copilot_no_github_token"
-		default:
-			if httpCode := copilotauth.StatusCode(err); httpCode != 0 {
-				if httpCode == 401 || httpCode == 403 {
-					code = 401
-					cause = "copilot_auth_rejected"
-				} else if httpCode >= 500 {
-					cause = "copilot_upstream_error"
-				}
+		if httpCode := copilotauth.StatusCode(err); httpCode != 0 {
+			if httpCode == 401 || httpCode == 403 {
+				code = 401
+				cause = "copilot_auth_rejected"
+			} else if httpCode >= 500 {
+				cause = "copilot_upstream_error"
+			}
+		}
+
+		var authErr *copilotauth.AuthenticationError
+		if errors.As(err, &authErr) {
+			switch authErr.Type {
+			case copilotauth.ErrNoCopilotSubscription.Type:
+				code = 401
+				cause = "copilot_no_subscription"
+			case copilotauth.ErrAccessDenied.Type:
+				code = 401
+				cause = "copilot_access_denied"
+			case copilotauth.ErrNoGitHubToken.Type:
+				code = 401
+				cause = "copilot_no_github_token"
 			}
 		}
 		return nil, statusErr{code: code, msg: "copilot token refresh failed (" + cause + ")"}
@@ -455,10 +460,10 @@ func TestCopilotExecutor_Refresh_ErrAccessDenied(t *testing.T) {
 	}
 }
 
-// TestCopilotExecutor_Refresh_HTTPStatusError401 tests 401 for HTTPStatusError with 401 code.
-func TestCopilotExecutor_Refresh_HTTPStatusError401(t *testing.T) {
+// TestCopilotExecutor_Refresh_AuthError401 tests 401 for auth errors with 401 code.
+func TestCopilotExecutor_Refresh_AuthError401(t *testing.T) {
 	mockFetcher := &mockCopilotTokenFetcher{
-		err: copilotauth.NewHTTPStatusError(401, "unauthorized", nil),
+		err: copilotauth.NewAuthenticationError(copilotauth.ErrNoCopilotSubscription, nil),
 	}
 	te := newTestCopilotExecutor(&config.Config{}, mockFetcher)
 
@@ -479,14 +484,14 @@ func TestCopilotExecutor_Refresh_HTTPStatusError401(t *testing.T) {
 		t.Fatalf("expected statusErr, got %T", err)
 	}
 	if se.code != 401 {
-		t.Errorf("expected status code 401 for HTTPStatusError(401), got %d", se.code)
+		t.Errorf("expected status code 401 for auth error, got %d", se.code)
 	}
 }
 
-// TestCopilotExecutor_Refresh_HTTPStatusError403 tests 401 for HTTPStatusError with 403 code.
-func TestCopilotExecutor_Refresh_HTTPStatusError403(t *testing.T) {
+// TestCopilotExecutor_Refresh_AuthError403 tests 401 for auth errors with 403 code.
+func TestCopilotExecutor_Refresh_AuthError403(t *testing.T) {
 	mockFetcher := &mockCopilotTokenFetcher{
-		err: copilotauth.NewHTTPStatusError(403, "forbidden", nil),
+		err: copilotauth.NewAuthenticationError(copilotauth.ErrNoCopilotSubscription, fmt.Errorf("forbidden")),
 	}
 	te := newTestCopilotExecutor(&config.Config{}, mockFetcher)
 
@@ -507,14 +512,15 @@ func TestCopilotExecutor_Refresh_HTTPStatusError403(t *testing.T) {
 		t.Fatalf("expected statusErr, got %T", err)
 	}
 	if se.code != 401 {
-		t.Errorf("expected status code 401 for HTTPStatusError(403), got %d", se.code)
+		t.Errorf("expected status code 401 for auth error, got %d", se.code)
 	}
 }
 
-// TestCopilotExecutor_Refresh_HTTPStatusError500 tests 503 for HTTPStatusError with 500 code.
-func TestCopilotExecutor_Refresh_HTTPStatusError500(t *testing.T) {
+// TestCopilotExecutor_Refresh_AuthError500 tests 503 for errors with 500 status code.
+func TestCopilotExecutor_Refresh_AuthError500(t *testing.T) {
+	// Use OAuthError for a non-authentication upstream error.
 	mockFetcher := &mockCopilotTokenFetcher{
-		err: copilotauth.NewHTTPStatusError(500, "internal server error", nil),
+		err: &copilotauth.OAuthError{Code: "server_error", Description: "internal server error", StatusCode: 500},
 	}
 	te := newTestCopilotExecutor(&config.Config{}, mockFetcher)
 
@@ -535,7 +541,7 @@ func TestCopilotExecutor_Refresh_HTTPStatusError500(t *testing.T) {
 		t.Fatalf("expected statusErr, got %T", err)
 	}
 	if se.code != 503 {
-		t.Errorf("expected status code 503 for HTTPStatusError(500), got %d", se.code)
+		t.Errorf("expected status code 503 for status 500 error, got %d", se.code)
 	}
 }
 
@@ -676,42 +682,15 @@ func TestAccountTypeValidation(t *testing.T) {
 	}
 }
 
-// TestHTTPStatusError tests the HTTPStatusError type.
-func TestHTTPStatusError(t *testing.T) {
-	cause := copilotauth.ErrNoCopilotSubscription
-	err := copilotauth.NewHTTPStatusError(401, "unauthorized", cause)
-
-	if err.StatusCode != 401 {
-		t.Errorf("expected StatusCode 401, got %d", err.StatusCode)
-	}
-
-	if err.Message != "unauthorized" {
-		t.Errorf("expected Message 'unauthorized', got '%s'", err.Message)
-	}
-
-	if err.Cause != cause {
-		t.Errorf("expected Cause to be ErrNoCopilotSubscription")
-	}
-
-	// Test Error() format
-	errStr := err.Error()
-	if errStr == "" {
-		t.Error("Error() returned empty string")
-	}
-
-	// Test Unwrap
-	if err.Unwrap() != cause {
-		t.Errorf("Unwrap() did not return cause")
-	}
-
-	// Test StatusCode helper
-	if copilotauth.StatusCode(err) != 401 {
+// TestAuthStatusCode tests StatusCode helper for structured errors.
+func TestAuthStatusCode(t *testing.T) {
+	err := copilotauth.NewAuthenticationError(copilotauth.ErrNoCopilotSubscription, fmt.Errorf("forbidden"))
+	if copilotauth.StatusCode(err) != 403 {
 		t.Errorf("StatusCode helper returned wrong value")
 	}
 
-	// Test StatusCode with non-HTTP error
-	if copilotauth.StatusCode(cause) != 0 {
-		t.Errorf("StatusCode should return 0 for non-HTTP error")
+	if copilotauth.StatusCode(fmt.Errorf("plain")) != 0 {
+		t.Errorf("StatusCode should return 0 for non-auth errors")
 	}
 }
 

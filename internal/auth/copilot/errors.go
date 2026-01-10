@@ -3,72 +3,236 @@ package copilot
 import (
 	"errors"
 	"fmt"
+	"net/http"
 )
 
-var (
-	// ErrDeviceCodeFailed indicates failure to obtain a device code.
-	ErrDeviceCodeFailed = errors.New("failed to get device code")
-
-	// ErrAccessTokenFailed indicates failure to obtain an access token.
-	ErrAccessTokenFailed = errors.New("failed to get access token")
-
-	// ErrCopilotTokenFailed indicates failure to obtain a Copilot token.
-	ErrCopilotTokenFailed = errors.New("failed to get Copilot token")
-
-	// ErrTokenExpired indicates the Copilot token has expired.
-	ErrTokenExpired = errors.New("copilot token has expired")
-
-	// ErrNoGitHubToken indicates no GitHub token is available.
-	ErrNoGitHubToken = errors.New("no GitHub token available")
-
-	// ErrNoCopilotToken indicates no Copilot token is available.
-	ErrNoCopilotToken = errors.New("no Copilot token available")
-
-	// ErrAuthorizationPending indicates the user has not yet completed authorization.
-	ErrAuthorizationPending = errors.New("authorization pending")
-
-	// ErrSlowDown indicates the polling interval should be increased.
-	ErrSlowDown = errors.New("slow down polling")
-
-	// ErrAccessDenied indicates the user denied access.
-	ErrAccessDenied = errors.New("access denied by user")
-
-	// ErrExpiredToken indicates the device code has expired.
-	ErrExpiredToken = errors.New("device code expired")
-
-	// ErrNoCopilotSubscription indicates the user does not have a Copilot subscription.
-	ErrNoCopilotSubscription = errors.New("no Copilot subscription found")
-)
-
-// HTTPStatusError wraps an error with an HTTP status code for structured error handling.
-// This allows callers to inspect the status code without parsing error message strings.
-type HTTPStatusError struct {
-	StatusCode int
-	Message    string
-	Cause      error
-}
-
-func (e *HTTPStatusError) Error() string {
-	if e.Cause != nil {
-		return fmt.Sprintf("status %d: %s: %v", e.StatusCode, e.Message, e.Cause)
+// StatusCode returns an HTTP status code for known auth errors.
+//
+// This is intentionally small glue so existing callers can map auth failures
+// to HTTP responses without needing to know about AuthenticationError internals.
+func StatusCode(err error) int {
+	var authErr *AuthenticationError
+	if errors.As(err, &authErr) {
+		return authErr.Code
 	}
-	return fmt.Sprintf("status %d: %s", e.StatusCode, e.Message)
+	var oauthErr *OAuthError
+	if errors.As(err, &oauthErr) {
+		return oauthErr.StatusCode
+	}
+	return 0
 }
 
-func (e *HTTPStatusError) Unwrap() error {
+// OAuthError represents an OAuth-specific error.
+type OAuthError struct {
+	// Code is the OAuth error code.
+	Code string `json:"error"`
+	// Description is a human-readable description of the error.
+	Description string `json:"error_description,omitempty"`
+	// URI is a URI identifying a human-readable web page with information about the error.
+	URI string `json:"error_uri,omitempty"`
+	// StatusCode is the HTTP status code associated with the error.
+	StatusCode int `json:"-"`
+}
+
+// Error returns a string representation of the OAuth error.
+func (e *OAuthError) Error() string {
+	if e.Description != "" {
+		return fmt.Sprintf("OAuth error %s: %s", e.Code, e.Description)
+	}
+	return fmt.Sprintf("OAuth error: %s", e.Code)
+}
+
+// NewOAuthError creates a new OAuth error with the specified code, description, and status code.
+func NewOAuthError(code, description string, statusCode int) *OAuthError {
+	return &OAuthError{
+		Code:        code,
+		Description: description,
+		StatusCode:  statusCode,
+	}
+}
+
+// AuthenticationError represents authentication-related errors.
+type AuthenticationError struct {
+	// Type is the type of authentication error.
+	Type string `json:"type"`
+	// Message is a human-readable message describing the error.
+	Message string `json:"message"`
+	// Code is the HTTP status code associated with the error.
+	Code int `json:"code"`
+	// Cause is the underlying error that caused this authentication error.
+	Cause error `json:"-"`
+}
+
+// Error returns a string representation of the authentication error.
+func (e *AuthenticationError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("%s: %s (caused by: %v)", e.Type, e.Message, e.Cause)
+	}
+	return fmt.Sprintf("%s: %s", e.Type, e.Message)
+}
+
+// Unwrap returns the underlying cause of the error.
+func (e *AuthenticationError) Unwrap() error {
 	return e.Cause
 }
 
-// NewHTTPStatusError creates a new HTTPStatusError with the given status code and message.
-func NewHTTPStatusError(statusCode int, message string, cause error) *HTTPStatusError {
-	return &HTTPStatusError{StatusCode: statusCode, Message: message, Cause: cause}
+// Common authentication error types for GitHub Copilot device flow.
+var (
+	// ErrDeviceCodeFailed represents an error when requesting the device code fails.
+	ErrDeviceCodeFailed = &AuthenticationError{
+		Type:    "device_code_failed",
+		Message: "Failed to request device code from GitHub",
+		Code:    http.StatusBadRequest,
+	}
+
+	// ErrDeviceCodeExpired represents an error when the device code has expired.
+	ErrDeviceCodeExpired = &AuthenticationError{
+		Type:    "device_code_expired",
+		Message: "Device code has expired. Please try again.",
+		Code:    http.StatusGone,
+	}
+
+	// ErrAuthorizationPending represents a pending authorization state (not an error, used for polling).
+	ErrAuthorizationPending = &AuthenticationError{
+		Type:    "authorization_pending",
+		Message: "Authorization is pending. Waiting for user to authorize.",
+		Code:    http.StatusAccepted,
+	}
+
+	// ErrSlowDown represents a request to slow down polling.
+	ErrSlowDown = &AuthenticationError{
+		Type:    "slow_down",
+		Message: "Polling too frequently. Slowing down.",
+		Code:    http.StatusTooManyRequests,
+	}
+
+	// ErrAccessDenied represents an error when the user denies authorization.
+	ErrAccessDenied = &AuthenticationError{
+		Type:    "access_denied",
+		Message: "User denied authorization",
+		Code:    http.StatusForbidden,
+	}
+
+	// ErrTokenExchangeFailed represents an error when token exchange fails.
+	ErrTokenExchangeFailed = &AuthenticationError{
+		Type:    "token_exchange_failed",
+		Message: "Failed to exchange device code for access token",
+		Code:    http.StatusBadRequest,
+	}
+
+	// ErrPollingTimeout represents an error when polling times out.
+	ErrPollingTimeout = &AuthenticationError{
+		Type:    "polling_timeout",
+		Message: "Timeout waiting for user authorization",
+		Code:    http.StatusRequestTimeout,
+	}
+
+	// ErrNoGitHubToken indicates no GitHub token is available.
+	ErrNoGitHubToken = &AuthenticationError{
+		Type:    "no_github_token",
+		Message: "No GitHub token available",
+		Code:    http.StatusUnauthorized,
+	}
+
+	// ErrNoCopilotToken indicates no Copilot token is available.
+	ErrNoCopilotToken = &AuthenticationError{
+		Type:    "no_copilot_token",
+		Message: "No Copilot token available",
+		Code:    http.StatusUnauthorized,
+	}
+
+	// ErrNoCopilotSubscription indicates the account has no Copilot subscription.
+	ErrNoCopilotSubscription = &AuthenticationError{
+		Type:    "no_copilot_subscription",
+		Message: "No Copilot subscription found",
+		Code:    http.StatusForbidden,
+	}
+
+	// ErrCopilotTokenFailed represents an error when getting a Copilot token fails.
+	ErrCopilotTokenFailed = &AuthenticationError{
+		Type:    "copilot_token_failed",
+		Message: "Failed to get Copilot token",
+		Code:    http.StatusBadRequest,
+	}
+
+	// ErrTokenExpired indicates the Copilot token has expired.
+	ErrTokenExpired = &AuthenticationError{
+		Type:    "copilot_token_expired",
+		Message: "Copilot token has expired",
+		Code:    http.StatusUnauthorized,
+	}
+
+	// ErrUserInfoFailed represents an error when fetching user info fails.
+	ErrUserInfoFailed = &AuthenticationError{
+		Type:    "user_info_failed",
+		Message: "Failed to fetch GitHub user information",
+		Code:    http.StatusBadRequest,
+	}
+)
+
+// NewAuthenticationError creates a new authentication error with a cause based on a base error.
+func NewAuthenticationError(baseErr *AuthenticationError, cause error) *AuthenticationError {
+	return &AuthenticationError{
+		Type:    baseErr.Type,
+		Message: baseErr.Message,
+		Code:    baseErr.Code,
+		Cause:   cause,
+	}
 }
 
-// StatusCode extracts the HTTP status code from an HTTPStatusError, or returns 0 if not applicable.
-func StatusCode(err error) int {
-	var httpErr *HTTPStatusError
-	if errors.As(err, &httpErr) {
-		return httpErr.StatusCode
+// IsAuthenticationError checks if an error is an authentication error.
+func IsAuthenticationError(err error) bool {
+	var authenticationError *AuthenticationError
+	ok := errors.As(err, &authenticationError)
+	return ok
+}
+
+// IsOAuthError checks if an error is an OAuth error.
+func IsOAuthError(err error) bool {
+	var oAuthError *OAuthError
+	ok := errors.As(err, &oAuthError)
+	return ok
+}
+
+// GetUserFriendlyMessage returns a user-friendly error message based on the error type.
+func GetUserFriendlyMessage(err error) string {
+	var authErr *AuthenticationError
+	if errors.As(err, &authErr) {
+		switch authErr.Type {
+		case "device_code_failed":
+			return "Failed to start GitHub authentication. Please check your network connection and try again."
+		case "device_code_expired":
+			return "The authentication code has expired. Please try again."
+		case "authorization_pending":
+			return "Waiting for you to authorize the application on GitHub."
+		case "slow_down":
+			return "Please wait a moment before trying again."
+		case "access_denied":
+			return "Authentication was cancelled or denied."
+		case "token_exchange_failed":
+			return "Failed to complete authentication. Please try again."
+		case "polling_timeout":
+			return "Authentication timed out. Please try again."
+		case "user_info_failed":
+			return "Failed to get your GitHub account information. Please try again."
+		default:
+			return "Authentication failed. Please try again."
+		}
 	}
-	return 0
+
+	var oauthErr *OAuthError
+	if errors.As(err, &oauthErr) {
+		switch oauthErr.Code {
+		case "access_denied":
+			return "Authentication was cancelled or denied."
+		case "invalid_request":
+			return "Invalid authentication request. Please try again."
+		case "server_error":
+			return "GitHub server error. Please try again later."
+		default:
+			return fmt.Sprintf("Authentication failed: %s", oauthErr.Description)
+		}
+	}
+
+	return "An unexpected error occurred. Please try again."
 }

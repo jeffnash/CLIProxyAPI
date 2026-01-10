@@ -68,8 +68,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
+	originalPayload := bytes.Clone(req.Payload)
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = bytes.Clone(opts.OriginalRequest)
+	}
+	originalTranslated := sdktranslator.TranslateRequest(from, to, model, originalPayload, false)
 	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), false)
-	// Apply alias reasoning effort if applicable
+	// Preserve fork alias reasoning effort behavior.
 	if aliasModel, effort, ok := resolveCodexAlias(req.Model); ok {
 		body = setReasoningEffortByAlias(body, aliasModel, effort)
 	}
@@ -78,7 +83,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if errValidate := ValidateThinkingConfig(body, model); errValidate != nil {
 		return resp, errValidate
 	}
-	body = applyPayloadConfig(e.cfg, model, body)
+	body = applyPayloadConfigWithRoot(e.cfg, model, to.String(), "", body, originalTranslated)
 	body, _ = sjson.SetBytes(body, "model", model)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
@@ -182,8 +187,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
+	originalPayload := bytes.Clone(req.Payload)
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = bytes.Clone(opts.OriginalRequest)
+	}
+	originalTranslated := sdktranslator.TranslateRequest(from, to, model, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, model, bytes.Clone(req.Payload), true)
-	// Apply alias reasoning effort if applicable
+	// Preserve fork alias reasoning effort behavior.
 	if aliasModel, effort, ok := resolveCodexAlias(req.Model); ok {
 		body = setReasoningEffortByAlias(body, aliasModel, effort)
 	}
@@ -193,7 +203,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if errValidate := ValidateThinkingConfig(body, model); errValidate != nil {
 		return nil, errValidate
 	}
-	body = applyPayloadConfig(e.cfg, model, body)
+	body = applyPayloadConfigWithRoot(e.cfg, model, to.String(), "", body, originalTranslated)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.SetBytes(body, "model", model)
 
@@ -293,10 +303,8 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 		}
 	}
 	// Apply codex alias resolution for tokenizer selection
-	modelForCounting := model
 	if aliasModel, _, ok := resolveCodexAlias(model); ok {
 		model = aliasModel
-		modelForCounting = aliasModel
 	}
 
 	from := opts.SourceFormat
@@ -313,7 +321,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.SetBytes(body, "stream", false)
 
-	enc, err := tokenizerForCodexModel(modelForCounting)
+	enc, err := tokenizerForCodexModel(model)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex executor: tokenizer init failed: %w", err)
 	}
@@ -573,14 +581,14 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if from == "claude" {
 		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
 		if userIDResult.Exists() {
-			var hasKey bool
 			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
-			if cache, hasKey = codexCacheMap[key]; !hasKey || cache.Expire.Before(time.Now()) {
+			var ok bool
+			if cache, ok = getCodexCache(key); !ok {
 				cache = codexCache{
 					ID:     uuid.New().String(),
 					Expire: time.Now().Add(1 * time.Hour),
 				}
-				codexCacheMap[key] = cache
+				setCodexCache(key, cache)
 			}
 		}
 	} else if from == "openai-response" {

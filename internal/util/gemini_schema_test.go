@@ -23,13 +23,11 @@ func TestCleanJSONSchemaForAntigravity_ConstToEnum(t *testing.T) {
 	expected := `{
 		"type": "object",
 		"properties": {
-			"_": { "type": "boolean" },
 			"kind": {
 				"type": "string",
 				"enum": ["InsightVizNode"]
 			}
-		},
-		"required": ["_"]
+		}
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -125,7 +123,6 @@ func TestCleanJSONSchemaForAntigravity_AnyOfFlattening_SmartSelection(t *testing
 	expected := `{
 		"type": "object",
 		"properties": {
-			"_": { "type": "boolean" },
 			"query": {
 				"type": "object",
 				"description": "Accepts: null | object",
@@ -135,8 +132,7 @@ func TestCleanJSONSchemaForAntigravity_AnyOfFlattening_SmartSelection(t *testing
 				},
 				"required": ["_"]
 			}
-		},
-		"required": ["_"]
+		}
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -159,13 +155,11 @@ func TestCleanJSONSchemaForAntigravity_OneOfFlattening(t *testing.T) {
 	expected := `{
 		"type": "object",
 		"properties": {
-			"_": { "type": "boolean" },
 			"config": {
 				"type": "string",
 				"description": "Accepts: string | integer"
 			}
-		},
-		"required": ["_"]
+		}
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -224,7 +218,6 @@ func TestCleanJSONSchemaForAntigravity_RefHandling(t *testing.T) {
 	expected := `{
 		"type": "object",
 		"properties": {
-			"_": { "type": "boolean" },
 			"customer": {
 				"type": "object",
 				"description": "See: User",
@@ -236,8 +229,7 @@ func TestCleanJSONSchemaForAntigravity_RefHandling(t *testing.T) {
 				},
 				"required": ["reason"]
 			}
-		},
-		"required": ["_"]
+		}
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -267,7 +259,6 @@ func TestCleanJSONSchemaForAntigravity_RefHandling_DescriptionEscaping(t *testin
 	expected := `{
 		"type": "object",
 		"properties": {
-			"_": { "type": "boolean" },
 			"customer": {
 				"type": "object",
 				"description": "He said \"hi\"\\nsecond line (See: User)",
@@ -279,8 +270,7 @@ func TestCleanJSONSchemaForAntigravity_RefHandling_DescriptionEscaping(t *testin
 				},
 				"required": ["reason"]
 			}
-		},
-		"required": ["_"]
+		}
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -577,13 +567,11 @@ func TestCleanJSONSchemaForAntigravity_AnyOfFlattening_PreservesDescription(t *t
 	expected := `{
 		"type": "object",
 		"properties": {
-			"_": { "type": "boolean" },
 			"config": {
 				"type": "string",
 				"description": "Parent desc (Child desc) (Accepts: string | integer)"
 			}
-		},
-		"required": ["_"]
+		}
 	}`
 
 	result := CleanJSONSchemaForAntigravity(input)
@@ -692,6 +680,7 @@ func TestCleanJSONSchemaForGemini_PropertyNamesRemoval_Nested(t *testing.T) {
 		t.Errorf("Nested propertyNames should be removed, got: %s", result)
 	}
 }
+
 
 func compareJSON(t *testing.T, expectedJSON, actualJSON string) {
 	var expMap, actMap map[string]interface{}
