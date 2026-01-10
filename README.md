@@ -1,8 +1,8 @@
-# CLI Proxy API
+# CLIProxyAPI Plus
 
-English | [中文](README_CN.md)
+English | [Chinese](README_CN.md)
 
-A proxy server that provides OpenAI/Gemini/Claude/Codex compatible API interfaces for CLI.
+This is the Plus version of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), adding support for third-party providers on top of the mainline project.
 
 > [!NOTE]
 > Upstream reference (for baseline behavior/docs): https://github.com/luispater/CLIProxyAPI/blob/main/README.md
@@ -35,11 +35,13 @@ A proxy server that provides OpenAI/Gemini/Claude/Codex compatible API interface
 
 ---
 
+All third-party provider support is maintained by community contributors; CLIProxyAPI does not provide technical support. Please contact the corresponding community maintainer if you need assistance.
+
 It now also supports OpenAI Codex (GPT models) and Claude Code via OAuth.
 
-So you can use local or multi-account CLI access with OpenAI(include Responses)/Gemini/Claude-compatible clients and SDKs.
+The Plus release stays in lockstep with the mainline features.
 
-## Sponsor
+## Differences from the Mainline
 
 [![z.ai](https://assets.router-for.me/english-4.7.png)](https://z.ai/subscribe?ic=8JVLJQFSKB)
 
@@ -155,6 +157,9 @@ Native macOS menu bar app to use your Claude Code & ChatGPT subscriptions with A
 
 Browser-based tool to translate SRT subtitles using your Gemini subscription via CLIProxyAPI with automatic validation/error correction - no API keys needed
 
+- Added GitHub Copilot support (OAuth login), provided by [em4go](https://github.com/em4go/CLIProxyAPI/tree/feature/github-copilot-auth)
+- Added Kiro (AWS CodeWhisperer) support (OAuth login), provided by [fuko2935](https://github.com/fuko2935/CLIProxyAPI/tree/feature/kiro-integration), [Ravens2121](https://github.com/Ravens2121/CLIProxyAPIPlus/)
+
 ### [CCS (Claude Code Switch)](https://github.com/kaitranntt/ccs)
 
 CLI wrapper for instant switching between multiple Claude accounts and alternative models (Gemini, Codex, Antigravity) via CLIProxyAPI OAuth - no API keys needed
@@ -217,6 +222,10 @@ Native macOS menu bar app that unifies Claude, Gemini, OpenAI, Qwen, and Antigra
 
 > [!NOTE]  
 > If you developed a project based on CLIProxyAPI, please open a PR to add it to this list.
+
+All third-party provider support is maintained by community contributors; CLIProxyAPI does not provide technical support. Please contact the corresponding community maintainer if you need assistance.
+
+If you need to submit any non-third-party provider changes, please open them against the mainline repository.
 
 ## Contributing
 

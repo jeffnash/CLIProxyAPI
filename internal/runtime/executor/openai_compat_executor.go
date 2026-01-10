@@ -53,6 +53,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	// Translate inbound request to OpenAI format
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
+	originalPayload := bytes.Clone(req.Payload)
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = bytes.Clone(opts.OriginalRequest)
+	}
+	originalTranslated := sdktranslator.TranslateRequest(from, to, req.Model, originalPayload, opts.Stream)
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), opts.Stream)
 	modelOverride := e.resolveUpstreamModel(req.Model, auth)
 	if auth != nil && auth.Attributes != nil {
@@ -63,7 +68,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if modelOverride != "" {
 		translated = e.overrideModel(translated, modelOverride)
 	}
-	translated = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", translated)
+	translated = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", translated, originalTranslated)
 	allowCompat := e.allowCompatReasoningEffort(req.Model, auth)
 	translated = ApplyReasoningEffortMetadata(translated, req.Metadata, req.Model, "reasoning_effort", allowCompat)
 	translated = NormalizeThinkingConfig(translated, req.Model, allowCompat)
@@ -150,6 +155,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
+	originalPayload := bytes.Clone(req.Payload)
+	if len(opts.OriginalRequest) > 0 {
+		originalPayload = bytes.Clone(opts.OriginalRequest)
+	}
+	originalTranslated := sdktranslator.TranslateRequest(from, to, req.Model, originalPayload, true)
 	translated := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 	modelOverride := e.resolveUpstreamModel(req.Model, auth)
 	if auth != nil && auth.Attributes != nil {
@@ -160,7 +170,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if modelOverride != "" {
 		translated = e.overrideModel(translated, modelOverride)
 	}
-	translated = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", translated)
+	translated = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", translated, originalTranslated)
 	allowCompat := e.allowCompatReasoningEffort(req.Model, auth)
 	translated = ApplyReasoningEffortMetadata(translated, req.Metadata, req.Model, "reasoning_effort", allowCompat)
 	translated = NormalizeThinkingConfig(translated, req.Model, allowCompat)
@@ -241,6 +251,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			if len(line) == 0 {
 				continue
 			}
+
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+
 			// OpenAI-compatible streams are SSE: lines typically prefixed with "data: ".
 			// Pass through translator; it yields one or more chunks for the target schema.
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, bytes.Clone(line), &param)

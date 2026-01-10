@@ -71,10 +71,13 @@ func ApplyGeminiThinkingConfig(body []byte, budget *int, includeThoughts *bool) 
 		incl = &defaultInclude
 	}
 	if incl != nil {
-		valuePath := "generationConfig.thinkingConfig.include_thoughts"
-		rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
-		if err == nil {
-			updated = rewritten
+		if !gjson.GetBytes(updated, "generationConfig.thinkingConfig.includeThoughts").Exists() &&
+			!gjson.GetBytes(updated, "generationConfig.thinkingConfig.include_thoughts").Exists() {
+			valuePath := "generationConfig.thinkingConfig.include_thoughts"
+			rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
+			if err == nil {
+				updated = rewritten
+			}
 		}
 	}
 	return updated
@@ -99,10 +102,13 @@ func ApplyGeminiCLIThinkingConfig(body []byte, budget *int, includeThoughts *boo
 		incl = &defaultInclude
 	}
 	if incl != nil {
-		valuePath := "request.generationConfig.thinkingConfig.include_thoughts"
-		rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
-		if err == nil {
-			updated = rewritten
+		if !gjson.GetBytes(updated, "request.generationConfig.thinkingConfig.includeThoughts").Exists() &&
+			!gjson.GetBytes(updated, "request.generationConfig.thinkingConfig.include_thoughts").Exists() {
+			valuePath := "request.generationConfig.thinkingConfig.include_thoughts"
+			rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
+			if err == nil {
+				updated = rewritten
+			}
 		}
 	}
 	return updated
@@ -130,14 +136,14 @@ func ApplyGeminiThinkingLevel(body []byte, level string, includeThoughts *bool) 
 		incl = &defaultInclude
 	}
 	if incl != nil {
-		valuePath := "generationConfig.thinkingConfig.includeThoughts"
-		rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
-		if err == nil {
-			updated = rewritten
+		if !gjson.GetBytes(updated, "generationConfig.thinkingConfig.includeThoughts").Exists() &&
+			!gjson.GetBytes(updated, "generationConfig.thinkingConfig.include_thoughts").Exists() {
+			valuePath := "generationConfig.thinkingConfig.includeThoughts"
+			rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
+			if err == nil {
+				updated = rewritten
+			}
 		}
-	}
-	if it := gjson.GetBytes(body, "generationConfig.thinkingConfig.include_thoughts"); it.Exists() {
-		updated, _ = sjson.DeleteBytes(updated, "generationConfig.thinkingConfig.include_thoughts")
 	}
 	if tb := gjson.GetBytes(body, "generationConfig.thinkingConfig.thinkingBudget"); tb.Exists() {
 		updated, _ = sjson.DeleteBytes(updated, "generationConfig.thinkingConfig.thinkingBudget")
@@ -167,14 +173,14 @@ func ApplyGeminiCLIThinkingLevel(body []byte, level string, includeThoughts *boo
 		incl = &defaultInclude
 	}
 	if incl != nil {
-		valuePath := "request.generationConfig.thinkingConfig.includeThoughts"
-		rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
-		if err == nil {
-			updated = rewritten
+		if !gjson.GetBytes(updated, "request.generationConfig.thinkingConfig.includeThoughts").Exists() &&
+			!gjson.GetBytes(updated, "request.generationConfig.thinkingConfig.include_thoughts").Exists() {
+			valuePath := "request.generationConfig.thinkingConfig.includeThoughts"
+			rewritten, err := sjson.SetBytes(updated, valuePath, *incl)
+			if err == nil {
+				updated = rewritten
+			}
 		}
-	}
-	if it := gjson.GetBytes(body, "request.generationConfig.thinkingConfig.include_thoughts"); it.Exists() {
-		updated, _ = sjson.DeleteBytes(updated, "request.generationConfig.thinkingConfig.include_thoughts")
 	}
 	if tb := gjson.GetBytes(body, "request.generationConfig.thinkingConfig.thinkingBudget"); tb.Exists() {
 		updated, _ = sjson.DeleteBytes(updated, "request.generationConfig.thinkingConfig.thinkingBudget")
@@ -251,9 +257,14 @@ func ThinkingBudgetToGemini3Level(model string, budget int) (string, bool) {
 
 // modelsWithDefaultThinking lists models that should have thinking enabled by default
 // when no explicit thinkingConfig is provided.
+// Note: Gemini 3 models are NOT included here because per Google's official documentation:
+//   - thinkingLevel defaults to "high" (dynamic thinking)
+//   - includeThoughts defaults to false
+//
+// We should not override these API defaults; let users explicitly configure if needed.
 var modelsWithDefaultThinking = map[string]bool{
-	"gemini-3-pro-preview":       true,
-	"gemini-3-pro-image-preview": true,
+	// "gemini-3-pro-preview":       true,
+	// "gemini-3-pro-image-preview": true,
 	// "gemini-3-flash-preview":     true,
 }
 

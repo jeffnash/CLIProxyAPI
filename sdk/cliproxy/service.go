@@ -391,6 +391,8 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 		s.coreManager.RegisterExecutor(executor.NewIFlowExecutor(s.cfg))
 	case "grok":
 		s.coreManager.RegisterExecutor(executor.NewGrokExecutor(s.cfg))
+	case "kiro":
+		s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -828,6 +830,8 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = applyExcludedModels(models, excluded)
 	case "iflow":
 		models = registry.GetIFlowModels()
+	case "kiro":
+		models = registry.GetKiroModels()
 		models = applyExcludedModels(models, excluded)
 	case "grok":
 		models = grokauth.GetGrokModels()
@@ -1297,7 +1301,12 @@ func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, mode
 	if len(mappings) == 0 {
 		return models
 	}
-	forward := make(map[string]string, len(mappings))
+	type mappingEntry struct {
+		alias string
+		fork  bool
+	}
+
+	forward := make(map[string]mappingEntry, len(mappings))
 	for i := range mappings {
 		name := strings.TrimSpace(mappings[i].Name)
 		alias := strings.TrimSpace(mappings[i].Alias)
@@ -1311,7 +1320,7 @@ func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, mode
 		if _, exists := forward[key]; exists {
 			continue
 		}
-		forward[key] = alias
+		forward[key] = mappingEntry{alias: alias, fork: mappings[i].Fork}
 	}
 	if len(forward) == 0 {
 		return models
@@ -1326,9 +1335,43 @@ func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, mode
 		if id == "" {
 			continue
 		}
-		mappedID := id
-		if to, ok := forward[strings.ToLower(id)]; ok && strings.TrimSpace(to) != "" {
-			mappedID = strings.TrimSpace(to)
+		key := strings.ToLower(id)
+		entry, ok := forward[key]
+		if !ok {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, model)
+			continue
+		}
+		mappedID := strings.TrimSpace(entry.alias)
+		if mappedID == "" {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, model)
+			continue
+		}
+
+		if entry.fork {
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				out = append(out, model)
+			}
+			aliasKey := strings.ToLower(mappedID)
+			if _, exists := seen[aliasKey]; exists {
+				continue
+			}
+			seen[aliasKey] = struct{}{}
+			clone := *model
+			clone.ID = mappedID
+			if clone.Name != "" {
+				clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)
+			}
+			out = append(out, &clone)
+			continue
 		}
 		uniqueKey := strings.ToLower(mappedID)
 		if _, exists := seen[uniqueKey]; exists {

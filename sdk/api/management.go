@@ -21,6 +21,7 @@ type ManagementTokenRequester interface {
 	RequestIFlowToken(*gin.Context)
 	RequestIFlowCookieToken(*gin.Context)
 	GetAuthStatus(c *gin.Context)
+	PostOAuthCallback(c *gin.Context)
 }
 
 type managementTokenRequester struct {
@@ -65,3 +66,8 @@ func (m *managementTokenRequester) RequestIFlowCookieToken(c *gin.Context) {
 func (m *managementTokenRequester) GetAuthStatus(c *gin.Context) {
 	m.handler.GetAuthStatus(c)
 }
+
+func (m *managementTokenRequester) PostOAuthCallback(c *gin.Context) {
+	m.handler.PostOAuthCallback(c)
+}
+
