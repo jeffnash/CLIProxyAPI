@@ -15,6 +15,7 @@ import (
 	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -53,6 +54,7 @@ type sharedModelCacheEntry struct {
 }
 
 const sharedModelCacheTTL = 30 * time.Minute
+
 // NewCopilotExecutor creates a new CopilotExecutor instance.
 
 func NewCopilotExecutor(cfg *config.Config) *CopilotExecutor {
@@ -65,7 +67,53 @@ func NewCopilotExecutor(cfg *config.Config) *CopilotExecutor {
 
 func (e *CopilotExecutor) Identifier() string { return "copilot" }
 
-func (e *CopilotExecutor) PrepareRequest(_ *http.Request, _ *cliproxyauth.Auth) error { return nil }
+func (e *CopilotExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
+	if req == nil {
+		return nil
+	}
+
+	payload := []byte{}
+	if req.Body != nil {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return err
+		}
+		payload = body
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	}
+
+	copilotToken, _, err := e.getCopilotToken(req.Context(), auth)
+	if err != nil {
+		return err
+	}
+
+	incoming := req.Header.Clone()
+	e.applyCopilotHeaders(req, copilotToken, payload, incoming)
+
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(req, attrs)
+
+	return nil
+}
+
+// HttpRequest injects Copilot credentials into the request and executes it.
+func (e *CopilotExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, fmt.Errorf("copilot executor: request is nil")
+	}
+	if ctx == nil {
+		ctx = req.Context()
+	}
+	httpReq := req.WithContext(ctx)
+	if err := e.PrepareRequest(httpReq, auth); err != nil {
+		return nil, err
+	}
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	return httpClient.Do(httpReq)
+}
 
 // reasoningCache returns the shared Gemini reasoning cache for a given auth, or a fresh
 // cache when auth is nil/unknown. This keeps Gemini reasoning warm across reauths.

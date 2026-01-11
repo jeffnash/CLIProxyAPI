@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	grokchat "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/grok/openai/chat-completions"
 	groktranslator "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/grok"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
@@ -45,8 +46,59 @@ func NewGrokExecutor(cfg *config.Config) *GrokExecutor {
 // Identifier implements cliproxy executor identification.
 func (e *GrokExecutor) Identifier() string { return "grok" }
 
-// PrepareRequest is a no-op hook for now.
-func (e *GrokExecutor) PrepareRequest(_ *http.Request, _ *cliproxyauth.Auth) error { return nil }
+// PrepareRequest injects Grok credentials and browser-like headers into the outgoing HTTP request.
+func (e *GrokExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
+	if req == nil {
+		return nil
+	}
+
+	ssoToken, cfClearance, _ := grokCreds(auth)
+	if strings.TrimSpace(ssoToken) == "" {
+		return statusErr{code: http.StatusUnauthorized, msg: "grok executor: missing sso token"}
+	}
+
+	path := ""
+	if req.URL != nil {
+		path = req.URL.Path
+	}
+	headerOpts := grokauth.HeaderOptions{
+		Path:        path,
+		ContentType: req.Header.Get("Content-Type"),
+		Referer:     req.Header.Get("Referer"),
+	}
+	headers := grokauth.BuildHeaders(e.cfg, ssoToken, cfClearance, headerOpts)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(req, attrs)
+	return nil
+}
+
+// HttpRequest injects Grok credentials into the request and executes it.
+func (e *GrokExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, fmt.Errorf("grok executor: request is nil")
+	}
+	if ctx == nil {
+		ctx = req.Context()
+	}
+	httpReq := req.WithContext(ctx)
+	if err := e.PrepareRequest(httpReq, auth); err != nil {
+		return nil, err
+	}
+
+	_, _, proxyURL := grokCreds(auth)
+	client := e.httpClient
+	if proxyURL != "" {
+		client = grokauth.NewGrokHTTPClient(e.cfg, proxyURL)
+	}
+	return client.Do(httpReq)
+}
 
 func (e *GrokExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ssoToken, cfClearance, proxyURL := grokCreds(auth)

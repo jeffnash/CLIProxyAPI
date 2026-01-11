@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"testing"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -117,9 +118,9 @@ func TestPickNext_ForcedProviderMetadataTypes(t *testing.T) {
 	tried := make(map[string]struct{})
 
 	tests := []struct {
-		name           string
-		metadata       map[string]any
-		shouldBypass   bool
+		name         string
+		metadata     map[string]any
+		shouldBypass bool
 	}{
 		{
 			name:         "bool true bypasses check",
@@ -267,7 +268,7 @@ func TestPickNext_DisabledAuthsExcluded(t *testing.T) {
 // TestPickNext_WrongProviderExcluded tests that auths for other providers are excluded.
 func TestPickNext_WrongProviderExcluded(t *testing.T) {
 	mgr := NewManager(nil, &mockSelector{}, NoopHook{})
-	
+
 	copilotExecutor := &mockProviderExecutor{id: "copilot"}
 	geminiExecutor := &mockProviderExecutor{id: "gemini"}
 	mgr.RegisterExecutor(copilotExecutor)
@@ -312,6 +313,10 @@ func (m *mockProviderExecutor) CountTokens(ctx context.Context, auth *Auth, req 
 
 func (m *mockProviderExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
 	return auth, nil
+}
+
+func (m *mockProviderExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+	return nil, nil
 }
 
 // mockSelector implements Selector for testing

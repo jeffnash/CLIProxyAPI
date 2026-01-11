@@ -56,6 +56,10 @@ func (e *failOnceStreamExecutor) CountTokens(context.Context, *coreauth.Auth, co
 	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
 }
 
+func (e *failOnceStreamExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{Code: "not_implemented", Message: "HttpRequest not implemented"}
+}
+
 func (e *failOnceStreamExecutor) Calls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
