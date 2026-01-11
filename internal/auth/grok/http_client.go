@@ -2,6 +2,8 @@ package grok
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"time"
 
 	"github.com/imroc/req/v3"
@@ -33,6 +35,13 @@ func NewGrokHTTPClient(cfg *config.Config, proxyURL string) *GrokHTTPClient {
 	}
 
 	return &GrokHTTPClient{client: client}
+}
+
+func (c *GrokHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	if c == nil || c.client == nil {
+		return nil, errors.New("grok http client: client is nil")
+	}
+	return c.client.Do(req)
 }
 
 func resolveGrokTimeout(cfg *config.Config) time.Duration {
