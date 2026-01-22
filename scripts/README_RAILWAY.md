@@ -41,6 +41,9 @@
   - What it does: sends a comment heartbeat every N seconds during SSE streaming to keep the connection alive.
   - Why you might want it: Railway has a **60-second proxy keep-alive timeout**. If an LLM response has gaps longer than 60s between chunks (e.g., during long thinking/reasoning), Railway closes the connection, causing `httpx.ReadError` or "0 events received" errors on the client.
   - Recommended value: `30` (sends heartbeats every 30 seconds, well under the 60s timeout).
+- `STREAMING_DISABLE_PROXY_BUFFERING` (default `false`) - when truthy, adds `X-Accel-Buffering: no` to SSE responses.
+  - What it is: a hint to Nginx-like reverse proxies (including some Railway setups) to disable response buffering for SSE.
+  - Why you might want it: buffering can delay or fragment SSE delivery, which shows up as "0 events received" or JSON parsing errors in strict SSE clients.
 
 Note: by default the proxy detects agent calls by looking for tool/agent activity in the payload; forcing these flags overrides that detection.
 

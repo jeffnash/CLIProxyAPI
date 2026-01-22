@@ -440,9 +440,12 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
+		c.Header("Cache-Control", "no-cache, no-transform")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+		if h.Cfg.Streaming.DisableProxyBuffering {
+			c.Header("X-Accel-Buffering", "no") // Disable proxy buffering for SSE
+		}
 	}
 
 	// Peek at the first chunk to determine success or failure before setting headers
@@ -543,9 +546,12 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
+		c.Header("Cache-Control", "no-cache, no-transform")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+		if h.Cfg.Streaming.DisableProxyBuffering {
+			c.Header("X-Accel-Buffering", "no") // Disable proxy buffering for SSE
+		}
 	}
 
 	// Peek at the first chunk

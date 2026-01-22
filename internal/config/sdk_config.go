@@ -37,6 +37,11 @@ type StreamingConfig struct {
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// DisableProxyBuffering when true adds "X-Accel-Buffering: no" header to SSE responses.
+	// This tells reverse proxies (Nginx, Railway) to not buffer the response.
+	// Useful when SSE streams get corrupted due to proxy chunking. Default is false.
+	DisableProxyBuffering bool `yaml:"disable-proxy-buffering,omitempty" json:"disable-proxy-buffering,omitempty"`
 }
 
 // AccessConfig groups request authentication providers.
