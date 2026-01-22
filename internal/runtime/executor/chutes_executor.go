@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"sort"
 	"strings"
 	"sync"
@@ -40,6 +41,20 @@ var chutesBackoffSchedule = []time.Duration{
 	15 * time.Second,
 	30 * time.Second,
 	60 * time.Second,
+}
+
+func waitForDuration(ctx context.Context, wait time.Duration) error {
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // chutesRetryableStatusCodes defines HTTP status codes that trigger retry logic.
@@ -114,31 +129,71 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	endpoint := strings.TrimSuffix(baseURL, "/") + chutesChatEndpoint
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return resp, err
+	maxRetries := chutesMaxRetries(e.cfg)
+	if maxRetries < 0 {
+		maxRetries = 0
 	}
-	applyChutesHeaders(httpReq, apiKey, false)
-
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		return resp, err
-	}
-	defer httpResp.Body.Close()
-
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		log.WithFields(log.Fields{
-			"status":   httpResp.StatusCode,
-			"endpoint": endpoint,
-		}).Debug("chutes request error")
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(b)}
+	attempts := maxRetries + 1
+	if attempts < 1 {
+		attempts = 1
 	}
 
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return resp, err
+	var data []byte
+	for attempt := 0; attempt < attempts; attempt++ {
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if errReq != nil {
+			return resp, errReq
+		}
+		applyChutesHeaders(httpReq, apiKey, false)
+
+		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			// Network errors are treated as transient; retry if we still have attempts.
+			if attempt < attempts-1 {
+				if errWait := chutesWaitForRetry(ctx, attempt, req.Model, 0); errWait != nil {
+					return resp, errWait
+				}
+				continue
+			}
+			return resp, errDo
+		}
+
+		func() {
+			defer httpResp.Body.Close()
+			data, _ = io.ReadAll(httpResp.Body)
+			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+				log.WithFields(log.Fields{
+					"status":   httpResp.StatusCode,
+					"endpoint": endpoint,
+				}).Debug("chutes request error")
+			}
+		}()
+
+		// Success path (2xx).
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			break
+		}
+
+		// Retryable status codes.
+		if chutesIsRetryableStatus(httpResp.StatusCode) && attempt < attempts-1 {
+			if errWait := chutesWaitForRetry(ctx, attempt, req.Model, httpResp.StatusCode); errWait != nil {
+				return resp, errWait
+			}
+			continue
+		}
+
+		// Not retryable or out of retries.
+		se := statusErr{code: httpResp.StatusCode, msg: string(data)}
+		if httpResp.StatusCode == http.StatusTooManyRequests {
+			se.retryAfter = chutesShortRetryAfter()
+		}
+		return resp, se
+	}
+
+	if len(data) == 0 {
+		// Defensive: should only happen if upstream returned empty body with 2xx.
+		data = []byte("{}")
 	}
 	reporter.publish(ctx, parseOpenAIUsage(data))
 	reporter.ensurePublished(ctx)
@@ -167,26 +222,75 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	endpoint := strings.TrimSuffix(baseURL, "/") + chutesChatEndpoint
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	maxRetries := chutesMaxRetries(e.cfg)
+	if maxRetries < 0 {
+		maxRetries = 0
 	}
-	applyChutesHeaders(httpReq, apiKey, true)
-
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		return nil, err
+	attempts := maxRetries + 1
+	if attempts < 1 {
+		attempts = 1
 	}
 
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		data, _ := io.ReadAll(httpResp.Body)
-		httpResp.Body.Close()
+	var httpResp *http.Response
+	for attempt := 0; attempt < attempts; attempt++ {
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if errReq != nil {
+			return nil, errReq
+		}
+		applyChutesHeaders(httpReq, apiKey, true)
+
+		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		resp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			if attempt < attempts-1 {
+				if errWait := chutesWaitForRetry(ctx, attempt, req.Model, 0); errWait != nil {
+					return nil, errWait
+				}
+				continue
+			}
+			return nil, errDo
+		}
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			httpResp = resp
+			break
+		}
+
+		// Read body for logging / error reporting.
+		data, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
 		log.WithFields(log.Fields{
-			"status":   httpResp.StatusCode,
+			"status":   resp.StatusCode,
 			"endpoint": endpoint,
 		}).Debug("chutes streaming error")
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(data)}
+
+		if chutesIsRetryableStatus(resp.StatusCode) && attempt < attempts-1 {
+			// Optional: respect upstream Retry-After, but cap to a short cooldown to avoid
+			// punishing other models when one is overloaded.
+			if resp.StatusCode == http.StatusTooManyRequests {
+				if ra := parseRetryAfterHeader(resp.Header); ra != nil {
+					cap := 5 * time.Second
+					wait := minPositiveDuration(*ra, cap)
+					if errWait := waitForDuration(ctx, wait); errWait != nil {
+						return nil, errWait
+					}
+					continue
+				}
+			}
+			if errWait := chutesWaitForRetry(ctx, attempt, req.Model, resp.StatusCode); errWait != nil {
+				return nil, errWait
+			}
+			continue
+		}
+
+		se := statusErr{code: resp.StatusCode, msg: string(data)}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			se.retryAfter = chutesShortRetryAfter()
+		}
+		return nil, se
+	}
+	if httpResp == nil {
+		return nil, fmt.Errorf("chutes executor: missing response")
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -623,6 +727,38 @@ func chutesWaitForRetry(ctx context.Context, attempt int, model string, statusCo
 	case <-timer.C:
 		return nil
 	}
+}
+
+func parseRetryAfterHeader(h http.Header) *time.Duration {
+	if h == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(h.Get("Retry-After"))
+	if raw == "" {
+		return nil
+	}
+	// Retry-After can be seconds or an HTTP-date, but we only support seconds here.
+	if seconds, err := strconv.Atoi(raw); err == nil {
+		if seconds < 0 {
+			seconds = 0
+		}
+		d := time.Duration(seconds) * time.Second
+		return &d
+	}
+	return nil
+}
+
+func minPositiveDuration(a, b time.Duration) time.Duration {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 {
+		return a
+	}
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // chutesShortRetryAfter returns a short retry-after duration for per-model cooldown.

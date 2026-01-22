@@ -785,6 +785,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if env := strings.TrimSpace(os.Getenv("CHUTES_PROXY_URL")); env != "" {
 		cfg.Chutes.ProxyURL = env
 	}
+	if env := strings.TrimSpace(os.Getenv("CHUTES_MAX_RETRIES")); env != "" {
+		if parsed, errParse := strconv.Atoi(env); errParse == nil {
+			cfg.Chutes.MaxRetries = parsed
+		}
+	}
 
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
