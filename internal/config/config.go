@@ -236,6 +236,7 @@ type ChutesConfig struct {
 
 	// Retry configuration for handling Chutes' intermittent 429 errors.
 	// MaxRetries is the maximum number of retry attempts for 429 errors (default: 4, for backoffs: 5s, 15s, 30s, 1m).
+	// Set to 0 to disable retries.
 	MaxRetries int `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
 }
 
@@ -787,6 +788,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if env := strings.TrimSpace(os.Getenv("CHUTES_MAX_RETRIES")); env != "" {
 		if parsed, errParse := strconv.Atoi(env); errParse == nil {
+			if parsed < 0 {
+				parsed = 0
+			}
 			cfg.Chutes.MaxRetries = parsed
 		}
 	}

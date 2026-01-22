@@ -32,8 +32,8 @@ func TestChutesExecutorExecuteStream_RetriesOn429ThenSucceeds(t *testing.T) {
 				return
 			}
 			if calls < 2 {
-				w.WriteHeader(http.StatusTooManyRequests)
 				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusTooManyRequests)
 				_, _ = w.Write([]byte("rate limited"))
 				return
 			}
@@ -68,11 +68,42 @@ func TestChutesExecutorExecuteStream_RetriesOn429ThenSucceeds(t *testing.T) {
 	})
 }
 
+func TestChutesExecutorExecute_MaxRetriesZero_NoRetry(t *testing.T) {
+	withChutesBackoffSchedule([]time.Duration{1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond}, func() {
+		var calls int
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+		}))
+		defer srv.Close()
+
+		cfg := &config.Config{}
+		cfg.Chutes.BaseURL = srv.URL
+		cfg.Chutes.APIKey = "k"
+		cfg.Chutes.MaxRetries = 0
+
+		exec := NewChutesExecutor(cfg)
+		auth := &cliproxyauth.Auth{ID: "a", Provider: "chutes", Attributes: map[string]string{"api_key": "k", "base_url": srv.URL}}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		_, err := exec.Execute(ctx, auth, cliproxyexecutor.Request{Model: "m", Payload: []byte(`{"model":"m","messages":[]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+		if calls != 1 {
+			t.Fatalf("expected 1 call when MaxRetries=0, got %d", calls)
+		}
+	})
+}
+
 func TestChutesExecutorExecuteStream_ReturnsRetryAfterOn429WhenOutOfRetries(t *testing.T) {
 	withChutesBackoffSchedule([]time.Duration{1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond}, func() {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusTooManyRequests)
 			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte("rate limited"))
 		}))
 		defer srv.Close()
