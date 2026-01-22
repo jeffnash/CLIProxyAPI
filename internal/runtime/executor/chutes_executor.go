@@ -28,7 +28,27 @@ const (
 	chutesDefaultBaseURL = "https://llm.chutes.ai/v1"
 	chutesModelsEndpoint = "/models"
 	chutesChatEndpoint   = "/chat/completions"
+
+	// Default retry configuration for Chutes 429 errors.
+	chutesDefaultMaxRetries = 4
 )
+
+// chutesBackoffSchedule defines the backoff durations for retry attempts.
+// Index 0 = first retry backoff, index 1 = second retry backoff, etc.
+var chutesBackoffSchedule = []time.Duration{
+	5 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+}
+
+// chutesRetryableStatusCodes defines HTTP status codes that trigger retry logic.
+var chutesRetryableStatusCodes = map[int]bool{
+	429: true, // Too Many Requests - primary target
+	502: true, // Bad Gateway
+	503: true, // Service Unavailable
+	504: true, // Gateway Timeout
+}
 
 // Shared caches (survive executor recreation)
 var (
@@ -559,4 +579,56 @@ func EvictChutesModelCache() {
 	chutesModelCacheMu.Lock()
 	chutesModelCache = nil
 	chutesModelCacheMu.Unlock()
+}
+
+// chutesMaxRetries returns the configured max retries or the default.
+func chutesMaxRetries(cfg *config.Config) int {
+	if cfg != nil && cfg.Chutes.MaxRetries > 0 {
+		return cfg.Chutes.MaxRetries
+	}
+	return chutesDefaultMaxRetries
+}
+
+// chutesBackoffDuration returns the backoff duration for a given attempt (0-indexed).
+func chutesBackoffDuration(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt >= len(chutesBackoffSchedule) {
+		return chutesBackoffSchedule[len(chutesBackoffSchedule)-1]
+	}
+	return chutesBackoffSchedule[attempt]
+}
+
+// chutesIsRetryableStatus returns true if the status code should trigger retry logic.
+func chutesIsRetryableStatus(statusCode int) bool {
+	return chutesRetryableStatusCodes[statusCode]
+}
+
+// chutesWaitForRetry waits for the backoff duration or until context is cancelled.
+func chutesWaitForRetry(ctx context.Context, attempt int, model string, statusCode int) error {
+	backoff := chutesBackoffDuration(attempt)
+	log.WithFields(log.Fields{
+		"attempt":     attempt + 1,
+		"backoff":     backoff.String(),
+		"model":       model,
+		"status_code": statusCode,
+	}).Debug("chutes: retrying after backoff")
+
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// chutesShortRetryAfter returns a short retry-after duration for per-model cooldown.
+// This ensures Chutes models have short cooldowns since one model being overloaded
+// doesn't mean others are affected.
+func chutesShortRetryAfter() *time.Duration {
+	d := 5 * time.Second
+	return &d
 }

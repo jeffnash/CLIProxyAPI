@@ -8,6 +8,7 @@ package chat_completions
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 )
 
 // ConvertOpenAIResponseToOpenAI translates a single chunk of a streaming response from the
@@ -25,13 +26,29 @@ import (
 // Returns:
 //   - []string: A slice of strings, each containing an OpenAI-compatible JSON response
 func ConvertOpenAIResponseToOpenAI(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
-	if bytes.HasPrefix(rawJSON, []byte("data:")) {
-		rawJSON = bytes.TrimSpace(rawJSON[5:])
-	}
-	if bytes.Equal(rawJSON, []byte("[DONE]")) {
+	trimmed := bytes.TrimSpace(rawJSON)
+	if len(trimmed) == 0 {
 		return []string{}
 	}
-	return []string{string(rawJSON)}
+
+	// Upstreams that already emit SSE lines will include `data:` prefixes.
+	// Strip them if present.
+	if bytes.HasPrefix(trimmed, []byte("data:")) {
+		trimmed = bytes.TrimSpace(trimmed[len("data:"):])
+	}
+
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("[DONE]")) {
+		return []string{}
+	}
+
+	// Only forward JSON objects to OpenAI-compatible streaming clients.
+	// This prevents empty lines / SSE metadata (": keep-alive", "event: ...") from being
+	// wrapped into `data:` events, which can crash JSON parsers in strict clients.
+	if trimmed[0] != '{' || !json.Valid(trimmed) {
+		return []string{}
+	}
+
+	return []string{string(trimmed)}
 }
 
 // ConvertOpenAIResponseToOpenAINonStream converts a non-streaming Gemini CLI response to a non-streaming OpenAI response.

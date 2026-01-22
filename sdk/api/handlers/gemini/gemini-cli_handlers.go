@@ -137,9 +137,12 @@ func (h *GeminiCLIAPIHandler) handleInternalStreamGenerateContent(c *gin.Context
 
 	if alt == "" {
 		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
+		c.Header("Cache-Control", "no-cache, no-transform")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+		if h.Cfg.Streaming.DisableProxyBuffering {
+			c.Header("X-Accel-Buffering", "no") // Disable proxy buffering for SSE
+		}
 	}
 
 	// Get the http.Flusher interface to manually flush the response.

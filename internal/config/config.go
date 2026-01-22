@@ -233,6 +233,10 @@ type ChutesConfig struct {
 	Priority      string   `yaml:"priority,omitempty" json:"priority,omitempty"`
 	TEEPreference string   `yaml:"tee-preference,omitempty" json:"tee-preference,omitempty"`
 	ProxyURL      string   `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// Retry configuration for handling Chutes' intermittent 429 errors.
+	// MaxRetries is the maximum number of retry attempts for 429 errors (default: 4, for backoffs: 5s, 15s, 30s, 1m).
+	MaxRetries int `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
 }
 
 // ModelNameMapping defines a model ID mapping for a specific channel.
@@ -731,6 +735,17 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if env := strings.TrimSpace(os.Getenv("STREAMING_KEEPALIVE_SECONDS")); env != "" {
 		if seconds, errParse := strconv.Atoi(env); errParse == nil && seconds > 0 {
 			cfg.Streaming.KeepAliveSeconds = seconds
+		}
+	}
+
+	// STREAMING_DISABLE_PROXY_BUFFERING adds X-Accel-Buffering: no header to SSE responses.
+	// Useful for Railway/Nginx deployments where proxy buffering corrupts SSE streams.
+	if env := strings.TrimSpace(os.Getenv("STREAMING_DISABLE_PROXY_BUFFERING")); env != "" {
+		switch strings.ToLower(env) {
+		case "true", "1", "yes", "y", "on":
+			cfg.Streaming.DisableProxyBuffering = true
+		default:
+			cfg.Streaming.DisableProxyBuffering = false
 		}
 	}
 

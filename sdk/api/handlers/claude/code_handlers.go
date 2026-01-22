@@ -206,9 +206,12 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
+		c.Header("Cache-Control", "no-cache, no-transform")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
+		if h.Cfg.Streaming.DisableProxyBuffering {
+			c.Header("X-Accel-Buffering", "no") // Disable proxy buffering for SSE
+		}
 	}
 
 	// Peek at the first chunk to determine success or failure before setting headers
