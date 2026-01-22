@@ -271,6 +271,14 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if ra := parseRetryAfterHeader(resp.Header); ra != nil {
 					cap := 5 * time.Second
 					wait := minPositiveDuration(*ra, cap)
+					log.WithFields(log.Fields{
+						"attempt":     attempt + 1,
+						"backoff":     wait.String(),
+						"model":       req.Model,
+						"status_code": resp.StatusCode,
+						"retry_after": ra.String(),
+						"capped":      cap.String(),
+					}).Info("chutes: retrying after Retry-After")
 					if errWait := waitForDuration(ctx, wait); errWait != nil {
 						return nil, errWait
 					}
@@ -687,9 +695,14 @@ func EvictChutesModelCache() {
 
 // chutesMaxRetries returns the configured max retries or the default.
 func chutesMaxRetries(cfg *config.Config) int {
-	if cfg != nil && cfg.Chutes.MaxRetries > 0 {
+	if cfg == nil {
+		return chutesDefaultMaxRetries
+	}
+	// Honor explicit 0 as "no retries".
+	if cfg.Chutes.MaxRetries >= 0 {
 		return cfg.Chutes.MaxRetries
 	}
+	// Negative values are treated as invalid and fall back to default.
 	return chutesDefaultMaxRetries
 }
 
@@ -717,7 +730,7 @@ func chutesWaitForRetry(ctx context.Context, attempt int, model string, statusCo
 		"backoff":     backoff.String(),
 		"model":       model,
 		"status_code": statusCode,
-	}).Debug("chutes: retrying after backoff")
+	}).Info("chutes: retrying after backoff")
 
 	timer := time.NewTimer(backoff)
 	defer timer.Stop()
