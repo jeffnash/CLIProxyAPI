@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -708,6 +709,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if len(cfg.Passthru) > 0 {
 		for i := range cfg.Passthru {
 			cfg.Passthru[i].Headers = NormalizeHeaders(cfg.Passthru[i].Headers)
+		}
+	}
+
+	// Load streaming keep-alive from env (useful for Railway deployments with 60s proxy timeout).
+	// STREAMING_KEEPALIVE_SECONDS sets how often the server emits SSE heartbeats.
+	if env := strings.TrimSpace(os.Getenv("STREAMING_KEEPALIVE_SECONDS")); env != "" {
+		if seconds, errParse := strconv.Atoi(env); errParse == nil && seconds > 0 {
+			cfg.Streaming.KeepAliveSeconds = seconds
 		}
 	}
 
