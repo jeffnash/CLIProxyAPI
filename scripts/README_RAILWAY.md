@@ -36,6 +36,11 @@
   - What it does: forces `X-Initiator: agent` for Copilot requests regardless of payload.
   - Why you might want it: can reduce user-quota usage by marking everything as agent calls.
   - Warning: **use at your own risk** — it may violate provider expectations/ToS, break accounting, or cause requests to be rejected.
+- `STREAMING_KEEPALIVE_SECONDS` (default `0` / disabled) - how often the server emits SSE heartbeats (`: keep-alive\n\n`) during streaming responses.
+  - What it is: a keep-alive mechanism to prevent Railway's proxy from closing idle connections.
+  - What it does: sends a comment heartbeat every N seconds during SSE streaming to keep the connection alive.
+  - Why you might want it: Railway has a **60-second proxy keep-alive timeout**. If an LLM response has gaps longer than 60s between chunks (e.g., during long thinking/reasoning), Railway closes the connection, causing `httpx.ReadError` or "0 events received" errors on the client.
+  - Recommended value: `30` (sends heartbeats every 30 seconds, well under the 60s timeout).
 
 Note: by default the proxy detects agent calls by looking for tool/agent activity in the payload; forcing these flags overrides that detection.
 
