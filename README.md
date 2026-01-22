@@ -18,6 +18,7 @@ This is the Plus version of [CLIProxyAPI](https://github.com/router-for-me/CLIPr
 > **What’s different from upstream (and why):**
 >
 > - **More provider adapters & auth flows (Copilot, Grok, etc.)** — so you can route requests through the subscription/provider you already pay for, using a consistent OpenAI-compatible API surface.
+> - **Chutes provider support (API key + dynamic model discovery)** — optionally expose Chutes-hosted models via OpenAI-compatible endpoints using `CHUTES_API_KEY` / `CHUTES_BASE_URL`.
 > - **Passthru model routing (env + YAML)** — declare arbitrary model IDs (e.g. `glm-4.7`) that are forwarded to external upstream APIs (OpenAI-compatible / Anthropic / Responses), with per-route API keys/headers; ideal for hosted deployments (Railway) via `PASSTHRU_MODELS_JSON`.
 > - **Railway-first deployment path** (`scripts/railway_start.sh`, `docs/RAILWAY_GUIDE.md`) — to make it dead simple to spin up a personal, always-on CLIProxyAPI instance you can call from anywhere.
 >   - Log in locally (interactive browser/device flows), then package credentials into `AUTH_BUNDLE` via `scripts/auth_bundle.sh` and restore them in a remote environment.
@@ -96,6 +97,11 @@ Provider & config matrix (fork-specific):
 | Copilot model registry | `internal/registry/copilot_models.go` | How Copilot models are enumerated/aliased. |
 | Force Copilot routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `copilot-<model>` to explicitly route to Copilot even if the model isn't registered; bypasses client model support filtering. |
 | Grok config schema | `internal/config/config.go` | `GrokKey` and `GrokConfig` sections define available knobs. |
+| Chutes support (env + YAML) | `internal/config/config.go` / `docs/RAILWAY_GUIDE.md` | Env vars: `CHUTES_API_KEY`, `CHUTES_BASE_URL`, `CHUTES_MODELS`, `CHUTES_MODELS_EXCLUDE`, `CHUTES_PRIORITY`, `CHUTES_TEE_PREFERENCE`, `CHUTES_PROXY_URL`. YAML: `chutes` section. |
+| Force Chutes routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `chutes-<model>` to explicitly route to Chutes; sets `forced_provider=true` to bypass client model support filtering. |
+| Chutes model aliasing + fallbacks | `internal/registry/chutes_models.go` | Generates `chutes-` aliases for explicit routing + contains conservative fallback models. |
+| Chutes executor | `internal/runtime/executor/chutes_executor.go` | Implements OpenAI-compatible chat completions + streams, model fetch/cache, and token counting. |
+| Chutes priority filtering | `sdk/cliproxy/service.go` / `sdk/cliproxy/chutes_priority_hook.go` | `CHUTES_PRIORITY=fallback` hides non-prefixed Chutes IDs when another provider has the same model ID; `chutes-` aliases remain routable. |
 | OAuth excluded models | `internal/config/config.go` | `oauth-excluded-models` config lets you disable models per provider. |
 | OpenAI-compat upstreams | `internal/config/config.go` | `openai-compatibility` for routing to other OpenAI-compatible providers. |
 | Routing behavior | `internal/config/config.go` | `routing` config controls credential selection/failover. |

@@ -59,6 +59,30 @@ We use a script to pack your local credentials into a single encrypted string th
 
 ## 4. Step 3: Deploy to Railway
 
+### Chutes (optional) API key configuration
+
+This fork supports the **Chutes** OpenAI-compatible API.
+
+You have two ways to route to Chutes:
+
+- **Explicit routing (always available when configured):** use `model: "chutes-<model>"` (for example, `chutes-deepseek-ai/DeepSeek-V3`).
+- **General routing (optional):** expose non-prefixed model IDs from Chutes in `/v1/models` and allow normal provider selection.
+
+To enable Chutes on Railway, set these environment variables:
+
+- `CHUTES_API_KEY` (required): Chutes API key.
+- `CHUTES_BASE_URL` (optional): defaults to `https://llm.chutes.ai/v1`.
+- `CHUTES_MODELS` (optional): comma-separated whitelist of Chutes model roots to expose.
+- `CHUTES_MODELS_EXCLUDE` (optional): comma-separated blocklist of Chutes model roots to hide.
+- `CHUTES_PRIORITY` (optional):
+  - `primary`: expose all Chutes non-prefixed IDs.
+  - `fallback` (default): hide Chutes non-prefixed IDs when another provider registers the *same* model ID.
+  - Note: `chutes-` prefixed aliases remain registered so explicit routing keeps working.
+- `CHUTES_TEE_PREFERENCE` (optional): `prefer` (default), `avoid`, or `both`.
+- `CHUTES_PROXY_URL` (optional): per-auth proxy URL for Chutes requests.
+
+Tip: If you want Chutes available but don’t want it to show up in `/v1/models` unless needed, keep `CHUTES_PRIORITY=fallback` and use `chutes-...` for explicit routing.
+
 ### Copilot (optional) behavior flags
 
 If you are using **GitHub Copilot** and want to fine-tune how the proxy behaves for Copilot-backed requests, you can set these Railway environment variables (they are consumed by `scripts/railway_start.sh`):
