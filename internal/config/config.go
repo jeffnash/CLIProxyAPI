@@ -115,6 +115,9 @@ type Config struct {
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
+	// Chutes holds Chutes API configuration.
+	Chutes ChutesConfig `yaml:"chutes" json:"chutes"`
+
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
@@ -219,6 +222,17 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+}
+
+// ChutesConfig holds Chutes API configuration.
+type ChutesConfig struct {
+	APIKey        string   `yaml:"api-key" json:"api-key"`
+	Models        []string `yaml:"models,omitempty" json:"models,omitempty"`
+	ModelsExclude []string `yaml:"models-exclude,omitempty" json:"models-exclude,omitempty"`
+	BaseURL       string   `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+	Priority      string   `yaml:"priority,omitempty" json:"priority,omitempty"`
+	TEEPreference string   `yaml:"tee-preference,omitempty" json:"tee-preference,omitempty"`
+	ProxyURL      string   `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 }
 
 // ModelNameMapping defines a model ID mapping for a specific channel.
@@ -734,6 +748,29 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 	}
 
+	// Load Chutes configuration from env.
+	if env := strings.TrimSpace(os.Getenv("CHUTES_API_KEY")); env != "" {
+		cfg.Chutes.APIKey = env
+	}
+	if env := strings.TrimSpace(os.Getenv("CHUTES_BASE_URL")); env != "" {
+		cfg.Chutes.BaseURL = env
+	}
+	if env := strings.TrimSpace(os.Getenv("CHUTES_MODELS")); env != "" {
+		cfg.Chutes.Models = splitAndTrim(env)
+	}
+	if env := strings.TrimSpace(os.Getenv("CHUTES_MODELS_EXCLUDE")); env != "" {
+		cfg.Chutes.ModelsExclude = splitAndTrim(env)
+	}
+	if env := strings.TrimSpace(os.Getenv("CHUTES_PRIORITY")); env != "" {
+		cfg.Chutes.Priority = strings.ToLower(env)
+	}
+	if env := strings.TrimSpace(os.Getenv("CHUTES_TEE_PREFERENCE")); env != "" {
+		cfg.Chutes.TEEPreference = strings.ToLower(env)
+	}
+	if env := strings.TrimSpace(os.Getenv("CHUTES_PROXY_URL")); env != "" {
+		cfg.Chutes.ProxyURL = env
+	}
+
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
@@ -1119,6 +1156,24 @@ func NormalizeExcludedModels(models []string) []string {
 	return out
 }
 
+func splitAndTrim(csv string) []string {
+	csv = strings.TrimSpace(csv)
+	if csv == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func normalizeList(entries []string) []string {
 	if len(entries) == 0 {
 		return nil
@@ -1126,14 +1181,12 @@ func normalizeList(entries []string) []string {
 	seen := make(map[string]struct{}, len(entries))
 	out := make([]string, 0, len(entries))
 	for _, raw := range entries {
-		for _, part := range strings.Split(raw, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				if _, ok := seen[trimmed]; ok {
-					continue
-				}
-				seen[trimmed] = struct{}{}
-				out = append(out, trimmed)
+		for _, part := range splitAndTrim(raw) {
+			if _, ok := seen[part]; ok {
+				continue
 			}
+			seen[part] = struct{}{}
+			out = append(out, part)
 		}
 	}
 	if len(out) == 0 {
