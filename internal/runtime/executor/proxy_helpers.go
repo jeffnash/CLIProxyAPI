@@ -28,6 +28,10 @@ var (
 //
 // This function caches HTTP clients by proxy URL to enable TCP/TLS connection reuse.
 //
+// NOTE: Avoid caching non-zero http.Client.Timeout values. http.Client.Timeout applies to the
+// entire request including reading the response body; caching a timed client can accidentally
+// impose that timeout on long-lived streaming requests.
+//
 // Parameters:
 //   - ctx: The context containing optional RoundTripper
 //   - cfg: The application configuration
@@ -55,7 +59,8 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	httpClientCacheMutex.RLock()
 	if cachedClient, ok := httpClientCache[cacheKey]; ok {
 		httpClientCacheMutex.RUnlock()
-		// Return a wrapper with the requested timeout but shared transport
+		// Return a wrapper with the requested timeout but shared transport.
+		// Cached clients are stored with Timeout=0 to avoid leaking timeouts across requests.
 		if timeout > 0 {
 			return &http.Client{
 				Transport: cachedClient.Transport,
@@ -66,21 +71,21 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 	httpClientCacheMutex.RUnlock()
 
-	// Create new client
+	// Create new base client (Timeout=0). If a timeout is requested, return a per-call wrapper.
 	httpClient := &http.Client{}
-	if timeout > 0 {
-		httpClient.Timeout = timeout
-	}
 
 	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
 		transport := buildProxyTransport(proxyURL)
 		if transport != nil {
 			httpClient.Transport = transport
-			// Cache the client
+			// Cache the base client (Timeout=0) for connection reuse.
 			httpClientCacheMutex.Lock()
 			httpClientCache[cacheKey] = httpClient
 			httpClientCacheMutex.Unlock()
+			if timeout > 0 {
+				return &http.Client{Transport: transport, Timeout: timeout}
+			}
 			return httpClient
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
@@ -92,13 +97,17 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		httpClient.Transport = rt
 	}
 
-	// Cache the client for no-proxy case
-	if proxyURL == "" {
+	// Cache the client for the true no-proxy/default-transport case only.
+	// If Transport came from context, it may be request/auth-specific and should not be shared.
+	if proxyURL == "" && httpClient.Transport == nil {
 		httpClientCacheMutex.Lock()
 		httpClientCache[cacheKey] = httpClient
 		httpClientCacheMutex.Unlock()
 	}
 
+	if timeout > 0 {
+		return &http.Client{Transport: httpClient.Transport, Timeout: timeout}
+	}
 	return httpClient
 }
 

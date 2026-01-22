@@ -415,7 +415,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				AuthValue: authValue,
 			})
 
-			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 120*time.Second)
+			// Do not set http.Client.Timeout for streaming responses; it applies while reading the body
+			// and can terminate long-lived event-stream responses mid-flight.
+			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
 				recordAPIResponseError(ctx, e.cfg, err)
