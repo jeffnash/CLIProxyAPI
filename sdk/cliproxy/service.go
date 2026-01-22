@@ -391,6 +391,8 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 		s.coreManager.RegisterExecutor(executor.NewIFlowExecutor(s.cfg))
 	case "grok":
 		s.coreManager.RegisterExecutor(executor.NewGrokExecutor(s.cfg))
+	case "chutes":
+		s.coreManager.RegisterExecutor(executor.NewChutesExecutor(s.cfg))
 	case "kiro":
 		s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg))
 	default:
@@ -431,6 +433,10 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	usage.StartDefault(ctx)
+
+	// Register Chutes priority hook with 500ms debounce
+	hook := newChutesPriorityHook(s, 500*time.Millisecond)
+	SetGlobalModelRegistryHook(hook)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -836,6 +842,14 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "grok":
 		models = grokauth.GetGrokModels()
 		models = applyExcludedModels(models, excluded)
+	case "chutes":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		models = executor.NewChutesExecutor(s.cfg).FetchModels(ctx, a, s.cfg)
+		cancel()
+		if len(models) == 0 {
+			log.Warnf("chutes: using static fallback models for auth %s", a.ID)
+			models = registry.GetChutesModels()
+		}
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
@@ -1287,6 +1301,67 @@ func rewriteModelInfoName(name, oldID, newID string) string {
 		return "models/" + newID
 	}
 	return name
+}
+
+// applyChutesModelPriority re-evaluates Chutes model visibility based on current registry state.
+// Priority filtering applies only to non-prefixed model IDs; chutes- prefixed aliases are always retained.
+func (s *Service) applyChutesModelPriority() {
+	if s.coreManager == nil {
+		return
+	}
+	reg := registry.GetGlobalRegistry()
+
+	for _, a := range s.coreManager.List() {
+		if strings.ToLower(strings.TrimSpace(a.Provider)) != "chutes" {
+			continue
+		}
+
+		priority := "fallback"
+		if a.Attributes != nil {
+			if p := strings.TrimSpace(a.Attributes["priority"]); p != "" {
+				priority = p
+			}
+		}
+
+		if priority == "primary" {
+			continue // Keep all models
+		}
+
+		models := reg.GetModelsForClient(a.ID)
+		if len(models) == 0 {
+			continue
+		}
+
+		filtered := make([]*registry.ModelInfo, 0, len(models))
+		for _, m := range models {
+			// Always retain chutes- prefixed aliases (explicit routing handles)
+			if strings.HasPrefix(m.ID, registry.ChutesModelPrefix) {
+				filtered = append(filtered, m)
+				continue
+			}
+
+			// For non-prefixed IDs, check if other providers exist
+			providers := reg.GetModelProviders(m.ID)
+			hasOtherProvider := false
+			for _, p := range providers {
+				if p != "chutes" {
+					hasOtherProvider = true
+					break
+				}
+			}
+
+			// fallback: hide if another provider has this model
+			if !hasOtherProvider {
+				filtered = append(filtered, m)
+			}
+		}
+
+		// Always re-register (never unregister) to preserve chutes- aliases
+		if len(filtered) != len(models) {
+			log.Debugf("chutes priority: filtered %d -> %d models for auth %s", len(models), len(filtered), a.ID)
+			reg.RegisterClient(a.ID, "chutes", filtered)
+		}
+	}
 }
 
 func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {

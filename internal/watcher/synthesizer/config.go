@@ -38,6 +38,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
 	// Vertex-compat
 	out = append(out, s.synthesizeVertexCompat(ctx)...)
+	// Chutes API keys
+	out = append(out, s.synthesizeChutesKeys(ctx)...)
 	// Passthru routes
 	out = append(out, s.synthesizePassthru(ctx)...)
 
@@ -135,6 +137,50 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 		out = append(out, a)
 	}
 	return out
+}
+
+// synthesizeChutesKeys creates Auth entries for Chutes API keys.
+func (s *ConfigSynthesizer) synthesizeChutesKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	key := strings.TrimSpace(cfg.Chutes.APIKey)
+	if key == "" {
+		return nil
+	}
+
+	base := strings.TrimSpace(cfg.Chutes.BaseURL)
+	if base == "" {
+		base = "https://llm.chutes.ai/v1"
+	}
+	proxyURL := strings.TrimSpace(cfg.Chutes.ProxyURL)
+
+	id, token := idGen.Next("chutes:apikey", key, base)
+	attrs := map[string]string{
+		"source":   fmt.Sprintf("config:chutes[%s]", token),
+		"api_key":  key,
+		"base_url": base,
+	}
+	// Store priority and TEE preference for executor access
+	if cfg.Chutes.Priority != "" {
+		attrs["priority"] = cfg.Chutes.Priority
+	}
+	if cfg.Chutes.TEEPreference != "" {
+		attrs["tee_preference"] = cfg.Chutes.TEEPreference
+	}
+
+	a := &coreauth.Auth{
+		ID:         id,
+		Provider:   "chutes",
+		Label:      "chutes-apikey",
+		Status:     coreauth.StatusActive,
+		ProxyURL:   proxyURL,
+		Attributes: attrs,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	return []*coreauth.Auth{a}
 }
 
 // synthesizeGeminiKeys creates Auth entries for Gemini API keys.

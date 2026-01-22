@@ -560,10 +560,23 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 		metadata["forced_provider"] = true
 	}
 
+	// Explicit Chutes routing via "chutes-" model aliases.
+	forcedChutes := strings.HasPrefix(strings.ToLower(strings.TrimSpace(normalizedModel)), registry.ChutesModelPrefix)
+	if forcedChutes {
+		normalizedModel = strings.TrimPrefix(normalizedModel, registry.ChutesModelPrefix)
+		if metadata == nil {
+			metadata = make(map[string]any)
+		}
+		metadata["forced_provider"] = true
+	}
+
 	// Use the normalizedModel to get the provider name.
 	providers = util.GetProviderName(normalizedModel)
 	if forcedCopilot {
 		providers = []string{"copilot"}
+	}
+	if forcedChutes {
+		providers = []string{"chutes"}
 	}
 	if len(providers) == 0 && metadata != nil {
 		if originalRaw, ok := metadata[util.ThinkingOriginalModelMetadataKey]; ok {
