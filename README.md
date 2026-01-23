@@ -97,7 +97,7 @@ Provider & config matrix (fork-specific):
 | Copilot model registry | `internal/registry/copilot_models.go` | How Copilot models are enumerated/aliased. |
 | Force Copilot routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `copilot-<model>` to explicitly route to Copilot even if the model isn't registered; bypasses client model support filtering. |
 | Grok config schema | `internal/config/config.go` | `GrokKey` and `GrokConfig` sections define available knobs. |
-| Chutes support (env + YAML) | `internal/config/config.go` / `docs/RAILWAY_GUIDE.md` | Env vars: `CHUTES_API_KEY`, `CHUTES_BASE_URL`, `CHUTES_MODELS`, `CHUTES_MODELS_EXCLUDE`, `CHUTES_PRIORITY`, `CHUTES_TEE_PREFERENCE`, `CHUTES_PROXY_URL`. YAML: `chutes` section. |
+| Chutes support (env + YAML) | `internal/config/config.go` / `docs/RAILWAY_GUIDE.md` | Env vars: `CHUTES_API_KEY`, `CHUTES_BASE_URL`, `CHUTES_MODELS`, `CHUTES_MODELS_EXCLUDE`, `CHUTES_PRIORITY`, `CHUTES_TEE_PREFERENCE`, `CHUTES_PROXY_URL`, `CHUTES_MAX_RETRIES`. YAML: `chutes` section. |
 | Force Chutes routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `chutes-<model>` to explicitly route to Chutes; sets `forced_provider=true` to bypass client model support filtering. |
 | Chutes model aliasing + fallbacks | `internal/registry/chutes_models.go` | Generates `chutes-` aliases for explicit routing + contains conservative fallback models. |
 | Chutes executor | `internal/runtime/executor/chutes_executor.go` | Implements OpenAI-compatible chat completions + streams, model fetch/cache, and token counting. |
@@ -119,6 +119,18 @@ You can override the default initiator detection:
   - What it’s for: a **hacky quota optimization** — mark everything as agent to try to reduce user-quota usage.
   - Behavior: always set `X-Initiator: agent` for Copilot requests, regardless of payload.
   - Warning: **use at your own risk** — forcing agent classification may violate provider expectations/ToS, break accounting, or cause requests to be rejected.
+
+### Chutes config (quick explainer)
+
+Chutes is an optional OpenAI-compatible upstream. You can route to it either explicitly (recommended) or by exposing non-prefixed IDs.
+
+- Explicit routing: set `model: "chutes-<model>"` (works as long as Chutes is configured).
+- Env vars:
+  - `CHUTES_API_KEY` (required), `CHUTES_BASE_URL` (optional)
+  - `CHUTES_MODELS` / `CHUTES_MODELS_EXCLUDE` (optional allow/block lists)
+  - `CHUTES_PRIORITY` (`fallback` default hides non-prefixed IDs when another provider offers the same ID; `primary` exposes them)
+  - `CHUTES_TEE_PREFERENCE` (`prefer` default), `CHUTES_PROXY_URL` (optional)
+  - `CHUTES_MAX_RETRIES` (default `4`; set `0` to disable) — retries intermittent 429s
 
 If you want the baseline upstream documentation/behavior, start here: https://github.com/luispater/CLIProxyAPI/blob/main/README.md
 
