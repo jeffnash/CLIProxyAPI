@@ -27,7 +27,12 @@
 
 - `AUTH_DIR_NAME` (default `auths_railway`) - folder name created at repo root
 - `FORCE_BUILD` (default `0`) - set to `1` (or any non-`0`) to force `go build` even if `./cli-proxy-api` already exists
+- `LOG_LEVEL` (default `info`) - log level for stdout/file logs (`debug`, `info`, `warn`, `error`).
 - `VERBOSE_LOGGING` (default unset) - when truthy, enables debug-level logging and request/response snippet capture (useful on Railway when diagnosing issues).
+- `WRITABLE_PATH` (default unset) - base directory for runtime-writable data (e.g. `logs/` and management panel `static/`) when the repo FS is read-only.
+- `MANAGEMENT_STATIC_PATH` (default unset) - override where the management control panel asset (`management.html`) is stored/served from (directory or full file path).
+- `GITSTORE_GIT_URL` / `GITSTORE_GIT_TOKEN` (default unset) - optional GitHub token wiring used when fetching the management panel asset from GitHub releases (useful if you hit rate limits).
+- `IFLOW_CLIENT_SECRET` (default unset) - overrides the built-in iFlow OAuth client secret (advanced; only needed if iFlow changes their integration secret).
 - `COPILOT_AGENT_INITIATOR_PERSIST` (default `true`) - when truthy, writes `copilot-api-key[].agent-initiator-persist: true` into `config.yaml`.
   - What it is: the **normal/expected agentic behavior** — once a workflow is in an agent loop, keep follow-up calls marked as agent.
   - What it does: if `prompt_cache_key` is present, once the proxy sees an agent-ish request for that cache key, it will keep setting `X-Initiator: agent` for subsequent requests using the same cache key.
