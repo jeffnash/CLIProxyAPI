@@ -121,6 +121,18 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Resolve model ID for Chutes API (strip chutes- prefix & consult cache)
 	apiModel := resolveChutesModel(req.Model)
+	log.WithFields(log.Fields{
+		"model":          req.Model,
+		"upstream_model": apiModel,
+		"endpoint":       "chat.completions",
+		"stream":         true,
+	}).Info("chutes: request")
+	log.WithFields(log.Fields{
+		"model":          req.Model,
+		"upstream_model": apiModel,
+		"endpoint":       "chat.completions",
+		"stream":         false,
+	}).Info("chutes: request")
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
@@ -140,15 +152,24 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	var data []byte
 	for attempt := 0; attempt < attempts; attempt++ {
+		start := time.Now()
 		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if errReq != nil {
 			return resp, errReq
 		}
 		applyChutesHeaders(httpReq, apiKey, false)
+		logChutesRequestHeaders(httpReq)
 
 		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 		httpResp, errDo := httpClient.Do(httpReq)
 		if errDo != nil {
+			log.WithFields(log.Fields{
+				"attempt":   attempt + 1,
+				"duration":  time.Since(start).String(),
+				"model":     req.Model,
+				"endpoint":  endpoint,
+				"http_error": errDo.Error(),
+			}).Warn("chutes: request error")
 			// Network errors are treated as transient; retry if we still have attempts.
 			if attempt < attempts-1 {
 				if errWait := chutesWaitForRetry(ctx, attempt, req.Model, 0); errWait != nil {
@@ -164,9 +185,22 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			data, _ = io.ReadAll(httpResp.Body)
 			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 				log.WithFields(log.Fields{
+					"attempt":      attempt + 1,
+					"status":       httpResp.StatusCode,
+					"duration":     time.Since(start).String(),
+					"endpoint":     endpoint,
+					"content_type": httpResp.Header.Get("Content-Type"),
+					"body":         summarizeErrorBody(httpResp.Header.Get("Content-Type"), data),
+				}).Warn("chutes: upstream non-2xx")
+				recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+				appendAPIResponseChunk(ctx, e.cfg, data)
+			} else {
+				log.WithFields(log.Fields{
+					"attempt":  attempt + 1,
 					"status":   httpResp.StatusCode,
+					"duration": time.Since(start).String(),
 					"endpoint": endpoint,
-				}).Debug("chutes request error")
+				}).Info("chutes: upstream ok")
 			}
 		}()
 
@@ -233,15 +267,24 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	var httpResp *http.Response
 	for attempt := 0; attempt < attempts; attempt++ {
+		start := time.Now()
 		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if errReq != nil {
 			return nil, errReq
 		}
 		applyChutesHeaders(httpReq, apiKey, true)
+		logChutesRequestHeaders(httpReq)
 
 		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 		resp, errDo := httpClient.Do(httpReq)
 		if errDo != nil {
+			log.WithFields(log.Fields{
+				"attempt":   attempt + 1,
+				"duration":  time.Since(start).String(),
+				"model":     req.Model,
+				"endpoint":  endpoint,
+				"http_error": errDo.Error(),
+			}).Warn("chutes: stream bootstrap error")
 			if attempt < attempts-1 {
 				if errWait := chutesWaitForRetry(ctx, attempt, req.Model, 0); errWait != nil {
 					return nil, errWait
@@ -260,9 +303,15 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		data, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		log.WithFields(log.Fields{
-			"status":   resp.StatusCode,
-			"endpoint": endpoint,
-		}).Debug("chutes streaming error")
+			"attempt":      attempt + 1,
+			"status":       resp.StatusCode,
+			"duration":     time.Since(start).String(),
+			"endpoint":     endpoint,
+			"content_type": resp.Header.Get("Content-Type"),
+			"body":         summarizeErrorBody(resp.Header.Get("Content-Type"), data),
+		}).Warn("chutes: stream bootstrap non-2xx")
+		recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+		appendAPIResponseChunk(ctx, e.cfg, data)
 
 		if chutesIsRetryableStatus(resp.StatusCode) && attempt < attempts-1 {
 			// Optional: respect upstream Retry-After, but cap to a short cooldown to avoid
@@ -309,8 +358,13 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800)
 		var param any
+		loggedLines := 0
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			if loggedLines < 8 {
+				loggedLines++
+				appendAPIResponseChunk(ctx, e.cfg, line)
+			}
 			if detail, ok := parseOpenAIStreamUsage(line); ok {
 				reporter.publish(ctx, detail)
 			}
