@@ -68,7 +68,23 @@ func (m *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 func SetupBaseLogger() {
 	setupOnce.Do(func() {
 		log.SetOutput(os.Stdout)
-		log.SetLevel(log.InfoLevel)
+		// Default log level is info; can be overridden via env.
+		level := log.InfoLevel
+		if env := strings.ToLower(strings.TrimSpace(os.Getenv("LOG_LEVEL"))); env != "" {
+			if parsed, err := log.ParseLevel(env); err == nil {
+				level = parsed
+			}
+		}
+		// VERBOSE_LOGGING enables debug-level logging and request/response snippet capture.
+		if env := strings.ToLower(strings.TrimSpace(os.Getenv("VERBOSE_LOGGING"))); env != "" {
+			switch env {
+			case "1", "true", "yes", "y", "on":
+				level = log.DebugLevel
+			case "0", "false", "no", "n", "off":
+				// no-op
+			}
+		}
+		log.SetLevel(level)
 		log.SetReportCaller(true)
 		log.SetFormatter(&LogFormatter{})
 
