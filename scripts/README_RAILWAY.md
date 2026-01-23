@@ -27,6 +27,7 @@
 
 - `AUTH_DIR_NAME` (default `auths_railway`) - folder name created at repo root
 - `FORCE_BUILD` (default `0`) - set to `1` (or any non-`0`) to force `go build` even if `./cli-proxy-api` already exists
+- `VERBOSE_LOGGING` (default unset) - when truthy, enables debug-level logging and request/response snippet capture (useful on Railway when diagnosing issues).
 - `COPILOT_AGENT_INITIATOR_PERSIST` (default `true`) - when truthy, writes `copilot-api-key[].agent-initiator-persist: true` into `config.yaml`.
   - What it is: the **normal/expected agentic behavior** — once a workflow is in an agent loop, keep follow-up calls marked as agent.
   - What it does: if `prompt_cache_key` is present, once the proxy sees an agent-ish request for that cache key, it will keep setting `X-Initiator: agent` for subsequent requests using the same cache key.
