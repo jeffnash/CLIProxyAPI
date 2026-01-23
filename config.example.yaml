@@ -40,6 +40,10 @@ api-keys:
 # Enable debug logging
 debug: false
 
+# When true, emit detailed per-request logs (request/response snippets where supported).
+# Tip: `VERBOSE_LOGGING=1` enables both debug + request-log at runtime (useful for Railway troubleshooting).
+request-log: false
+
 # When true, disable high-overhead HTTP middleware features to reduce per-request memory usage under high concurrency.
 commercial-mode: false
 
@@ -57,6 +61,9 @@ logs-max-total-size-mb: 0
 
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
+
+# When true, disables quota cooldown scheduling (immediate re-selection behavior).
+disable-cooling: false
 
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 proxy-url: ""
@@ -82,6 +89,10 @@ routing:
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false
 
+# ScannerBufferSize defines the buffer size for reading response streams (in bytes).
+# If 0, a default of 20MB is used.
+scanner-buffer-size: 0
+
 # When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
 nonstream-keepalive-interval: 0
 
@@ -89,6 +100,17 @@ nonstream-keepalive-interval: 0
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+#   disable-proxy-buffering: false # Default: false. When true, adds "X-Accel-Buffering: no" to SSE responses.
+
+# Advanced (optional) auth provider configuration.
+# Most users only need top-level `api-keys:`. This is here for extensibility when embedding the SDK.
+#
+# auth:
+#   providers:
+#     - name: "config-inline"
+#       type: "config-api-key"
+#       api-keys:
+#         - "your-api-key-1"
 
 # When true, enable official Codex instructions injection for Codex API requests.
 # When false (default), CodexInstructionsForModel returns immediately without modification.
@@ -192,6 +214,35 @@ codex-instructions-enabled: false
 #    profile-arn: "arn:aws:codewhisperer:us-east-1:..."
 #    proxy-url: "socks5://proxy.example.com:1080" # optional: proxy override
 
+# Optional global preferred Kiro endpoint/quota.
+# Values: "ide" (default, CodeWhisperer) or "cli" (Amazon Q).
+#kiro-preferred-endpoint: "ide"
+
+# Grok (X.AI) configuration (SSO cookies).
+# Note: Grok uses SSO cookies from grok.com, not API keys.
+#grok-api-key:
+#  - sso-token: ""            # raw JWT from grok.com "sso" cookie (without "sso=" prefix)
+#    cf-clearance: ""         # optional Cloudflare clearance cookie
+#    token-type: "normal"     # normal|super
+#    label: "primary"         # optional label
+#    proxy-url: ""            # optional per-account proxy
+#
+# Optional Grok behavior configuration (headers, stream timeouts, response translation).
+#grok:
+#  temporary: true
+#  dynamic-statsig: true
+#  x-statsig-id: ""           # used only when dynamic-statsig=false
+#  cf-clearance: ""           # global Cloudflare clearance cookie
+#  proxy-url: ""              # per-provider proxy override
+#  accept-language: "en-US,en;q=0.9"
+#  show-thinking: true
+#  filtered-tags: []
+#  image-mode: "url"          # url|base64
+#  stream-chunk-timeout: 0
+#  stream-first-chunk-timeout: 0
+#  stream-total-timeout: 0
+#  request-timeout: 120
+
 # OpenAI compatibility providers
 # openai-compatibility:
 #   - name: "openrouter" # The name of the provider; it will be used in the user agent and other places.
@@ -206,19 +257,6 @@ codex-instructions-enabled: false
 #     models: # The models supported by the provider.
 #       - name: "moonshotai/kimi-k2:free" # The actual model name.
 #         alias: "kimi-k2" # The alias used in the API.
-+
-+# Passthrough model routes (map a unique local model id to an upstream API).
-+# Useful when multiple providers advertise the same model name (e.g. OAuth + passthru):
-+#   - clients request model-routing-name (unique)
-+#   - passthru forwards upstream-model/model to the upstream
-+#
-+# passthru:
-+#   - model: "glm-4.7"                # upstream model name (sent to provider)
-+#     model-routing-name: "zai-glm-4.7" # optional unique local routing id
-+#     protocol: "claude"              # openai|claude|codex
-+#     base-url: "https://api.z.ai/api/anthropic"
-+#     api-key: "za-..."
-
 # Vertex API keys (Vertex-compatible endpoints, use API key + base URL)
 # vertex-api-key:
 #   - api-key: "vk-123..."                        # x-goog-api-key header
@@ -266,6 +304,18 @@ codex-instructions-enabled: false
 #       to: "gemini-claude-sonnet-4-5-thinking"
 #     - from: "claude-haiku-4-5-20251001"
 #       to: "gemini-2.5-flash"
+
+# Chutes configuration (optional; OpenAI-compatible upstream).
+# Route explicitly via `model: "chutes-<model>"` or expose non-prefixed IDs depending on priority.
+#chutes:
+#  api-key: ""                # required to enable Chutes
+#  base-url: "https://llm.chutes.ai/v1"
+#  models: []                 # optional allowlist (model roots)
+#  models-exclude: []         # optional denylist (model roots)
+#  priority: "fallback"       # fallback (default) or primary
+#  tee-preference: "prefer"   # prefer (default), avoid, or both
+#  proxy-url: ""              # per-auth proxy override
+#  max-retries: 4             # retry intermittent 429s; set to 0 to disable
 
 # Global OAuth model name aliases (per channel)
 # These aliases rename model IDs for both model listing and request routing.

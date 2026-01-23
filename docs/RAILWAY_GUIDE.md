@@ -155,3 +155,5 @@ curl https://your-url.up.railway.app/v1/chat/completions \
 - **Auth Errors:** If your session expires, you must repeat **Step 1 & 2** and update the `AUTH_BUNDLE` variable in Railway.
 - **Port Issues:** Railway automatically assigns a port. The script is designed to detect `$PORT` automatically.
 - **Need more logs:** Set `VERBOSE_LOGGING=1` to enable debug-level logging and request logging (be careful with sensitive data in logs).
+- **Control log level:** Set `LOG_LEVEL=debug|info|warn|error` to control verbosity without enabling snippet capture.
+- **Read-only filesystem issues:** Set `WRITABLE_PATH=/tmp/cli-proxy-api` to force logs/static assets into a writable folder; use `MANAGEMENT_STATIC_PATH` to explicitly control where `management.html` is stored/served from.
