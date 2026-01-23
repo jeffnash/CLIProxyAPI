@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
@@ -48,7 +49,7 @@ type upstreamAttempt struct {
 
 // recordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequestLog) {
-	if cfg == nil || !cfg.RequestLog {
+	if cfg == nil || (!cfg.RequestLog && !internallogging.VerboseEnabled()) {
 		return
 	}
 	ginCtx := ginContextFrom(ctx)
@@ -77,7 +78,7 @@ func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequ
 	writeHeaders(builder, info.Headers)
 	builder.WriteString("\nBody:\n")
 	if len(info.Body) > 0 {
-		builder.WriteString(string(bytes.Clone(info.Body)))
+		builder.WriteString(truncateForLog(bytes.Clone(info.Body), 8*1024))
 	} else {
 		builder.WriteString("<empty>")
 	}
@@ -95,7 +96,7 @@ func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequ
 
 // recordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
 func recordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
-	if cfg == nil || !cfg.RequestLog {
+	if cfg == nil || (!cfg.RequestLog && !internallogging.VerboseEnabled()) {
 		return
 	}
 	ginCtx := ginContextFrom(ctx)
@@ -121,7 +122,7 @@ func recordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status i
 
 // recordAPIResponseError adds an error entry for the latest attempt when no HTTP response is available.
 func recordAPIResponseError(ctx context.Context, cfg *config.Config, err error) {
-	if cfg == nil || !cfg.RequestLog || err == nil {
+	if cfg == nil || (!cfg.RequestLog && !internallogging.VerboseEnabled()) || err == nil {
 		return
 	}
 	ginCtx := ginContextFrom(ctx)
@@ -146,13 +147,14 @@ func recordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 
 // appendAPIResponseChunk appends an upstream response chunk to Gin context for request logging.
 func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byte) {
-	if cfg == nil || !cfg.RequestLog {
+	if cfg == nil || (!cfg.RequestLog && !internallogging.VerboseEnabled()) {
 		return
 	}
 	data := bytes.TrimSpace(bytes.Clone(chunk))
 	if len(data) == 0 {
 		return
 	}
+	data = []byte(truncateForLog(data, 8*1024))
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
 		return
@@ -333,6 +335,21 @@ func summarizeErrorBody(contentType string, body []byte) string {
 		return "[html body omitted]"
 	}
 	return string(body)
+}
+
+func truncateForLog(data []byte, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = 1024
+	}
+	if len(data) <= maxBytes {
+		return string(data)
+	}
+	suffix := fmt.Sprintf("\n... (truncated, %d bytes shown of %d)", maxBytes, len(data))
+	cut := maxBytes
+	if cut < 0 {
+		cut = 0
+	}
+	return string(data[:cut]) + suffix
 }
 
 func extractHTMLTitle(body []byte) string {

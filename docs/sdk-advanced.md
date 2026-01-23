@@ -120,6 +120,19 @@ models := []*cliproxy.ModelInfo{
 cliproxy.GlobalModelRegistry().RegisterClient(authID, "myprov", models)
 ```
 
+## Verbose Logging (Railway)
+
+For debugging intermittent upstream issues, you can enable verbose logging without changing YAML.
+
+- `VERBOSE_LOGGING=1` enables:
+  - debug-level logs (logrus)
+  - request/response snippet capture (equivalent to enabling `request-log`)
+- `VERBOSE_LOGGING=0` disables the env override.
+
+Notes:
+- Snippet capture is truncated to avoid huge logs.
+- Sensitive headers are masked.
+
 The embedded server calls this automatically for built‑in providers; for custom providers, register during startup (e.g., after loading auths) or upon auth registration hooks.
 
 ## Credentials & Transports

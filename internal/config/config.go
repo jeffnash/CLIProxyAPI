@@ -632,6 +632,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 				// Missing and optional: return empty config (cloud deploy standby).
 				return &Config{}, nil
 			}
+
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
@@ -736,6 +737,18 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if env := strings.TrimSpace(os.Getenv("STREAMING_KEEPALIVE_SECONDS")); env != "" {
 		if seconds, errParse := strconv.Atoi(env); errParse == nil && seconds > 0 {
 			cfg.Streaming.KeepAliveSeconds = seconds
+		}
+	}
+
+	// VERBOSE_LOGGING enables debug-level logging and request/response snippet capture.
+	// This is useful for Railway deployments where you need more visibility without editing YAML.
+	if env := strings.TrimSpace(os.Getenv("VERBOSE_LOGGING")); env != "" {
+		switch strings.ToLower(env) {
+		case "true", "1", "yes", "y", "on":
+			cfg.Debug = true
+			cfg.RequestLog = true
+		case "false", "0", "no", "n", "off":
+			// no-op: keep config values
 		}
 	}
 
