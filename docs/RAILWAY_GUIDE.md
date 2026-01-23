@@ -80,6 +80,7 @@ To enable Chutes on Railway, set these environment variables:
   - Note: `chutes-` prefixed aliases remain registered so explicit routing keeps working.
 - `CHUTES_TEE_PREFERENCE` (optional): `prefer` (default), `avoid`, or `both`.
 - `CHUTES_PROXY_URL` (optional): per-auth proxy URL for Chutes requests.
+- `CHUTES_MAX_RETRIES` (optional): max retry attempts for intermittent 429s (default `4`; set `0` to disable).
 
 Tip: If you want Chutes available but don’t want it to show up in `/v1/models` unless needed, keep `CHUTES_PRIORITY=fallback` and use `chutes-...` for explicit routing.
 
@@ -153,3 +154,4 @@ curl https://your-url.up.railway.app/v1/chat/completions \
 - **Build Fails:** If the binary doesn't build correctly on Railway, add an environment variable `FORCE_BUILD=1`.
 - **Auth Errors:** If your session expires, you must repeat **Step 1 & 2** and update the `AUTH_BUNDLE` variable in Railway.
 - **Port Issues:** Railway automatically assigns a port. The script is designed to detect `$PORT` automatically.
+- **Need more logs:** Set `VERBOSE_LOGGING=1` to enable debug-level logging and request logging (be careful with sensitive data in logs).
