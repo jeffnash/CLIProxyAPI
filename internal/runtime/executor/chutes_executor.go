@@ -125,12 +125,6 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		"model":          req.Model,
 		"upstream_model": apiModel,
 		"endpoint":       "chat.completions",
-		"stream":         true,
-	}).Info("chutes: request")
-	log.WithFields(log.Fields{
-		"model":          req.Model,
-		"upstream_model": apiModel,
-		"endpoint":       "chat.completions",
 		"stream":         false,
 	}).Info("chutes: request")
 
@@ -179,6 +173,8 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			}
 			return resp, errDo
 		}
+		// Always record upstream status/headers for request logging (including happy paths).
+		recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
 		func() {
 			defer httpResp.Body.Close()
@@ -192,7 +188,6 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 					"content_type": httpResp.Header.Get("Content-Type"),
 					"body":         summarizeErrorBody(httpResp.Header.Get("Content-Type"), data),
 				}).Warn("chutes: upstream non-2xx")
-				recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 				appendAPIResponseChunk(ctx, e.cfg, data)
 			} else {
 				log.WithFields(log.Fields{
@@ -293,6 +288,8 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			return nil, errDo
 		}
+		// Always record upstream status/headers for request logging (including happy paths).
+		recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			httpResp = resp
@@ -310,7 +307,6 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			"content_type": resp.Header.Get("Content-Type"),
 			"body":         summarizeErrorBody(resp.Header.Get("Content-Type"), data),
 		}).Warn("chutes: stream bootstrap non-2xx")
-		recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 		appendAPIResponseChunk(ctx, e.cfg, data)
 
 		if chutesIsRetryableStatus(resp.StatusCode) && attempt < attempts-1 {
