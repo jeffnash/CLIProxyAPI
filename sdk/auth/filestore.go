@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,18 +76,26 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		if existing, errRead := os.ReadFile(path); errRead == nil {
 			// Use metadataEqualIgnoringTimestamps to skip writes when only timestamp fields change.
 			// This prevents the token refresh loop caused by timestamp/expired/expires_in changes.
-			if metadataEqualIgnoringTimestamps(existing, raw) {
+			if metadataEqualIgnoringTimestamps(existing, raw, auth.Provider) {
 				return path, nil
 			}
-		} else if errRead != nil && !os.IsNotExist(errRead) {
+			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+			if errOpen != nil {
+				return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
+			}
+			if _, errWrite := file.Write(raw); errWrite != nil {
+				_ = file.Close()
+				return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
+			}
+			if errClose := file.Close(); errClose != nil {
+				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
+			}
+			return path, nil
+		} else if !os.IsNotExist(errRead) {
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 		}
-		tmp := path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("auth filestore: write temp failed: %w", errWrite)
-		}
-		if errRename := os.Rename(tmp, path); errRename != nil {
-			return "", fmt.Errorf("auth filestore: rename failed: %w", errRename)
+		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
 		}
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
@@ -178,6 +187,30 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
+	}
+	if provider == "antigravity" {
+		projectID := ""
+		if pid, ok := metadata["project_id"].(string); ok {
+			projectID = strings.TrimSpace(pid)
+		}
+		if projectID == "" {
+			accessToken := ""
+			if token, ok := metadata["access_token"].(string); ok {
+				accessToken = strings.TrimSpace(token)
+			}
+			if accessToken != "" {
+				fetchedProjectID, errFetch := FetchAntigravityProjectID(context.Background(), accessToken, http.DefaultClient)
+				if errFetch == nil && strings.TrimSpace(fetchedProjectID) != "" {
+					metadata["project_id"] = strings.TrimSpace(fetchedProjectID)
+					if raw, errMarshal := json.Marshal(metadata); errMarshal == nil {
+						if file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600); errOpen == nil {
+							_, _ = file.Write(raw)
+							_ = file.Close()
+						}
+					}
+				}
+			}
+		}
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -340,7 +373,10 @@ func jsonEqual(a, b []byte) bool {
 // ignoring fields that change on every refresh but don't affect functionality.
 // This prevents unnecessary file writes that would trigger watcher events and
 // create refresh loops.
-func metadataEqualIgnoringTimestamps(a, b []byte) bool {
+// The provider parameter controls whether access_token is ignored: providers like
+// Google OAuth (gemini, gemini-cli) can re-fetch tokens when needed, while others
+// like iFlow require the refreshed token to be persisted.
+func metadataEqualIgnoringTimestamps(a, b []byte, provider string) bool {
 	var objA, objB map[string]any
 	if err := json.Unmarshal(a, &objA); err != nil {
 		return false
@@ -351,9 +387,15 @@ func metadataEqualIgnoringTimestamps(a, b []byte) bool {
 
 	// Fields to ignore: these change on every refresh but don't affect authentication logic.
 	// - timestamp, expired, expires_in, last_refresh: time-related fields that change on refresh
-	// - access_token: Google OAuth returns a new access_token on each refresh, this is expected
-	//   and shouldn't trigger file writes (the new token will be fetched again when needed)
-	ignoredFields := []string{"timestamp", "expired", "expires_in", "last_refresh", "access_token"}
+	ignoredFields := []string{"timestamp", "expired", "expires_in", "last_refresh"}
+
+	// For providers that can re-fetch tokens when needed (e.g., Google OAuth),
+	// we ignore access_token to avoid unnecessary file writes.
+	switch provider {
+	case "gemini", "gemini-cli", "antigravity":
+		ignoredFields = append(ignoredFields, "access_token")
+	}
+
 	for _, field := range ignoredFields {
 		delete(objA, field)
 		delete(objB, field)

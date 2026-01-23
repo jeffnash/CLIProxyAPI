@@ -35,55 +35,53 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 	// Model
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
-	// Reasoning effort -> thinkingBudget/include_thoughts
-	// Note: OpenAI official fields take precedence over extra_body.google.thinking_config
-	// Only apply numeric budgets for models that use budgets (not discrete levels) to avoid
-	// incorrectly applying thinkingBudget for level-based models like gpt-5. Gemini 3 models
-	// use thinkingLevel/includeThoughts instead.
+	// Apply thinking configuration: convert OpenAI reasoning_effort to Gemini thinkingConfig.
+	// Inline translation-only mapping; capability checks happen later in ApplyThinking.
 	re := gjson.GetBytes(rawJSON, "reasoning_effort")
-	hasOfficialThinking := re.Exists()
-	if hasOfficialThinking && util.ModelSupportsThinking(modelName) {
+	if re.Exists() {
 		effort := strings.ToLower(strings.TrimSpace(re.String()))
-		if util.IsGemini3Model(modelName) {
-			switch effort {
-			case "none":
-				out, _ = sjson.DeleteBytes(out, "generationConfig.thinkingConfig")
-			case "auto":
-				includeThoughts := true
-				out = util.ApplyGeminiThinkingLevel(out, "", &includeThoughts)
-			default:
-				if level, ok := util.ValidateGemini3ThinkingLevel(modelName, effort); ok {
-					out = util.ApplyGeminiThinkingLevel(out, level, nil)
+		if effort != "" {
+			thinkingPath := "generationConfig.thinkingConfig"
+			if effort == "auto" {
+				out, _ = sjson.SetBytes(out, thinkingPath+".thinkingBudget", -1)
+				out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", true)
+			} else {
+				out, _ = sjson.SetBytes(out, thinkingPath+".thinkingLevel", effort)
+				out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", effort != "none")
+			}
+		}
+	} else {
+		// OpenRouter-style extension: extra_body.google.thinking_config → generationConfig.thinkingConfig.
+		// This is applied only when reasoning_effort is not provided so official parameter has priority.
+		extraThinking := gjson.GetBytes(rawJSON, "extra_body.google.thinking_config")
+		if extraThinking.Exists() && extraThinking.IsObject() {
+			thinkingPath := "generationConfig.thinkingConfig"
+
+			// Budget (numeric): thinkingBudget / thinking_budget.
+			if v := extraThinking.Get("thinkingBudget"); v.Exists() && v.Type == gjson.Number {
+				out, _ = sjson.SetBytes(out, thinkingPath+".thinkingBudget", v.Int())
+			} else if v := extraThinking.Get("thinking_budget"); v.Exists() && v.Type == gjson.Number {
+				out, _ = sjson.SetBytes(out, thinkingPath+".thinkingBudget", v.Int())
+			}
+
+			// Level (string): thinkingLevel / thinking_level.
+			if v := extraThinking.Get("thinkingLevel"); v.Exists() && v.Type == gjson.String {
+				level := strings.ToLower(strings.TrimSpace(v.String()))
+				if level != "" {
+					out, _ = sjson.SetBytes(out, thinkingPath+".thinkingLevel", level)
+				}
+			} else if v := extraThinking.Get("thinking_level"); v.Exists() && v.Type == gjson.String {
+				level := strings.ToLower(strings.TrimSpace(v.String()))
+				if level != "" {
+					out, _ = sjson.SetBytes(out, thinkingPath+".thinkingLevel", level)
 				}
 			}
-		} else if !util.ModelUsesThinkingLevels(modelName) {
-			out = util.ApplyReasoningEffortToGemini(out, effort)
-		}
-	}
 
-	// Cherry Studio extension extra_body.google.thinking_config (effective only when official fields are absent)
-	// Only apply for models that use numeric budgets, not discrete levels.
-	if !hasOfficialThinking && util.ModelSupportsThinking(modelName) && !util.ModelUsesThinkingLevels(modelName) {
-		if tc := gjson.GetBytes(rawJSON, "extra_body.google.thinking_config"); tc.Exists() && tc.IsObject() {
-			var setBudget bool
-			var budget int
-
-			if v := tc.Get("thinkingBudget"); v.Exists() {
-				budget = int(v.Int())
-				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
-				setBudget = true
-			} else if v := tc.Get("thinking_budget"); v.Exists() {
-				budget = int(v.Int())
-				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.thinkingBudget", budget)
-				setBudget = true
-			}
-
-			if v := tc.Get("includeThoughts"); v.Exists() {
-				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.include_thoughts", v.Bool())
-			} else if v := tc.Get("include_thoughts"); v.Exists() {
-				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.include_thoughts", v.Bool())
-			} else if setBudget && budget != 0 {
-				out, _ = sjson.SetBytes(out, "generationConfig.thinkingConfig.include_thoughts", true)
+			// IncludeThoughts (bool): includeThoughts / include_thoughts.
+			if v := extraThinking.Get("includeThoughts"); v.Exists() && (v.Type == gjson.True || v.Type == gjson.False) {
+				out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", v.Bool())
+			} else if v := extraThinking.Get("include_thoughts"); v.Exists() && (v.Type == gjson.True || v.Type == gjson.False) {
+				out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", v.Bool())
 			}
 		}
 	}
@@ -97,6 +95,13 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 	}
 	if tkr := gjson.GetBytes(rawJSON, "top_k"); tkr.Exists() && tkr.Type == gjson.Number {
 		out, _ = sjson.SetBytes(out, "generationConfig.topK", tkr.Num)
+	}
+
+	// Candidate count (OpenAI 'n' parameter)
+	if n := gjson.GetBytes(rawJSON, "n"); n.Exists() && n.Type == gjson.Number {
+		if val := n.Int(); val > 1 {
+			out, _ = sjson.SetBytes(out, "generationConfig.candidateCount", val)
+		}
 	}
 
 	// Map OpenAI modalities -> Gemini generationConfig.responseModalities
@@ -165,6 +170,7 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			}
 		}
 
+		systemPartIndex := 0
 		for i := 0; i < len(arr); i++ {
 			m := arr[i]
 			role := m.Get("role").String()
@@ -174,16 +180,19 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				// system -> system_instruction as a user message style
 				if content.Type == gjson.String {
 					out, _ = sjson.SetBytes(out, "system_instruction.role", "user")
-					out, _ = sjson.SetBytes(out, "system_instruction.parts.0.text", content.String())
+					out, _ = sjson.SetBytes(out, fmt.Sprintf("system_instruction.parts.%d.text", systemPartIndex), content.String())
+					systemPartIndex++
 				} else if content.IsObject() && content.Get("type").String() == "text" {
 					out, _ = sjson.SetBytes(out, "system_instruction.role", "user")
-					out, _ = sjson.SetBytes(out, "system_instruction.parts.0.text", content.Get("text").String())
+					out, _ = sjson.SetBytes(out, fmt.Sprintf("system_instruction.parts.%d.text", systemPartIndex), content.Get("text").String())
+					systemPartIndex++
 				} else if content.IsArray() {
 					contents := content.Array()
 					if len(contents) > 0 {
-						out, _ = sjson.SetBytes(out, "request.systemInstruction.role", "user")
+						out, _ = sjson.SetBytes(out, "system_instruction.role", "user")
 						for j := 0; j < len(contents); j++ {
-							out, _ = sjson.SetBytes(out, fmt.Sprintf("request.systemInstruction.parts.%d.text", j), contents[j].Get("text").String())
+							out, _ = sjson.SetBytes(out, fmt.Sprintf("system_instruction.parts.%d.text", systemPartIndex), contents[j].Get("text").String())
+							systemPartIndex++
 						}
 					}
 				}
@@ -198,7 +207,10 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 					for _, item := range items {
 						switch item.Get("type").String() {
 						case "text":
-							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", item.Get("text").String())
+							text := item.Get("text").String()
+							if text != "" {
+								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
+							}
 							p++
 						case "image_url":
 							imageURL := item.Get("image_url.url").String()
@@ -243,6 +255,10 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 					for _, item := range content.Array() {
 						switch item.Get("type").String() {
 						case "text":
+							text := item.Get("text").String()
+							if text != "" {
+								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
+							}
 							p++
 						case "image_url":
 							// If the assistant returned an inline data URL, preserve it for history fidelity.
