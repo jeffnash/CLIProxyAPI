@@ -22,6 +22,42 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func writeGeminiCLISSEChunk(w http.ResponseWriter, chunk []byte) bool {
+	// Drop empty/whitespace-only chunks to avoid emitting `data: \n\n`.
+	chunk = bytes.TrimSuffix(chunk, []byte("\r"))
+	if len(bytes.TrimSpace(chunk)) == 0 {
+		return false
+	}
+
+	// Skip done markers (both wrapped and raw).
+	if bytes.Equal(chunk, []byte("data: [DONE]")) || bytes.Equal(chunk, []byte("[DONE]")) {
+		return false
+	}
+
+	// Normalize to a payload without leading "data:".
+	if bytes.HasPrefix(chunk, []byte("data:")) {
+		payload := bytes.TrimSpace(chunk[5:])
+		if len(payload) == 0 {
+			return false
+		}
+		chunk = payload
+	}
+
+	// Write SSE-compliant multiline data.
+	lines := bytes.Split(bytes.TrimSuffix(chunk, []byte("\n")), []byte("\n"))
+	for _, line := range lines {
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(line)
+		_, _ = w.Write([]byte("\n"))
+	}
+	_, _ = w.Write([]byte("\n"))
+	return true
+}
+
 // GeminiCLIAPIHandler contains the handlers for Gemini CLI API endpoints.
 // It holds a pool of clients to interact with the backend service.
 type GeminiCLIAPIHandler struct {
@@ -195,16 +231,7 @@ func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flus
 		KeepAliveInterval: keepAliveInterval,
 		WriteChunk: func(chunk []byte) {
 			if alt == "" {
-				if bytes.Equal(chunk, []byte("data: [DONE]")) || bytes.Equal(chunk, []byte("[DONE]")) {
-					return
-				}
-
-				if !bytes.HasPrefix(chunk, []byte("data:")) {
-					_, _ = c.Writer.Write([]byte("data: "))
-				}
-
-				_, _ = c.Writer.Write(chunk)
-				_, _ = c.Writer.Write([]byte("\n\n"))
+				_ = writeGeminiCLISSEChunk(c.Writer, chunk)
 			} else {
 				_, _ = c.Writer.Write(chunk)
 			}
