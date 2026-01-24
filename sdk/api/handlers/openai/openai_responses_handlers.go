@@ -27,8 +27,10 @@ type OpenAIResponsesAPIHandler struct {
 }
 
 type responsesSSEWriteState struct {
-	wroteNonEmptyData bool
-	lastWasDelimiter  bool
+	wroteNonEmptyData   bool   // true if we've ever written non-empty data (for suppressing leading delimiters)
+	currentEventHasData bool   // true if current event block has non-empty data since last boundary
+	lastWasDelimiter    bool   // true if last write was a delimiter
+	pendingEventLine    []byte // buffered event: line, written only when non-empty data arrives
 }
 
 func (st *responsesSSEWriteState) writeLine(w http.ResponseWriter, line []byte) {
@@ -37,45 +39,92 @@ func (st *responsesSSEWriteState) writeLine(w http.ResponseWriter, line []byte) 
 
 	// Treat empty line as an SSE delimiter.
 	if len(line) == 0 {
-		if !st.wroteNonEmptyData {
+		// Suppress leading delimiters (before any data) and delimiters for event-only blocks.
+		if !st.wroteNonEmptyData || !st.currentEventHasData {
+			// Clear pending event line since this event block had no data.
+			st.pendingEventLine = nil
 			return
 		}
 		_, _ = w.Write([]byte("\n"))
 		st.lastWasDelimiter = true
+		st.currentEventHasData = false // reset per-event flag at boundary
+		st.pendingEventLine = nil
 		return
 	}
 
-	// Avoid injecting blank lines before the first non-empty data payload.
-	if bytes.HasPrefix(line, []byte("event:")) && st.wroteNonEmptyData && !st.lastWasDelimiter {
-		_, _ = w.Write([]byte("\n"))
+	// Buffer event: lines until we see non-empty data.
+	if bytes.HasPrefix(line, []byte("event:")) {
+		st.pendingEventLine = append([]byte(nil), line...) // copy
+		return
+	}
+
+	// Filter empty data: payloads to prevent downstream json.loads("") errors.
+	// Empty "data:" lines would cause SSE decoders to emit events with data="" which fails JSON parsing.
+	if bytes.HasPrefix(line, []byte("data:")) {
+		if len(bytes.TrimSpace(line[5:])) == 0 {
+			return
+		}
+		// Non-empty data: flush pending event line first.
+		if st.pendingEventLine != nil {
+			// Inject delimiter before event if we have prior data and not already at boundary.
+			if st.currentEventHasData && !st.lastWasDelimiter {
+				_, _ = w.Write([]byte("\n"))
+			}
+			_, _ = w.Write(st.pendingEventLine)
+			_, _ = w.Write([]byte("\n"))
+			st.pendingEventLine = nil
+			st.lastWasDelimiter = false
+		}
+		st.wroteNonEmptyData = true
+		st.currentEventHasData = true
 	}
 
 	_, _ = w.Write(line)
 	_, _ = w.Write([]byte("\n"))
 
 	st.lastWasDelimiter = false
-	if bytes.HasPrefix(line, []byte("data:")) && len(bytes.TrimSpace(line[5:])) > 0 {
-		st.wroteNonEmptyData = true
-	}
 }
 
 func (st *responsesSSEWriteState) writeChunk(w http.ResponseWriter, chunk []byte) {
 	// Handle chunks that contain multiple SSE lines (some translators emit "event: ...\ndata: ...").
 	// Split on newline and run the line-level logic per line so state tracking works correctly.
+	//
+	// Special case: if chunk ends with a single \n (but not \n\n), drop the trailing empty segment
+	// to avoid treating it as a delimiter. This preserves buffered event lines for subsequent data.
+	// - "event: foo\n" splits to ["event: foo", ""] - drop the trailing ""
+	// - "event: foo\n\n" splits to ["event: foo", "", ""] - keep one "" as delimiter
+	// - "" (empty chunk from upstream) - honor as explicit delimiter signal
 	lines := bytes.Split(chunk, []byte("\n"))
+
+	// If chunk is empty, pass through as-is (explicit delimiter from upstream).
+	if len(chunk) == 0 {
+		st.writeLine(w, chunk)
+		return
+	}
+
+	// Drop trailing empty segment from single trailing newline, but keep for double newline.
+	// Double newline produces [..., "", ""], so we check if last two are both empty.
+	if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
+		if len(lines) < 2 || len(lines[len(lines)-2]) != 0 {
+			// Single trailing newline - drop the empty segment
+			lines = lines[:len(lines)-1]
+		}
+	}
+
 	for i := range lines {
 		st.writeLine(w, lines[i])
 	}
 }
 
 func (st *responsesSSEWriteState) writeDone(w http.ResponseWriter) {
-	// Only emit a delimiter if we've actually emitted a non-empty data payload and we're not already
+	// Only emit a delimiter if the current event block has non-empty data and we're not already
 	// at an event boundary. This avoids dispatching empty SSE events downstream.
-	if !st.wroteNonEmptyData || st.lastWasDelimiter {
+	if !st.currentEventHasData || st.lastWasDelimiter {
 		return
 	}
 	_, _ = w.Write([]byte("\n"))
 	st.lastWasDelimiter = true
+	st.currentEventHasData = false
 }
 
 // NewOpenAIResponsesAPIHandler creates a new OpenAIResponses API handlers instance.
