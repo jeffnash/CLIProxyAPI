@@ -7,6 +7,7 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,6 +23,27 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+func writeOpenAISSEData(w http.ResponseWriter, chunk []byte) bool {
+	if len(bytes.TrimSpace(chunk)) == 0 {
+		return false
+	}
+	// Write SSE-compliant multiline data: split on '\n' and emit one "data:" line per segment.
+	// (Streaming JSON chunks should not contain literal newlines, but this avoids malformed framing
+	// if they do.)
+	lines := bytes.Split(bytes.TrimSuffix(chunk, []byte("\n")), []byte("\n"))
+	for _, line := range lines {
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		if len(line) == 0 {
+			continue
+		}
+		_, _ = fmt.Fprint(w, "data: ")
+		_, _ = w.Write(line)
+		_, _ = fmt.Fprint(w, "\n")
+	}
+	_, _ = fmt.Fprint(w, "\n")
+	return true
+}
 
 // OpenAIAPIHandler contains the handlers for OpenAI API endpoints.
 // It holds a pool of clients to interact with the backend service.
@@ -478,10 +500,14 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 				return
 			}
 
+			if len(bytes.TrimSpace(chunk)) == 0 {
+				continue
+			}
+
 			// Success! Commit to streaming headers.
 			setSSEHeaders()
 
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+			_ = writeOpenAISSEData(c.Writer, chunk)
 			flusher.Flush()
 
 			// Continue streaming the rest
@@ -589,8 +615,8 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 
 			// Write the first chunk
 			converted := convertChatCompletionsStreamChunkToCompletions(chunk)
-			if converted != nil {
-				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(converted))
+			if converted != nil && len(bytes.TrimSpace(converted)) > 0 {
+				_ = writeOpenAISSEData(c.Writer, converted)
 				flusher.Flush()
 			}
 
@@ -610,7 +636,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 							return
 						}
 						converted := convertChatCompletionsStreamChunkToCompletions(chunk)
-						if converted == nil {
+						if converted == nil || len(bytes.TrimSpace(converted)) == 0 {
 							continue
 						}
 						select {
@@ -633,7 +659,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+			_ = writeOpenAISSEData(c.Writer, chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
@@ -648,7 +674,7 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 				errText = errMsg.Error.Error()
 			}
 			body := handlers.BuildErrorResponseBody(status, errText)
-			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
+			_ = writeOpenAISSEData(c.Writer, body)
 		},
 		WriteDone: func() {
 			_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")

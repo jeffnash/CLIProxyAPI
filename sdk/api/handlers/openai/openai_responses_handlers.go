@@ -26,6 +26,58 @@ type OpenAIResponsesAPIHandler struct {
 	*handlers.BaseAPIHandler
 }
 
+type responsesSSEWriteState struct {
+	wroteNonEmptyData bool
+	lastWasDelimiter  bool
+}
+
+func (st *responsesSSEWriteState) writeLine(w http.ResponseWriter, line []byte) {
+	// Normalize CRLF.
+	line = bytes.TrimSuffix(line, []byte("\r"))
+
+	// Treat empty line as an SSE delimiter.
+	if len(line) == 0 {
+		if !st.wroteNonEmptyData {
+			return
+		}
+		_, _ = w.Write([]byte("\n"))
+		st.lastWasDelimiter = true
+		return
+	}
+
+	// Avoid injecting blank lines before the first non-empty data payload.
+	if bytes.HasPrefix(line, []byte("event:")) && st.wroteNonEmptyData && !st.lastWasDelimiter {
+		_, _ = w.Write([]byte("\n"))
+	}
+
+	_, _ = w.Write(line)
+	_, _ = w.Write([]byte("\n"))
+
+	st.lastWasDelimiter = false
+	if bytes.HasPrefix(line, []byte("data:")) && len(bytes.TrimSpace(line[5:])) > 0 {
+		st.wroteNonEmptyData = true
+	}
+}
+
+func (st *responsesSSEWriteState) writeChunk(w http.ResponseWriter, chunk []byte) {
+	// Handle chunks that contain multiple SSE lines (some translators emit "event: ...\ndata: ...").
+	// Split on newline and run the line-level logic per line so state tracking works correctly.
+	lines := bytes.Split(chunk, []byte("\n"))
+	for i := range lines {
+		st.writeLine(w, lines[i])
+	}
+}
+
+func (st *responsesSSEWriteState) writeDone(w http.ResponseWriter) {
+	// Only emit a delimiter if we've actually emitted a non-empty data payload and we're not already
+	// at an event boundary. This avoids dispatching empty SSE events downstream.
+	if !st.wroteNonEmptyData || st.lastWasDelimiter {
+		return
+	}
+	_, _ = w.Write([]byte("\n"))
+	st.lastWasDelimiter = true
+}
+
 // NewOpenAIResponsesAPIHandler creates a new OpenAIResponses API handlers instance.
 // It takes an BaseAPIHandler instance as input and returns an OpenAIResponsesAPIHandler.
 //
@@ -152,6 +204,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 
 	// Peek at the first chunk
+	writeState := &responsesSSEWriteState{}
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -175,7 +228,6 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			if !ok {
 				// Stream closed without data? Send headers and done.
 				setSSEHeaders()
-				_, _ = c.Writer.Write([]byte("\n"))
 				flusher.Flush()
 				cliCancel(nil)
 				return
@@ -185,28 +237,20 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			setSSEHeaders()
 
 			// Write first chunk logic (matching forwardResponsesStream)
-			if bytes.HasPrefix(chunk, []byte("event:")) {
-				_, _ = c.Writer.Write([]byte("\n"))
-			}
-			_, _ = c.Writer.Write(chunk)
-			_, _ = c.Writer.Write([]byte("\n"))
+			writeState.writeChunk(c.Writer, chunk)
 			flusher.Flush()
 
 			// Continue
-			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, writeState)
 			return
 		}
 	}
 }
 
-func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, writeState *responsesSSEWriteState) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			if bytes.HasPrefix(chunk, []byte("event:")) {
-				_, _ = c.Writer.Write([]byte("\n"))
-			}
-			_, _ = c.Writer.Write(chunk)
-			_, _ = c.Writer.Write([]byte("\n"))
+			writeState.writeChunk(c.Writer, chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
@@ -221,10 +265,13 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 				errText = errMsg.Error.Error()
 			}
 			body := handlers.BuildErrorResponseBody(status, errText)
-			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
+			// Write error as a well-formed SSE event without emitting a leading delimiter that could
+			// be interpreted as an empty event by downstream clients.
+			writeState.writeChunk(c.Writer, []byte("event: error\ndata: "+string(body)))
+			writeState.writeChunk(c.Writer, []byte(""))
 		},
 		WriteDone: func() {
-			_, _ = c.Writer.Write([]byte("\n"))
+			writeState.writeDone(c.Writer)
 		},
 	})
 }

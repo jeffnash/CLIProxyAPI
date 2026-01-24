@@ -6,6 +6,7 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -18,6 +19,25 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 )
+
+func writeGeminiSSEData(w http.ResponseWriter, chunk []byte) bool {
+	if len(bytes.TrimSpace(chunk)) == 0 {
+		return false
+	}
+	// Write SSE-compliant multiline data: split on '\n' and emit one "data:" line per segment.
+	lines := bytes.Split(bytes.TrimSuffix(chunk, []byte("\n")), []byte("\n"))
+	for _, line := range lines {
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		if len(line) == 0 {
+			continue
+		}
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(line)
+		_, _ = w.Write([]byte("\n"))
+	}
+	_, _ = w.Write([]byte("\n"))
+	return true
+}
 
 // GeminiAPIHandler contains the handlers for Gemini API endpoints.
 // It holds a pool of clients to interact with the backend service.
@@ -234,9 +254,9 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 
 			// Write first chunk
 			if alt == "" {
-				_, _ = c.Writer.Write([]byte("data: "))
-				_, _ = c.Writer.Write(chunk)
-				_, _ = c.Writer.Write([]byte("\n\n"))
+				if !writeGeminiSSEData(c.Writer, chunk) {
+					continue
+				}
 			} else {
 				_, _ = c.Writer.Write(chunk)
 			}
@@ -307,9 +327,7 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 		KeepAliveInterval: keepAliveInterval,
 		WriteChunk: func(chunk []byte) {
 			if alt == "" {
-				_, _ = c.Writer.Write([]byte("data: "))
-				_, _ = c.Writer.Write(chunk)
-				_, _ = c.Writer.Write([]byte("\n\n"))
+				_ = writeGeminiSSEData(c.Writer, chunk)
 			} else {
 				_, _ = c.Writer.Write(chunk)
 			}
