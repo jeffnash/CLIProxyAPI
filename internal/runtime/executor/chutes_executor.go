@@ -23,6 +23,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -225,6 +226,8 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		// Defensive: should only happen if upstream returned empty body with 2xx.
 		data = []byte("{}")
 	}
+	// Repair malformed tool_calls arguments in non-streaming response
+	data = repairChutesNonStreamToolCallArguments(data)
 	reporter.publish(ctx, parseOpenAIUsage(data))
 	reporter.ensurePublished(ctx)
 
@@ -358,6 +361,8 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		loggedLines := 0
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			// Repair malformed tool_calls arguments before processing
+			line = repairChutesToolCallArguments(line)
 			if loggedLines < 8 {
 				loggedLines++
 				appendAPIResponseChunk(ctx, e.cfg, line)
@@ -912,4 +917,189 @@ func minPositiveDuration(a, b time.Duration) time.Duration {
 func chutesShortRetryAfter() *time.Duration {
 	d := 5 * time.Second
 	return &d
+}
+
+// repairChutesToolCallArguments repairs malformed JSON in tool_calls[].function.arguments
+// fields in OpenAI chat completion streaming responses. Some models (e.g., Kimi K2) may
+// produce invalid JSON in arguments, causing downstream 400 errors.
+func repairChutesToolCallArguments(line []byte) []byte {
+	// Only process SSE data lines
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return line
+	}
+
+	jsonData := bytes.TrimSpace(trimmed[5:])
+	if len(jsonData) == 0 || jsonData[0] != '{' {
+		return line
+	}
+
+	// Check if this chunk has tool_calls with arguments
+	root := gjson.ParseBytes(jsonData)
+	toolCalls := root.Get("choices.0.delta.tool_calls")
+	if !toolCalls.Exists() || !toolCalls.IsArray() {
+		return line
+	}
+
+	modified := false
+	result := jsonData
+
+	for i, tc := range toolCalls.Array() {
+		args := tc.Get("function.arguments")
+		if !args.Exists() || args.Type != gjson.String {
+			continue
+		}
+
+		argsStr := args.String()
+		if argsStr == "" {
+			continue
+		}
+
+		// Check if arguments is valid JSON (for complete arguments in non-streaming)
+		// For streaming deltas, arguments are typically partial, so we can't validate them here.
+		// However, we can fix common issues like unescaped characters.
+		repairedArgs := repairChutesJSONString(argsStr)
+		if repairedArgs != argsStr {
+			path := fmt.Sprintf("choices.0.delta.tool_calls.%d.function.arguments", i)
+			if newResult, err := sjson.SetBytes(result, path, repairedArgs); err == nil {
+				result = newResult
+				modified = true
+				log.Debugf("chutes: repaired tool_calls arguments at index %d", i)
+			}
+		}
+	}
+
+	if modified {
+		return append([]byte("data: "), result...)
+	}
+	return line
+}
+
+// repairChutesJSONString attempts to fix common JSON string issues in tool call arguments.
+// This handles issues like unescaped newlines, tabs, and control characters within JSON strings.
+func repairChutesJSONString(input string) string {
+	if input == "" {
+		return input
+	}
+
+	// Fast path: if it's valid JSON or a valid partial JSON fragment, return as-is
+	var test interface{}
+	if json.Unmarshal([]byte(input), &test) == nil {
+		return input
+	}
+
+	// Attempt repairs for common issues
+	var result strings.Builder
+	result.Grow(len(input) + 50)
+
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(input); i++ {
+		c := input[i]
+
+		if escaped {
+			result.WriteByte(c)
+			escaped = false
+			continue
+		}
+
+		if c == '\\' {
+			result.WriteByte(c)
+			escaped = true
+			continue
+		}
+
+		if c == '"' {
+			inString = !inString
+			result.WriteByte(c)
+			continue
+		}
+
+		if inString {
+			// Escape control characters that should be escaped in JSON strings
+			switch c {
+			case '\n':
+				result.WriteString("\\n")
+			case '\r':
+				result.WriteString("\\r")
+			case '\t':
+				result.WriteString("\\t")
+			case '\b':
+				result.WriteString("\\b")
+			case '\f':
+				result.WriteString("\\f")
+			default:
+				if c < 32 {
+					// Other control characters: use \uXXXX format
+					result.WriteString(fmt.Sprintf("\\u%04x", c))
+				} else {
+					result.WriteByte(c)
+				}
+			}
+		} else {
+			result.WriteByte(c)
+		}
+	}
+
+	repaired := result.String()
+
+	// Validate the repair produced valid JSON (or at least parseable partial JSON)
+	if json.Unmarshal([]byte(repaired), &test) == nil {
+		return repaired
+	}
+
+	// If still invalid, return original (let downstream handle the error)
+	return input
+}
+
+// repairChutesNonStreamToolCallArguments repairs malformed JSON in tool_calls[].function.arguments
+// fields in non-streaming OpenAI chat completion responses.
+func repairChutesNonStreamToolCallArguments(data []byte) []byte {
+	if len(data) == 0 || data[0] != '{' {
+		return data
+	}
+
+	root := gjson.ParseBytes(data)
+	choices := root.Get("choices")
+	if !choices.Exists() || !choices.IsArray() {
+		return data
+	}
+
+	modified := false
+	result := data
+
+	for i, choice := range choices.Array() {
+		toolCalls := choice.Get("message.tool_calls")
+		if !toolCalls.Exists() || !toolCalls.IsArray() {
+			continue
+		}
+
+		for j, tc := range toolCalls.Array() {
+			args := tc.Get("function.arguments")
+			if !args.Exists() || args.Type != gjson.String {
+				continue
+			}
+
+			argsStr := args.String()
+			if argsStr == "" {
+				continue
+			}
+
+			repairedArgs := repairChutesJSONString(argsStr)
+			if repairedArgs != argsStr {
+				path := fmt.Sprintf("choices.%d.message.tool_calls.%d.function.arguments", i, j)
+				if newResult, err := sjson.SetBytes(result, path, repairedArgs); err == nil {
+					result = newResult
+					modified = true
+					log.Debugf("chutes: repaired non-stream tool_calls arguments at choice %d, index %d", i, j)
+				}
+			}
+		}
+	}
+
+	if modified {
+		log.Info("chutes: repaired malformed tool_calls arguments in non-streaming response")
+	}
+	return result
 }
