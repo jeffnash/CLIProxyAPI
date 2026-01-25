@@ -81,6 +81,7 @@ To enable Chutes on Railway, set these environment variables:
 - `CHUTES_TEE_PREFERENCE` (optional): `prefer` (default), `avoid`, or `both`.
 - `CHUTES_PROXY_URL` (optional): per-auth proxy URL for Chutes requests.
 - `CHUTES_MAX_RETRIES` (optional): max retry attempts for intermittent 429s (default `4`; set `0` to disable).
+- `CHUTES_RETRY_BACKOFF` (optional): comma-separated backoff durations in seconds for each retry attempt (default `5,15,30,60`). Example: `10,30,60,120` means wait 10s before 1st retry, 30s before 2nd, etc. If fewer values than max-retries, the last value is repeated.
 
 Tip: If you want Chutes available but don’t want it to show up in `/v1/models` unless needed, keep `CHUTES_PRIORITY=fallback` and use `chutes-...` for explicit routing.
 

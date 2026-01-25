@@ -316,6 +316,7 @@ codex-instructions-enabled: false
 #  tee-preference: "prefer"   # prefer (default), avoid, or both
 #  proxy-url: ""              # per-auth proxy override
 #  max-retries: 4             # retry intermittent 429s; set to 0 to disable
+#  retry-backoff: "5,15,30,60" # comma-separated seconds for each retry (default: 5s, 15s, 30s, 60s)
 
 # Global OAuth model name aliases (per channel)
 # These aliases rename model IDs for both model listing and request routing.

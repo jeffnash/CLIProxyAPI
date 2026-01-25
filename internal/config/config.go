@@ -241,9 +241,15 @@ type ChutesConfig struct {
 	ProxyURL      string   `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 
 	// Retry configuration for handling Chutes' intermittent 429 errors.
-	// MaxRetries is the maximum number of retry attempts for 429 errors (default: 4, for backoffs: 5s, 15s, 30s, 1m).
+	// MaxRetries is the maximum number of retry attempts for 429 errors (default: 4).
 	// Set to 0 to disable retries.
 	MaxRetries int `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
+
+	// RetryBackoff is a comma-separated list of backoff durations in seconds for each retry attempt.
+	// Example: "5,15,30,60" means 5s wait before 1st retry, 15s before 2nd, etc.
+	// If fewer values than max-retries, the last value is repeated.
+	// Default: "5,15,30,60"
+	RetryBackoff string `yaml:"retry-backoff,omitempty" json:"retry-backoff,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -876,6 +882,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 			}
 			cfg.Chutes.MaxRetries = parsed
 		}
+	}
+	if env := strings.TrimSpace(os.Getenv("CHUTES_RETRY_BACKOFF")); env != "" {
+		cfg.Chutes.RetryBackoff = env
 	}
 
 	// Normalize OAuth provider model exclusion map.

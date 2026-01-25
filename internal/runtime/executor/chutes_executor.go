@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"sort"
 	"strings"
@@ -166,7 +167,7 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			}).Warn("chutes: request error")
 			// Network errors are treated as transient; retry if we still have attempts.
 			if attempt < attempts-1 {
-				if errWait := chutesWaitForRetry(ctx, attempt, req.Model, 0); errWait != nil {
+				if errWait := chutesWaitForRetry(ctx, e.cfg, attempt, req.Model, 0); errWait != nil {
 					return resp, errWait
 				}
 				continue
@@ -181,13 +182,13 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			data, _ = io.ReadAll(httpResp.Body)
 			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 				log.WithFields(log.Fields{
-					"attempt":      attempt + 1,
-					"status":       httpResp.StatusCode,
-					"duration":     time.Since(start).String(),
-					"endpoint":     endpoint,
-					"content_type": httpResp.Header.Get("Content-Type"),
-					"body":         summarizeErrorBody(httpResp.Header.Get("Content-Type"), data),
-				}).Warn("chutes: upstream non-2xx")
+					"attempt":          attempt + 1,
+					"status":           httpResp.StatusCode,
+					"duration":         time.Since(start).String(),
+					"endpoint":         endpoint,
+					"response_headers": formatChutesResponseHeaders(httpResp.Header),
+					"body":             sanitizeResponseBody(data),
+				}).Info("chutes: upstream non-2xx")
 				appendAPIResponseChunk(ctx, e.cfg, data)
 			} else {
 				log.WithFields(log.Fields{
@@ -206,7 +207,7 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 		// Retryable status codes.
 		if chutesIsRetryableStatus(httpResp.StatusCode) && attempt < attempts-1 {
-			if errWait := chutesWaitForRetry(ctx, attempt, req.Model, httpResp.StatusCode); errWait != nil {
+			if errWait := chutesWaitForRetry(ctx, e.cfg, attempt, req.Model, httpResp.StatusCode); errWait != nil {
 				return resp, errWait
 			}
 			continue
@@ -281,7 +282,7 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				"http_error": errDo.Error(),
 			}).Warn("chutes: stream bootstrap error")
 			if attempt < attempts-1 {
-				if errWait := chutesWaitForRetry(ctx, attempt, req.Model, 0); errWait != nil {
+				if errWait := chutesWaitForRetry(ctx, e.cfg, attempt, req.Model, 0); errWait != nil {
 					return nil, errWait
 				}
 				continue
@@ -300,13 +301,13 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		data, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		log.WithFields(log.Fields{
-			"attempt":      attempt + 1,
-			"status":       resp.StatusCode,
-			"duration":     time.Since(start).String(),
-			"endpoint":     endpoint,
-			"content_type": resp.Header.Get("Content-Type"),
-			"body":         summarizeErrorBody(resp.Header.Get("Content-Type"), data),
-		}).Warn("chutes: stream bootstrap non-2xx")
+			"attempt":          attempt + 1,
+			"status":           resp.StatusCode,
+			"duration":         time.Since(start).String(),
+			"endpoint":         endpoint,
+			"response_headers": formatChutesResponseHeaders(resp.Header),
+			"body":             sanitizeResponseBody(data),
+		}).Info("chutes: stream bootstrap non-2xx")
 		appendAPIResponseChunk(ctx, e.cfg, data)
 
 		if chutesIsRetryableStatus(resp.StatusCode) && attempt < attempts-1 {
@@ -330,7 +331,7 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					continue
 				}
 			}
-			if errWait := chutesWaitForRetry(ctx, attempt, req.Model, resp.StatusCode); errWait != nil {
+			if errWait := chutesWaitForRetry(ctx, e.cfg, attempt, req.Model, resp.StatusCode); errWait != nil {
 				return nil, errWait
 			}
 			continue
@@ -715,6 +716,48 @@ func logChutesRequestHeaders(r *http.Request) {
 	log.WithFields(fields).Debug("chutes request headers")
 }
 
+// formatChutesResponseHeaders formats all response headers for logging non-2xx responses.
+// Sensitive values (like API keys) are masked using util.MaskSensitiveHeaderValue.
+func formatChutesResponseHeaders(h http.Header) map[string]string {
+	if h == nil {
+		return nil
+	}
+	headers := make(map[string]string)
+	for key := range h {
+		headers[key] = util.MaskSensitiveHeaderValue(key, h.Get(key))
+	}
+	return headers
+}
+
+// sensitiveBodyPatterns contains regex patterns for sensitive data in response bodies.
+var sensitiveBodyPatterns = []*regexp.Regexp{
+	// API keys: sk-..., pk-..., key-..., etc.
+	regexp.MustCompile(`(?i)(["\']?(?:api[_-]?key|secret[_-]?key|access[_-]?key|auth[_-]?token|bearer)["\']?\s*[:=]\s*["\']?)([a-zA-Z0-9_-]{8,})(["\']?)`),
+	// Bearer tokens in JSON
+	regexp.MustCompile(`(?i)(["\']?bearer["\']?\s*[:=]\s*["\']?)([a-zA-Z0-9_.-]{20,})(["\']?)`),
+	// Generic long tokens/keys that look like secrets
+	regexp.MustCompile(`(?i)(["\']?(?:token|credential|password|secret)["\']?\s*[:=]\s*["\']?)([a-zA-Z0-9_+/=-]{16,})(["\']?)`),
+}
+
+// sanitizeResponseBody masks sensitive patterns in the response body while preserving structure.
+func sanitizeResponseBody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	result := string(body)
+	for _, pattern := range sensitiveBodyPatterns {
+		result = pattern.ReplaceAllStringFunc(result, func(match string) string {
+			submatches := pattern.FindStringSubmatch(match)
+			if len(submatches) >= 4 {
+				// submatches[1] = prefix, submatches[2] = sensitive value, submatches[3] = suffix
+				return submatches[1] + util.HideAPIKey(submatches[2]) + submatches[3]
+			}
+			return match
+		})
+	}
+	return result
+}
+
 func chutesCreds(auth *cliproxyauth.Auth, cfg *config.Config) (apiKey, baseURL string) {
 	if auth != nil && auth.Attributes != nil {
 		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
@@ -757,14 +800,53 @@ func chutesMaxRetries(cfg *config.Config) int {
 }
 
 // chutesBackoffDuration returns the backoff duration for a given attempt (0-indexed).
-func chutesBackoffDuration(attempt int) time.Duration {
+// Uses configured backoff schedule from cfg if available, otherwise uses default schedule.
+func chutesBackoffDuration(cfg *config.Config, attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
 	}
-	if attempt >= len(chutesBackoffSchedule) {
-		return chutesBackoffSchedule[len(chutesBackoffSchedule)-1]
+
+	schedule := parseChutesBackoffSchedule(cfg)
+	if attempt >= len(schedule) {
+		return schedule[len(schedule)-1]
 	}
-	return chutesBackoffSchedule[attempt]
+	return schedule[attempt]
+}
+
+// parseChutesBackoffSchedule parses the configured backoff schedule or returns default.
+// Format: comma-separated seconds like "5,15,30,60"
+func parseChutesBackoffSchedule(cfg *config.Config) []time.Duration {
+	if cfg == nil || cfg.Chutes.RetryBackoff == "" {
+		return chutesBackoffSchedule
+	}
+
+	parts := strings.Split(cfg.Chutes.RetryBackoff, ",")
+	if len(parts) == 0 {
+		return chutesBackoffSchedule
+	}
+
+	var schedule []time.Duration
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		seconds, err := strconv.Atoi(trimmed)
+		if err != nil || seconds < 0 {
+			// Invalid value, fall back to default
+			log.WithFields(log.Fields{
+				"value":   trimmed,
+				"section": "chutes.retry-backoff",
+			}).Warn("invalid backoff value, using default schedule")
+			return chutesBackoffSchedule
+		}
+		schedule = append(schedule, time.Duration(seconds)*time.Second)
+	}
+
+	if len(schedule) == 0 {
+		return chutesBackoffSchedule
+	}
+	return schedule
 }
 
 // chutesIsRetryableStatus returns true if the status code should trigger retry logic.
@@ -773,8 +855,8 @@ func chutesIsRetryableStatus(statusCode int) bool {
 }
 
 // chutesWaitForRetry waits for the backoff duration or until context is cancelled.
-func chutesWaitForRetry(ctx context.Context, attempt int, model string, statusCode int) error {
-	backoff := chutesBackoffDuration(attempt)
+func chutesWaitForRetry(ctx context.Context, cfg *config.Config, attempt int, model string, statusCode int) error {
+	backoff := chutesBackoffDuration(cfg, attempt)
 	log.WithFields(log.Fields{
 		"attempt":     attempt + 1,
 		"backoff":     backoff.String(),

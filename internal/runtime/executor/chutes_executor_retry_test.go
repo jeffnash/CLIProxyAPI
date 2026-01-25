@@ -21,6 +21,157 @@ func withChutesBackoffSchedule(schedule []time.Duration, fn func()) {
 	fn()
 }
 
+// Tests for parseChutesBackoffSchedule
+
+func TestParseChutesBackoffSchedule_NilConfig(t *testing.T) {
+	schedule := parseChutesBackoffSchedule(nil)
+	if len(schedule) != len(chutesBackoffSchedule) {
+		t.Fatalf("expected default schedule length %d, got %d", len(chutesBackoffSchedule), len(schedule))
+	}
+}
+
+func TestParseChutesBackoffSchedule_EmptyString(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = ""
+	schedule := parseChutesBackoffSchedule(cfg)
+	if len(schedule) != len(chutesBackoffSchedule) {
+		t.Fatalf("expected default schedule length %d, got %d", len(chutesBackoffSchedule), len(schedule))
+	}
+}
+
+func TestParseChutesBackoffSchedule_ValidSingleValue(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = "10"
+	schedule := parseChutesBackoffSchedule(cfg)
+	if len(schedule) != 1 {
+		t.Fatalf("expected 1 value, got %d", len(schedule))
+	}
+	if schedule[0] != 10*time.Second {
+		t.Fatalf("expected 10s, got %s", schedule[0])
+	}
+}
+
+func TestParseChutesBackoffSchedule_ValidMultipleValues(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = "5,15,30,60"
+	schedule := parseChutesBackoffSchedule(cfg)
+	if len(schedule) != 4 {
+		t.Fatalf("expected 4 values, got %d", len(schedule))
+	}
+	expected := []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second}
+	for i, exp := range expected {
+		if schedule[i] != exp {
+			t.Fatalf("expected %s at index %d, got %s", exp, i, schedule[i])
+		}
+	}
+}
+
+func TestParseChutesBackoffSchedule_ValidWithSpaces(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = " 10 , 20 , 30 "
+	schedule := parseChutesBackoffSchedule(cfg)
+	if len(schedule) != 3 {
+		t.Fatalf("expected 3 values, got %d", len(schedule))
+	}
+	expected := []time.Duration{10 * time.Second, 20 * time.Second, 30 * time.Second}
+	for i, exp := range expected {
+		if schedule[i] != exp {
+			t.Fatalf("expected %s at index %d, got %s", exp, i, schedule[i])
+		}
+	}
+}
+
+func TestParseChutesBackoffSchedule_InvalidValue(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = "5,invalid,30"
+	schedule := parseChutesBackoffSchedule(cfg)
+	// Should fall back to default on invalid value
+	if len(schedule) != len(chutesBackoffSchedule) {
+		t.Fatalf("expected default schedule on invalid input, got length %d", len(schedule))
+	}
+}
+
+func TestParseChutesBackoffSchedule_NegativeValue(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = "5,-10,30"
+	schedule := parseChutesBackoffSchedule(cfg)
+	// Should fall back to default on negative value
+	if len(schedule) != len(chutesBackoffSchedule) {
+		t.Fatalf("expected default schedule on negative value, got length %d", len(schedule))
+	}
+}
+
+func TestParseChutesBackoffSchedule_ZeroValue(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = "0,5,10"
+	schedule := parseChutesBackoffSchedule(cfg)
+	if len(schedule) != 3 {
+		t.Fatalf("expected 3 values, got %d", len(schedule))
+	}
+	if schedule[0] != 0 {
+		t.Fatalf("expected 0s at index 0, got %s", schedule[0])
+	}
+}
+
+func TestParseChutesBackoffSchedule_LargeValues(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = "30,60,120,300"
+	schedule := parseChutesBackoffSchedule(cfg)
+	if len(schedule) != 4 {
+		t.Fatalf("expected 4 values, got %d", len(schedule))
+	}
+	expected := []time.Duration{30 * time.Second, 60 * time.Second, 120 * time.Second, 300 * time.Second}
+	for i, exp := range expected {
+		if schedule[i] != exp {
+			t.Fatalf("expected %s at index %d, got %s", exp, i, schedule[i])
+		}
+	}
+}
+
+// Tests for chutesBackoffDuration with config
+
+func TestChutesBackoffDuration_UsesConfigSchedule(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = "10,20,30"
+
+	if d := chutesBackoffDuration(cfg, 0); d != 10*time.Second {
+		t.Fatalf("expected 10s for attempt 0, got %s", d)
+	}
+	if d := chutesBackoffDuration(cfg, 1); d != 20*time.Second {
+		t.Fatalf("expected 20s for attempt 1, got %s", d)
+	}
+	if d := chutesBackoffDuration(cfg, 2); d != 30*time.Second {
+		t.Fatalf("expected 30s for attempt 2, got %s", d)
+	}
+}
+
+func TestChutesBackoffDuration_RepeatsLastValue(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = "5,10"
+
+	// Attempt beyond schedule length should repeat last value
+	if d := chutesBackoffDuration(cfg, 5); d != 10*time.Second {
+		t.Fatalf("expected 10s for attempt 5 (repeat last), got %s", d)
+	}
+}
+
+func TestChutesBackoffDuration_NilConfigUsesDefault(t *testing.T) {
+	d := chutesBackoffDuration(nil, 0)
+	if d != chutesBackoffSchedule[0] {
+		t.Fatalf("expected default first backoff %s, got %s", chutesBackoffSchedule[0], d)
+	}
+}
+
+func TestChutesBackoffDuration_NegativeAttempt(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Chutes.RetryBackoff = "10,20,30"
+
+	// Negative attempt should be treated as 0
+	if d := chutesBackoffDuration(cfg, -1); d != 10*time.Second {
+		t.Fatalf("expected 10s for negative attempt, got %s", d)
+	}
+}
+
 func TestChutesExecutorExecuteStream_RetriesOn429ThenSucceeds(t *testing.T) {
 	withChutesBackoffSchedule([]time.Duration{1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond}, func() {
 		var calls int
