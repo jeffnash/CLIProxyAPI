@@ -655,7 +655,9 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 			var ok bool
 			if cache, ok = getCodexCache(key); !ok {
 				cache = codexCache{
-					ID:     uuid.New().String(),
+					// Deterministic cache ID (stable across restarts) to maximize upstream
+					// prompt cache prefix matching.
+					ID:     uuid.NewSHA1(uuid.Nil, []byte(key)).String(),
 					Expire: time.Now().Add(1 * time.Hour),
 				}
 				setCodexCache(key, cache)
