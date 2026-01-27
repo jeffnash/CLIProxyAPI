@@ -7,9 +7,11 @@ package gemini
 
 import (
 	"bytes"
-	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -70,22 +72,43 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		}
 	}
 
-	// helper for generating paired call IDs in the form: call_<alphanum>
 	// Gemini uses sequential pairing across possibly multiple in-flight
 	// functionCalls, so we keep a FIFO queue of generated call IDs and
 	// consume them in order when functionResponses arrive.
+	//
+	// IMPORTANT (prompt caching): call_id MUST be deterministic for identical requests,
+	// otherwise upstream prompt cache prefix matching will miss.
 	var pendingCallIDs []string
+	callIndex := 0
+	orphanIndex := 0
 
-	// genCallID creates a random call id like: call_<8chars>
-	genCallID := func() string {
-		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-		var b strings.Builder
-		// 8 chars random suffix
-		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-			b.WriteByte(letters[n.Int64()])
+	// stableCallID generates a deterministic call ID.
+	//
+	// We return a "call_"-prefixed, alphanumeric (hex) identifier derived from a
+	// hash of stable request content.
+	stableCallID := func(seed string) string {
+		sum := sha256.Sum256([]byte(seed))
+		// 12 bytes => 24 hex chars
+		return "call_" + hex.EncodeToString(sum[:12])
+	}
+
+	// normalizeJSONForHash returns a canonical JSON representation with sorted keys.
+	// This ensures semantically identical JSON objects produce the same hash
+	// regardless of original key ordering.
+	normalizeJSONForHash := func(raw string) string {
+		if raw == "" {
+			return ""
 		}
-		return "call_" + b.String()
+		var v interface{}
+		if err := json.Unmarshal([]byte(raw), &v); err != nil {
+			// If unmarshal fails, return original (fallback)
+			return raw
+		}
+		normalized, err := marshalSorted(v)
+		if err != nil {
+			return raw
+		}
+		return string(normalized)
 	}
 
 	// Model
@@ -147,6 +170,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				// function call from model
 				if fc := p.Get("functionCall"); fc.Exists() {
 					fn := `{"type":"function_call"}`
+					nameForID := ""
 					if name := fc.Get("name"); name.Exists() {
 						n := name.String()
 						if short, ok := shortMap[n]; ok {
@@ -154,15 +178,21 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						} else {
 							n = shortenNameIfNeeded(n)
 						}
+						nameForID = n
 						fn, _ = sjson.Set(fn, "name", n)
 					}
+					argsRaw := ""
 					if args := fc.Get("args"); args.Exists() {
+						argsRaw = args.Raw
 						fn, _ = sjson.Set(fn, "arguments", args.Raw)
 					}
-					// generate a paired random call_id and enqueue it so the
+					// Generate a paired deterministic call_id and enqueue it so the
 					// corresponding functionResponse can pop the earliest id
 					// to preserve ordering when multiple calls are present.
-					id := genCallID()
+					// Normalize args JSON to ensure consistent key ordering for hashing.
+					seed := fmt.Sprintf("%s|%s|%s|%d", modelName, nameForID, normalizeJSONForHash(argsRaw), callIndex)
+					id := stableCallID(seed)
+					callIndex++
 					fn, _ = sjson.Set(fn, "call_id", id)
 					pendingCallIDs = append(pendingCallIDs, id)
 					out, _ = sjson.SetRaw(out, "input.-1", fn)
@@ -187,7 +217,11 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						// pop the first element
 						pendingCallIDs = pendingCallIDs[1:]
 					} else {
-						id = genCallID()
+						// Orphan response: generate deterministic ID so repeated requests
+						// translate identically.
+						seed := fmt.Sprintf("orphan|%s|%d", fr.Raw, orphanIndex)
+						id = stableCallID(seed)
+						orphanIndex++
 					}
 					fno, _ = sjson.Set(fno, "call_id", id)
 					out, _ = sjson.SetRaw(out, "input.-1", fno)
@@ -357,4 +391,62 @@ func buildShortNameMap(names []string) map[string]string {
 		m[n] = uniq
 	}
 	return m
+}
+
+// marshalSorted marshals a value to JSON with map keys sorted alphabetically.
+// This ensures consistent output regardless of Go's map iteration order or
+// the original JSON key ordering.
+func marshalSorted(v interface{}) ([]byte, error) {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		// Sort keys
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		var buf bytes.Buffer
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			// Marshal the key
+			keyBytes, err := json.Marshal(k)
+			if err != nil {
+				return nil, err
+			}
+			buf.Write(keyBytes)
+			buf.WriteByte(':')
+			// Recursively marshal the value
+			valBytes, err := marshalSorted(val[k])
+			if err != nil {
+				return nil, err
+			}
+			buf.Write(valBytes)
+		}
+		buf.WriteByte('}')
+		return buf.Bytes(), nil
+
+	case []interface{}:
+		var buf bytes.Buffer
+		buf.WriteByte('[')
+		for i, elem := range val {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			elemBytes, err := marshalSorted(elem)
+			if err != nil {
+				return nil, err
+			}
+			buf.Write(elemBytes)
+		}
+		buf.WriteByte(']')
+		return buf.Bytes(), nil
+
+	default:
+		// For primitives (string, number, bool, null), use standard marshal
+		return json.Marshal(v)
+	}
 }

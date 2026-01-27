@@ -1,8 +1,13 @@
 package executor
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"testing"
 
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -207,6 +212,62 @@ func TestSetReasoningEffortByAlias(t *testing.T) {
 				t.Errorf("setReasoningEffortByAlias() reasoning.effort = %q, want %q", gotEffort, tt.wantEffort)
 			}
 		})
+	}
+}
+
+func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministic(t *testing.T) {
+	e := &CodexExecutor{}
+	ctx := context.Background()
+	url := "https://example.com/responses"
+
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5",
+		Payload: []byte(`{"metadata":{"user_id":"u1"}}`),
+	}
+
+	// Raw JSON doesn't have to be a full upstream payload for this test; we just
+	// care that prompt_cache_key is set deterministically.
+	raw := []byte(`{"model":"gpt-5","input":[],"instructions":""}`)
+
+	key := fmt.Sprintf("%s-%s", req.Model, "u1")
+	deleteCodexCache(key)
+
+	httpReq1, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
+	if err != nil {
+		t.Fatalf("cacheHelper #1 error: %v", err)
+	}
+	body1, err := io.ReadAll(httpReq1.Body)
+	if err != nil {
+		t.Fatalf("read request #1 body: %v", err)
+	}
+	cacheKey1 := gjson.GetBytes(body1, "prompt_cache_key").String()
+	if cacheKey1 == "" {
+		t.Fatalf("expected prompt_cache_key to be set: %s", string(body1))
+	}
+	if got := httpReq1.Header.Get("Session_id"); got != cacheKey1 {
+		t.Fatalf("Session_id header = %q, want %q", got, cacheKey1)
+	}
+	if got := httpReq1.Header.Get("Conversation_id"); got != cacheKey1 {
+		t.Fatalf("Conversation_id header = %q, want %q", got, cacheKey1)
+	}
+
+	// Simulate a cache miss (e.g., restart/eviction) and ensure the ID is still stable.
+	deleteCodexCache(key)
+
+	httpReq2, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
+	if err != nil {
+		t.Fatalf("cacheHelper #2 error: %v", err)
+	}
+	body2, err := io.ReadAll(httpReq2.Body)
+	if err != nil {
+		t.Fatalf("read request #2 body: %v", err)
+	}
+	cacheKey2 := gjson.GetBytes(body2, "prompt_cache_key").String()
+	if cacheKey2 == "" {
+		t.Fatalf("expected prompt_cache_key to be set: %s", string(body2))
+	}
+	if cacheKey1 != cacheKey2 {
+		t.Fatalf("prompt_cache_key changed across cache misses: %q vs %q", cacheKey1, cacheKey2)
 	}
 }
 
