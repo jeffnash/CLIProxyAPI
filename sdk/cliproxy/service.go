@@ -285,6 +285,16 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		auth.CreatedAt = existing.CreatedAt
 		auth.LastRefreshedAt = existing.LastRefreshedAt
 		auth.NextRefreshAfter = existing.NextRefreshAfter
+		// Preserve runtime availability state that shouldn't be reset by file changes.
+		// This prevents model unavailability flags from being wiped when auth files
+		// are updated during refresh operations.
+		auth.Unavailable = existing.Unavailable
+		auth.NextRetryAfter = existing.NextRetryAfter
+		auth.Status = existing.Status
+		auth.LastError = existing.LastError
+		auth.StatusMessage = existing.StatusMessage
+		auth.Quota = existing.Quota
+		auth.ModelStates = existing.ModelStates
 		if _, err := s.coreManager.Update(ctx, auth); err != nil {
 			log.Errorf("failed to update auth %s: %v", auth.ID, err)
 		}
