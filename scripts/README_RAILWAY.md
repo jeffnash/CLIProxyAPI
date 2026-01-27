@@ -8,13 +8,29 @@
 
 `scripts/railway_start.sh` bootstraps a Railway container by:
 
-1. Restoring auth files from `AUTH_BUNDLE` **or** downloading a zip from `AUTH_ZIP_URL`
-2. Unpacking into a fresh folder at repo root (`auths_railway` by default)
+1. **Smart credential restore**: Checks if auth files should be restored from `AUTH_BUNDLE` or `AUTH_ZIP_URL`:
+   - First run (empty directory): restores from bundle/URL
+   - AUTH_BUNDLE changed (hash mismatch): restores new bundle
+   - AUTH_BUNDLE unchanged: **skips restore** to preserve refreshed OAuth tokens
+2. Unpacking into a folder at repo root (`auths_railway` by default)
 3. Writing `./config.yaml` with a fixed template, but:
    - sets `auth-dir: "./auths_railway"` (or `AUTH_DIR_NAME`)
    - sets `api-keys:` to a single entry from `API_KEY_1`
 4. Ensuring `./cli-proxy-api` exists (builds it with `go mod download` + `go build` if missing, or if `FORCE_BUILD` is set)
 5. Running `./cli-proxy-api --config ./config.yaml`
+
+## Persistent volume (recommended)
+
+OAuth tokens (Codex, Claude, Gemini, etc.) are refreshed automatically by the server. Without persistence, container restarts restore stale tokens from `AUTH_BUNDLE`, causing "refresh_token_reused" errors.
+
+**To add a persistent volume:**
+
+1. In Railway Dashboard, right-click your service
+2. Select **"Add Volume"**
+3. Set mount path: `/app/auths_railway`
+4. Deploy
+
+The startup script automatically detects existing credentials and skips `AUTH_BUNDLE` restore when tokens are already present (unless you update `AUTH_BUNDLE`, which triggers a re-restore).
 
 ## Required env vars
 

@@ -30,6 +30,14 @@ info() {
   echo "[railway] $*"
 }
 
+decode_base64() {
+  if base64 --help 2>&1 | grep -q -- "-d"; then
+    base64 -d
+  else
+    base64 --decode
+  fi
+}
+
 require_any_env "AUTH_ZIP_URL" "AUTH_BUNDLE"
 require_env "API_KEY_1"
 
@@ -42,44 +50,127 @@ TAR_PATH="${ROOT_DIR}/auths.tar.gz"
 OUT_CONFIG_PATH="${ROOT_DIR}/config.yaml"
 
 info "Preparing auth dir: ${AUTH_DIR_PATH}"
-rm -rf "${AUTH_DIR_PATH}"
 mkdir -p "${AUTH_DIR_PATH}"
 
-decode_base64() {
-  if base64 --help 2>&1 | grep -q -- "-d"; then
-    base64 -d
-  else
-    base64 --decode
+# Hash file for detecting changes to auth source (AUTH_BUNDLE or AUTH_ZIP_URL).
+# If the hash matches the stored hash, skip restore to preserve refreshed tokens.
+# If the hash differs (new bundle/URL content) or no hash file exists, restore.
+BUNDLE_HASH_FILE="${AUTH_DIR_PATH}/.auth_bundle_hash"
+
+# For AUTH_ZIP_URL, we download once and cache the path to avoid double download.
+CACHED_ZIP_PATH=""
+
+# compute_source_hash outputs the sha256 hash of the auth source content.
+# For AUTH_BUNDLE: hash the bundle string directly.
+# For AUTH_ZIP_URL: download to ZIP_PATH and hash the content, caching the path.
+compute_source_hash() {
+  if [[ -n "${AUTH_BUNDLE:-}" ]]; then
+    printf '%s' "${AUTH_BUNDLE}" | sha256sum | cut -d' ' -f1
+  elif [[ -n "${AUTH_ZIP_URL:-}" ]]; then
+    # Download to ZIP_PATH (reused later during restore)
+    if [[ ! -s "${ZIP_PATH}" ]]; then
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${AUTH_ZIP_URL}" -o "${ZIP_PATH}" 2>/dev/null
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "${ZIP_PATH}" "${AUTH_ZIP_URL}" 2>/dev/null
+      fi
+    fi
+    if [[ -s "${ZIP_PATH}" ]]; then
+      CACHED_ZIP_PATH="${ZIP_PATH}"
+      sha256sum "${ZIP_PATH}" | cut -d' ' -f1
+    else
+      echo ""
+    fi
   fi
 }
 
-if [[ -n "${AUTH_BUNDLE:-}" ]]; then
-  info "Restoring auths from AUTH_BUNDLE"
-  require_cmd "tar"
-  require_cmd "base64"
-  printf '%s' "${AUTH_BUNDLE}" | tr -d '\r\n' | decode_base64 > "${TAR_PATH}"
-  tar -xzf "${TAR_PATH}" -C "${AUTH_DIR_PATH}"
-  rm -f "${TAR_PATH}"
+should_restore_bundle() {
+  # No existing credentials -> restore
+  local existing_auth_files
+  existing_auth_files=$(find "${AUTH_DIR_PATH}" -maxdepth 1 -name '*.json' 2>/dev/null | head -1)
+  if [[ -z "${existing_auth_files}" ]]; then
+    info "Auth directory is empty"
+    return 0
+  fi
+  
+  # No hash file (legacy or first run with volumes) -> restore
+  if [[ ! -f "${BUNDLE_HASH_FILE}" ]]; then
+    info "No bundle hash file found (first run with persistent volume?)"
+    return 0
+  fi
+  
+  # Compute current source hash
+  local current_hash
+  current_hash=$(compute_source_hash)
+  
+  # Hash changed -> restore (user updated AUTH_BUNDLE or AUTH_ZIP_URL content)
+  local stored_hash
+  stored_hash=$(cat "${BUNDLE_HASH_FILE}" 2>/dev/null || echo "")
+  if [[ "${stored_hash}" != "${current_hash}" ]]; then
+    info "Auth source has changed (hash mismatch)"
+    return 0
+  fi
+  
+  # Hash matches -> skip restore to preserve refreshed tokens
+  # Clean up any cached zip since we won't use it
+  if [[ -n "${CACHED_ZIP_PATH}" && -f "${CACHED_ZIP_PATH}" ]]; then
+    rm -f "${CACHED_ZIP_PATH}"
+    CACHED_ZIP_PATH=""
+  fi
+  return 1
+}
+
+if should_restore_bundle; then
+  info "Restoring credentials from AUTH_BUNDLE or AUTH_ZIP_URL"
+  # Clear existing files before restore
+  rm -rf "${AUTH_DIR_PATH:?}"/*
+
+  if [[ -n "${AUTH_BUNDLE:-}" ]]; then
+    info "Restoring auths from AUTH_BUNDLE"
+    require_cmd "tar"
+    require_cmd "base64"
+    printf '%s' "${AUTH_BUNDLE}" | tr -d '\r\n' | decode_base64 > "${TAR_PATH}"
+    tar -xzf "${TAR_PATH}" -C "${AUTH_DIR_PATH}"
+    rm -f "${TAR_PATH}"
+    # Save hash of AUTH_BUNDLE content
+    RESTORED_HASH=$(printf '%s' "${AUTH_BUNDLE}" | sha256sum | cut -d' ' -f1)
+  else
+    # Use cached zip if available (downloaded during hash check), otherwise download now
+    if [[ -z "${CACHED_ZIP_PATH}" || ! -s "${CACHED_ZIP_PATH}" ]]; then
+      info "Downloading auth zip from AUTH_ZIP_URL"
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${AUTH_ZIP_URL}" -o "${ZIP_PATH}"
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "${ZIP_PATH}" "${AUTH_ZIP_URL}"
+      else
+        echo "Need curl or wget installed to fetch ${AUTH_ZIP_URL}" >&2
+        exit 1
+      fi
+    else
+      info "Using cached auth zip from hash check"
+    fi
+
+    # Save hash of downloaded zip content before extracting
+    RESTORED_HASH=$(sha256sum "${ZIP_PATH}" | cut -d' ' -f1)
+
+    info "Unzipping auths"
+    if command -v unzip >/dev/null 2>&1; then
+      unzip -q "${ZIP_PATH}" -d "${AUTH_DIR_PATH}"
+    else
+      echo "Need unzip installed to extract auth files" >&2
+      exit 1
+    fi
+
+    rm -f "${ZIP_PATH}"
+  fi
+
+  # Save the source hash so subsequent restarts skip restore (preserving refreshed tokens)
+  if [[ -n "${RESTORED_HASH}" ]]; then
+    printf '%s' "${RESTORED_HASH}" > "${BUNDLE_HASH_FILE}"
+    info "Saved auth source hash for future comparison"
+  fi
 else
-  info "Downloading auth zip from AUTH_ZIP_URL"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "${AUTH_ZIP_URL}" -o "${ZIP_PATH}"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "${ZIP_PATH}" "${AUTH_ZIP_URL}"
-  else
-    echo "Need curl or wget installed to fetch ${AUTH_ZIP_URL}" >&2
-    exit 1
-  fi
-
-  info "Unzipping auths"
-  if command -v unzip >/dev/null 2>&1; then
-    unzip -q "${ZIP_PATH}" -d "${AUTH_DIR_PATH}"
-  else
-    echo "Need unzip installed to extract auth files" >&2
-    exit 1
-  fi
-
-  rm -f "${ZIP_PATH}"
+  info "Skipping auth restore to preserve refreshed tokens (hash unchanged)"
 fi
 
 info "Writing config: ${OUT_CONFIG_PATH}"
