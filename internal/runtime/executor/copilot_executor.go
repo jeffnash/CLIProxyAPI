@@ -220,8 +220,9 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 
+	requestedModel := payloadRequestedModel(opts, req.Model)
 	body := sdktranslator.TranslateRequest(from, to, apiModel, bytes.Clone(req.Payload), false)
-	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil)
+	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", false)
 
@@ -315,8 +316,9 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 
+	requestedModel := payloadRequestedModel(opts, req.Model)
 	body := sdktranslator.TranslateRequest(from, to, apiModel, bytes.Clone(req.Payload), true)
-	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil)
+	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 
