@@ -14,6 +14,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -334,6 +336,12 @@ func summarizeErrorBody(contentType string, body []byte) string {
 		}
 		return "[html body omitted]"
 	}
+
+	// Try to extract error message from JSON response
+	if message := extractJSONErrorMessage(body); message != "" {
+		return message
+	}
+
 	return string(body)
 }
 
@@ -374,4 +382,26 @@ func extractHTMLTitle(body []byte) string {
 		return ""
 	}
 	return strings.Join(strings.Fields(title), " ")
+}
+
+// extractJSONErrorMessage attempts to extract error.message from JSON error responses
+func extractJSONErrorMessage(body []byte) string {
+	result := gjson.GetBytes(body, "error.message")
+	if result.Exists() && result.String() != "" {
+		return result.String()
+	}
+	return ""
+}
+
+// logWithRequestID returns a logrus Entry with request_id field populated from context.
+// If no request ID is found in context, it returns the standard logger.
+func logWithRequestID(ctx context.Context) *log.Entry {
+	if ctx == nil {
+		return log.NewEntry(log.StandardLogger())
+	}
+	requestID := internallogging.GetRequestID(ctx)
+	if requestID == "" {
+		return log.NewEntry(log.StandardLogger())
+	}
+	return log.WithField("request_id", requestID)
 }
