@@ -3,10 +3,9 @@ package copilot
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
 // CopilotTokenStorage stores authentication tokens for GitHub Copilot API.
@@ -26,8 +25,8 @@ type CopilotTokenStorage struct {
 	CopilotToken string `json:"-"`
 
 	// CopilotTokenExpiry is the RFC3339 timestamp when the Copilot token expires.
-	// Note: marked as "-" to prevent persistence to disk.
-	CopilotTokenExpiry string `json:"-"`
+	// Persisted to disk to enable proper refresh scheduling after reload.
+	CopilotTokenExpiry string `json:"copilot_token_expiry,omitempty"`
 
 	// RefreshIn is the number of seconds after which the token should be refreshed.
 	// Note: marked as "-" to prevent persistence to disk.
@@ -44,8 +43,12 @@ type CopilotTokenStorage struct {
 	Username string `json:"username"`
 
 	// LastRefresh is the RFC3339 timestamp of the last token refresh.
-	// Note: marked as "-" to prevent persistence to disk.
-	LastRefresh string `json:"-"`
+	// Persisted to disk to track refresh history after reload.
+	LastRefresh string `json:"last_refresh,omitempty"`
+
+	// ExpiresAt is the RFC3339 timestamp when the Copilot token expires.
+	// Standard field used by the refresh scheduler for expiry-based refresh decisions.
+	ExpiresAt string `json:"expires_at,omitempty"`
 
 	// Type indicates the authentication provider type, always "copilot" for this storage.
 	Type string `json:"type"`
@@ -54,6 +57,7 @@ type CopilotTokenStorage struct {
 // SaveTokenToFile serializes the Copilot token storage to a JSON file.
 // This method creates the necessary directory structure and writes the token
 // data in JSON format to the specified file path for persistent storage.
+// Uses atomic write to prevent race conditions with file watchers.
 //
 // Parameters:
 //   - authFilePath: The full path where the token file should be saved
@@ -63,22 +67,18 @@ type CopilotTokenStorage struct {
 func (ts *CopilotTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "copilot"
-	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
-	}
 
-	f, err := os.Create(authFilePath)
+	data, err := json.MarshalIndent(ts, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to create token file: %w", err)
+		return fmt.Errorf("failed to marshal token: %w", err)
 	}
-	defer func() {
-		_ = f.Close()
-	}()
 
-	encoder := json.NewEncoder(f)
-	encoder.SetIndent("", "  ")
-	if err = encoder.Encode(ts); err != nil {
-		return fmt.Errorf("failed to write token to file: %w", err)
+	// Append newline for consistency with encoder behavior
+	data = append(data, '\n')
+
+	// Use atomic write to prevent race conditions with file watcher
+	if err = util.AtomicWriteFile(authFilePath, data, 0o600); err != nil {
+		return fmt.Errorf("failed to write token file: %w", err)
 	}
 	return nil
 }

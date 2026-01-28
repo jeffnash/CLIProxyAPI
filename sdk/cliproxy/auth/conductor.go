@@ -1845,8 +1845,6 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duration) {
 	if interval <= 0 || interval > refreshCheckInterval {
 		interval = refreshCheckInterval
-	} else {
-		interval = refreshCheckInterval
 	}
 	if m.refreshCancel != nil {
 		m.refreshCancel()
@@ -2174,8 +2172,32 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	// Preserve NextRefreshAfter set by the Authenticator
 	// If the Authenticator set a reasonable refresh time, it should not be overwritten
 	// If the Authenticator did not set it (zero value), shouldRefresh will use default logic
-	updated.LastError = nil
 	updated.UpdatedAt = now
+
+	// Clear availability state after successful refresh, but only for auth-related failures.
+	// 429 quota cooldowns are "real" and should not be bypassed by a token refresh.
+	// Only clear state when the previous failure was an auth issue (401/403) that
+	// a successful token refresh would actually resolve.
+	lastHTTPStatus := 0
+	if updated.LastError != nil {
+		lastHTTPStatus = updated.LastError.HTTPStatus
+	}
+	isAuthRelatedFailure := lastHTTPStatus == 401 || lastHTTPStatus == 403
+
+	updated.LastError = nil
+	if isAuthRelatedFailure {
+		updated.Unavailable = false
+		updated.NextRetryAfter = time.Time{}
+		updated.Status = StatusActive
+		updated.StatusMessage = ""
+		for _, state := range updated.ModelStates {
+			if state != nil && !state.Quota.Exceeded {
+				// Only reset non-quota failures for this model
+				resetModelState(state, now)
+			}
+		}
+	}
+
 	_, _ = m.Update(ctx, updated)
 }
 

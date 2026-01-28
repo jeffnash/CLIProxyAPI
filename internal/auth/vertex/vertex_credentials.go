@@ -5,11 +5,9 @@ package vertex
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
-	log "github.com/sirupsen/logrus"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
 // VertexCredentialStorage stores the service account JSON for Vertex AI access.
@@ -34,6 +32,7 @@ type VertexCredentialStorage struct {
 
 // SaveTokenToFile writes the credential payload to the given file path in JSON format.
 // It ensures the parent directory exists and logs the operation for transparency.
+// Uses atomic write to prevent race conditions with file watchers.
 func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	if s == nil {
@@ -45,22 +44,17 @@ func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 	// Ensure we tag the file with the provider type.
 	s.Type = "vertex"
 
-	if err := os.MkdirAll(filepath.Dir(authFilePath), 0o700); err != nil {
-		return fmt.Errorf("vertex credential: create directory failed: %w", err)
-	}
-	f, err := os.Create(authFilePath)
+	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
-		return fmt.Errorf("vertex credential: create file failed: %w", err)
+		return fmt.Errorf("vertex credential: marshal failed: %w", err)
 	}
-	defer func() {
-		if errClose := f.Close(); errClose != nil {
-			log.Errorf("vertex credential: failed to close file: %v", errClose)
-		}
-	}()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err = enc.Encode(s); err != nil {
-		return fmt.Errorf("vertex credential: encode failed: %w", err)
+
+	// Append newline for consistency with encoder behavior
+	data = append(data, '\n')
+
+	// Use atomic write to prevent race conditions with file watcher
+	if err = util.AtomicWriteFile(authFilePath, data, 0o600); err != nil {
+		return fmt.Errorf("vertex credential: write file failed: %w", err)
 	}
 	return nil
 }

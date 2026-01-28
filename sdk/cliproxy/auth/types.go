@@ -273,7 +273,7 @@ func RegisterRefreshLeadProvider(provider string, factory func() *time.Duration)
 	refreshLeadMu.Unlock()
 }
 
-var expireKeys = [...]string{"expired", "expire", "expires_at", "expiresAt", "expiry", "expires"}
+var expireKeys = [...]string{"expired", "expire", "expires_at", "expiresAt", "expiry", "expires", "copilot_token_expiry"}
 
 func expirationFromMap(meta map[string]any) (time.Time, bool) {
 	if meta == nil {

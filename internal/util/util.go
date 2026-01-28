@@ -154,3 +154,75 @@ func WritablePath() string {
 	}
 	return ""
 }
+
+// AtomicWriteFile writes data to a file atomically by first writing to a temporary
+// file in the same directory, then renaming it to the target path. This prevents
+// race conditions where file watchers might observe an empty or partial file.
+//
+// On POSIX systems, the rename operation is atomic. On Windows, the rename is
+// not guaranteed to be atomic, but this approach still reduces the window for
+// observing partial writes.
+//
+// Parameters:
+//   - path: The target file path
+//   - data: The data to write
+//   - perm: The file permissions (e.g., 0600)
+//
+// Returns:
+//   - error: An error if the operation fails, nil otherwise
+func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("atomic write: create directory failed: %w", err)
+	}
+
+	// Create temp file in the same directory to ensure same filesystem for atomic rename
+	tmpFile, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("atomic write: create temp file failed: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	// Ensure cleanup on error
+	success := false
+	defer func() {
+		if !success {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	// Set permissions before writing (some systems check this)
+	if err = tmpFile.Chmod(perm); err != nil {
+		return fmt.Errorf("atomic write: chmod temp file failed: %w", err)
+	}
+
+	// Write data
+	if _, err = tmpFile.Write(data); err != nil {
+		return fmt.Errorf("atomic write: write temp file failed: %w", err)
+	}
+
+	// Sync to ensure data is on disk before rename
+	if err = tmpFile.Sync(); err != nil {
+		return fmt.Errorf("atomic write: sync temp file failed: %w", err)
+	}
+
+	// Close before rename
+	if err = tmpFile.Close(); err != nil {
+		return fmt.Errorf("atomic write: close temp file failed: %w", err)
+	}
+
+	// On Windows, os.Rename cannot overwrite an existing file.
+	// Remove the destination first; ignore not-exist errors.
+	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("atomic write: remove existing file failed: %w", err)
+	}
+
+	// Atomic rename
+	if err = os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("atomic write: rename failed: %w", err)
+	}
+
+	success = true
+	return nil
+}

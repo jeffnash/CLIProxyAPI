@@ -3,10 +3,9 @@ package grok
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
 // GrokTokenStorage stores Grok authentication JWTs and status metadata.
@@ -23,27 +22,23 @@ type GrokTokenStorage struct {
 }
 
 // SaveTokenToFile persists Grok token data to the provided path.
+// Uses atomic write to prevent race conditions with file watchers.
 func (g *GrokTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	g.Type = "grok"
 	g.SSOToken = NormalizeSSOToken(g.SSOToken)
 
-	if err := os.MkdirAll(filepath.Dir(authFilePath), 0o700); err != nil {
-		return fmt.Errorf("failed to create auth directory: %w", err)
-	}
-
-	f, err := os.Create(authFilePath)
+	data, err := json.MarshalIndent(g, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to create auth file: %w", err)
-	}
-	defer f.Close()
-
-	encoder := json.NewEncoder(f)
-	encoder.SetIndent("", "  ")
-
-	if err := encoder.Encode(g); err != nil {
-		return fmt.Errorf("failed to encode grok token: %w", err)
+		return fmt.Errorf("failed to marshal grok token: %w", err)
 	}
 
+	// Append newline for consistency with encoder behavior
+	data = append(data, '\n')
+
+	// Use atomic write to prevent race conditions with file watcher
+	if err = util.AtomicWriteFile(authFilePath, data, 0o600); err != nil {
+		return fmt.Errorf("failed to write grok token file: %w", err)
+	}
 	return nil
 }
