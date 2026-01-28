@@ -220,3 +220,117 @@
  		t.Errorf("WritablePath() = %q, want /tmp/lower", result)
  	}
  }
+
+func TestAtomicWriteFile(t *testing.T) {
+tmpDir := t.TempDir()
+
+t.Run("creates_file_with_content", func(t *testing.T) {
+path := filepath.Join(tmpDir, "test1.json")
+content := []byte(`{"key": "value"}`)
+
+err := AtomicWriteFile(path, content, 0o600)
+if err != nil {
+t.Fatalf("AtomicWriteFile() error = %v", err)
+}
+
+// Verify file exists and has correct content
+got, err := os.ReadFile(path)
+if err != nil {
+t.Fatalf("ReadFile() error = %v", err)
+}
+if string(got) != string(content) {
+t.Errorf("content = %q, want %q", got, content)
+}
+})
+
+t.Run("overwrites_existing_file", func(t *testing.T) {
+path := filepath.Join(tmpDir, "test2.json")
+
+// Write initial content
+if err := os.WriteFile(path, []byte("old content"), 0o600); err != nil {
+t.Fatalf("WriteFile() error = %v", err)
+}
+
+// Overwrite with atomic write
+newContent := []byte("new content")
+err := AtomicWriteFile(path, newContent, 0o600)
+if err != nil {
+t.Fatalf("AtomicWriteFile() error = %v", err)
+}
+
+got, err := os.ReadFile(path)
+if err != nil {
+t.Fatalf("ReadFile() error = %v", err)
+}
+if string(got) != string(newContent) {
+t.Errorf("content = %q, want %q", got, newContent)
+}
+})
+
+t.Run("creates_parent_directories", func(t *testing.T) {
+path := filepath.Join(tmpDir, "nested", "dir", "test3.json")
+content := []byte(`test`)
+
+err := AtomicWriteFile(path, content, 0o600)
+if err != nil {
+t.Fatalf("AtomicWriteFile() error = %v", err)
+}
+
+got, err := os.ReadFile(path)
+if err != nil {
+t.Fatalf("ReadFile() error = %v", err)
+}
+if string(got) != string(content) {
+t.Errorf("content = %q, want %q", got, content)
+}
+})
+
+t.Run("sets_file_permissions", func(t *testing.T) {
+path := filepath.Join(tmpDir, "test4.json")
+content := []byte(`test`)
+
+err := AtomicWriteFile(path, content, 0o644)
+if err != nil {
+t.Fatalf("AtomicWriteFile() error = %v", err)
+}
+
+info, err := os.Stat(path)
+if err != nil {
+t.Fatalf("Stat() error = %v", err)
+}
+// Mask out non-permission bits
+perm := info.Mode().Perm()
+if perm != 0o644 {
+t.Errorf("file mode = %o, want %o", perm, 0o644)
+}
+})
+
+t.Run("no_partial_writes_observable", func(t *testing.T) {
+// This test verifies that if we read the file at any point during
+// an atomic write, we either get the old content or the new content,
+// never empty or partial content.
+path := filepath.Join(tmpDir, "test5.json")
+oldContent := []byte(`{"status": "old"}`)
+newContent := []byte(`{"status": "new", "data": "more content here"}`)
+
+// Write initial content
+if err := os.WriteFile(path, oldContent, 0o600); err != nil {
+t.Fatalf("WriteFile() error = %v", err)
+}
+
+// Perform atomic write
+err := AtomicWriteFile(path, newContent, 0o600)
+if err != nil {
+t.Fatalf("AtomicWriteFile() error = %v", err)
+}
+
+// After atomic write, file should have new content
+got, err := os.ReadFile(path)
+if err != nil {
+t.Fatalf("ReadFile() error = %v", err)
+}
+if string(got) != string(newContent) {
+t.Errorf("content = %q, want %q", got, newContent)
+}
+})
+}

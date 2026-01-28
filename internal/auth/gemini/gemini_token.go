@@ -6,12 +6,10 @@ package gemini
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
-	log "github.com/sirupsen/logrus"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
 // GeminiTokenStorage stores OAuth2 token information for Google Gemini API authentication.
@@ -40,6 +38,7 @@ type GeminiTokenStorage struct {
 // SaveTokenToFile serializes the Gemini token storage to a JSON file.
 // This method creates the necessary directory structure and writes the token
 // data in JSON format to the specified file path for persistent storage.
+// Uses atomic write to prevent race conditions with file watchers.
 //
 // Parameters:
 //   - authFilePath: The full path where the token file should be saved
@@ -49,22 +48,18 @@ type GeminiTokenStorage struct {
 func (ts *GeminiTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "gemini"
-	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
-	}
 
-	f, err := os.Create(authFilePath)
+	data, err := json.Marshal(ts)
 	if err != nil {
-		return fmt.Errorf("failed to create token file: %w", err)
+		return fmt.Errorf("failed to marshal token: %w", err)
 	}
-	defer func() {
-		if errClose := f.Close(); errClose != nil {
-			log.Errorf("failed to close file: %v", errClose)
-		}
-	}()
 
-	if err = json.NewEncoder(f).Encode(ts); err != nil {
-		return fmt.Errorf("failed to write token to file: %w", err)
+	// Append newline for consistency with encoder behavior
+	data = append(data, '\n')
+
+	// Use atomic write to prevent race conditions with file watcher
+	if err = util.AtomicWriteFile(authFilePath, data, 0o600); err != nil {
+		return fmt.Errorf("failed to write token file: %w", err)
 	}
 	return nil
 }

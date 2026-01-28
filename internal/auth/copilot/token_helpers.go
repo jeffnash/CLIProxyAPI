@@ -22,12 +22,15 @@ func ApplyTokenRefresh(auth *coreauth.Auth, tokenResp *CopilotTokenResponse, now
 	}
 	auth.Metadata["copilot_token"] = tokenResp.Token
 	auth.Metadata["copilot_token_expiry"] = expiryStr
+	auth.Metadata["expires_at"] = expiryStr
+	auth.Metadata["last_refresh"] = lastRefreshStr
 	auth.Metadata["type"] = "copilot"
 
 	// Update storage (persistence layer)
 	if storage, ok := auth.Storage.(*CopilotTokenStorage); ok && storage != nil {
 		storage.CopilotToken = tokenResp.Token
 		storage.CopilotTokenExpiry = expiryStr
+		storage.ExpiresAt = expiryStr
 		storage.RefreshIn = tokenResp.RefreshIn
 		storage.LastRefresh = lastRefreshStr
 	}

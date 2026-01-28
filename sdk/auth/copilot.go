@@ -124,6 +124,7 @@ func (a *CopilotAuthenticator) Login(ctx context.Context, cfg *config.Config, op
 		"username":             tokenStorage.Username,
 		"account_type":         tokenStorage.AccountType,
 		"copilot_token_expiry": tokenStorage.CopilotTokenExpiry,
+		"expires_at":           tokenStorage.CopilotTokenExpiry,
 		"github_token":         tokenStorage.GitHubToken,
 		"copilot_token":        tokenStorage.CopilotToken,
 		"type":                 "copilot",
