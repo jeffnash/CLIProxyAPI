@@ -182,6 +182,102 @@ func mergeEssentialCopilotModels(models []*registry.ModelInfo, now int64) []*reg
 	return models
 }
 
+// resolveCopilotAlias resolves model aliases with reasoning effort suffixes.
+// For example: "gpt-5-high" -> ("gpt-5", "high", true)
+// Supported efforts: low, medium, high, xhigh (xhigh only for gpt-5.1-codex-max and gpt-5.2)
+func resolveCopilotAlias(modelName string) (baseModel, effort string, ok bool) {
+	m := strings.ToLower(strings.TrimSpace(modelName))
+
+	// gpt-5.2 variants (supports xhigh)
+	switch m {
+	case "gpt-5.2-low":
+		return "gpt-5.2", "low", true
+	case "gpt-5.2-medium":
+		return "gpt-5.2", "medium", true
+	case "gpt-5.2-high":
+		return "gpt-5.2", "high", true
+	case "gpt-5.2-xhigh":
+		return "gpt-5.2", "xhigh", true
+	}
+
+	// gpt-5.1-codex-max variants (supports xhigh)
+	switch m {
+	case "gpt-5.1-codex-max-low":
+		return "gpt-5.1-codex-max", "low", true
+	case "gpt-5.1-codex-max-medium":
+		return "gpt-5.1-codex-max", "medium", true
+	case "gpt-5.1-codex-max-high":
+		return "gpt-5.1-codex-max", "high", true
+	case "gpt-5.1-codex-max-xhigh":
+		return "gpt-5.1-codex-max", "xhigh", true
+	}
+
+	// gpt-5.1-codex variants
+	switch m {
+	case "gpt-5.1-codex-low":
+		return "gpt-5.1-codex", "low", true
+	case "gpt-5.1-codex-medium":
+		return "gpt-5.1-codex", "medium", true
+	case "gpt-5.1-codex-high":
+		return "gpt-5.1-codex", "high", true
+	}
+
+	// gpt-5.1-codex-mini variants
+	switch m {
+	case "gpt-5.1-codex-mini-low":
+		return "gpt-5.1-codex-mini", "low", true
+	case "gpt-5.1-codex-mini-medium":
+		return "gpt-5.1-codex-mini", "medium", true
+	case "gpt-5.1-codex-mini-high":
+		return "gpt-5.1-codex-mini", "high", true
+	}
+
+	// gpt-5.1 variants
+	switch m {
+	case "gpt-5.1-low":
+		return "gpt-5.1", "low", true
+	case "gpt-5.1-medium":
+		return "gpt-5.1", "medium", true
+	case "gpt-5.1-high":
+		return "gpt-5.1", "high", true
+	}
+
+	// gpt-5 variants
+	switch m {
+	case "gpt-5-low":
+		return "gpt-5", "low", true
+	case "gpt-5-medium":
+		return "gpt-5", "medium", true
+	case "gpt-5-high":
+		return "gpt-5", "high", true
+	}
+
+	// gpt-5-mini variants
+	switch m {
+	case "gpt-5-mini-low":
+		return "gpt-5-mini", "low", true
+	case "gpt-5-mini-medium":
+		return "gpt-5-mini", "medium", true
+	case "gpt-5-mini-high":
+		return "gpt-5-mini", "high", true
+	}
+
+	return "", "", false
+}
+
+// setCopilotReasoningEffort sets reasoning.effort in the payload for Copilot GPT models.
+// Also sets reasoning.summary to "auto" and includes reasoning.encrypted_content.
+func setCopilotReasoningEffort(payload []byte, effort string) []byte {
+	if strings.TrimSpace(effort) == "" {
+		return payload
+	}
+	payload, _ = sjson.SetBytes(payload, "reasoning.effort", strings.ToLower(strings.TrimSpace(effort)))
+	payload, _ = sjson.SetBytes(payload, "reasoning.summary", "auto")
+	// Note: "include" for encrypted_content is typically set via query params or headers,
+	// but we set it in body for completeness where supported
+	return payload
+}
+
 // sanitizeCopilotPayload removes fields that Copilot's Chat Completions endpoint
 // rejects (strip max_tokens and parallel_tool_calls).
 func sanitizeCopilotPayload(body []byte, model string) []byte {
@@ -209,6 +305,13 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 
 	apiModel := stripCopilotPrefix(req.Model)
 
+	// Resolve reasoning effort aliases (e.g., gpt-5-high -> gpt-5 with high effort)
+	var aliasEffort string
+	if resolvedModel, effort, ok := resolveCopilotAlias(apiModel); ok {
+		apiModel = resolvedModel
+		aliasEffort = effort
+	}
+
 	translatorModel := req.Model
 	if !strings.HasPrefix(strings.ToLower(req.Model), "copilot-") && strings.HasPrefix(strings.ToLower(apiModel), "gemini") {
 		translatorModel = "copilot-" + apiModel
@@ -225,6 +328,12 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", false)
+
+	// Apply reasoning effort from alias if resolved
+	if aliasEffort != "" {
+		body = setCopilotReasoningEffort(body, aliasEffort)
+		body, _ = sjson.SetBytes(body, "model", apiModel)
+	}
 
 	// Inject cached Gemini reasoning for models that require it
 	if strings.HasPrefix(strings.ToLower(apiModel), "gemini") {
@@ -305,6 +414,13 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 
 	apiModel := stripCopilotPrefix(req.Model)
 
+	// Resolve reasoning effort aliases (e.g., gpt-5-high -> gpt-5 with high effort)
+	var aliasEffort string
+	if resolvedModel, effort, ok := resolveCopilotAlias(apiModel); ok {
+		apiModel = resolvedModel
+		aliasEffort = effort
+	}
+
 	translatorModel := req.Model
 	if !strings.HasPrefix(strings.ToLower(req.Model), "copilot-") && strings.HasPrefix(strings.ToLower(apiModel), "gemini") {
 		translatorModel = "copilot-" + apiModel
@@ -321,6 +437,12 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
+
+	// Apply reasoning effort from alias if resolved
+	if aliasEffort != "" {
+		body = setCopilotReasoningEffort(body, aliasEffort)
+		body, _ = sjson.SetBytes(body, "model", apiModel)
+	}
 
 	// Inject cached Gemini reasoning for models that require it
 	if strings.HasPrefix(strings.ToLower(apiModel), "gemini") {

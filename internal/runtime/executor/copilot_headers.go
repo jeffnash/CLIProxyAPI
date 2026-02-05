@@ -391,6 +391,12 @@ func (e *CopilotExecutor) applyCopilotHeaders(r *http.Request, copilotToken stri
 		log.Info("copilot executor: [user call]")
 	}
 
+	// Add Anthropic beta header for Claude models to enable interleaved thinking
+	model := strings.ToLower(gjson.GetBytes(payload, "model").String())
+	if strings.Contains(model, "claude") {
+		r.Header.Set("Anthropic-Beta", "interleaved-thinking-2025-05-14")
+	}
+
 	// Apply header profile after defaults are set so it can override relevant headers.
 	e.applyCopilotHeaderProfile(r, gjson.GetBytes(payload, "model").String())
 }

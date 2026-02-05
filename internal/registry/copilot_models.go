@@ -211,6 +211,18 @@ func GetCopilotModels() []*ModelInfo {
 			SupportedParameters: paramsWithTools,
 		},
 		{
+			ID:                  "claude-opus-4.6",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "copilot",
+			Type:                "copilot",
+			DisplayName:         "Claude Opus 4.6",
+			Description:         "Anthropic model via GitHub Copilot",
+			ContextLength:       200000,
+			MaxCompletionTokens: 64000,
+			SupportedParameters: paramsWithTools,
+		},
+		{
 			ID:                  "gemini-2.5-pro",
 			Object:              "model",
 			Created:             now,
