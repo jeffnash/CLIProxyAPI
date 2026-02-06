@@ -184,12 +184,26 @@ func mergeEssentialCopilotModels(models []*registry.ModelInfo, now int64) []*reg
 
 // resolveCopilotAlias resolves model aliases with reasoning effort suffixes.
 // For example: "gpt-5-high" -> ("gpt-5", "high", true)
-// Supported efforts: low, medium, high, xhigh (xhigh only for gpt-5.1-codex-max and gpt-5.2)
+// Supported efforts: minimal, none, low, medium, high, xhigh (xhigh only for gpt-5.1-codex-max, gpt-5.2, and gpt-5.2-codex)
 func resolveCopilotAlias(modelName string) (baseModel, effort string, ok bool) {
 	m := strings.ToLower(strings.TrimSpace(modelName))
 
+	// gpt-5.2-codex variants (supports xhigh)
+	switch m {
+	case "gpt-5.2-codex-low":
+		return "gpt-5.2-codex", "low", true
+	case "gpt-5.2-codex-medium":
+		return "gpt-5.2-codex", "medium", true
+	case "gpt-5.2-codex-high":
+		return "gpt-5.2-codex", "high", true
+	case "gpt-5.2-codex-xhigh":
+		return "gpt-5.2-codex", "xhigh", true
+	}
+
 	// gpt-5.2 variants (supports xhigh)
 	switch m {
+	case "gpt-5.2-none":
+		return "gpt-5.2", "none", true
 	case "gpt-5.2-low":
 		return "gpt-5.2", "low", true
 	case "gpt-5.2-medium":
@@ -234,6 +248,8 @@ func resolveCopilotAlias(modelName string) (baseModel, effort string, ok bool) {
 
 	// gpt-5.1 variants
 	switch m {
+	case "gpt-5.1-none":
+		return "gpt-5.1", "none", true
 	case "gpt-5.1-low":
 		return "gpt-5.1", "low", true
 	case "gpt-5.1-medium":
@@ -242,8 +258,28 @@ func resolveCopilotAlias(modelName string) (baseModel, effort string, ok bool) {
 		return "gpt-5.1", "high", true
 	}
 
+	// gpt-5-codex variants
+	switch m {
+	case "gpt-5-codex-low":
+		return "gpt-5-codex", "low", true
+	case "gpt-5-codex-medium":
+		return "gpt-5-codex", "medium", true
+	case "gpt-5-codex-high":
+		return "gpt-5-codex", "high", true
+	}
+
+	// gpt-5-codex-mini variants
+	switch m {
+	case "gpt-5-codex-mini-medium":
+		return "gpt-5-codex-mini", "medium", true
+	case "gpt-5-codex-mini-high":
+		return "gpt-5-codex-mini", "high", true
+	}
+
 	// gpt-5 variants
 	switch m {
+	case "gpt-5-minimal":
+		return "gpt-5", "minimal", true
 	case "gpt-5-low":
 		return "gpt-5", "low", true
 	case "gpt-5-medium":
