@@ -80,7 +80,7 @@ func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequ
 	writeHeaders(builder, info.Headers)
 	builder.WriteString("\nBody:\n")
 	if len(info.Body) > 0 {
-		builder.WriteString(truncateForLog(bytes.Clone(info.Body), 8*1024))
+		builder.WriteString(truncateForLog(info.Body, 8*1024))
 	} else {
 		builder.WriteString("<empty>")
 	}
@@ -152,7 +152,7 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	if cfg == nil || (!cfg.RequestLog && !internallogging.VerboseEnabled()) {
 		return
 	}
-	data := bytes.TrimSpace(bytes.Clone(chunk))
+	data := bytes.TrimSpace(chunk)
 	if len(data) == 0 {
 		return
 	}
