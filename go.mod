@@ -15,6 +15,7 @@ require (
 	github.com/klauspost/compress v1.18.2
 	github.com/minio/minio-go/v7 v7.0.66
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
+	github.com/refraction-networking/utls v1.8.2
 	github.com/sirupsen/logrus v1.9.3
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
@@ -23,7 +24,6 @@ require (
 	golang.org/x/net v0.48.0
 	golang.org/x/oauth2 v0.30.0
 	golang.org/x/term v0.38.0
-	golang.org/x/text v0.32.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -68,7 +68,6 @@ require (
 	github.com/pjbgf/sha1cd v0.5.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.57.1 // indirect
-	github.com/refraction-networking/utls v1.8.1 // indirect
 	github.com/rs/xid v1.5.0 // indirect
 	github.com/sergi/go-diff v1.4.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
@@ -78,6 +77,7 @@ require (
 	golang.org/x/arch v0.8.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
+	golang.org/x/text v0.32.0 // indirect
 	google.golang.org/protobuf v1.34.1 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 )

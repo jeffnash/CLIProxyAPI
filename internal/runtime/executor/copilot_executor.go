@@ -184,7 +184,7 @@ func mergeEssentialCopilotModels(models []*registry.ModelInfo, now int64) []*reg
 
 // resolveCopilotAlias resolves model aliases with reasoning effort suffixes.
 // For example: "gpt-5-high" -> ("gpt-5", "high", true)
-// Supported efforts: minimal, none, low, medium, high, xhigh (xhigh only for gpt-5.1-codex-max, gpt-5.2, and gpt-5.2-codex)
+// Supported efforts: minimal, none, low, medium, high, xhigh (xhigh only for gpt-5.1-codex-max, gpt-5.2, gpt-5.2-codex, gpt-5.3-codex)
 func resolveCopilotAlias(modelName string) (baseModel, effort string, ok bool) {
 	m := strings.ToLower(strings.TrimSpace(modelName))
 
@@ -198,6 +198,18 @@ func resolveCopilotAlias(modelName string) (baseModel, effort string, ok bool) {
 		return "gpt-5.2-codex", "high", true
 	case "gpt-5.2-codex-xhigh":
 		return "gpt-5.2-codex", "xhigh", true
+	}
+
+	// gpt-5.3-codex variants (supports xhigh)
+	switch m {
+	case "gpt-5.3-codex-low":
+		return "gpt-5.3-codex", "low", true
+	case "gpt-5.3-codex-medium":
+		return "gpt-5.3-codex", "medium", true
+	case "gpt-5.3-codex-high":
+		return "gpt-5.3-codex", "high", true
+	case "gpt-5.3-codex-xhigh":
+		return "gpt-5.3-codex", "xhigh", true
 	}
 
 	// gpt-5.2 variants (supports xhigh)
