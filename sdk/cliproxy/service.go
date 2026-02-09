@@ -424,6 +424,8 @@ func (s *Service) ensureExecutorsForAuth(a *coreauth.Auth) {
 		s.coreManager.RegisterExecutor(executor.NewChutesExecutor(s.cfg))
 	case "kiro":
 		s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg))
+	case "kimi":
+		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -893,6 +895,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			log.Warnf("chutes: using static fallback models for auth %s", a.ID)
 			models = registry.GetChutesModels()
 		}
+	case "kimi":
+		models = registry.GetKimiModels()
+		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {

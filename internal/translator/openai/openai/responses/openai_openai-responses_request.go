@@ -70,48 +70,40 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				if role == "developer" {
 					role = "user"
 				}
-				message := `{"role":"","content":""}`
+				message := `{"role":"","content":[]}`
 				message, _ = sjson.Set(message, "role", role)
 
-				if content := item.Get("content"); content.Exists() {
-					if content.IsArray() {
-						var messageContent string
-						var toolCalls []interface{}
+				if content := item.Get("content"); content.Exists() && content.IsArray() {
+					var messageContent string
+					var toolCalls []interface{}
 
-						content.ForEach(func(_, contentItem gjson.Result) bool {
-							contentType := contentItem.Get("type").String()
-							if contentType == "" {
-								contentType = "input_text"
-							}
-
-							switch contentType {
-							case "input_text":
-								text := contentItem.Get("text").String()
-								if messageContent != "" {
-									messageContent += "\n" + text
-								} else {
-									messageContent = text
-								}
-							case "output_text":
-								text := contentItem.Get("text").String()
-								if messageContent != "" {
-									messageContent += "\n" + text
-								} else {
-									messageContent = text
-								}
-							}
-							return true
-						})
-
-						if messageContent != "" {
-							message, _ = sjson.Set(message, "content", messageContent)
+					content.ForEach(func(_, contentItem gjson.Result) bool {
+						contentType := contentItem.Get("type").String()
+						if contentType == "" {
+							contentType = "input_text"
 						}
 
-						if len(toolCalls) > 0 {
-							message, _ = sjson.Set(message, "tool_calls", toolCalls)
+						switch contentType {
+						case "input_text", "output_text":
+							text := contentItem.Get("text").String()
+							contentPart := `{"type":"text","text":""}`
+							contentPart, _ = sjson.Set(contentPart, "text", text)
+							message, _ = sjson.SetRaw(message, "content.-1", contentPart)
+						case "input_image":
+							imageURL := contentItem.Get("image_url").String()
+							contentPart := `{"type":"image_url","image_url":{"url":""}}`
+							contentPart, _ = sjson.Set(contentPart, "image_url.url", imageURL)
+							message, _ = sjson.SetRaw(message, "content.-1", contentPart)
 						}
-					} else if content.Type == gjson.String {
-						message, _ = sjson.Set(message, "content", content.String())
+						return true
+					})
+
+					if messageContent != "" {
+						message, _ = sjson.Set(message, "content", messageContent)
+					}
+
+					if len(toolCalls) > 0 {
+						message, _ = sjson.Set(message, "tool_calls", toolCalls)
 					}
 				} else if content.Type == gjson.String {
 					message, _ = sjson.Set(message, "content", content.String())
