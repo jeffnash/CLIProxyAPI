@@ -1518,7 +1518,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			Type:                "github-copilot",
 			DisplayName:         "Claude Opus 4.6",
 			Description:         "Anthropic Claude Opus 4.6 via GitHub Copilot",
-			ContextLength:       128000,
+			ContextLength:       200000,
 			MaxCompletionTokens: 64000,
 		},
 		{
@@ -1529,7 +1529,7 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			Type:                "github-copilot",
 			DisplayName:         "Claude Opus 4.6 (fast mode) (Preview)",
 			Description:         "Anthropic Claude Opus 4.6 Fast via GitHub Copilot",
-			ContextLength:       128000,
+			ContextLength:       200000,
 			MaxCompletionTokens: 64000,
 		},
 		{
