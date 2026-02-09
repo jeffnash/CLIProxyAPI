@@ -21,6 +21,7 @@ func newAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewAntigravityAuthenticator(),
 		sdkAuth.NewCopilotAuthenticator(),
 		sdkAuth.NewKiroAuthenticator(),
+		sdkAuth.NewKimiAuthenticator(),
 	)
 	return manager
 }
