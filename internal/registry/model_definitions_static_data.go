@@ -1522,6 +1522,17 @@ func GetGitHubCopilotModels() []*ModelInfo {
 			MaxCompletionTokens: 64000,
 		},
 		{
+			ID:                  "claude-opus-4.6-fast",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "github-copilot",
+			Type:                "github-copilot",
+			DisplayName:         "Claude Opus 4.6 (fast mode) (Preview)",
+			Description:         "Anthropic Claude Opus 4.6 Fast via GitHub Copilot",
+			ContextLength:       128000,
+			MaxCompletionTokens: 64000,
+		},
+		{
 			ID:                  "claude-sonnet-4",
 			Object:              "model",
 			Created:             now,
