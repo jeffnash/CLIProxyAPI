@@ -116,11 +116,48 @@ func (e *CopilotExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Au
 	// then fall back to Go's net/http transport.
 	if copilotPreferElectronTransport() {
 		var proxyURL string
+		proxySource := ""
 		if auth != nil {
 			proxyURL = strings.TrimSpace(auth.ProxyURL)
+			if proxyURL != "" {
+				proxySource = "auth"
+			}
 		}
 		if proxyURL == "" && e != nil && e.cfg != nil && e.cfg.SDKConfig.ProxyEnabledFor("copilot") {
 			proxyURL = strings.TrimSpace(e.cfg.ProxyURL)
+			if proxyURL != "" {
+				proxySource = "global"
+			}
+		} else if proxyURL == "" && e != nil && e.cfg != nil && strings.TrimSpace(e.cfg.ProxyURL) != "" && !e.cfg.SDKConfig.ProxyEnabledFor("copilot") {
+			logProxyOnce(
+				"proxy.disabled.copilot.electron",
+				"proxy: service=copilot disabled by OUTBOUND_PROXY_SERVICES (proxy configured but not enabled for service)",
+			)
+		}
+
+		if proxyURL != "" {
+			noProxyRaw := noProxyEnvRaw()
+			noProxyList := parseNoProxyList(noProxyRaw)
+			if httpReq.URL != nil {
+				host := strings.TrimSpace(httpReq.URL.Hostname())
+				if shouldBypassProxy(host, noProxyList) {
+					logProxyOnce(
+						"proxy.bypass.copilot.electron."+strings.ToLower(host),
+						"proxy: service=copilot bypass host=%s reason=NO_PROXY transport=electron",
+						host,
+					)
+					proxyURL = ""
+				}
+			}
+			if proxyURL != "" {
+				logProxyOnce(
+					"proxy.enabled.copilot.electron."+maskProxyURL(proxyURL),
+					"proxy: service=copilot enabled proxy=%s source=%s no_proxy=%q transport=electron",
+					maskProxyURL(proxyURL),
+					proxySource,
+					noProxyRaw,
+				)
+			}
 		}
 		if resp, err := httpResponseFromElectron(ctx, httpReq, proxyURL); err == nil {
 			return resp, nil
