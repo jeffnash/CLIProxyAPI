@@ -85,19 +85,15 @@ To enable Chutes on Railway, set these environment variables:
 
 Tip: If you want Chutes available but don’t want it to show up in `/v1/models` unless needed, keep `CHUTES_PRIORITY=fallback` and use `chutes-...` for explicit routing.
 
-### Copilot (optional) behavior flags
+### Copilot (fork defaults + parity transport)
 
-If you are using **GitHub Copilot** and want to fine-tune how the proxy behaves for Copilot-backed requests, you can set these Railway environment variables (they are consumed by `scripts/railway_start.sh`):
+This fork defaults Copilot requests to:
 
-- `COPILOT_AGENT_INITIATOR_PERSIST` (default `true`): when truthy, writes `copilot-api-key[].agent-initiator-persist: true` into `config.yaml`.
-  - What it is: the **normal/expected agentic behavior** — once you’re in an agent loop, keep follow-up calls marked as agent.
-  - What it does: if `prompt_cache_key` is present, once the proxy sees an agent-ish request for that cache key, it will keep setting `X-Initiator: agent` for subsequent requests using the same cache key.
-  - Why you might want it: in many Copilot setups, **user calls count against monthly quota** while **agent calls do not**; this prevents an agent loop from unexpectedly burning user quota mid-workflow.
-- `COPILOT_FORCE_AGENT_CALL` (default `false`): when truthy, writes `copilot-api-key[].force-agent-call: true` into `config.yaml`.
-  - What it is: a **hacky quota optimization** — force everything to be tagged as an agent call.
-  - What it does: forces `X-Initiator: agent` for Copilot requests regardless of payload.
-  - Why you might want it: can reduce user-quota usage by marking everything as agent calls.
-  - Warning: **use at your own risk** — it may violate provider expectations/ToS, break accounting, or cause requests to be rejected.
+- `X-Initiator: agent` (by design)
+- `OpenAI-Intent: conversation-edits` and `X-Interaction-Type: conversation-edits`
+- Chromium/Electron transport shim by default (falls back to Go `net/http` if Electron isn’t available)
+
+If you want to control Electron availability on Railway, see `docs/RAILWAY_ELECTRON_SHIM.md`.
 
 Optional (YAML-only) header emulation knobs (edit `config.yaml` yourself; not currently wired via `scripts/railway_start.sh`):
 
@@ -110,6 +106,46 @@ Note: by default the proxy detects agent calls by looking for tool/agent activit
 
 Tip: you can explicitly route a request to Copilot by using `model: "copilot-<model>"` (for example, `copilot-gpt-5`) which forces the provider selection to Copilot even if the model isn't registered in the local model registry.
 
+### Copilot Electron transport shim (VS Code parity)
+
+This fork can send Copilot LLM requests using an Electron/Chromium transport shim (to better match VS Code’s network
+fingerprints). By default, CLIProxyAPI will try Electron first and fall back to Go `net/http` if Electron is not
+available.
+
+Recommended Railway variables:
+
+- `COPILOT_TRANSPORT=electron`
+- If Electron is not on `PATH`, set one of:
+  - `ELECTRON_PATH=/path/to/electron`
+  - `COPILOT_ELECTRON_PATH=/path/to/electron`
+
+If you want Railway to install Electron at container start (slower; less reliable than baking it into the image):
+
+- `INSTALL_ELECTRON=1`
+
+Note: if you use `INSTALL_ELECTRON=1`, your image must include the required system libraries for Electron. This repo’s
+`railpack.json` has been updated to include typical Electron runtime deps.
+
+### Copilot Hot Takes (optional background job)
+
+If you set `COPILOT_HOT_TAKES_INTERVAL_MINS` to a non-empty value, the server will:
+
+1. Fetch Hacker News top story IDs (`/v0/topstories.json`)
+2. Randomly select 7 IDs
+3. Fetch each story’s `title`
+4. Ask Copilot (as `X-Initiator: user`) "What do you think about these headliens?" with the 7 titles as bullet points
+5. Print Copilot’s response to the container logs
+
+Railway variables:
+
+- `COPILOT_HOT_TAKES_INTERVAL_MINS=60` (example)
+- `COPILOT_HOT_TAKES_MODEL=claude-haiku-4.5` (defaults to `claude-haiku-4.5` if empty)
+
+Notes:
+
+- The job calls the local server at `http://127.0.0.1:$PORT/v1/chat/completions` using your first `api-keys` entry, so it
+  works in the standard Railway deployment path.
+- It forces Copilot routing by prefixing the model with `copilot-` internally (unless you already include it).
 
 ### Option A: Using the Railway Dashboard
 1. Go to your [Railway Dashboard](https://railway.app/) and click **New Project**.

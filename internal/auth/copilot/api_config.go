@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"strings"
 
 	copilotshared "github.com/router-for-me/CLIProxyAPI/v6/internal/copilot"
 )
@@ -26,7 +28,11 @@ const (
 
 	CopilotVersion       = "0.0.363"
 	EditorPluginVersion  = "copilot/" + CopilotVersion
-	CopilotUserAgent     = "copilot/" + CopilotVersion + " (linux v22.15.0)"
+	// CopilotUserAgent is the default User-Agent used for Copilot-related outbound requests.
+	// It intentionally mirrors VS Code's extension style ("GithubCopilot/<version>").
+	//
+	// Override with COPILOT_USER_AGENT when needed (e.g., to match a specific extension build).
+	CopilotUserAgent     = "GithubCopilot/1.388.0"
 	CopilotAPIVersion    = "2025-05-01"
 	CopilotIntegrationID = "copilot-developer-cli"
 	DefaultVSCodeVersion = "1.95.0"
@@ -73,7 +79,7 @@ func GitHubHeaders(githubToken, vsCodeVersion string) map[string]string {
 		"Authorization":                       fmt.Sprintf("token %s", githubToken),
 		"Editor-Version":                      fmt.Sprintf("vscode/%s", vsCodeVersion),
 		"Editor-Plugin-Version":               EditorPluginVersion,
-		"User-Agent":                          CopilotUserAgent,
+		"User-Agent":                          CopilotUserAgentValue(),
 		"X-Github-Api-Version":                CopilotAPIVersion,
 		"X-Vscode-User-Agent-Library-Version": "electron-fetch",
 	}
@@ -86,11 +92,9 @@ func CopilotHeaders(copilotToken, vsCodeVersion string, enableVision bool) map[s
 	headers := map[string]string{
 		"Content-Type":                        "application/json",
 		"Authorization":                       fmt.Sprintf("Bearer %s", copilotToken),
-		"Copilot-Integration-Id":              CopilotIntegrationID,
 		"Editor-Version":                      fmt.Sprintf("vscode/%s", vsCodeVersion),
 		"Editor-Plugin-Version":               EditorPluginVersion,
-		"User-Agent":                          CopilotUserAgent,
-		"Openai-Intent":                       "conversation-agent",
+		"User-Agent":                          CopilotUserAgentValue(),
 		"X-Github-Api-Version":                CopilotAPIVersion,
 		"X-Request-Id":                        generateRequestID(),
 		"X-Interaction-Id":                    generateRequestID(),
@@ -100,6 +104,15 @@ func CopilotHeaders(copilotToken, vsCodeVersion string, enableVision bool) map[s
 		headers["Copilot-Vision-Request"] = "true"
 	}
 	return headers
+}
+
+// CopilotUserAgentValue returns the effective User-Agent string for Copilot requests.
+// If COPILOT_USER_AGENT is set, it takes precedence.
+func CopilotUserAgentValue() string {
+	if env := strings.TrimSpace(os.Getenv("COPILOT_USER_AGENT")); env != "" {
+		return env
+	}
+	return CopilotUserAgent
 }
 
 func generateRequestID() string {

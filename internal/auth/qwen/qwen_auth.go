@@ -85,7 +85,7 @@ type QwenAuth struct {
 // NewQwenAuth creates a new QwenAuth instance with a proxy-configured HTTP client.
 func NewQwenAuth(cfg *config.Config) *QwenAuth {
 	return &QwenAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
+		httpClient: util.SetProxyForService(&cfg.SDKConfig, "qwen", &http.Client{}),
 	}
 }
 

@@ -61,7 +61,7 @@ type IFlowAuth struct {
 // NewIFlowAuth constructs a new IFlowAuth with proxy-aware transport.
 func NewIFlowAuth(cfg *config.Config) *IFlowAuth {
 	client := &http.Client{Timeout: 30 * time.Second}
-	return &IFlowAuth{httpClient: util.SetProxy(&cfg.SDKConfig, client)}
+	return &IFlowAuth{httpClient: util.SetProxyForService(&cfg.SDKConfig, "iflow", client)}
 }
 
 // AuthorizationURL builds the authorization URL and matching redirect URI.

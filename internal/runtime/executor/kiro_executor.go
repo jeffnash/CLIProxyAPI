@@ -290,7 +290,7 @@ func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "kiro")
 	return httpClient.Do(httpReq)
 }
 
@@ -417,7 +417,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			// Do not set http.Client.Timeout for streaming responses; it applies while reading the body
 			// and can terminate long-lived event-stream responses mid-flight.
-			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "kiro")
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
 				recordAPIResponseError(ctx, e.cfg, err)
@@ -750,7 +750,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				AuthValue: authValue,
 			})
 
-			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "kiro")
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
 				recordAPIResponseError(ctx, e.cfg, err)

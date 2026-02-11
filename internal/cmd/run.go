@@ -25,13 +25,13 @@ import (
 //   - configPath: The path to the configuration file
 //   - localPassword: Optional password accepted for local management requests
 func StartService(cfg *config.Config, configPath string, localPassword string) {
+	ctxSignal, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	builder := cliproxy.NewBuilder().
 		WithConfig(cfg).
 		WithConfigPath(configPath).
 		WithLocalManagementPassword(localPassword)
-
-	ctxSignal, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	runCtx := ctxSignal
 	if localPassword != "" {
@@ -48,6 +48,9 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 		log.Errorf("failed to build proxy service: %v", err)
 		return
 	}
+
+	// Background opt-in job (disabled unless COPILOT_HOT_TAKES_INTERVAL_MINS is set).
+	StartCopilotHotTakesLoop(runCtx, cfg)
 
 	err = service.Run(runCtx)
 	if err != nil && !errors.Is(err, context.Canceled) {

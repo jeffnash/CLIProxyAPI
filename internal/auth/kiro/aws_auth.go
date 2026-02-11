@@ -48,7 +48,7 @@ type KiroAuth struct {
 //   - *KiroAuth: A new Kiro authentication service instance
 func NewKiroAuth(cfg *config.Config) *KiroAuth {
 	return &KiroAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{Timeout: 120 * time.Second}),
+		httpClient: util.SetProxyForService(&cfg.SDKConfig, "kiro", &http.Client{Timeout: 120 * time.Second}),
 		endpoint:   awsKiroEndpoint,
 	}
 }

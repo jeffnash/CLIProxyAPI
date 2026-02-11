@@ -41,6 +41,61 @@ decode_base64() {
 require_any_env "AUTH_ZIP_URL" "AUTH_BUNDLE"
 require_env "API_KEY_1"
 
+ensure_electron() {
+  # Installs Electron (and Node.js) if requested and missing.
+  #
+  # Railway note: this requires the container image to have apt + curl available.
+  # Prefer baking Electron into the image for faster/reliable deploys; this is a fallback.
+  if [[ "${COPILOT_TRANSPORT:-}" == "go" ]]; then
+    info "COPILOT_TRANSPORT=go; skipping Electron install"
+    return 0
+  fi
+
+  # If electron already exists, we are good.
+  if command -v electron >/dev/null 2>&1; then
+    info "Electron already present: $(command -v electron)"
+    export ELECTRON_PATH="${ELECTRON_PATH:-electron}"
+    export COPILOT_ELECTRON_PATH="${COPILOT_ELECTRON_PATH:-electron}"
+    return 0
+  fi
+
+  # Optional: install Electron during container start (slower).
+  if [[ "${INSTALL_ELECTRON:-0}" == "0" ]]; then
+    info "Electron not found; set INSTALL_ELECTRON=1 to install at startup (or bake into image)"
+    return 0
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    info "Electron not found and apt-get is unavailable; cannot install Electron at startup"
+    return 0
+  fi
+
+  info "Installing Node.js + Electron (INSTALL_ELECTRON=1)"
+
+  # Install Node (20.x) then Electron.
+  # NOTE: railpack.json should include the shared libs Electron needs; this function assumes that.
+  apt-get update -y >/dev/null
+  if ! command -v node >/dev/null 2>&1; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
+    apt-get install -y --no-install-recommends nodejs >/dev/null
+  fi
+
+  if ! command -v npm >/dev/null 2>&1; then
+    info "npm not available after node install; cannot install electron"
+    return 0
+  fi
+
+  npm i -g electron@latest >/dev/null
+
+  if command -v electron >/dev/null 2>&1; then
+    info "Electron installed: $(command -v electron)"
+    export ELECTRON_PATH="${ELECTRON_PATH:-electron}"
+    export COPILOT_ELECTRON_PATH="${COPILOT_ELECTRON_PATH:-electron}"
+  else
+    info "Electron install completed but electron is still not on PATH"
+  fi
+}
+
 ROOT_DIR="$(pwd)"
 AUTH_DIR_NAME="${AUTH_DIR_NAME:-auths_railway}"
 AUTH_DIR_PATH="${ROOT_DIR}/${AUTH_DIR_NAME}"
@@ -48,6 +103,8 @@ AUTH_DIR_PATH="${ROOT_DIR}/${AUTH_DIR_NAME}"
 ZIP_PATH="${ROOT_DIR}/auths.zip"
 TAR_PATH="${ROOT_DIR}/auths.tar.gz"
 OUT_CONFIG_PATH="${ROOT_DIR}/config.yaml"
+
+ensure_electron
 
 info "Preparing auth dir: ${AUTH_DIR_PATH}"
 mkdir -p "${AUTH_DIR_PATH}"

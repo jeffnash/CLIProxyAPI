@@ -156,7 +156,7 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		applyChutesHeaders(httpReq, apiKey, false)
 		logChutesRequestHeaders(httpReq)
 
-		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "chutes")
 		httpResp, errDo := httpClient.Do(httpReq)
 		if errDo != nil {
 			log.WithFields(log.Fields{
@@ -274,7 +274,7 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		applyChutesHeaders(httpReq, apiKey, true)
 		logChutesRequestHeaders(httpReq)
 
-		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "chutes")
 		resp, errDo := httpClient.Do(httpReq)
 		if errDo != nil {
 			log.WithFields(log.Fields{
@@ -424,7 +424,7 @@ func (e *ChutesExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "chutes")
 	return httpClient.Do(httpReq)
 }
 
@@ -455,7 +455,7 @@ func (e *ChutesExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 15*time.Second)
+	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 15*time.Second, "chutes")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Warnf("chutes: failed to fetch models: %v", err)

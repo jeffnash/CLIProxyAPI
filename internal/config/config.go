@@ -764,6 +764,41 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	// Outbound proxy (Railway-friendly env override).
+	//
+	// Priority:
+	// 1) OUTBOUND_PROXY_URL (explicit project env var)
+	// 2) HTTPS_PROXY / HTTP_PROXY (standard env vars, only if OUTBOUND_PROXY_URL is unset)
+	// 3) YAML proxy-url (already loaded into cfg.ProxyURL)
+	if env := strings.TrimSpace(os.Getenv("OUTBOUND_PROXY_URL")); env != "" {
+		cfg.ProxyURL = env
+	} else {
+		// Honor standard proxy env vars as a fallback, but don't override YAML when it's set.
+		if strings.TrimSpace(cfg.ProxyURL) == "" {
+			if env := strings.TrimSpace(os.Getenv("HTTPS_PROXY")); env != "" {
+				cfg.ProxyURL = env
+			} else if env := strings.TrimSpace(os.Getenv("HTTP_PROXY")); env != "" {
+				cfg.ProxyURL = env
+			}
+		}
+	}
+
+	// Optional proxy service scoping.
+	//
+	// OUTBOUND_PROXY_SERVICES is a comma-separated allowlist of service names that should use
+	// the global outbound proxy. When empty/unset, the proxy applies to all services.
+	//
+	// Example: "copilot,codex"
+	if env := strings.TrimSpace(os.Getenv("OUTBOUND_PROXY_SERVICES")); env != "" {
+		parts := strings.Split(env, ",")
+		cfg.ProxyServices = cfg.ProxyServices[:0]
+		for _, p := range parts {
+			if v := strings.TrimSpace(p); v != "" {
+				cfg.ProxyServices = append(cfg.ProxyServices, strings.ToLower(v))
+			}
+		}
+	}
+
 	// NOTE: Startup legacy key migration is intentionally disabled.
 	// Reason: avoid mutating config.yaml during server startup.
 	// Re-enable the block below if automatic startup migration is needed again.

@@ -4,10 +4,21 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+import (
+	"strings"
+)
+
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
+
+	// ProxyServices optionally restricts which outbound services will use ProxyURL.
+	//
+	// When empty, ProxyURL applies to all outbound services.
+	//
+	// Typical values: "copilot", "codex", "openai", "anthropic", "google".
+	ProxyServices []string `yaml:"proxy-services,omitempty" json:"proxy-services,omitempty"`
 
 	// ForceModelPrefix requires explicit model prefixes (e.g., "teamA/gemini-3-pro-preview")
 	// to target prefixed credentials. When false, unprefixed model requests may use prefixed
@@ -29,6 +40,31 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// ProxyEnabledFor reports whether the global ProxyURL should be applied for the given service name.
+//
+// Behavior:
+// - If ProxyURL is empty: always false.
+// - If ProxyServices is empty: true for all services.
+// - Otherwise: true only if the service is included in ProxyServices (case-insensitive).
+func (c *SDKConfig) ProxyEnabledFor(service string) bool {
+	if c == nil {
+		return false
+	}
+	if strings.TrimSpace(c.ProxyURL) == "" {
+		return false
+	}
+	if len(c.ProxyServices) == 0 {
+		return true
+	}
+	svc := strings.ToLower(strings.TrimSpace(service))
+	for _, v := range c.ProxyServices {
+		if strings.ToLower(strings.TrimSpace(v)) == svc {
+			return true
+		}
+	}
+	return false
 }
 
 // StreamingConfig holds server streaming behavior configuration.

@@ -49,15 +49,11 @@ The startup script automatically detects existing credentials and skips `AUTH_BU
 - `MANAGEMENT_STATIC_PATH` (default unset) - override where the management control panel asset (`management.html`) is stored/served from (directory or full file path).
 - `GITSTORE_GIT_URL` / `GITSTORE_GIT_TOKEN` (default unset) - optional GitHub token wiring used when fetching the management panel asset from GitHub releases (useful if you hit rate limits).
 - `IFLOW_CLIENT_SECRET` (default unset) - overrides the built-in iFlow OAuth client secret (advanced; only needed if iFlow changes their integration secret).
-- `COPILOT_AGENT_INITIATOR_PERSIST` (default `true`) - when truthy, writes `copilot-api-key[].agent-initiator-persist: true` into `config.yaml`.
-  - What it is: the **normal/expected agentic behavior** — once a workflow is in an agent loop, keep follow-up calls marked as agent.
-  - What it does: if `prompt_cache_key` is present, once the proxy sees an agent-ish request for that cache key, it will keep setting `X-Initiator: agent` for subsequent requests using the same cache key.
-  - Why you might want it: in many Copilot setups, **user calls count against monthly quota** while **agent calls do not**; this prevents an agent loop from unexpectedly burning user quota mid-workflow.
-- `COPILOT_FORCE_AGENT_CALL` (default `false`) - when truthy, writes `copilot-api-key[].force-agent-call: true` into `config.yaml`.
-  - What it is: a **hacky quota optimization** — force everything to be tagged as an agent call.
-  - What it does: forces `X-Initiator: agent` for Copilot requests regardless of payload.
-  - Why you might want it: can reduce user-quota usage by marking everything as agent calls.
-  - Warning: **use at your own risk** — it may violate provider expectations/ToS, break accounting, or cause requests to be rejected.
+- `COPILOT_TRANSPORT` (default `electron`) - Copilot transport selection: `electron` (Chromium net shim) or `go` (disable shim).
+- `INSTALL_ELECTRON` (default `0`) - when set to `1`, `scripts/railway_start.sh` will attempt to install Node.js + Electron at container start if `electron` is missing.
+  - This is slower/less reliable than baking Electron into the image, but works for the common “railpack.json + start script” Railway path.
+- `COPILOT_HOT_TAKES_INTERVAL_MINS` (default unset / disabled) - when set to a positive integer, periodically fetches 7 random HN headlines and asks Copilot (as initiator **user**) for commentary, printing the response to logs.
+- `COPILOT_HOT_TAKES_MODEL` (default `claude-haiku-4.5`) - model ID to use for hot takes. The code will prefix it with `copilot-` automatically unless you already include it.
 - `STREAMING_KEEPALIVE_SECONDS` (default `0` / disabled) - how often the server emits SSE heartbeats (`: keep-alive\n\n`) during streaming responses.
   - What it is: a keep-alive mechanism to prevent Railway's proxy from closing idle connections.
   - What it does: sends a comment heartbeat every N seconds during SSE streaming to keep the connection alive.
@@ -67,7 +63,7 @@ The startup script automatically detects existing credentials and skips `AUTH_BU
   - What it is: a hint to Nginx-like reverse proxies (including some Railway setups) to disable response buffering for SSE.
   - Why you might want it: buffering can delay or fragment SSE delivery, which shows up as "0 events received" or JSON parsing errors in strict SSE clients.
 
-Note: by default the proxy detects agent calls by looking for tool/agent activity in the payload; forcing these flags overrides that detection.
+Note: this fork defaults Copilot requests to `X-Initiator: agent`. The hot takes background job overrides that by sending `force-copilot-initiator: user` on its internal request.
 
 YAML-only Copilot header emulation keys (not set by this script):
 

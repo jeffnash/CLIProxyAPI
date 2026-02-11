@@ -62,7 +62,7 @@ type CopilotAuth struct {
 // It initializes an HTTP client with proxy settings from the provided configuration.
 func NewCopilotAuth(cfg *config.Config) *CopilotAuth {
 	return &CopilotAuth{
-		httpClient:    util.SetProxy(&cfg.SDKConfig, &http.Client{Timeout: 30 * time.Second}),
+		httpClient:    util.SetProxyForService(&cfg.SDKConfig, "copilot", &http.Client{Timeout: 30 * time.Second}),
 		vsCodeVersion: DefaultVSCodeVersion,
 	}
 }
@@ -275,7 +275,7 @@ func (a *CopilotAuth) GetGitHubUser(ctx context.Context, githubToken string) (*G
 	// Use simpler headers for the GitHub user API - only authorization and standard headers
 	req.Header.Set("Authorization", fmt.Sprintf("token %s", githubToken))
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", CopilotUserAgent)
+	req.Header.Set("User-Agent", CopilotUserAgentValue())
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {

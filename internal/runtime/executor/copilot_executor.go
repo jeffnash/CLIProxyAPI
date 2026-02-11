@@ -111,7 +111,25 @@ func (e *CopilotExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Au
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+
+	// Parity default: attempt to use Electron/Chromium net stack first (if available),
+	// then fall back to Go's net/http transport.
+	if copilotPreferElectronTransport() {
+		var proxyURL string
+		if auth != nil {
+			proxyURL = strings.TrimSpace(auth.ProxyURL)
+		}
+		if proxyURL == "" && e != nil && e.cfg != nil && e.cfg.SDKConfig.ProxyEnabledFor("copilot") {
+			proxyURL = strings.TrimSpace(e.cfg.ProxyURL)
+		}
+		if resp, err := httpResponseFromElectron(ctx, httpReq, proxyURL); err == nil {
+			return resp, nil
+		} else if err != nil && !errors.Is(err, errCopilotElectronUnavailable) {
+			log.Debugf("copilot executor: electron transport failed, falling back to go transport: %v", err)
+		}
+	}
+
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "copilot")
 	return httpClient.Do(httpReq)
 }
 
@@ -416,7 +434,7 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 		AuthValue: authValue,
 	})
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "copilot")
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
@@ -525,7 +543,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 		AuthValue: authValue,
 	})
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "copilot")
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)

@@ -103,7 +103,7 @@ func (e *AntigravityExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "antigravity")
 	return httpClient.Do(httpReq)
 }
 
@@ -150,7 +150,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, "antigravity", "request", translated, originalTranslated, requestedModel)
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "antigravity")
 
 	attempts := antigravityRetryAttempts(auth, e.cfg)
 
@@ -292,7 +292,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, "antigravity", "request", translated, originalTranslated, requestedModel)
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "antigravity")
 
 	attempts := antigravityRetryAttempts(auth, e.cfg)
 
@@ -684,7 +684,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, "antigravity", "request", translated, originalTranslated, requestedModel)
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "antigravity")
 
 	attempts := antigravityRetryAttempts(auth, e.cfg)
 
@@ -887,7 +887,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	payload = deleteJSONField(payload, "request.safetySettings")
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "antigravity")
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -1015,7 +1015,7 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 	}
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
-	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0, "antigravity")
 
 	for idx, baseURL := range baseURLs {
 		modelsURL := baseURL + antigravityModelsPath
@@ -1158,7 +1158,7 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 	httpReq.Header.Set("User-Agent", defaultAntigravityAgent)
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "antigravity")
 	httpResp, errDo := httpClient.Do(httpReq)
 	if errDo != nil {
 		return auth, errDo
@@ -1229,7 +1229,7 @@ func (e *AntigravityExecutor) ensureAntigravityProjectID(ctx context.Context, au
 		return nil
 	}
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "antigravity")
 	projectID, errFetch := sdkAuth.FetchAntigravityProjectID(ctx, token, httpClient)
 	if errFetch != nil {
 		return errFetch

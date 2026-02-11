@@ -13,6 +13,7 @@ import (
 
 	grokauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/grok"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -536,7 +537,7 @@ func createGrokVideoPost(ctx context.Context, client *grokauth.GrokHTTPClient, c
 }
 
 func uploadImageToGrok(ctx context.Context, client *grokauth.GrokHTTPClient, cfg *config.Config, ssoToken, cfClearance, imageURL string) (fileID, fileURI string) {
-	encoded, mimeType, err := fetchBase64Image(ctx, imageURL)
+	encoded, mimeType, err := fetchBase64Image(ctx, cfg, imageURL)
 	if err != nil {
 		log.Warnf("grok translator: download image for upload failed: %v", err)
 		return "", ""
@@ -573,7 +574,7 @@ func uploadImageToGrok(ctx context.Context, client *grokauth.GrokHTTPClient, cfg
 	return fileID, fileURI
 }
 
-func fetchBase64Image(ctx context.Context, imageURL string) (encoded, mimeType string, err error) {
+func fetchBase64Image(ctx context.Context, cfg *config.Config, imageURL string) (encoded, mimeType string, err error) {
 	trimmed := strings.TrimSpace(imageURL)
 	if trimmed == "" {
 		return "", "", fmt.Errorf("empty image url")
@@ -587,7 +588,12 @@ func fetchBase64Image(ctx context.Context, imageURL string) (encoded, mimeType s
 		return "", "", err
 	}
 
-	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	httpClient := &http.Client{Timeout: 20 * time.Second}
+	// Ensure even this auxiliary download path respects the global outbound proxy.
+	if cfg != nil {
+		httpClient = util.SetProxy(&cfg.SDKConfig, httpClient)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", "", err
 	}

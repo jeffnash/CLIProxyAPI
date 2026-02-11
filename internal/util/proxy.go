@@ -8,16 +8,29 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/proxy"
 )
 
-// SetProxy configures the provided HTTP client with proxy settings from the configuration.
+// SetProxyForService configures the provided HTTP client with proxy settings from the configuration,
+// but only when the proxy is enabled for the given service via OUTBOUND_PROXY_SERVICES / proxy-services.
+//
 // It supports SOCKS5, HTTP, and HTTPS proxies. The function modifies the client's transport
 // to route requests through the configured proxy server.
-func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
+func SetProxyForService(cfg *config.SDKConfig, service string, httpClient *http.Client) *http.Client {
+	if cfg == nil || httpClient == nil {
+		return httpClient
+	}
+	if !cfg.ProxyEnabledFor(service) {
+		return httpClient
+	}
+	if strings.TrimSpace(cfg.ProxyURL) == "" {
+		return httpClient
+	}
+
 	var transport *http.Transport
 	// Attempt to parse the proxy URL from the configuration.
 	proxyURL, errParse := url.Parse(cfg.ProxyURL)
@@ -52,4 +65,11 @@ func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
 		httpClient.Transport = transport
 	}
 	return httpClient
+}
+
+// SetProxy is a legacy helper that preserves prior behavior for callsites that haven't
+// been updated to pass an explicit service name. When OUTBOUND_PROXY_SERVICES is set,
+// these callsites will only use the proxy if the allowlist is empty (meaning "all").
+func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
+	return SetProxyForService(cfg, "", httpClient)
 }

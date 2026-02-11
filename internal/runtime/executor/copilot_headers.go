@@ -144,12 +144,8 @@ func copilotHeaderProfileForModel(entry *config.CopilotKey, model string) copilo
 
 func applyCopilotVSCodeChatHeaderProfile(r *http.Request) {
 	// Matches VS Code Copilot Chat extension behavior
-	r.Header.Set("Copilot-Integration-Id", "vscode-chat")
-	r.Header.Set("Editor-Plugin-Version", "copilot-chat/0.35.2")
-	r.Header.Set("Editor-Version", "vscode/1.108.0-insider")
-	r.Header.Set("VScode-SessionId", "00000000-0000-0000-0000-000000000000")
-	r.Header.Set("VScode-MachineId", "00000000-0000-0000-0000-000000000000")
-	r.Header.Set("OpenAI-Intent", "conversation-agent")
+	// This profile is intentionally a no-op by default: for parity we avoid sending
+	// additional editor/machine identifiers unless explicitly required.
 }
 
 func applyCopilotCLIHeaderProfile(r *http.Request) {
@@ -192,6 +188,33 @@ func forceAgentCallFromHeaders(headers http.Header) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// forcedCopilotInitiatorFromHeaders allows internal callers to override the initiator.
+//
+// This is intentionally narrow: we keep "always agent" as the default behavior, but
+// allow background jobs (or trusted internal callers) to explicitly request "user".
+//
+// Accepted values (case-insensitive):
+//   - "agent"
+//   - "user"
+func forcedCopilotInitiatorFromHeaders(headers http.Header) (string, bool) {
+	if headers == nil {
+		return "", false
+	}
+	raw := strings.TrimSpace(headers.Get("force-copilot-initiator"))
+	if raw == "" {
+		raw = strings.TrimSpace(headers.Get("Force-Copilot-Initiator"))
+	}
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	switch raw {
+	case "agent":
+		return "agent", true
+	case "user":
+		return "user", true
+	default:
+		return "", false
 	}
 }
 
@@ -365,24 +388,24 @@ func (e *CopilotExecutor) shouldUseAgentInitiator(h copilotHeaderHints) bool {
 // It handles both Chat Completions format (messages array) and Responses API format (input array).
 func (e *CopilotExecutor) applyCopilotHeaders(r *http.Request, copilotToken string, payload []byte, incoming http.Header) {
 	hints := collectCopilotHeaderHints(payload, incoming)
-	isAgentCall := e.shouldUseAgentInitiator(hints)
+	// Explicit exception: keep our "always agent" behavior, regardless of payload heuristics.
+	isAgentCall := true
+	if forced, ok := forcedCopilotInitiatorFromHeaders(incoming); ok {
+		isAgentCall = forced == "agent"
+	}
 
 	headers := copilotauth.CopilotHeaders(copilotToken, "", hints.hasVision)
 	for k, v := range headers {
 		r.Header.Set(k, v)
 	}
 
-	// Align with Copilot CLI defaults
-	r.Header.Set("X-Interaction-Type", "conversation-agent")
-	r.Header.Set("Openai-Intent", "conversation-agent")
-	r.Header.Set("X-Stainless-Retry-Count", "0")
-	r.Header.Set("X-Stainless-Lang", "js")
-	r.Header.Set("X-Stainless-Package-Version", "5.20.1")
-	r.Header.Set("X-Stainless-OS", "Linux")
-	r.Header.Set("X-Stainless-Arch", "arm64")
-	r.Header.Set("X-Stainless-Runtime", "node")
-	r.Header.Set("X-Stainless-Runtime-Version", "v22.15.0")
-	r.Header.Set("User-Agent", copilotauth.CopilotUserAgent)
+	// VS Code parity defaults:
+	// - OpenAI-Intent and X-Interaction-Type match and are visible to the Copilot API.
+	// - Always send conversation-edits (explicit exception requested).
+	interactionType := "conversation-edits"
+	r.Header.Set("X-Interaction-Type", interactionType)
+	r.Header.Set("OpenAI-Intent", interactionType)
+	r.Header.Set("User-Agent", copilotauth.CopilotUserAgentValue())
 	if isAgentCall {
 		r.Header.Set("X-Initiator", "agent")
 		log.Info("copilot executor: [agent call]")
@@ -396,7 +419,4 @@ func (e *CopilotExecutor) applyCopilotHeaders(r *http.Request, copilotToken stri
 	if strings.Contains(model, "claude") {
 		r.Header.Set("Anthropic-Beta", "interleaved-thinking-2025-05-14")
 	}
-
-	// Apply header profile after defaults are set so it can override relevant headers.
-	e.applyCopilotHeaderProfile(r, gjson.GetBytes(payload, "model").String())
 }

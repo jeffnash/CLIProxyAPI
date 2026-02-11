@@ -77,7 +77,8 @@ This fork is primarily optimized for:
 Key docs:
 
 - End-user Railway deployment: `docs/RAILWAY_GUIDE.md`
-- Railway scripts reference (includes Copilot config flags like `COPILOT_FORCE_AGENT_CALL`): `scripts/README_RAILWAY.md`
+- Railway Copilot Electron shim: `docs/RAILWAY_ELECTRON_SHIM.md`
+- Railway scripts reference: `scripts/README_RAILWAY.md`
 - SDK usage (embed the proxy in Go): `docs/sdk-usage.md`
 - SDK advanced: `docs/sdk-advanced.md`
 - SDK access/auth: `docs/sdk-access.md`
@@ -91,11 +92,12 @@ Provider & config matrix (fork-specific):
 | Grok support | `docs/RAILWAY_GUIDE.md` | Uses `--grok-login` (SSO cookies flow). |
 | Copilot support | `docs/RAILWAY_GUIDE.md` | Uses `--copilot-login` (device code flow). |
 | Railway env vars (auth transfer) | `scripts/README_RAILWAY.md` | `AUTH_BUNDLE` or `AUTH_ZIP_URL`, plus `API_KEY_1`, optional `AUTH_DIR_NAME`, `FORCE_BUILD`. |
-| Copilot toggles (env + YAML) | `scripts/README_RAILWAY.md` / `docs/RAILWAY_GUIDE.md` / `internal/config/config.go` | Env vars: `COPILOT_AGENT_INITIATOR_PERSIST`, `COPILOT_FORCE_AGENT_CALL`. YAML keys: `copilot-api-key[].agent-initiator-persist`, `copilot-api-key[].force-agent-call`. These control whether requests are sent as `X-Initiator: user` vs `X-Initiator: agent` (often affects monthly quota attribution). |
+| Copilot initiator behavior | `internal/runtime/executor/copilot_headers.go` | Default is `X-Initiator: agent` for Copilot requests. Trusted internal callers can override via request header `force-copilot-initiator: user` (used by Copilot Hot Takes). |
 | Copilot config keys (YAML) | `internal/config/config.go` | Look under `CopilotKey` config + related fields for the authoritative schema (initiator flags + header profile selection). |
 | Copilot header behavior | `internal/runtime/executor/copilot_headers.go` | Implementation for request header shaping / agent-call behavior + optional header profile emulation. |
 | Copilot model registry | `internal/registry/copilot_models.go` | How Copilot models are enumerated/aliased. |
 | Force Copilot routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `copilot-<model>` to explicitly route to Copilot even if the model isn't registered; bypasses client model support filtering. |
+| Copilot Hot Takes | `internal/cmd/copilot_hot_takes.go` / `docs/RAILWAY_GUIDE.md` | Optional background job controlled by `COPILOT_HOT_TAKES_INTERVAL_MINS` and `COPILOT_HOT_TAKES_MODEL`. |
 | Grok config schema | `internal/config/config.go` | `GrokKey` and `GrokConfig` sections define available knobs. |
 | Chutes support (env + YAML) | `internal/config/config.go` / `docs/RAILWAY_GUIDE.md` | Env vars: `CHUTES_API_KEY`, `CHUTES_BASE_URL`, `CHUTES_MODELS`, `CHUTES_MODELS_EXCLUDE`, `CHUTES_PRIORITY`, `CHUTES_TEE_PREFERENCE`, `CHUTES_PROXY_URL`, `CHUTES_MAX_RETRIES`. YAML: `chutes` section. |
 | Force Chutes routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `chutes-<model>` to explicitly route to Chutes; sets `forced_provider=true` to bypass client model support filtering. |
@@ -106,19 +108,15 @@ Provider & config matrix (fork-specific):
 | OpenAI-compat upstreams | `internal/config/config.go` | `openai-compatibility` for routing to other OpenAI-compatible providers. |
 | Routing behavior | `internal/config/config.go` | `routing` config controls credential selection/failover. |
 
-### Copilot quota / initiator flags (quick explainer)
+### Copilot initiator (fork default)
 
-Copilot requests are tagged with `X-Initiator: user` or `X-Initiator: agent`. The proxy **detects agent calls by default** by looking for tool/agent activity in the payload (this is why tool calls in the request can flip it to `agent`). In many Copilot setups, **user calls count against monthly quota** while **agent calls do not**.
+This fork defaults Copilot requests to `X-Initiator: agent`.
 
-You can override the default initiator detection:
+Trusted internal callers can override the initiator with the request header:
 
-- `COPILOT_AGENT_INITIATOR_PERSIST` / `copilot-api-key[].agent-initiator-persist` (default `true`)
-  - What it’s for: this is the **“normal” agentic behavior** — once a workflow/conversation is in an agent loop, keep follow-up requests marked as `X-Initiator: agent`.
-  - Behavior: if `prompt_cache_key` is present, once an agent-ish request is seen for that cache key, subsequent requests with the same cache key will keep using `X-Initiator: agent`.
-- `COPILOT_FORCE_AGENT_CALL` / `copilot-api-key[].force-agent-call` (default `false`)
-  - What it’s for: a **hacky quota optimization** — mark everything as agent to try to reduce user-quota usage.
-  - Behavior: always set `X-Initiator: agent` for Copilot requests, regardless of payload.
-  - Warning: **use at your own risk** — forcing agent classification may violate provider expectations/ToS, break accounting, or cause requests to be rejected.
+- `force-copilot-initiator: user|agent`
+
+This is used for opt-in background jobs (see Copilot Hot Takes in `docs/RAILWAY_GUIDE.md`).
 
 ### Chutes config (quick explainer)
 

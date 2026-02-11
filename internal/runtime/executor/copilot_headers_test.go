@@ -327,8 +327,8 @@ func TestApplyCopilotHeaders_XInitiator(t *testing.T) {
 			e.applyCopilotHeaders(req, "test-token", []byte(tt.payload), nil)
 
 			got := req.Header.Get("X-Initiator")
-			if got != tt.expectedInitiator {
-				t.Errorf("X-Initiator = %q, want %q", got, tt.expectedInitiator)
+			if got != "agent" {
+				t.Errorf("X-Initiator = %q, want agent", got)
 			}
 		})
 	}
@@ -356,15 +356,15 @@ func TestApplyCopilotHeaders_XInitiator_PersistAcrossCalls(t *testing.T) {
 		req1 := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
 		e.applyCopilotHeaders(req1, "test-token", []byte(payload), nil)
 
-		if got := req1.Header.Get("X-Initiator"); got != "user" {
-			t.Fatalf("first call initiator = %q, want user", got)
+		if got := req1.Header.Get("X-Initiator"); got != "agent" {
+			t.Fatalf("first call initiator = %q, want agent", got)
 		}
 
 		req2 := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
 		e.applyCopilotHeaders(req2, "test-token", []byte(payload), nil)
 
-		if got := req2.Header.Get("X-Initiator"); got != "user" {
-			t.Fatalf("second call initiator = %q, want user when flag disabled", got)
+		if got := req2.Header.Get("X-Initiator"); got != "agent" {
+			t.Fatalf("second call initiator = %q, want agent when flag disabled", got)
 		}
 	})
 
@@ -373,8 +373,8 @@ func TestApplyCopilotHeaders_XInitiator_PersistAcrossCalls(t *testing.T) {
 		req1 := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
 		e.applyCopilotHeaders(req1, "test-token", []byte(payload), nil)
 
-		if got := req1.Header.Get("X-Initiator"); got != "user" {
-			t.Fatalf("first call initiator = %q, want user", got)
+		if got := req1.Header.Get("X-Initiator"); got != "agent" {
+			t.Fatalf("first call initiator = %q, want agent", got)
 		}
 
 		req2 := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
@@ -624,11 +624,11 @@ func TestApplyCopilotHeaderProfile(t *testing.T) {
 			expectedEditorPlugin: "", // CLI profile does not set this header
 		},
 		{
-			name:                 "vscode-chat profile sets VS Code headers",
+			name:                 "vscode-chat profile is no-op by default",
 			model:                "gemini-2.5-pro",
 			copilotConfig:        nil,
-			expectedIntegration:  "vscode-chat",
-			expectedEditorPlugin: "copilot-chat/0.35.2",
+			expectedIntegration:  "",
+			expectedEditorPlugin: "",
 		},
 	}
 
@@ -645,5 +645,37 @@ func TestApplyCopilotHeaderProfile(t *testing.T) {
 				t.Errorf("Editor-Plugin-Version = %q, want %q", got, tt.expectedEditorPlugin)
 			}
 		})
+	}
+}
+
+func TestApplyCopilotHeaders_ParityDefaults(t *testing.T) {
+	e := NewCopilotExecutor(&config.Config{})
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
+	payload := `{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}`
+	e.applyCopilotHeaders(req, "test-token", []byte(payload), nil)
+
+	if got := req.Header.Get("X-Interaction-Type"); got != "conversation-edits" {
+		t.Fatalf("X-Interaction-Type = %q, want conversation-edits", got)
+	}
+	if got := req.Header.Get("OpenAI-Intent"); got != "conversation-edits" {
+		t.Fatalf("OpenAI-Intent = %q, want conversation-edits", got)
+	}
+	if got := req.Header.Get("Copilot-Integration-Id"); got != "" {
+		t.Fatalf("Copilot-Integration-Id = %q, want empty", got)
+	}
+	if got := req.Header.Get("X-Stainless-Lang"); got != "" {
+		t.Fatalf("X-Stainless-Lang = %q, want empty", got)
+	}
+}
+
+func TestApplyCopilotHeaders_ForcedInitiatorUser(t *testing.T) {
+	e := NewCopilotExecutor(&config.Config{})
+	req := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
+	incoming := http.Header{}
+	incoming.Set("force-copilot-initiator", "user")
+	payload := `{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}`
+	e.applyCopilotHeaders(req, "test-token", []byte(payload), incoming)
+	if got := req.Header.Get("X-Initiator"); got != "user" {
+		t.Fatalf("X-Initiator = %q, want user", got)
 	}
 }
