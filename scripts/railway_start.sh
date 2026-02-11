@@ -380,21 +380,39 @@ GO_INSTALL_METHOD="${GO_INSTALL_METHOD:-auto}" # auto|tarball|apt
 GO_TARBALL_VARIANT="${GO_TARBALL_VARIANT:-linux-amd64}" # Railway is typically amd64
 
 go_mod_version() {
-  # go.mod "go" directive should be major.minor (e.g. 1.24)
-  awk '/^go[[:space:]]+[0-9]+\.[0-9]+/{print $2; exit}' "${ROOT_DIR}/go.mod" 2>/dev/null
+  # Return major.minor from go.mod (e.g. "1.24" even if file says "1.24.0").
+  # Some build steps may rewrite the directive with a patch component.
+  awk '
+    /^go[[:space:]]+[0-9]+\.[0-9]+(\.[0-9]+)?[[:space:]]*$/ {
+      v=$2
+      n=split(v, a, ".")
+      if (n >= 2) print a[1]"."a[2]
+      exit
+    }
+  ' "${ROOT_DIR}/go.mod" 2>/dev/null
 }
 
-go_major_minor() {
-  # Prints major.minor from a Go version string like "go1.24.0" => "1.24"
-  local v="${1#go}"
-  v="${v#1.}"
-  # Not used; keeping helper for readability (we parse with a regex below).
-  printf '%s' "${v}"
+go_mod_toolchain_version() {
+  # Return toolchain patch version from go.mod if present (e.g. "1.24.13" from "toolchain go1.24.13").
+  awk '
+    /^toolchain[[:space:]]+go[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$/ {
+      v=$2
+      sub(/^go/, "", v)
+      print v
+      exit
+    }
+  ' "${ROOT_DIR}/go.mod" 2>/dev/null
 }
 
 install_go_tarball() {
   local want_minor="${1:?}"
-  local want_patch="${GO_TARBALL_VERSION:-${want_minor}.0}" # default to .0
+  local want_patch=""
+  # If build tooling wrote a "toolchain goX.Y.Z" line, use that exact patch version.
+  want_patch="${GO_TARBALL_VERSION:-$(go_mod_toolchain_version)}"
+  if [[ -z "${want_patch}" ]]; then
+    # Default to .0 for the requested minor.
+    want_patch="${want_minor}.0"
+  fi
   local url="https://go.dev/dl/go${want_patch}.${GO_TARBALL_VARIANT}.tar.gz"
 
   info "Installing Go ${want_patch} from tarball: ${url}"
@@ -405,7 +423,10 @@ install_go_tarball() {
   fi
 
   local tmp="/tmp/go${want_patch}.tar.gz"
-  curl -fsSL "${url}" -o "${tmp}"
+  if ! curl -fsSL "${url}" -o "${tmp}"; then
+    err "failed to download Go tarball: ${url}"
+    return 1
+  fi
   rm -rf /usr/local/go
   tar -C /usr/local -xzf "${tmp}"
   rm -f "${tmp}" || true
