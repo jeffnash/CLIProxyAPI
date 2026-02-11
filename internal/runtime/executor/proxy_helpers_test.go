@@ -19,7 +19,7 @@ func TestNewProxyAwareHTTPClient_DoesNotCacheTimeout_NoProxy(t *testing.T) {
 	resetProxyHTTPClientCacheForTest()
 	ctx := context.Background()
 
-	wrapper := newProxyAwareHTTPClient(ctx, nil, nil, 5*time.Second)
+	wrapper := newProxyAwareHTTPClient(ctx, nil, nil, 5*time.Second, "test")
 	if wrapper.Timeout != 5*time.Second {
 		t.Fatalf("expected wrapper Timeout=5s, got %v", wrapper.Timeout)
 	}
@@ -34,7 +34,7 @@ func TestNewProxyAwareHTTPClient_DoesNotCacheTimeout_NoProxy(t *testing.T) {
 		t.Fatalf("expected cached Timeout=0, got %v", cached.Timeout)
 	}
 
-	client := newProxyAwareHTTPClient(ctx, nil, nil, 0)
+	client := newProxyAwareHTTPClient(ctx, nil, nil, 0, "test")
 	if client.Timeout != 0 {
 		t.Fatalf("expected client Timeout=0, got %v", client.Timeout)
 	}
@@ -45,7 +45,7 @@ func TestNewProxyAwareHTTPClient_DoesNotCacheTimeout_WithProxy(t *testing.T) {
 	ctx := context.Background()
 
 	auth := &cliproxyauth.Auth{ProxyURL: "http://example.com:8080"}
-	wrapper := newProxyAwareHTTPClient(ctx, nil, auth, 7*time.Second)
+	wrapper := newProxyAwareHTTPClient(ctx, nil, auth, 7*time.Second, "test")
 	if wrapper.Timeout != 7*time.Second {
 		t.Fatalf("expected wrapper Timeout=7s, got %v", wrapper.Timeout)
 	}

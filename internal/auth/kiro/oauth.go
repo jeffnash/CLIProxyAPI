@@ -49,7 +49,7 @@ type KiroOAuth struct {
 func NewKiroOAuth(cfg *config.Config) *KiroOAuth {
 	client := &http.Client{Timeout: 30 * time.Second}
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		client = util.SetProxyForService(&cfg.SDKConfig, "kiro", client)
 	}
 	return &KiroOAuth{
 		httpClient: client,

@@ -613,7 +613,7 @@ func prepareGeminiCLITokenSource(ctx context.Context, cfg *config.Config, auth *
 	}
 
 	ctxToken := ctx
-	if httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0); httpClient != nil {
+	if httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 0, "gemini-cli"); httpClient != nil {
 		ctxToken = context.WithValue(ctxToken, oauth2.HTTPClient, httpClient)
 	}
 
@@ -709,7 +709,7 @@ func geminiOAuthMetadata(auth *cliproxyauth.Auth) map[string]any {
 }
 
 func newHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	return newProxyAwareHTTPClient(ctx, cfg, auth, timeout)
+	return newProxyAwareHTTPClient(ctx, cfg, auth, timeout, "gemini-cli")
 }
 
 func cloneMap(in map[string]any) map[string]any {

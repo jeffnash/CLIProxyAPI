@@ -23,7 +23,7 @@ var (
 
 // newProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
-// 2. Use cfg.ProxyURL if auth proxy is not configured
+// 2. Use cfg.ProxyURL if auth proxy is not configured AND the proxy is enabled for the given service
 // 3. Use RoundTripper from context if neither are configured
 //
 // This function caches HTTP clients by proxy URL to enable TCP/TLS connection reuse.
@@ -37,10 +37,11 @@ var (
 //   - cfg: The application configuration
 //   - auth: The authentication information
 //   - timeout: The client timeout (0 means no timeout)
+//   - service: the logical outbound service name (e.g. "copilot", "codex") for OUTBOUND_PROXY_SERVICES allowlisting
 //
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
-func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, service string) *http.Client {
 	// Priority 1: Use auth.ProxyURL if configured
 	var proxyURL string
 	if auth != nil {
@@ -49,7 +50,9 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
 	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+		if cfg.SDKConfig.ProxyEnabledFor(service) {
+			proxyURL = strings.TrimSpace(cfg.ProxyURL)
+		}
 	}
 
 	// Build cache key from proxy URL (empty string for no proxy)

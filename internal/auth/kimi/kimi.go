@@ -104,7 +104,7 @@ func NewDeviceFlowClient(cfg *config.Config) *DeviceFlowClient {
 func NewDeviceFlowClientWithDeviceID(cfg *config.Config, deviceID string) *DeviceFlowClient {
 	client := &http.Client{Timeout: 30 * time.Second}
 	if cfg != nil {
-		client = util.SetProxy(&cfg.SDKConfig, client)
+		client = util.SetProxyForService(&cfg.SDKConfig, "kimi", client)
 	}
 	resolvedDeviceID := strings.TrimSpace(deviceID)
 	if resolvedDeviceID == "" {
