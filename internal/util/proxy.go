@@ -16,7 +16,8 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-func maskProxyURL(raw string) string {
+// MaskProxyURL redacts user credentials from a proxy URL for safe logging.
+func MaskProxyURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ""
@@ -31,14 +32,16 @@ func maskProxyURL(raw string) string {
 	return u.String()
 }
 
-func noProxyEnvRaw() string {
+// NoProxyEnvRaw returns the raw NO_PROXY / no_proxy environment variable value.
+func NoProxyEnvRaw() string {
 	if v := strings.TrimSpace(os.Getenv("NO_PROXY")); v != "" {
 		return v
 	}
 	return strings.TrimSpace(os.Getenv("no_proxy"))
 }
 
-func parseNoProxyList(raw string) []string {
+// ParseNoProxyList splits a comma-separated NO_PROXY value into a lowercase list.
+func ParseNoProxyList(raw string) []string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil
@@ -55,7 +58,8 @@ func parseNoProxyList(raw string) []string {
 	return out
 }
 
-func shouldBypassProxy(host string, patterns []string) bool {
+// ShouldBypassProxy returns true when host matches any NO_PROXY pattern.
+func ShouldBypassProxy(host string, patterns []string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	if host == "" || len(patterns) == 0 {
 		return false
@@ -97,8 +101,8 @@ func SetProxyForService(cfg *config.SDKConfig, service string, httpClient *http.
 		return httpClient
 	}
 
-	noProxyRaw := noProxyEnvRaw()
-	noProxyList := parseNoProxyList(noProxyRaw)
+	noProxyRaw := NoProxyEnvRaw()
+	noProxyList := ParseNoProxyList(noProxyRaw)
 
 	var transport *http.Transport
 	// Attempt to parse the proxy URL from the configuration.
@@ -123,7 +127,7 @@ func SetProxyForService(cfg *config.SDKConfig, service string, httpClient *http.
 			transport = &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					// addr is host:port
-					if shouldBypassProxy(addr, noProxyList) {
+					if ShouldBypassProxy(addr, noProxyList) {
 						return direct.DialContext(ctx, network, addr)
 					}
 					return dialer.Dial(network, addr)
@@ -135,7 +139,7 @@ func SetProxyForService(cfg *config.SDKConfig, service string, httpClient *http.
 				Proxy: func(req *http.Request) (*url.URL, error) {
 					if req != nil && req.URL != nil {
 						host := req.URL.Hostname()
-						if shouldBypassProxy(host, noProxyList) {
+						if ShouldBypassProxy(host, noProxyList) {
 							return nil, nil
 						}
 					}
