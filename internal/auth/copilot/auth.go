@@ -68,73 +68,23 @@ type CopilotAuth struct {
 func NewCopilotAuth(cfg *config.Config) *CopilotAuth {
 	proxyURL := ""
 	noProxy := ""
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+
 	if cfg != nil && strings.TrimSpace(cfg.ProxyURL) != "" && cfg.SDKConfig.ProxyEnabledFor("copilot") {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+		httpClient = util.SetProxyForService(&cfg.SDKConfig, "copilot", httpClient)
 	}
+
 	noProxy = strings.TrimSpace(os.Getenv("NO_PROXY"))
 	if noProxy == "" {
 		noProxy = strings.TrimSpace(os.Getenv("no_proxy"))
 	}
 	return &CopilotAuth{
-		httpClient:    util.SetProxyForService(&cfg.SDKConfig, "copilot", &http.Client{Timeout: 30 * time.Second}),
+		httpClient:    httpClient,
 		vsCodeVersion: DefaultVSCodeVersion,
 		proxyURL:      proxyURL,
 		noProxy:       noProxy,
 	}
-}
-
-func maskProxyURL(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u == nil {
-		return "<invalid-proxy-url>"
-	}
-	if u.User != nil {
-		u.User = url.UserPassword("****", "****")
-	}
-	return u.String()
-}
-
-func parseNoProxyList(raw string) []string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.ToLower(strings.TrimSpace(p))
-		if p == "" {
-			continue
-		}
-		out = append(out, p)
-	}
-	return out
-}
-
-func shouldBypassProxy(host string, patterns []string) bool {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if host == "" || len(patterns) == 0 {
-		return false
-	}
-	for _, p := range patterns {
-		if p == "*" {
-			return true
-		}
-		if host == p {
-			return true
-		}
-		if strings.HasPrefix(p, ".") && strings.HasSuffix(host, p) {
-			return true
-		}
-		if !strings.HasPrefix(p, ".") && strings.HasSuffix(host, "."+p) {
-			return true
-		}
-	}
-	return false
 }
 
 func (a *CopilotAuth) logProxyUsedForRefresh(urlStr string) {
@@ -147,7 +97,7 @@ func (a *CopilotAuth) logProxyUsedForRefresh(urlStr string) {
 	used := false
 	if strings.TrimSpace(a.proxyURL) != "" {
 		// Best-effort NO_PROXY evaluation.
-		if host != "" && shouldBypassProxy(host, parseNoProxyList(a.noProxy)) {
+		if host != "" && util.ShouldBypassProxy(host, util.ParseNoProxyList(a.noProxy)) {
 			used = false
 		} else {
 			used = true
@@ -156,7 +106,7 @@ func (a *CopilotAuth) logProxyUsedForRefresh(urlStr string) {
 
 	log.Infof("copilot auth refresh: proxy_used=%t proxy=%s host=%s no_proxy=%q",
 		used,
-		maskProxyURL(a.proxyURL),
+		util.MaskProxyURL(a.proxyURL),
 		host,
 		strings.TrimSpace(a.noProxy),
 	)
