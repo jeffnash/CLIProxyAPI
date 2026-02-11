@@ -145,6 +145,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return resp, err
 	}
+	translated = applyTemperatureSuffix(translated, req.Model, opts, to.String())
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, "antigravity", "request", translated, originalTranslated, requestedModel)
@@ -287,6 +288,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if err != nil {
 		return resp, err
 	}
+	translated = applyTemperatureSuffix(translated, req.Model, opts, to.String())
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, "antigravity", "request", translated, originalTranslated, requestedModel)
@@ -679,6 +681,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	if err != nil {
 		return nil, err
 	}
+	translated = applyTemperatureSuffix(translated, req.Model, opts, to.String())
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, "antigravity", "request", translated, originalTranslated, requestedModel)
@@ -881,6 +884,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	payload = applyTemperatureSuffix(payload, req.Model, opts, to.String())
 
 	payload = deleteJSONField(payload, "project")
 	payload = deleteJSONField(payload, "model")

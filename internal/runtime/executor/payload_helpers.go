@@ -7,6 +7,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -316,4 +317,80 @@ func matchModelPattern(pattern, model string) bool {
 		pi++
 	}
 	return pi == len(pattern)
+}
+
+// isGPT5Model returns true if the model name indicates a gpt-5.x family model
+// which does not support the temperature parameter.
+func isGPT5Model(model string) bool {
+	base := strings.ToLower(strings.TrimSpace(model))
+	// Strip any thinking suffix to get the pure model name.
+	parsed := thinking.ParseSuffix(base)
+	base = strings.TrimSpace(parsed.ModelName)
+	return strings.HasPrefix(base, "gpt-5")
+}
+
+// applyTemperatureSuffix injects a temperature value into the request payload
+// if a temperature suffix was parsed from the model name and stored in opts.Metadata.
+//
+// For gpt-5.x models the temperature parameter is not supported; a warning is
+// logged and the body is returned unchanged.
+//
+// The provider parameter determines the JSON path used to set the temperature:
+//   - "gemini": generationConfig.temperature
+//   - "gemini-cli", "antigravity": request.generationConfig.temperature
+//   - All others (openai, claude, codex, copilot, etc.): temperature (top-level)
+func applyTemperatureSuffix(body []byte, model string, opts cliproxyexecutor.Options, provider string) []byte {
+	if len(opts.Metadata) == 0 {
+		return body
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.TemperatureSuffixMetadataKey]
+	if !ok {
+		return body
+	}
+	temp, ok := raw.(float64)
+	if !ok {
+		return body
+	}
+
+	// gpt-5.x models do not support the temperature parameter.
+	if isGPT5Model(model) {
+		log.WithFields(log.Fields{
+			"model":       model,
+			"temperature": temp,
+			"provider":    provider,
+		}).Warn("temperature: gpt-5.x models do not support temperature parameter, ignoring -temp- suffix |")
+		return body
+	}
+
+	var path string
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "gemini":
+		path = "generationConfig.temperature"
+	case "gemini-cli", "antigravity":
+		path = "request.generationConfig.temperature"
+	default:
+		// OpenAI, Claude, Codex, Copilot, iFlow, Kimi, Qwen, Grok, Kiro, Chutes, etc.
+		path = "temperature"
+	}
+
+	updated, err := sjson.SetBytes(body, path, temp)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"model":       model,
+			"temperature": temp,
+			"provider":    provider,
+			"path":        path,
+			"error":       err.Error(),
+		}).Warn("temperature: failed to set temperature in payload |")
+		return body
+	}
+
+	log.WithFields(log.Fields{
+		"model":       model,
+		"temperature": temp,
+		"provider":    provider,
+		"path":        path,
+	}).Info("temperature: applied -temp- suffix to payload |")
+
+	return updated
 }

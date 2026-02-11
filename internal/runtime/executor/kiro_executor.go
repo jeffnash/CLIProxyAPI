@@ -325,6 +325,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	kiroModelID := e.mapModelToKiro(req.Model)
 
@@ -662,6 +663,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	kiroModelID := e.mapModelToKiro(req.Model)
 

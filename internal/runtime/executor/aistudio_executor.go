@@ -404,6 +404,7 @@ func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts c
 	if err != nil {
 		return nil, translatedPayload{}, err
 	}
+	payload = applyTemperatureSuffix(payload, req.Model, opts, to.String())
 	payload = fixGeminiImageAspectRatio(baseModel, payload)
 	requestedModel := payloadRequestedModel(opts, req.Model)
 	payload = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", payload, originalTranslated, requestedModel)
