@@ -376,10 +376,68 @@ BIN_PATH="${ROOT_DIR}/cli-proxy-api"
 FORCE_BUILD="${FORCE_BUILD:-0}"
 LDFLAGS_PKG="github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 INSTALL_GO="${INSTALL_GO:-1}"
+GO_INSTALL_METHOD="${GO_INSTALL_METHOD:-auto}" # auto|tarball|apt
+GO_TARBALL_VARIANT="${GO_TARBALL_VARIANT:-linux-amd64}" # Railway is typically amd64
+
+go_mod_version() {
+  # go.mod "go" directive should be major.minor (e.g. 1.24)
+  awk '/^go[[:space:]]+[0-9]+\.[0-9]+/{print $2; exit}' "${ROOT_DIR}/go.mod" 2>/dev/null
+}
+
+go_major_minor() {
+  # Prints major.minor from a Go version string like "go1.24.0" => "1.24"
+  local v="${1#go}"
+  v="${v#1.}"
+  # Not used; keeping helper for readability (we parse with a regex below).
+  printf '%s' "${v}"
+}
+
+install_go_tarball() {
+  local want_minor="${1:?}"
+  local want_patch="${GO_TARBALL_VERSION:-${want_minor}.0}" # default to .0
+  local url="https://go.dev/dl/go${want_patch}.${GO_TARBALL_VARIANT}.tar.gz"
+
+  info "Installing Go ${want_patch} from tarball: ${url}"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    err "curl is required to install Go from tarball but was not found"
+    return 1
+  fi
+
+  local tmp="/tmp/go${want_patch}.tar.gz"
+  curl -fsSL "${url}" -o "${tmp}"
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf "${tmp}"
+  rm -f "${tmp}" || true
+  export PATH="/usr/local/go/bin:${PATH}"
+}
 
 ensure_go() {
+  local want_minor
+  want_minor="$(go_mod_version)"
+  if [[ -z "${want_minor}" ]]; then
+    # Fallback if go.mod isn't readable for some reason.
+    want_minor="1.24"
+  fi
+
   if command -v go >/dev/null 2>&1; then
-    return 0
+    # If Go exists, ensure it's new enough for the go.mod directive.
+    local have_minor
+    have_minor="$(go env GOVERSION 2>/dev/null | sed -nE 's/^go([0-9]+\\.[0-9]+).*/\\1/p')"
+    if [[ -n "${have_minor}" ]]; then
+      if [[ "${have_minor}" == "${want_minor}" ]]; then
+        return 0
+      fi
+      # Compare as floats is dangerous; compare major then minor as ints.
+      local have_major="${have_minor%%.*}"
+      local have_min="${have_minor#*.}"
+      local want_major="${want_minor%%.*}"
+      local want_min="${want_minor#*.}"
+      if [[ "${have_major}" -gt "${want_major}" ]] || { [[ "${have_major}" -eq "${want_major}" ]] && [[ "${have_min}" -ge "${want_min}" ]]; }; then
+        return 0
+      fi
+    fi
+    info "Existing Go toolchain is too old for go.mod (have=${have_minor:-unknown} want=${want_minor}); upgrading"
   fi
 
   if [[ "${INSTALL_GO}" == "0" ]]; then
@@ -387,19 +445,31 @@ ensure_go() {
     return 1
   fi
 
-  info "go not found on PATH; installing Go toolchain via apt (INSTALL_GO=${INSTALL_GO})"
-  if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y --no-install-recommends golang-go git ca-certificates
-    rm -rf /var/lib/apt/lists/* || true
-  elif command -v apt >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt update
-    apt install -y --no-install-recommends golang-go git ca-certificates
-  else
-    err "neither apt-get nor apt is available; cannot auto-install Go"
-    return 1
+  # Prefer tarball for newer Go versions; Debian/Ubuntu repos tend to lag.
+  if [[ "${GO_INSTALL_METHOD}" == "auto" ]] || [[ "${GO_INSTALL_METHOD}" == "tarball" ]]; then
+    install_go_tarball "${want_minor}" || {
+      if [[ "${GO_INSTALL_METHOD}" == "tarball" ]]; then
+        return 1
+      fi
+      info "Tarball install failed; falling back to apt"
+    }
+  fi
+
+  if ! command -v go >/dev/null 2>&1; then
+    info "Installing Go toolchain via apt (GO_INSTALL_METHOD=${GO_INSTALL_METHOD}, INSTALL_GO=${INSTALL_GO})"
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends golang-go git ca-certificates tar gzip
+      rm -rf /var/lib/apt/lists/* || true
+    elif command -v apt >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt update
+      apt install -y --no-install-recommends golang-go git ca-certificates tar gzip
+    else
+      err "neither apt-get nor apt is available; cannot auto-install Go"
+      return 1
+    fi
   fi
 
   if ! command -v go >/dev/null 2>&1; then
