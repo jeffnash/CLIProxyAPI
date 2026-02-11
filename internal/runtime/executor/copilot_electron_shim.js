@@ -12,6 +12,12 @@
 
 const { app, net, session } = require("electron");
 
+// Prevent Chromium from trying to use a GPU or display server in headless environments.
+app.disableHardwareAcceleration();
+// Allow running without a display (Railway, Docker, etc.).
+app.commandLine.appendSwitch("disable-software-rasterizer");
+app.commandLine.appendSwitch("no-sandbox");
+
 function write(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
