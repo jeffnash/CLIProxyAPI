@@ -157,7 +157,14 @@ func httpResponseFromElectron(ctx context.Context, req *http.Request, proxyURL s
 	}
 	raw, _ := json.Marshal(payload)
 
-	cmd := exec.CommandContext(ctx, electronPath, "--no-sandbox", "--disable-gpu", shimPath)
+	cmd := exec.CommandContext(ctx, electronPath,
+		"--no-sandbox",
+		"--disable-gpu",
+		"--headless=new",
+		"--disable-software-rasterizer",
+		"--disable-dev-shm-usage",
+		shimPath,
+	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("electron transport: stdin pipe: %w", err)
