@@ -30,6 +30,10 @@ info() {
   echo "[railway] $*"
 }
 
+err() {
+  echo "[railway] ERROR: $*" >&2
+}
+
 decode_base64() {
   if base64 --help 2>&1 | grep -q -- "-d"; then
     base64 -d
@@ -516,6 +520,11 @@ fi
 
 if [[ -x "${BIN_PATH}" ]] && [[ "${STORED_SHA}" == "${CURRENT_SHA}" ]]; then
   info "Binary is up-to-date for commit ${CURRENT_SHA}: ${BIN_PATH}"
+elif [[ -x "${BIN_PATH}" ]] && [[ "${CURRENT_SHA}" == "unknown" ]] && [[ -z "${STORED_SHA}" ]]; then
+  # In some Railpack deployments, `.git` isn't available in the runtime image, so we can't
+  # compute a stable commit SHA. If we already have a binary and no stored SHA, don't
+  # force a rebuild loop (which may require Go at runtime).
+  info "Binary exists but commit SHA is unavailable; skipping rebuild: ${BIN_PATH}"
 else
   if [[ -x "${BIN_PATH}" ]] && [[ "${STORED_SHA}" != "${CURRENT_SHA}" ]]; then
     info "Binary is stale (stored=${STORED_SHA:-none} current=${CURRENT_SHA}); rebuilding"
