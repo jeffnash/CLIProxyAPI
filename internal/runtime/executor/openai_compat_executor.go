@@ -117,6 +117,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	translated = applyTemperatureSuffix(translated, req.Model, opts, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -224,6 +225,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if err != nil {
 		return nil, err
 	}
+	translated = applyTemperatureSuffix(translated, req.Model, opts, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -334,6 +336,7 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	translated = applyTemperatureSuffix(translated, req.Model, opts, to.String())
 
 	enc, err := tokenizerForModel(modelForCounting)
 	if err != nil {

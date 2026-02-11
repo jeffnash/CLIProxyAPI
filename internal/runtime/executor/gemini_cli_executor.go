@@ -131,6 +131,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if err != nil {
 		return resp, err
 	}
+	basePayload = applyTemperatureSuffix(basePayload, req.Model, opts, to.String())
 
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
 	requestedModel := payloadRequestedModel(opts, req.Model)
@@ -285,6 +286,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if err != nil {
 		return nil, err
 	}
+	basePayload = applyTemperatureSuffix(basePayload, req.Model, opts, to.String())
 
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
 	requestedModel := payloadRequestedModel(opts, req.Model)
@@ -493,6 +495,7 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 		if err != nil {
 			return cliproxyexecutor.Response{}, err
 		}
+		payload = applyTemperatureSuffix(payload, req.Model, opts, to.String())
 
 		payload = deleteJSONField(payload, "project")
 		payload = deleteJSONField(payload, "model")

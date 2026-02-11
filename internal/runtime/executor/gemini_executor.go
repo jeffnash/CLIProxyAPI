@@ -128,6 +128,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
+	body = applyTemperatureSuffix(body, req.Model, opts, to.String())
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
@@ -235,6 +236,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
+	body = applyTemperatureSuffix(body, req.Model, opts, to.String())
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
@@ -352,6 +354,7 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	translatedReq = applyTemperatureSuffix(translatedReq, req.Model, opts, to.String())
 
 	translatedReq = fixGeminiImageAspectRatio(baseModel, translatedReq)
 	respCtx := context.WithValue(ctx, "alt", opts.Alt)

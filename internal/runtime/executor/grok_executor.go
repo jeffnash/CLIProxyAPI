@@ -405,6 +405,7 @@ func (e *GrokExecutor) buildGrokPayload(ctx context.Context, req cliproxyexecuto
 	}
 	body, _ = sjson.SetBytes(body, "model", apiModel)
 	body = e.applyGrokConfigToPayload(body)
+	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	return body, headerOpts, nil
 }

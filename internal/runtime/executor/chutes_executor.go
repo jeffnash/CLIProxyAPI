@@ -134,6 +134,7 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	to := sdktranslator.FromString("openai")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 	body, _ = sjson.SetBytes(body, "model", apiModel)
+	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	endpoint := strings.TrimSuffix(baseURL, "/") + chutesChatEndpoint
 
@@ -252,6 +253,7 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	to := sdktranslator.FromString("openai")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 	body, _ = sjson.SetBytes(body, "model", apiModel)
+	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	endpoint := strings.TrimSuffix(baseURL, "/") + chutesChatEndpoint
 
