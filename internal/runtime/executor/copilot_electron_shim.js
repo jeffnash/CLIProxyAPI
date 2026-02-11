@@ -59,31 +59,32 @@ function proxyRulesFromURL(proxyURL) {
   if (!proxyURL) return "";
   try {
     const u = new URL(proxyURL);
-    // session.setProxy wants proxyRules like:
-    // - "http=host:port;https=host:port" or
-    // - "socks5://host:port" or
-    // - "host:port"
-    const hostPort = u.host;
+    // Strip credentials — Electron's proxyRules must be bare host:port.
+    // Auth is handled separately via the session "login" event.
+    const hostPort = u.hostname + (u.port ? ":" + u.port : "");
     if (!hostPort) return "";
     if (u.protocol === "socks5:" || u.protocol === "socks5h:") return `socks5://${hostPort}`;
-    if (u.protocol === "http:" || u.protocol === "https:") return hostPort;
+    // Use explicit per-scheme rules so Chromium doesn't reject the format.
+    if (u.protocol === "http:" || u.protocol === "https:") {
+      return `http=${hostPort};https=${hostPort}`;
+    }
     return "";
   } catch {
     return "";
   }
 }
 
-function proxyAuthHeader(proxyURL) {
-  if (!proxyURL) return "";
+function proxyCredentials(proxyURL) {
+  if (!proxyURL) return null;
   try {
     const u = new URL(proxyURL);
-    if (!u.username) return "";
-    const user = decodeURIComponent(u.username);
-    const pass = decodeURIComponent(u.password || "");
-    const token = Buffer.from(`${user}:${pass}`).toString("base64");
-    return `Basic ${token}`;
+    if (!u.username) return null;
+    return {
+      username: decodeURIComponent(u.username),
+      password: decodeURIComponent(u.password || ""),
+    };
   } catch {
-    return "";
+    return null;
   }
 }
 
@@ -116,12 +117,19 @@ async function main() {
     } catch {
       // ignore
     }
-  }
 
-  // If proxy URL includes credentials, attempt to supply Proxy-Authorization.
-  const proxyAuth = proxyAuthHeader(proxyURL);
-  if (proxyAuth && !headers["Proxy-Authorization"] && !headers["proxy-authorization"]) {
-    headers["Proxy-Authorization"] = proxyAuth;
+    // Handle proxy authentication via the session "login" event.
+    // Electron's net module does not support Proxy-Authorization as a request header;
+    // instead Chromium issues a 407 challenge and expects credentials via this callback.
+    const creds = proxyCredentials(proxyURL);
+    if (creds) {
+      session.defaultSession.on("login", (event, _webContents, _details, authInfo, callback) => {
+        if (authInfo.isProxy) {
+          event.preventDefault();
+          callback(creds.username, creds.password);
+        }
+      });
+    }
   }
 
   const request = net.request({ method, url, session: session.defaultSession });
