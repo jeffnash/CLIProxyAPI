@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ func resetProxyHTTPClientCacheForTest() {
 	httpClientCacheMutex.Lock()
 	defer httpClientCacheMutex.Unlock()
 	httpClientCache = make(map[string]*http.Client)
+	proxyInfoOnce = sync.Map{}
 }
 
 func TestNewProxyAwareHTTPClient_DoesNotCacheTimeout_NoProxy(t *testing.T) {
