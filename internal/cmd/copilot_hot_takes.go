@@ -246,6 +246,70 @@ func waitForLocalServer(ctx context.Context, port int) error {
 	}
 }
 
+func waitForCopilotAuthReady(ctx context.Context, cfg *config.Config) error {
+	if cfg == nil {
+		return fmt.Errorf("nil config")
+	}
+	if cfg.Port == 0 {
+		return fmt.Errorf("missing port")
+	}
+	if len(cfg.APIKeys) == 0 || strings.TrimSpace(cfg.APIKeys[0]) == "" {
+		return fmt.Errorf("missing api key")
+	}
+
+	targetModel := hotTakesModel()
+	u := fmt.Sprintf("http://127.0.0.1:%d/v1/models", cfg.Port)
+	client := &http.Client{Timeout: 5 * time.Second}
+	backoff := 500 * time.Millisecond
+	deadline := time.Now().Add(5 * time.Minute)
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("copilot not ready after 5m (waiting for model %q)", targetModel)
+		}
+
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKeys[0])
+		resp, err := client.Do(req)
+		if err == nil && resp != nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				// Consider Copilot ready if we see at least one Copilot model, ideally the target.
+				if gjson.GetBytes(body, "data").IsArray() {
+					foundAnyCopilot := false
+					foundTarget := false
+					for _, it := range gjson.GetBytes(body, "data").Array() {
+						id := strings.ToLower(strings.TrimSpace(it.Get("id").String()))
+						if strings.HasPrefix(id, "copilot-") {
+							foundAnyCopilot = true
+							if id == strings.ToLower(targetModel) {
+								foundTarget = true
+								break
+							}
+						}
+					}
+					if foundTarget || foundAnyCopilot {
+						return nil
+					}
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
 func StartCopilotHotTakesLoop(ctx context.Context, cfg *config.Config) {
 	interval, ok := hotTakesInterval()
 	if !ok {
@@ -259,6 +323,12 @@ func StartCopilotHotTakesLoop(ctx context.Context, cfg *config.Config) {
 	go func() {
 		if err := waitForLocalServer(ctx, cfg.Port); err != nil {
 			log.Warnf("copilot hot takes: server readiness failed: %v", err)
+			return
+		}
+
+		// Don't attempt the Copilot call until Copilot auth/models have loaded.
+		if err := waitForCopilotAuthReady(ctx, cfg); err != nil {
+			log.Warnf("copilot hot takes: copilot readiness failed: %v", err)
 			return
 		}
 
