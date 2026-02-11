@@ -67,6 +67,78 @@ func NewCopilotExecutor(cfg *config.Config) *CopilotExecutor {
 
 func (e *CopilotExecutor) Identifier() string { return "copilot" }
 
+func (e *CopilotExecutor) logOutboundProxyDecision(httpReq *http.Request, auth *cliproxyauth.Auth, transport string) {
+	// Request-scoped log (no dedupe): user wants to see proxy usage for every outbound Copilot request.
+	host := ""
+	if httpReq != nil && httpReq.URL != nil {
+		host = strings.TrimSpace(httpReq.URL.Hostname())
+	}
+
+	// Match newProxyAwareHTTPClient + electron decision order:
+	// 1) auth.ProxyURL (always allowed)
+	// 2) global cfg.ProxyURL (only if enabled for "copilot")
+	// then apply NO_PROXY.
+	proxyURL := ""
+	proxySource := ""
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
+		if proxyURL != "" {
+			proxySource = "auth"
+		}
+	}
+
+	disabledByServices := false
+	if proxyURL == "" && e != nil && e.cfg != nil {
+		if e.cfg.SDKConfig.ProxyEnabledFor("copilot") {
+			proxyURL = strings.TrimSpace(e.cfg.ProxyURL)
+			if proxyURL != "" {
+				proxySource = "global"
+			}
+		} else if strings.TrimSpace(e.cfg.ProxyURL) != "" {
+			disabledByServices = true
+		}
+	}
+
+	noProxyRaw := ""
+	noProxyList := []string(nil)
+	if proxyURL != "" {
+		noProxyRaw = noProxyEnvRaw()
+		noProxyList = parseNoProxyList(noProxyRaw)
+	}
+
+	used := false
+	reason := ""
+	if proxyURL == "" {
+		if disabledByServices {
+			reason = "disabled_by_OUTBOUND_PROXY_SERVICES"
+		} else {
+			reason = "not_configured"
+		}
+	} else if host != "" && shouldBypassProxy(host, noProxyList) {
+		reason = "NO_PROXY"
+	} else {
+		used = true
+		reason = "enabled"
+	}
+
+	if used {
+		log.Infof("copilot outbound: proxy_used=true proxy=%s source=%s host=%s no_proxy=%q transport=%s",
+			maskProxyURL(proxyURL),
+			proxySource,
+			host,
+			noProxyRaw,
+			transport,
+		)
+		return
+	}
+	log.Infof("copilot outbound: proxy_used=false reason=%s host=%s no_proxy=%q transport=%s",
+		reason,
+		host,
+		noProxyRaw,
+		transport,
+	)
+}
+
 func (e *CopilotExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
 		return nil
@@ -159,12 +231,20 @@ func (e *CopilotExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Au
 				)
 			}
 		}
+
+		// Per-request proxy log (no dedupe) for the actual electron attempt.
+		// If NO_PROXY caused a bypass above, proxyURL will be empty here.
+		e.logOutboundProxyDecision(httpReq, auth, "electron")
+
 		if resp, err := httpResponseFromElectron(ctx, httpReq, proxyURL); err == nil {
 			return resp, nil
 		} else if err != nil && !errors.Is(err, errCopilotElectronUnavailable) {
 			log.Debugf("copilot executor: electron transport failed, falling back to go transport: %v", err)
 		}
 	}
+
+	// Per-request proxy log (no dedupe) for Go net/http transport.
+	e.logOutboundProxyDecision(httpReq, auth, "go")
 
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "copilot")
 	return httpClient.Do(httpReq)
