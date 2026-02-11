@@ -52,6 +52,8 @@ The startup script automatically detects existing credentials and skips `AUTH_BU
 - `COPILOT_TRANSPORT` (default `electron`) - Copilot transport selection: `electron` (Chromium net shim) or `go` (disable shim).
 - `INSTALL_ELECTRON` (default `0`) - when set to `1`, `scripts/railway_start.sh` will attempt to install Node.js + Electron at container start if `electron` is missing.
   - This is slower/less reliable than baking Electron into the image, but works for the common “railpack.json + start script” Railway path.
+- `INSTALL_GO` (default `1`) - when the script needs to rebuild `./cli-proxy-api` and `go` is missing on `PATH`, it will attempt to install `golang-go` via `apt-get` at container start.
+  - Set to `0` to disable auto-install (startup will fail fast if a rebuild is needed but Go isn't available).
 - `COPILOT_HOT_TAKES_INTERVAL_MINS` (default unset / disabled) - when set to a positive integer, periodically fetches 7 random HN headlines and asks Copilot (as initiator **user**) for commentary, printing the response to logs.
 - `COPILOT_HOT_TAKES_MODEL` (default `claude-haiku-4.5`) - model ID to use for hot takes. The code will prefix it with `copilot-` automatically unless you already include it.
 - `STREAMING_KEEPALIVE_SECONDS` (default `0` / disabled) - how often the server emits SSE heartbeats (`: keep-alive\n\n`) during streaming responses.

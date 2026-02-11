@@ -375,6 +375,38 @@ fi
 BIN_PATH="${ROOT_DIR}/cli-proxy-api"
 FORCE_BUILD="${FORCE_BUILD:-0}"
 LDFLAGS_PKG="github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
+INSTALL_GO="${INSTALL_GO:-1}"
+
+ensure_go() {
+  if command -v go >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "${INSTALL_GO}" == "0" ]]; then
+    err "go is required to build on startup, but was not found on PATH and INSTALL_GO=0"
+    return 1
+  fi
+
+  info "go not found on PATH; installing Go toolchain via apt (INSTALL_GO=${INSTALL_GO})"
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends golang-go git ca-certificates
+    rm -rf /var/lib/apt/lists/* || true
+  elif command -v apt >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt update
+    apt install -y --no-install-recommends golang-go git ca-certificates
+  else
+    err "neither apt-get nor apt is available; cannot auto-install Go"
+    return 1
+  fi
+
+  if ! command -v go >/dev/null 2>&1; then
+    err "Go installation attempted but 'go' is still not on PATH"
+    return 1
+  fi
+}
 
 # Determine current repo SHA for build staleness detection and ldflags embedding.
 CURRENT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo "unknown")"
@@ -397,6 +429,8 @@ else
   if [[ -x "${BIN_PATH}" ]] && [[ "${STORED_SHA}" != "${CURRENT_SHA}" ]]; then
     info "Binary is stale (stored=${STORED_SHA:-none} current=${CURRENT_SHA}); rebuilding"
   fi
+
+  ensure_go
 
   info "Installing Go deps"
   go mod download
