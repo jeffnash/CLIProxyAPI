@@ -374,20 +374,41 @@ fi
 
 BIN_PATH="${ROOT_DIR}/cli-proxy-api"
 FORCE_BUILD="${FORCE_BUILD:-0}"
+LDFLAGS_PKG="github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
+
+# Determine current repo SHA for build staleness detection and ldflags embedding.
+CURRENT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo "unknown")"
+BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 if [[ "${FORCE_BUILD}" != "0" ]]; then
   info "FORCE_BUILD set; rebuilding server binary"
-  rm -f "${BIN_PATH}"
+  rm -f "${BIN_PATH}" "${BIN_PATH}.sha"
 fi
 
-if [[ -x "${BIN_PATH}" ]]; then
-  info "Using existing server binary: ${BIN_PATH}"
+# Rebuild when the repo SHA changes or the binary is missing.
+STORED_SHA=""
+if [[ -f "${BIN_PATH}.sha" ]]; then
+  STORED_SHA="$(cat "${BIN_PATH}.sha" 2>/dev/null || echo "")"
+fi
+
+if [[ -x "${BIN_PATH}" ]] && [[ "${STORED_SHA}" == "${CURRENT_SHA}" ]]; then
+  info "Binary is up-to-date for commit ${CURRENT_SHA}: ${BIN_PATH}"
 else
+  if [[ -x "${BIN_PATH}" ]] && [[ "${STORED_SHA}" != "${CURRENT_SHA}" ]]; then
+    info "Binary is stale (stored=${STORED_SHA:-none} current=${CURRENT_SHA}); rebuilding"
+  fi
+
   info "Installing Go deps"
   go mod download
 
-  info "Building server binary"
-  go build -o "${BIN_PATH}" ./cmd/server
+  info "Building server binary (commit: ${CURRENT_SHA})"
+  go build \
+    -ldflags "-X ${LDFLAGS_PKG}.Commit=${CURRENT_SHA} -X ${LDFLAGS_PKG}.BuildDate=${BUILD_DATE}" \
+    -o "${BIN_PATH}" ./cmd/server
+
+  # Persist the SHA so subsequent restarts skip the rebuild.
+  printf '%s' "${CURRENT_SHA}" > "${BIN_PATH}.sha"
+  info "Build complete; SHA written to ${BIN_PATH}.sha"
 fi
 
 info "Starting server"
