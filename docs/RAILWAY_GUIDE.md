@@ -67,18 +67,19 @@ We use a script to pack your local credentials into a single encrypted string th
 
 ### Recommended Railpack Build Command
 
-If you are using Railpack, set your service **Build Command** to:
+If you are using Railpack, recommended **Build Command** is:
 
 ```bash
-go mod tidy && go build -o cli-proxy-api ./cmd/server
+go build -o cli-proxy-api ./cmd/server
 ```
 
 Notes:
 
-- Railpack commonly runs with module files treated as read-only during `go build` (equivalent to `-mod=readonly`).
-  If your repo isn't already tidy, `go build` will fail with `go: updates to go.mod needed; to update it: go mod tidy`.
-- Do not append `go mod edit -go=...` to the build command: editing `go.mod` after `go mod tidy` can make the module
-  files "not tidy" again for the subsequent `go build`.
+- Railpack commonly treats module files as read-only during `go build` (equivalent to `-mod=readonly`). If `go build`
+  fails with `go: updates to go.mod needed; to update it: go mod tidy`, run `go mod tidy` locally, commit `go.mod` and
+  `go.sum`, then redeploy.
+- Avoid running `go mod tidy` in the Railway build step: it mutates `go.mod` and can introduce a `toolchain` directive
+  during build, which may then be present at runtime/start (where an older Go toolchain would fail to parse it).
 
 ### Chutes (optional) API key configuration
 
