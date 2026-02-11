@@ -59,6 +59,12 @@ We use a script to pack your local credentials into a single encrypted string th
 
 ## 4. Step 3: Deploy to Railway
 
+> [!IMPORTANT]
+> This repo can be deployed to Railway via either `railpack.json` or a root `Dockerfile`.
+> If your Railway logs show `go: command not found`, Railway is not using the Go build image for your service.
+> Easiest fix: ensure the service is using the included `Dockerfile` (Railway will auto-detect it when present),
+> or explicitly select a Go/Railpack-based builder.
+
 ### Chutes (optional) API key configuration
 
 This fork supports the **Chutes** OpenAI-compatible API.
