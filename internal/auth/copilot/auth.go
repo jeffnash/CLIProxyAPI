@@ -9,6 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -56,15 +59,107 @@ type GitHubUserResponse struct {
 type CopilotAuth struct {
 	httpClient    *http.Client
 	vsCodeVersion string
+	proxyURL      string
+	noProxy       string
 }
 
 // NewCopilotAuth creates a new CopilotAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
 func NewCopilotAuth(cfg *config.Config) *CopilotAuth {
+	proxyURL := ""
+	noProxy := ""
+	if cfg != nil && strings.TrimSpace(cfg.ProxyURL) != "" && cfg.SDKConfig.ProxyEnabledFor("copilot") {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+	noProxy = strings.TrimSpace(os.Getenv("NO_PROXY"))
+	if noProxy == "" {
+		noProxy = strings.TrimSpace(os.Getenv("no_proxy"))
+	}
 	return &CopilotAuth{
 		httpClient:    util.SetProxyForService(&cfg.SDKConfig, "copilot", &http.Client{Timeout: 30 * time.Second}),
 		vsCodeVersion: DefaultVSCodeVersion,
+		proxyURL:      proxyURL,
+		noProxy:       noProxy,
 	}
+}
+
+func maskProxyURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return "<invalid-proxy-url>"
+	}
+	if u.User != nil {
+		u.User = url.UserPassword("****", "****")
+	}
+	return u.String()
+}
+
+func parseNoProxyList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func shouldBypassProxy(host string, patterns []string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" || len(patterns) == 0 {
+		return false
+	}
+	for _, p := range patterns {
+		if p == "*" {
+			return true
+		}
+		if host == p {
+			return true
+		}
+		if strings.HasPrefix(p, ".") && strings.HasSuffix(host, p) {
+			return true
+		}
+		if !strings.HasPrefix(p, ".") && strings.HasSuffix(host, "."+p) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *CopilotAuth) logProxyUsedForRefresh(urlStr string) {
+	// Caller asked for a single, explicit log line each refresh.
+	host := ""
+	if u, err := url.Parse(urlStr); err == nil && u != nil {
+		host = strings.TrimSpace(u.Hostname())
+	}
+
+	used := false
+	if strings.TrimSpace(a.proxyURL) != "" {
+		// Best-effort NO_PROXY evaluation.
+		if host != "" && shouldBypassProxy(host, parseNoProxyList(a.noProxy)) {
+			used = false
+		} else {
+			used = true
+		}
+	}
+
+	log.Infof("copilot auth refresh: proxy_used=%t proxy=%s host=%s no_proxy=%q",
+		used,
+		maskProxyURL(a.proxyURL),
+		host,
+		strings.TrimSpace(a.noProxy),
+	)
 }
 
 // GetDeviceCode initiates the device code flow by requesting a device code from GitHub.
@@ -386,6 +481,9 @@ func (a *CopilotAuth) RefreshCopilotToken(ctx context.Context, storage *CopilotT
 	if storage == nil || storage.GitHubToken == "" {
 		return ErrNoGitHubToken
 	}
+
+	// Log proxy usage for this refresh call (explicitly requested).
+	a.logProxyUsedForRefresh(GitHubAPIBaseURL + path.Clean(CopilotTokenPath))
 
 	tokenResp, err := a.GetCopilotToken(ctx, storage.GitHubToken)
 	if err != nil {
