@@ -330,6 +330,7 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 		if err != nil {
 			return resp, err
 		}
+		body = applyTemperatureSuffix(body, req.Model, opts, to.String())
 
 		body = fixGeminiImageAspectRatio(baseModel, body)
 		requestedModel := payloadRequestedModel(opts, req.Model)
@@ -445,6 +446,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	if err != nil {
 		return resp, err
 	}
+	body = applyTemperatureSuffix(body, req.Model, opts, to.String())
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
@@ -550,6 +552,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 	if err != nil {
 		return nil, err
 	}
+	body = applyTemperatureSuffix(body, req.Model, opts, to.String())
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
@@ -675,6 +678,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 	if err != nil {
 		return nil, err
 	}
+	body = applyTemperatureSuffix(body, req.Model, opts, to.String())
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
 	requestedModel := payloadRequestedModel(opts, req.Model)
@@ -791,6 +795,7 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	translatedReq = applyTemperatureSuffix(translatedReq, req.Model, opts, to.String())
 
 	translatedReq = fixGeminiImageAspectRatio(baseModel, translatedReq)
 	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)
@@ -875,6 +880,7 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
+	translatedReq = applyTemperatureSuffix(translatedReq, req.Model, opts, to.String())
 
 	translatedReq = fixGeminiImageAspectRatio(baseModel, translatedReq)
 	translatedReq, _ = sjson.SetBytes(translatedReq, "model", baseModel)

@@ -10,6 +10,10 @@ import (
 // RequestedModelMetadataKey stores the client-requested model name in Options.Metadata.
 const RequestedModelMetadataKey = "requested_model"
 
+// TemperatureSuffixMetadataKey stores a temperature value parsed from a model name
+// suffix (e.g., "model-temp-0.7") in Options.Metadata. The value is a float64.
+const TemperatureSuffixMetadataKey = "temperature_suffix"
+
 // Request encapsulates the translated payload that will be sent to a provider executor.
 type Request struct {
 	// Model is the upstream model identifier after translation.

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +25,7 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -670,6 +673,18 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 		forcedProvider = "chutes"
 	}
 
+	// Parse and strip temperature suffix (-temp-x.x) before thinking suffix processing.
+	// The temperature suffix appears before the thinking suffix, e.g. model-temp-0.7(16384).
+	var tempValue float64
+	var hasTemp bool
+	rawModel, tempValue, hasTemp = parseTemperatureSuffix(rawModel)
+	if hasTemp {
+		if metadata == nil {
+			metadata = make(map[string]any, 1)
+		}
+		metadata[TemperatureSuffixMetadataKey] = tempValue
+	}
+
 	// Resolve "auto" to an actual available model, preserving any thinking suffix.
 	resolvedModelName := rawModel
 	initialSuffix := thinking.ParseSuffix(rawModel)
@@ -806,3 +821,56 @@ func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *inter
 // APIHandlerCancelFunc is a function type for canceling an API handler's context.
 // It can optionally accept parameters, which are used for logging the response.
 type APIHandlerCancelFunc func(params ...interface{})
+
+// TemperatureSuffixMetadataKey is re-exported from the executor package for convenience.
+const TemperatureSuffixMetadataKey = coreexecutor.TemperatureSuffixMetadataKey
+
+// temperatureSuffixRe matches the -temp-<number> suffix in a model name.
+// The suffix must appear before any thinking suffix (...).
+// Examples: -temp-0.7, -temp-1, -temp-1.5
+var temperatureSuffixRe = regexp.MustCompile(`-temp-(\d+(?:\.\d+)?)$`)
+
+// parseTemperatureSuffix extracts a -temp-x.x suffix from a model name.
+//
+// The suffix can appear before a thinking suffix (...). For example:
+//   - "claude-sonnet-4-5-temp-0.7" → ("claude-sonnet-4-5", 0.7, true)
+//   - "claude-sonnet-4-5-temp-0.7(16384)" → ("claude-sonnet-4-5(16384)", 0.7, true)
+//   - "gemini-2.5-pro" → ("gemini-2.5-pro", 0, false)
+//
+// Returns the model name with the temp suffix stripped, the temperature value,
+// and whether a valid temp suffix was found.
+func parseTemperatureSuffix(model string) (cleanModel string, temperature float64, hasTemp bool) {
+	// Separate the thinking suffix (...) from the model name if present.
+	thinkingSuffix := ""
+	base := model
+	if idx := strings.LastIndex(model, "("); idx != -1 && strings.HasSuffix(model, ")") {
+		base = model[:idx]
+		thinkingSuffix = model[idx:]
+	}
+
+	loc := temperatureSuffixRe.FindStringSubmatchIndex(base)
+	if loc == nil {
+		return model, 0, false
+	}
+
+	// Extract the numeric value.
+	valueStr := base[loc[2]:loc[3]]
+	value, err := strconv.ParseFloat(valueStr, 64)
+	if err != nil {
+		return model, 0, false
+	}
+
+	// Strip the -temp-x.x suffix from the base model name and re-attach thinking suffix.
+	cleanBase := base[:loc[0]]
+	if cleanBase == "" {
+		return model, 0, false
+	}
+
+	log.WithFields(log.Fields{
+		"model":       model,
+		"temperature": value,
+		"clean_model": cleanBase + thinkingSuffix,
+	}).Info("temperature: parsed -temp- suffix from model name |")
+
+	return cleanBase + thinkingSuffix, value, true
+}
