@@ -54,6 +54,12 @@ The startup script automatically detects existing credentials and skips `AUTH_BU
   - This is slower/less reliable than baking Electron into the image, but works for the common “railpack.json + start script” Railway path.
 - `INSTALL_GO` (default `1`) - when the script needs to rebuild `./cli-proxy-api` and `go` is missing on `PATH`, it will attempt to install `golang-go` via `apt-get` at container start.
   - Set to `0` to disable auto-install (startup will fail fast if a rebuild is needed but Go isn't available).
+- `GO_INSTALL_METHOD` (default `auto`) - how the script installs Go when a rebuild is needed and the runtime toolchain is missing/too old:
+  - `auto`: try official Go tarball first, then fall back to apt
+  - `tarball`: use official Go tarball only (fail fast if download/install fails)
+  - `apt`: use OS packages only (`golang-go`)
+- `GO_TARBALL_VERSION` (default `${go_mod_version}.0`) - pin the Go patch version used for the tarball install (example: `1.24.13`).
+- `GO_TARBALL_VARIANT` (default `linux-amd64`) - tarball variant (Railway is typically `linux-amd64`).
 - `COPILOT_HOT_TAKES_INTERVAL_MINS` (default unset / disabled) - when set to a positive integer, periodically fetches 7 random HN headlines and asks Copilot (as initiator **user**) for commentary, printing the response to logs.
 - `COPILOT_HOT_TAKES_MODEL` (default `claude-haiku-4.5`) - model ID to use for hot takes. The code will prefix it with `copilot-` automatically unless you already include it.
 - `STREAMING_KEEPALIVE_SECONDS` (default `0` / disabled) - how often the server emits SSE heartbeats (`: keep-alive\n\n`) during streaming responses.
