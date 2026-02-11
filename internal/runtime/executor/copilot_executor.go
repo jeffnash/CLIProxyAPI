@@ -171,19 +171,11 @@ func (e *CopilotExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.A
 	return nil
 }
 
-// HttpRequest injects Copilot credentials into the request and executes it.
-func (e *CopilotExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
-	if req == nil {
-		return nil, fmt.Errorf("copilot executor: request is nil")
-	}
-	if ctx == nil {
-		ctx = req.Context()
-	}
-	httpReq := req.WithContext(ctx)
-	if err := e.PrepareRequest(httpReq, auth); err != nil {
-		return nil, err
-	}
-
+// copilotDoRequest performs the outbound HTTP request for Copilot, attempting
+// Electron/Chromium transport first (when configured) then falling back to Go's
+// net/http transport. This is the single code path used by HttpRequest, Execute,
+// and ExecuteStream to ensure consistent transport selection and proxy logging.
+func (e *CopilotExecutor) copilotDoRequest(ctx context.Context, auth *cliproxyauth.Auth, httpReq *http.Request) (*http.Response, error) {
 	// Parity default: attempt to use Electron/Chromium net stack first (if available),
 	// then fall back to Go's net/http transport.
 	if copilotPreferElectronTransport() {
@@ -248,6 +240,22 @@ func (e *CopilotExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Au
 
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "copilot")
 	return httpClient.Do(httpReq)
+}
+
+// HttpRequest injects Copilot credentials into the request and executes it.
+func (e *CopilotExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, fmt.Errorf("copilot executor: request is nil")
+	}
+	if ctx == nil {
+		ctx = req.Context()
+	}
+	httpReq := req.WithContext(ctx)
+	if err := e.PrepareRequest(httpReq, auth); err != nil {
+		return nil, err
+	}
+
+	return e.copilotDoRequest(ctx, auth, httpReq)
 }
 
 // reasoningCache returns the shared Gemini reasoning cache for a given auth, or a fresh
@@ -522,6 +530,7 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	if strings.HasPrefix(strings.ToLower(apiModel), "gemini") {
 		body = e.reasoningCache(auth).InjectReasoning(body)
 	}
+	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	baseURL := copilotauth.CopilotBaseURL(accountType)
 	url := baseURL + "/chat/completions"
@@ -551,8 +560,7 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 		AuthValue: authValue,
 	})
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "copilot")
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.copilotDoRequest(ctx, auth, httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -631,6 +639,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 	if strings.HasPrefix(strings.ToLower(apiModel), "gemini") {
 		body = e.reasoningCache(auth).InjectReasoning(body)
 	}
+	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	baseURL := copilotauth.CopilotBaseURL(accountType)
 	url := baseURL + "/chat/completions"
@@ -660,8 +669,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 		AuthValue: authValue,
 	})
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "copilot")
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := e.copilotDoRequest(ctx, auth, httpReq)
 	if err != nil {
 		recordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
