@@ -1,10 +1,12 @@
 package synthesizer
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -345,6 +347,52 @@ func TestConfigSynthesizer_PassthruRoutes_NoContextWindowWhenZero(t *testing.T) 
 	// Verify max_tokens is NOT set when zero
 	if v := a.Attributes["max_tokens"]; v != "" {
 		t.Fatalf("expected no max_tokens when zero, got %q", v)
+	}
+}
+
+func TestConfigSynthesizer_PassthruRoutes_ModelOverride(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:            "glm-5",
+					ModelRoutingName: "zai-glm-5",
+					Protocol:         "claude",
+					BaseURL:          "https://z.ai",
+					APIKey:           "test-key",
+					ContextWindow:    204800,
+					ModelOverride: &registry.ModelInfo{
+						Thinking:            &registry.ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true},
+						MaxCompletionTokens: 64000,
+					},
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	a := auths[0]
+
+	// Verify model_override is stored as JSON in attributes
+	overrideJSON := a.Attributes["model_override"]
+	if overrideJSON == "" {
+		t.Fatal("expected model_override attribute to be set")
+	}
+	// Should contain thinking config
+	if !strings.Contains(overrideJSON, "\"min\":1024") {
+		t.Errorf("expected model_override to contain thinking min, got %q", overrideJSON)
+	}
+	if !strings.Contains(overrideJSON, "\"max_completion_tokens\":64000") {
+		t.Errorf("expected model_override to contain max_completion_tokens, got %q", overrideJSON)
 	}
 }
 

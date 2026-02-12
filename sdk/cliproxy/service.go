@@ -5,6 +5,7 @@ package cliproxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -790,7 +791,52 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 					DisplayName:         routingName,
 					ContextLength:       contextWindow,
 					MaxCompletionTokens: maxTokens,
+					UserDefined:         true,
 				}}
+
+				// Resolve model capabilities. Priority:
+				// 1. Explicit model-override from passthru JSON → highest priority
+				// 2. Static model definitions (by upstream model name) → fallback
+				// 3. UserDefined=true → thinking config passed through to upstream without validation
+				upstreamModel := strings.TrimSpace(a.Attributes["upstream_model"])
+				if upstreamModel == "" {
+					upstreamModel = strings.TrimSpace(a.Attributes["passthru_model"])
+				}
+				// Try static resolution first
+				if upstreamModel != "" {
+					if static := registry.LookupStaticModelInfo(upstreamModel); static != nil {
+						if static.Thinking != nil {
+							models[0].Thinking = static.Thinking
+						}
+						if static.MaxCompletionTokens > 0 && models[0].MaxCompletionTokens == 32000 {
+							models[0].MaxCompletionTokens = static.MaxCompletionTokens
+						}
+						if static.ContextLength > 0 && models[0].ContextLength == 128000 {
+							models[0].ContextLength = static.ContextLength
+						}
+					}
+				}
+				// Apply explicit model-override (overrides static resolution)
+				if overrideJSON := strings.TrimSpace(a.Attributes["model_override"]); overrideJSON != "" {
+					var override registry.ModelInfo
+					if err := json.Unmarshal([]byte(overrideJSON), &override); err == nil {
+						if override.Thinking != nil {
+							models[0].Thinking = override.Thinking
+						}
+						if override.MaxCompletionTokens > 0 {
+							models[0].MaxCompletionTokens = override.MaxCompletionTokens
+						}
+						if override.ContextLength > 0 {
+							models[0].ContextLength = override.ContextLength
+						}
+					} else {
+						short := overrideJSON
+						if len(short) > 200 {
+							short = short[:200] + "..."
+						}
+						log.Warnf("passthru %s: failed to parse model_override JSON: %v | override=%s", a.ID, err, short)
+					}
+				}
 				GlobalModelRegistry().RegisterClient(a.ID, provider, models)
 				return
 			}
