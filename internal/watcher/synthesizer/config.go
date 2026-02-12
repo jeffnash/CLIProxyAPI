@@ -1,6 +1,7 @@
 package synthesizer
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -101,6 +102,12 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 		}
 		if r.MaxTokens > 0 {
 			attrs["max_tokens"] = fmt.Sprintf("%d", r.MaxTokens)
+		}
+		// Store model override as JSON for model registration to apply
+		if r.ModelOverride != nil {
+			if overrideJSON, err := json.Marshal(r.ModelOverride); err == nil {
+				attrs["model_override"] = string(overrideJSON)
+			}
 		}
 		addConfigHeadersToAttrs(r.Headers, attrs)
 
