@@ -141,6 +141,19 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
+		// Populate auth Metadata from rate-limit config so the conductor's
+		// per-auth override system (RequestRetryOverride, DisableCoolingOverride) applies.
+		if r.RateLimit != nil {
+			if a.Metadata == nil {
+				a.Metadata = make(map[string]any)
+			}
+			if r.RateLimit.RequestRetry != nil {
+				a.Metadata["request_retry"] = *r.RateLimit.RequestRetry
+			}
+			if r.RateLimit.DisableCooling != nil {
+				a.Metadata["disable_cooling"] = *r.RateLimit.DisableCooling
+			}
+		}
 		ApplyAuthExcludedModelsMeta(a, cfg, nil, "passthru")
 		out = append(out, a)
 	}

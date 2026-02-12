@@ -206,6 +206,26 @@ type PassthruRoute struct {
 	//
 	// Example: {"thinking": {"min": 1024, "max": 128000, "zero_allowed": true}, "max_completion_tokens": 64000}
 	ModelOverride *registry.ModelInfo `yaml:"model-override,omitempty" json:"model-override,omitempty"`
+
+	// RateLimit optionally configures retry and cooldown behavior for this passthru model.
+	// These map to per-auth overrides already supported by the conductor.
+	// When omitted, global request-retry and cooling settings apply.
+	//
+	// Example: {"request-retry": 3, "disable-cooling": false}
+	RateLimit *PassthruRateLimit `yaml:"rate-limit,omitempty" json:"rate-limit,omitempty"`
+}
+
+// PassthruRateLimit configures per-route retry and cooldown behavior.
+// Pointer fields allow distinguishing "not set" from zero values.
+type PassthruRateLimit struct {
+	// RequestRetry is the max number of retry attempts on failure.
+	// When omitted, the global request-retry config applies.
+	// Set to 0 to disable retries for this route.
+	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
+
+	// DisableCooling disables exponential backoff cooldown on 429s for this route.
+	// When omitted, the global disable-cooling config applies.
+	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.
