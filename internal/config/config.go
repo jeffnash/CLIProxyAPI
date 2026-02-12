@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	copilotshared "github.com/router-for-me/CLIProxyAPI/v6/internal/copilot"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -193,6 +194,18 @@ type PassthruRoute struct {
 	// MaxTokens specifies the model's max output tokens (optional).
 	// Used for /v1/models metadata. Defaults to 32000 if not set.
 	MaxTokens int `yaml:"max-tokens,omitempty" json:"max-tokens,omitempty"`
+
+	// ModelOverride optionally provides explicit model capability metadata for this passthru model.
+	// Fields set here override any auto-resolved values from static model definitions.
+	// Unset fields fall back to static resolution (by upstream model name) or defaults.
+	//
+	// Use this when the upstream model is too new for the static registry, or when
+	// the passthru route's capabilities differ from the static definition (e.g.,
+	// a model accessed via claude protocol may have different thinking config than
+	// the same model accessed via iflow).
+	//
+	// Example: {"thinking": {"min": 1024, "max": 128000, "zero_allowed": true}, "max_completion_tokens": 64000}
+	ModelOverride *registry.ModelInfo `yaml:"model-override,omitempty" json:"model-override,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.

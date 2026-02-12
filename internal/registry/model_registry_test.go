@@ -127,6 +127,7 @@ func TestModelRegistry_PassthruModelRegistration(t *testing.T) {
 		DisplayName:         "zai-test-model",
 		ContextLength:       128000,
 		MaxCompletionTokens: 32000,
+		UserDefined:         true,
 	}}
 
 	reg.RegisterClient(clientID, "claude", models)
@@ -158,5 +159,52 @@ func TestModelRegistry_PassthruModelRegistration(t *testing.T) {
 	}
 	if !found {
 		t.Error("expected zai-test-model in available models")
+	}
+}
+
+func TestModelRegistry_PassthruModelWithThinking(t *testing.T) {
+	reg := GetGlobalRegistry()
+
+	clientID := "passthru-thinking-test"
+
+	// Register a passthru model with UserDefined=true and Thinking set
+	models := []*ModelInfo{{
+		ID:                  "zai-glm-test",
+		Object:              "model",
+		Created:             time.Now().Unix(),
+		OwnedBy:             "passthru",
+		Type:                "claude",
+		DisplayName:         "zai-glm-test",
+		ContextLength:       204800,
+		MaxCompletionTokens: 64000,
+		UserDefined:         true,
+		Thinking:            &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true},
+	}}
+
+	reg.RegisterClient(clientID, "claude", models)
+	defer reg.UnregisterClient(clientID)
+
+	// Verify model is registered and has thinking support
+	info := reg.GetModelInfo("zai-glm-test", "claude")
+	if info == nil {
+		t.Fatal("expected model info to be non-nil")
+	}
+	if !info.UserDefined {
+		t.Error("expected UserDefined to be true")
+	}
+	if info.Thinking == nil {
+		t.Fatal("expected Thinking to be non-nil")
+	}
+	if info.Thinking.Min != 1024 {
+		t.Errorf("expected Thinking.Min 1024, got %d", info.Thinking.Min)
+	}
+	if info.Thinking.Max != 128000 {
+		t.Errorf("expected Thinking.Max 128000, got %d", info.Thinking.Max)
+	}
+	if !info.Thinking.ZeroAllowed {
+		t.Error("expected Thinking.ZeroAllowed to be true")
+	}
+	if !info.Thinking.DynamicAllowed {
+		t.Error("expected Thinking.DynamicAllowed to be true")
 	}
 }
