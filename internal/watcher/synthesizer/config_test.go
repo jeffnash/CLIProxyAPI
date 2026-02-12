@@ -396,6 +396,86 @@ func TestConfigSynthesizer_PassthruRoutes_ModelOverride(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_PassthruRoutes_RateLimit(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	retries := 3
+	disableCooling := true
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:    "rate-limited-model",
+					Protocol: "openai",
+					BaseURL:  "https://api.example.com/v1",
+					APIKey:   "test-key",
+					RateLimit: &config.PassthruRateLimit{
+						RequestRetry:   &retries,
+						DisableCooling: &disableCooling,
+					},
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	a := auths[0]
+
+	// Verify Metadata contains rate-limit overrides
+	if a.Metadata == nil {
+		t.Fatal("expected Metadata to be non-nil")
+	}
+	if v, ok := a.Metadata["request_retry"]; !ok {
+		t.Fatal("expected request_retry in Metadata")
+	} else if v != 3 {
+		t.Errorf("expected request_retry 3, got %v", v)
+	}
+	if v, ok := a.Metadata["disable_cooling"]; !ok {
+		t.Fatal("expected disable_cooling in Metadata")
+	} else if v != true {
+		t.Errorf("expected disable_cooling true, got %v", v)
+	}
+}
+
+func TestConfigSynthesizer_PassthruRoutes_RateLimitOmitted(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:    "no-ratelimit-model",
+					Protocol: "openai",
+					BaseURL:  "https://api.example.com/v1",
+					APIKey:   "test-key",
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	a := auths[0]
+
+	// Metadata should be nil when no rate-limit is configured
+	if a.Metadata != nil {
+		t.Errorf("expected nil Metadata when no rate-limit, got %v", a.Metadata)
+	}
+}
+
 func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{
