@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +57,8 @@ type sharedModelCacheEntry struct {
 
 const sharedModelCacheTTL = 30 * time.Minute
 const defaultCopilotStreamReadBufferSize = 64 * 1024
+const defaultCopilotStreamMaxAttempts = 2
+const defaultCopilotStreamIdleBudget = 45 * time.Second
 
 // NewCopilotExecutor creates a new CopilotExecutor instance.
 
@@ -645,95 +649,278 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 	baseURL := copilotauth.CopilotBaseURL(accountType)
 	url := baseURL + "/chat/completions"
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	e.applyCopilotHeaders(httpReq, copilotToken, req.Payload, opts.Headers)
-
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      body,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
-	httpResp, err := e.copilotDoRequest(ctx, auth, httpReq)
-	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
-	}
-
-	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		data, readErr := io.ReadAll(httpResp.Body)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("copilot executor: close response body error: %v", errClose)
-		}
-		if readErr != nil {
-			recordAPIResponseError(ctx, e.cfg, readErr)
-			return nil, readErr
-		}
-		appendAPIResponseChunk(ctx, e.cfg, data)
-		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = copilotStatusErr(httpResp.StatusCode, string(data))
-		return nil, err
-	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
 	stream = out
 	go func() {
 		defer close(out)
-		defer func() {
+
+		isGemini := strings.HasPrefix(strings.ToLower(apiModel), "gemini")
+		maxAttempts := copilotStreamMaxAttempts()
+		idleBudget := copilotStreamIdleBudget()
+		emittedAnyPayload := false
+
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+			if reqErr != nil {
+				reporter.publishFailure(ctx)
+				out <- cliproxyexecutor.StreamChunk{Err: reqErr}
+				return
+			}
+			e.applyCopilotHeaders(httpReq, copilotToken, req.Payload, opts.Headers)
+
+			recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+				URL:       url,
+				Method:    http.MethodPost,
+				Headers:   httpReq.Header.Clone(),
+				Body:      body,
+				Provider:  e.Identifier(),
+				AuthID:    authID,
+				AuthLabel: authLabel,
+				AuthType:  authType,
+				AuthValue: authValue,
+			})
+
+			httpResp, reqErr := e.copilotDoRequest(ctx, auth, httpReq)
+			if reqErr != nil {
+				recordAPIResponseError(ctx, e.cfg, reqErr)
+				if !emittedAnyPayload && attempt < maxAttempts && isRecoverableCopilotStreamErr(reqErr) && sleepWithContext(ctx, copilotStreamRetryBackoff(attempt)) {
+					log.Warnf("copilot executor: retrying stream request after transport error (attempt %d/%d): %v", attempt, maxAttempts, reqErr)
+					continue
+				}
+				reporter.publishFailure(ctx)
+				out <- cliproxyexecutor.StreamChunk{Err: reqErr}
+				return
+			}
+
+			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
+			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+				data, readErr := io.ReadAll(httpResp.Body)
+				if errClose := httpResp.Body.Close(); errClose != nil {
+					log.Errorf("copilot executor: close response body error: %v", errClose)
+				}
+				if readErr != nil {
+					recordAPIResponseError(ctx, e.cfg, readErr)
+					reporter.publishFailure(ctx)
+					out <- cliproxyexecutor.StreamChunk{Err: readErr}
+					return
+				}
+				appendAPIResponseChunk(ctx, e.cfg, data)
+				log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+				status := copilotStatusErr(httpResp.StatusCode, string(data))
+				if !emittedAnyPayload && attempt < maxAttempts && isRetryableCopilotStatus(status.code) && sleepWithContext(ctx, copilotStreamRetryBackoff(attempt)) {
+					log.Warnf("copilot executor: retrying stream request after upstream status %d (attempt %d/%d)", status.code, attempt, maxAttempts)
+					continue
+				}
+				reporter.publishFailure(ctx)
+				out <- cliproxyexecutor.StreamChunk{Err: status}
+				return
+			}
+
+			var param any
+			errRead := e.streamCopilotSSELinesWithIdleBudget(ctx, httpResp.Body, idleBudget, func(line []byte) {
+				appendAPIResponseChunk(ctx, e.cfg, line)
+
+				// Parse usage from final chunk if present
+				if bytes.HasPrefix(line, dataTag) {
+					data := bytes.TrimSpace(line[5:])
+					if gjson.GetBytes(data, "usage").Exists() {
+						reporter.publish(ctx, parseOpenAIUsage(data))
+					}
+
+					// Cache Gemini reasoning data for subsequent requests
+					if isGemini {
+						e.reasoningCache(auth).CacheReasoning(data)
+					}
+				}
+
+				chunks := sdktranslator.TranslateStream(ctx, to, from, translatorModel, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
+				for i := range chunks {
+					emittedAnyPayload = true
+					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				}
+			})
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("copilot executor: close response body error: %v", errClose)
 			}
-		}()
 
-		isGemini := strings.HasPrefix(strings.ToLower(apiModel), "gemini")
-		var param any
-		errRead := e.streamCopilotSSELines(httpResp.Body, func(line []byte) {
-			appendAPIResponseChunk(ctx, e.cfg, line)
-
-			// Parse usage from final chunk if present
-			if bytes.HasPrefix(line, dataTag) {
-				data := bytes.TrimSpace(line[5:])
-				if gjson.GetBytes(data, "usage").Exists() {
-					reporter.publish(ctx, parseOpenAIUsage(data))
-				}
-
-				// Cache Gemini reasoning data for subsequent requests
-				if isGemini {
-					e.reasoningCache(auth).CacheReasoning(data)
-				}
+			if errRead == nil {
+				return
 			}
 
-			chunks := sdktranslator.TranslateStream(ctx, to, from, translatorModel, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
-			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
-			}
-		})
-		if errRead != nil {
 			recordAPIResponseError(ctx, e.cfg, errRead)
+			if !emittedAnyPayload && attempt < maxAttempts && isRecoverableCopilotStreamErr(errRead) && sleepWithContext(ctx, copilotStreamRetryBackoff(attempt)) {
+				log.Warnf("copilot executor: retrying stream after pre-output stream drop (attempt %d/%d): %v", attempt, maxAttempts, errRead)
+				continue
+			}
+
 			reporter.publishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errRead}
+			return
 		}
 	}()
 
 	return stream, nil
+}
+
+func copilotStreamMaxAttempts() int {
+	raw := strings.TrimSpace(os.Getenv("COPILOT_STREAM_MAX_ATTEMPTS"))
+	if raw == "" {
+		return defaultCopilotStreamMaxAttempts
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return defaultCopilotStreamMaxAttempts
+	}
+	if n > 5 {
+		return 5
+	}
+	return n
+}
+
+func copilotStreamIdleBudget() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("COPILOT_STREAM_IDLE_BUDGET_MS"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("COPILOT_STREAM_IDLE_TIMEOUT_MS"))
+	}
+	if raw == "" {
+		return defaultCopilotStreamIdleBudget
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultCopilotStreamIdleBudget
+	}
+	if n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Millisecond
+}
+
+func copilotStreamRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	backoff := time.Duration(attempt) * 500 * time.Millisecond
+	if backoff > 2*time.Second {
+		return 2 * time.Second
+	}
+	return backoff
+}
+
+func isRetryableCopilotStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return code >= 500
+	}
+}
+
+func isRecoverableCopilotStreamErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToUpper(err.Error())
+	retryMarkers := []string{
+		"ERR_CONNECTION_CLOSED",
+		"ERR_CONNECTION_RESET",
+		"ERR_TIMED_OUT",
+		"ERR_NETWORK_CHANGED",
+		"ERR_TUNNEL_CONNECTION_FAILED",
+		"UPSTREAM RESPONSE ABORTED",
+		"UPSTREAM RESPONSE CLOSED BEFORE END",
+		"INCOMPLETE CHUNKED READ",
+		"UNEXPECTED EOF",
+		"I/O TIMEOUT",
+	}
+	for _, marker := range retryMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (e *CopilotExecutor) streamCopilotSSELinesWithIdleBudget(ctx context.Context, body io.ReadCloser, idleBudget time.Duration, onLine func([]byte)) error {
+	if idleBudget <= 0 {
+		return e.streamCopilotSSELines(body, onLine)
+	}
+
+	activity := make(chan struct{}, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- e.streamCopilotSSELines(body, func(line []byte) {
+			select {
+			case activity <- struct{}{}:
+			default:
+			}
+			onLine(line)
+		})
+	}()
+
+	timer := time.NewTimer(idleBudget)
+	defer timer.Stop()
+
+	for {
+		select {
+		case err := <-errCh:
+			return err
+		case <-activity:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(idleBudget)
+		case <-timer.C:
+			_ = body.Close()
+			select {
+			case err := <-errCh:
+				if err == nil || errors.Is(err, io.EOF) {
+					return fmt.Errorf("copilot executor: stream idle timeout after %s: %w", idleBudget, context.DeadlineExceeded)
+				}
+				return fmt.Errorf("copilot executor: stream idle timeout after %s: %w", idleBudget, err)
+			case <-time.After(2 * time.Second):
+				return fmt.Errorf("copilot executor: stream idle timeout after %s: %w", idleBudget, context.DeadlineExceeded)
+			}
+		case <-ctx.Done():
+			_ = body.Close()
+			select {
+			case err := <-errCh:
+				if err != nil && !errors.Is(err, io.EOF) {
+					return err
+				}
+			default:
+			}
+			return ctx.Err()
+		}
+	}
 }
 
 func (e *CopilotExecutor) streamCopilotSSELines(body io.Reader, onLine func([]byte)) error {
@@ -749,6 +936,9 @@ func (e *CopilotExecutor) streamCopilotSSELines(body io.Reader, onLine func([]by
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				log.Warnf("copilot executor: truncated SSE stream detected: %v", err)
+			}
 			return err
 		}
 		onLine(line)
@@ -758,38 +948,43 @@ func (e *CopilotExecutor) streamCopilotSSELines(body io.Reader, onLine func([]by
 // readSSELine reads a single SSE line without imposing Scanner token limits.
 // It reassembles oversized lines split by bufio.Reader and logs when that occurs.
 func readSSELine(reader *bufio.Reader) ([]byte, error) {
-	line, isPrefix, err := reader.ReadLine()
-	if err != nil {
-		if errors.Is(err, io.EOF) && len(line) > 0 {
-			return bytes.TrimSuffix(append([]byte(nil), line...), []byte{'\r'}), nil
+	fragment, err := reader.ReadSlice('\n')
+	if err == nil {
+		line := append([]byte(nil), fragment...)
+		line = bytes.TrimSuffix(line, []byte{'\n'})
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		return line, nil
+	}
+	if errors.Is(err, io.EOF) {
+		if len(fragment) == 0 {
+			return nil, io.EOF
 		}
+		return nil, fmt.Errorf("copilot executor: partial SSE line at EOF (%d bytes): %w", len(fragment), io.ErrUnexpectedEOF)
+	}
+	if !errors.Is(err, bufio.ErrBufferFull) {
 		return nil, err
 	}
 
-	if !isPrefix {
-		return bytes.TrimSuffix(append([]byte(nil), line...), []byte{'\r'}), nil
-	}
-
-	fullLine := append([]byte(nil), line...)
+	fullLine := append([]byte(nil), fragment...)
 	fragments := 1
-	for isPrefix {
-		part, nextPrefix, nextErr := reader.ReadLine()
-		if nextErr != nil {
-			if errors.Is(nextErr, io.EOF) {
-				fullLine = append(fullLine, part...)
-				fragments++
-				log.Warnf("copilot executor: partial SSE line ended at EOF while reassembling long line (fragments=%d bytes=%d)", fragments, len(fullLine))
-				return bytes.TrimSuffix(fullLine, []byte{'\r'}), nil
-			}
-			return nil, nextErr
-		}
+	for {
+		part, nextErr := reader.ReadSlice('\n')
 		fullLine = append(fullLine, part...)
 		fragments++
-		isPrefix = nextPrefix
+		if nextErr == nil {
+			log.Warnf("copilot executor: oversized SSE line reassembled (fragments=%d bytes=%d)", fragments, len(fullLine))
+			fullLine = bytes.TrimSuffix(fullLine, []byte{'\n'})
+			fullLine = bytes.TrimSuffix(fullLine, []byte{'\r'})
+			return fullLine, nil
+		}
+		if errors.Is(nextErr, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(nextErr, io.EOF) {
+			return nil, fmt.Errorf("copilot executor: partial SSE line ended at EOF while reassembling long line (fragments=%d bytes=%d): %w", fragments, len(fullLine), io.ErrUnexpectedEOF)
+		}
+		return nil, nextErr
 	}
-
-	log.Warnf("copilot executor: oversized SSE line reassembled (fragments=%d bytes=%d)", fragments, len(fullLine))
-	return bytes.TrimSuffix(fullLine, []byte{'\r'}), nil
 }
 
 func (e *CopilotExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {

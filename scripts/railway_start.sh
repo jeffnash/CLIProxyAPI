@@ -74,7 +74,8 @@ ensure_electron() {
     return 0
   fi
 
-  info "Installing Node.js + Electron (INSTALL_ELECTRON=1)"
+  local electron_version="${COPILOT_ELECTRON_VERSION:-40.4.0}"
+  info "Installing Node.js + Electron ${electron_version} (INSTALL_ELECTRON=1)"
 
   # Install Node (20.x) then Electron.
   # NOTE: railpack.json should include the shared libs Electron needs; this function assumes that.
@@ -89,10 +90,10 @@ ensure_electron() {
     return 0
   fi
 
-  npm i -g electron@latest >/dev/null
+  npm i -g "electron@${electron_version}" >/dev/null
 
   if command -v electron >/dev/null 2>&1; then
-    info "Electron installed: $(command -v electron)"
+    info "Electron installed: $(command -v electron) ($(electron --version 2>/dev/null || echo unknown-version))"
     export ELECTRON_PATH="${ELECTRON_PATH:-electron}"
     export COPILOT_ELECTRON_PATH="${COPILOT_ELECTRON_PATH:-electron}"
   else

@@ -17,9 +17,36 @@ app.disableHardwareAcceleration();
 // Allow running without a display (Railway, Docker, etc.).
 app.commandLine.appendSwitch("disable-software-rasterizer");
 app.commandLine.appendSwitch("no-sandbox");
+// Prefer HTTP/1.1 for long SSE streams; HTTP/2 session churn can trigger resets.
+app.commandLine.appendSwitch("disable-http2");
 
-function write(obj) {
-  process.stdout.write(JSON.stringify(obj) + "\n");
+function writeLine(obj) {
+  return new Promise((resolve, reject) => {
+    const line = JSON.stringify(obj) + "\n";
+    process.stdout.write(line, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+let writeQueue = Promise.resolve();
+function queueWrite(obj) {
+  writeQueue = writeQueue.catch(() => {}).then(() => writeLine(obj));
+  return writeQueue;
+}
+
+async function flushAndExit(code) {
+  try {
+    await writeQueue;
+  } catch {
+    // Ignore stdout flush errors on shutdown.
+  }
+  try {
+    app.exit(code);
+  } catch {
+    process.exit(code);
+  }
 }
 
 function readAllStdin() {
@@ -88,6 +115,17 @@ function proxyCredentials(proxyURL) {
   }
 }
 
+function isRetryableElectronError(errLike) {
+  const msg = String(errLike && errLike.message ? errLike.message : errLike).toUpperCase();
+  return (
+    msg.includes("ERR_CONNECTION_CLOSED") ||
+    msg.includes("ERR_CONNECTION_RESET") ||
+    msg.includes("ERR_TIMED_OUT") ||
+    msg.includes("ERR_NETWORK_CHANGED") ||
+    msg.includes("ERR_TUNNEL_CONNECTION_FAILED")
+  );
+}
+
 async function main() {
   const raw = await readAllStdin();
   const req = JSON.parse(raw || "{}");
@@ -132,50 +170,90 @@ async function main() {
     }
   }
 
-  const request = net.request({ method, url, session: session.defaultSession });
-  for (const [k, v] of Object.entries(headers)) {
-    try {
-      request.setHeader(k, v);
-    } catch {
-      // ignore invalid headers
+  let finished = false;
+  let sawResponseEnd = false;
+  let sawResponseHeaders = false;
+  const maxAttemptsRaw = Number.parseInt(process.env.COPILOT_ELECTRON_MAX_ATTEMPTS || "2", 10);
+  const maxAttempts = Number.isFinite(maxAttemptsRaw) && maxAttemptsRaw > 0 ? maxAttemptsRaw : 2;
+  let attempt = 0;
+  function finishWithError(errLike) {
+    if (finished) return;
+    finished = true;
+    const message = String(errLike && errLike.message ? errLike.message : errLike);
+    queueWrite({ type: "error", message }).finally(() => flushAndExit(1));
+  }
+  function finishSuccess() {
+    if (finished) return;
+    finished = true;
+    queueWrite({ type: "end" }).finally(() => flushAndExit(0));
+  }
+
+  function makeAttempt() {
+    if (finished) return;
+    attempt += 1;
+    const request = net.request({ method, url, session: session.defaultSession });
+    if (!Object.keys(headers).some((k) => k.toLowerCase() === "connection")) {
+      request.setHeader("Connection", "keep-alive");
     }
+    if (!Object.keys(headers).some((k) => k.toLowerCase() === "cache-control")) {
+      request.setHeader("Cache-Control", "no-cache");
+    }
+    for (const [k, v] of Object.entries(headers)) {
+      try {
+        request.setHeader(k, v);
+      } catch {
+        // ignore invalid headers
+      }
+    }
+
+    request.on("response", (response) => {
+      sawResponseHeaders = true;
+      queueWrite({
+        type: "meta",
+        status: response.statusCode,
+        statusText: response.statusMessage || "",
+        headers: normalizeHeaders(response.headers || {}),
+      }).catch((err) => finishWithError(`failed to write response meta: ${err}`));
+
+      response.on("data", (chunk) => {
+        if (finished) return;
+        queueWrite({ type: "chunk", b64: Buffer.from(chunk).toString("base64") }).catch((err) =>
+          finishWithError(`failed to write response chunk: ${err}`),
+        );
+      });
+      response.on("end", () => {
+        sawResponseEnd = true;
+        finishSuccess();
+      });
+      response.on("aborted", () => finishWithError("electron transport: upstream response aborted"));
+      response.on("error", (err) => finishWithError(err));
+      response.on("close", () => {
+        if (!sawResponseEnd) {
+          finishWithError("electron transport: upstream response closed before end");
+        }
+      });
+    });
+
+    request.on("error", (err) => {
+      const retryable = !sawResponseHeaders && isRetryableElectronError(err) && attempt < maxAttempts;
+      if (retryable) {
+        const backoffMs = Math.min(1000, 250 * attempt);
+        setTimeout(makeAttempt, backoffMs);
+        return;
+      }
+      finishWithError(err);
+    });
+
+    if (bodyB64) {
+      request.write(Buffer.from(bodyB64, "base64"));
+    }
+    request.end();
   }
 
-  request.on("response", (response) => {
-    write({
-      type: "meta",
-      status: response.statusCode,
-      statusText: response.statusMessage || "",
-      headers: normalizeHeaders(response.headers || {}),
-    });
-
-    response.on("data", (chunk) => {
-      write({ type: "chunk", b64: Buffer.from(chunk).toString("base64") });
-    });
-    response.on("end", () => {
-      write({ type: "end" });
-      setTimeout(() => app.exit(0), 0);
-    });
-  });
-
-  request.on("error", (err) => {
-    write({ type: "error", message: String(err && err.message ? err.message : err) });
-    setTimeout(() => app.exit(1), 0);
-  });
-
-  if (bodyB64) {
-    request.write(Buffer.from(bodyB64, "base64"));
-  }
-  request.end();
+  makeAttempt();
 }
 
 main()
   .catch((err) => {
-    write({ type: "error", message: String(err && err.message ? err.message : err) });
-    try {
-      app.exit(1);
-    } catch {
-      process.exit(1);
-    }
+    queueWrite({ type: "error", message: String(err && err.message ? err.message : err) }).finally(() => flushAndExit(1));
   });
-

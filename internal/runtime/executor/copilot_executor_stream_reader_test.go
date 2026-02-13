@@ -37,23 +37,27 @@ func TestReadSSELine_ReassemblesOversizedLine(t *testing.T) {
 	}
 }
 
-func TestReadSSELine_HandlesEOFWithoutTrailingNewline(t *testing.T) {
+func TestReadSSELine_RejectsPartialLineAtEOF(t *testing.T) {
 	t.Parallel()
 
 	const input = "data: {\"type\":\"chunk\"}"
 	reader := bufio.NewReaderSize(strings.NewReader(input), 16)
 
-	line, err := readSSELine(reader)
-	if err != nil {
-		t.Fatalf("readSSELine: %v", err)
+	_, err := readSSELine(reader)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected UnexpectedEOF, got %v", err)
 	}
-	if got, want := string(line), input; got != want {
-		t.Fatalf("line mismatch got=%q want=%q", got, want)
-	}
+}
 
-	_, err = readSSELine(reader)
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("expected EOF, got %v", err)
+func TestReadSSELine_RejectsPartialLongLineAtEOF(t *testing.T) {
+	t.Parallel()
+
+	const input = "data: " + "abcdef"
+	reader := bufio.NewReaderSize(strings.NewReader(input), 4)
+
+	_, err := readSSELine(reader)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected UnexpectedEOF, got %v", err)
 	}
 }
 
@@ -69,4 +73,3 @@ func TestReadSSELine_TrimsCRLFLineEnding(t *testing.T) {
 		t.Fatalf("line mismatch got=%q want=%q", got, want)
 	}
 }
-

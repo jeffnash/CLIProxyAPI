@@ -52,6 +52,14 @@ The startup script automatically detects existing credentials and skips `AUTH_BU
 - `COPILOT_TRANSPORT` (default `electron`) - Copilot transport selection: `electron` (Chromium net shim) or `go` (disable shim).
 - `INSTALL_ELECTRON` (default `0`) - when set to `1`, `scripts/railway_start.sh` will attempt to install Node.js + Electron at container start if `electron` is missing.
   - This is slower/less reliable than baking Electron into the image, but works for the common “railpack.json + start script” Railway path.
+- `COPILOT_ELECTRON_VERSION` (default `40.4.0`) - pinned Electron version installed by `scripts/railway_start.sh` when `INSTALL_ELECTRON=1`.
+  - This avoids non-deterministic `electron@latest` drift across deploys.
+- `COPILOT_ELECTRON_MAX_ATTEMPTS` (default `2`) - in-shim retries for pre-response transient Electron transport errors (`ERR_CONNECTION_CLOSED`, `ERR_TIMED_OUT`, etc.).
+- `COPILOT_STREAM_MAX_ATTEMPTS` (default `2`) - app-layer stream retry attempts in the Copilot executor.
+  - Retries only happen before any stream payload has been emitted, to avoid duplicate partial output.
+- `COPILOT_STREAM_IDLE_BUDGET_MS` (default `45000`) - idle budget for SSE lines in app-layer stream handling.
+  - If no SSE line arrives within this budget, the executor closes and retries the request (pre-output only).
+  - Set to `0` to disable idle-budget retries.
 - `INSTALL_GO` (default `1`) - when the script needs to rebuild `./cli-proxy-api` and `go` is missing on `PATH`, it will attempt to install `golang-go` via `apt-get` at container start.
   - Set to `0` to disable auto-install (startup will fail fast if a rebuild is needed but Go isn't available).
 - `GO_INSTALL_METHOD` (default `auto`) - how the script installs Go when a rebuild is needed and the runtime toolchain is missing/too old:
