@@ -77,11 +77,18 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	return httpClient.Do(httpReq)
 }
 
+// stripCodexPrefix removes the "codex-" prefix from model names if present.
+// This allows users to explicitly route to Codex using "codex-gpt-5.2-xhigh" while
+// the upstream API receives the bare model name "gpt-5.2-xhigh".
+func stripCodexPrefix(model string) string {
+	return strings.TrimPrefix(model, "codex-")
+}
+
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
 	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := stripCodexPrefix(thinking.ParseSuffix(req.Model).ModelName)
 
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
@@ -212,7 +219,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := stripCodexPrefix(thinking.ParseSuffix(req.Model).ModelName)
 
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
@@ -303,7 +310,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := stripCodexPrefix(thinking.ParseSuffix(req.Model).ModelName)
 
 	apiKey, baseURL := codexCreds(auth)
 	if baseURL == "" {
@@ -444,7 +451,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := stripCodexPrefix(thinking.ParseSuffix(req.Model).ModelName)
 	modelForUpstream := baseModel
 	// Check auth attributes for passthru route upstream_model override.
 	if auth != nil && auth.Attributes != nil {
