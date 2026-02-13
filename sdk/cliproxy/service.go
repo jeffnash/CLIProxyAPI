@@ -914,6 +914,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 		models = applyExcludedModels(models, excluded)
+		models = registry.GenerateCodexAliases(models)
 	case "copilot":
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		models = executor.NewCopilotExecutor(s.cfg).FetchModels(ctx, a, s.cfg)
