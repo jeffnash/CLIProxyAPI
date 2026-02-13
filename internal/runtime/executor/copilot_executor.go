@@ -54,6 +54,7 @@ type sharedModelCacheEntry struct {
 }
 
 const sharedModelCacheTTL = 30 * time.Minute
+const defaultCopilotStreamReadBufferSize = 64 * 1024
 
 // NewCopilotExecutor creates a new CopilotExecutor instance.
 
@@ -703,15 +704,8 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 		}()
 
 		isGemini := strings.HasPrefix(strings.ToLower(apiModel), "gemini")
-		scanner := bufio.NewScanner(httpResp.Body)
-		bufSize := e.cfg.ScannerBufferSize
-		if bufSize <= 0 {
-			bufSize = 20_971_520
-		}
-		scanner.Buffer(nil, bufSize)
 		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
+		errRead := e.streamCopilotSSELines(httpResp.Body, func(line []byte) {
 			appendAPIResponseChunk(ctx, e.cfg, line)
 
 			// Parse usage from final chunk if present
@@ -731,15 +725,71 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
 			}
-		}
-		if errScan := scanner.Err(); errScan != nil {
-			recordAPIResponseError(ctx, e.cfg, errScan)
+		})
+		if errRead != nil {
+			recordAPIResponseError(ctx, e.cfg, errRead)
 			reporter.publishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			out <- cliproxyexecutor.StreamChunk{Err: errRead}
 		}
 	}()
 
 	return stream, nil
+}
+
+func (e *CopilotExecutor) streamCopilotSSELines(body io.Reader, onLine func([]byte)) error {
+	readBufSize := defaultCopilotStreamReadBufferSize
+	if e != nil && e.cfg != nil && e.cfg.ScannerBufferSize > 0 {
+		readBufSize = e.cfg.ScannerBufferSize
+	}
+	reader := bufio.NewReaderSize(body, readBufSize)
+
+	for {
+		line, err := readSSELine(reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		onLine(line)
+	}
+}
+
+// readSSELine reads a single SSE line without imposing Scanner token limits.
+// It reassembles oversized lines split by bufio.Reader and logs when that occurs.
+func readSSELine(reader *bufio.Reader) ([]byte, error) {
+	line, isPrefix, err := reader.ReadLine()
+	if err != nil {
+		if errors.Is(err, io.EOF) && len(line) > 0 {
+			return bytes.TrimSuffix(append([]byte(nil), line...), []byte{'\r'}), nil
+		}
+		return nil, err
+	}
+
+	if !isPrefix {
+		return bytes.TrimSuffix(append([]byte(nil), line...), []byte{'\r'}), nil
+	}
+
+	fullLine := append([]byte(nil), line...)
+	fragments := 1
+	for isPrefix {
+		part, nextPrefix, nextErr := reader.ReadLine()
+		if nextErr != nil {
+			if errors.Is(nextErr, io.EOF) {
+				fullLine = append(fullLine, part...)
+				fragments++
+				log.Warnf("copilot executor: partial SSE line ended at EOF while reassembling long line (fragments=%d bytes=%d)", fragments, len(fullLine))
+				return bytes.TrimSuffix(fullLine, []byte{'\r'}), nil
+			}
+			return nil, nextErr
+		}
+		fullLine = append(fullLine, part...)
+		fragments++
+		isPrefix = nextPrefix
+	}
+
+	log.Warnf("copilot executor: oversized SSE line reassembled (fragments=%d bytes=%d)", fragments, len(fullLine))
+	return bytes.TrimSuffix(fullLine, []byte{'\r'}), nil
 }
 
 func (e *CopilotExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
