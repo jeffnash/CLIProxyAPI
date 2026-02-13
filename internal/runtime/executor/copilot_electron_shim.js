@@ -18,7 +18,9 @@ app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("disable-software-rasterizer");
 app.commandLine.appendSwitch("no-sandbox");
 // Prefer HTTP/1.1 for long SSE streams; HTTP/2 session churn can trigger resets.
-app.commandLine.appendSwitch("disable-http2");
+if (String(process.env.COPILOT_ELECTRON_DISABLE_HTTP2 || "1") !== "0") {
+  app.commandLine.appendSwitch("disable-http2");
+}
 
 function writeLine(obj) {
   return new Promise((resolve, reject) => {
@@ -122,8 +124,19 @@ function isRetryableElectronError(errLike) {
     msg.includes("ERR_CONNECTION_RESET") ||
     msg.includes("ERR_TIMED_OUT") ||
     msg.includes("ERR_NETWORK_CHANGED") ||
-    msg.includes("ERR_TUNNEL_CONNECTION_FAILED")
+    msg.includes("ERR_TUNNEL_CONNECTION_FAILED") ||
+    msg.includes("ERR_INCOMPLETE_CHUNKED_ENCODING") ||
+    msg.includes("ERR_HTTP2_PROTOCOL_ERROR")
   );
+}
+
+function summarizeError(errLike) {
+  if (!errLike) return "unknown error";
+  if (typeof errLike === "string") return errLike;
+  if (errLike && typeof errLike.message === "string" && errLike.message.trim()) {
+    return errLike.message;
+  }
+  return String(errLike);
 }
 
 async function main() {
@@ -138,6 +151,14 @@ async function main() {
   const noProxy = (req.no_proxy || "").trim();
 
   if (!url) throw new Error("missing url");
+
+  const requestStartedAt = Date.now();
+  let urlHost = "";
+  try {
+    urlHost = new URL(url).host || "";
+  } catch {
+    // Keep empty host if URL parsing fails.
+  }
 
   await app.whenReady();
 
@@ -170,23 +191,62 @@ async function main() {
     }
   }
 
+  let resolvedProxy = "UNKNOWN";
+  try {
+    resolvedProxy = (await session.defaultSession.resolveProxy(url)) || "UNKNOWN";
+  } catch {
+    resolvedProxy = "UNRESOLVED";
+  }
+
   let finished = false;
   let sawResponseEnd = false;
   let sawResponseHeaders = false;
+  let responseHeadersAt = 0;
+  let firstByteAt = 0;
+  let lastByteAt = 0;
+  let bytesReceived = 0;
+  let chunksEmitted = 0;
   const maxAttemptsRaw = Number.parseInt(process.env.COPILOT_ELECTRON_MAX_ATTEMPTS || "2", 10);
   const maxAttempts = Number.isFinite(maxAttemptsRaw) && maxAttemptsRaw > 0 ? maxAttemptsRaw : 2;
   let attempt = 0;
+  function currentPhase() {
+    if (!sawResponseHeaders) return "before_headers";
+    if (!firstByteAt) return "after_headers_before_data";
+    return "streaming";
+  }
+  function telemetrySnapshot() {
+    const now = Date.now();
+    const idleMsSinceLastByte = lastByteAt > 0 ? now - lastByteAt : responseHeadersAt > 0 ? now - responseHeadersAt : now - requestStartedAt;
+    return {
+      phase: currentPhase(),
+      attempt,
+      maxAttempts,
+      resolvedProxy,
+      urlHost,
+      bytesReceived,
+      chunksEmitted,
+      idleMsSinceLastByte,
+      elapsedMs: now - requestStartedAt,
+      sawResponseHeaders,
+      sawResponseEnd,
+      electron: process.versions.electron || "",
+      chromium: process.versions.chrome || "",
+      node: process.versions.node || "",
+    };
+  }
   function finishWithError(errLike) {
     if (finished) return;
     finished = true;
-    const message = String(errLike && errLike.message ? errLike.message : errLike);
-    queueWrite({ type: "error", message }).finally(() => flushAndExit(1));
+    const message = summarizeError(errLike);
+    queueWrite({ type: "error", message, ...telemetrySnapshot() }).finally(() => flushAndExit(1));
   }
   function finishSuccess() {
     if (finished) return;
     finished = true;
     queueWrite({ type: "end" }).finally(() => flushAndExit(0));
   }
+  process.once("uncaughtException", (err) => finishWithError(err));
+  process.once("unhandledRejection", (err) => finishWithError(err));
 
   function makeAttempt() {
     if (finished) return;
@@ -208,15 +268,31 @@ async function main() {
 
     request.on("response", (response) => {
       sawResponseHeaders = true;
+      responseHeadersAt = Date.now();
       queueWrite({
         type: "meta",
         status: response.statusCode,
         statusText: response.statusMessage || "",
         headers: normalizeHeaders(response.headers || {}),
+        attempt,
+        maxAttempts,
+        resolvedProxy,
+        urlHost,
+        tHeadersMs: responseHeadersAt - requestStartedAt,
+        electron: process.versions.electron || "",
+        chromium: process.versions.chrome || "",
+        node: process.versions.node || "",
       }).catch((err) => finishWithError(`failed to write response meta: ${err}`));
 
       response.on("data", (chunk) => {
         if (finished) return;
+        const now = Date.now();
+        if (!firstByteAt) {
+          firstByteAt = now;
+        }
+        lastByteAt = now;
+        bytesReceived += Buffer.byteLength(chunk);
+        chunksEmitted += 1;
         queueWrite({ type: "chunk", b64: Buffer.from(chunk).toString("base64") }).catch((err) =>
           finishWithError(`failed to write response chunk: ${err}`),
         );

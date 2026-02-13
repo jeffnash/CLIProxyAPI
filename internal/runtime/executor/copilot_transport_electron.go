@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	log "github.com/sirupsen/logrus"
 )
 
 //go:embed copilot_electron_shim.js
@@ -39,11 +41,24 @@ type copilotElectronRequest struct {
 }
 
 type copilotElectronResponseMeta struct {
-	Type       string            `json:"type"`
-	Status     int               `json:"status"`
-	StatusText string            `json:"statusText"`
-	Headers    map[string]string `json:"headers"`
-	Message    string            `json:"message"`
+	Type                string            `json:"type"`
+	Status              int               `json:"status"`
+	StatusText          string            `json:"statusText"`
+	Headers             map[string]string `json:"headers"`
+	Message             string            `json:"message"`
+	Attempt             int               `json:"attempt"`
+	MaxAttempts         int               `json:"maxAttempts"`
+	ResolvedProxy       string            `json:"resolvedProxy"`
+	URLHost             string            `json:"urlHost"`
+	THeadersMs          int64             `json:"tHeadersMs"`
+	Phase               string            `json:"phase"`
+	BytesReceived       int64             `json:"bytesReceived"`
+	ChunksEmitted       int64             `json:"chunksEmitted"`
+	IdleMsSinceLastByte int64             `json:"idleMsSinceLastByte"`
+	ElapsedMs           int64             `json:"elapsedMs"`
+	Electron            string            `json:"electron"`
+	Chromium            string            `json:"chromium"`
+	Node                string            `json:"node"`
 }
 
 type electronResponseBody struct {
@@ -111,6 +126,78 @@ func copilotPreferElectronTransport() bool {
 	}
 }
 
+func envTruthy(key string, defaultValue bool) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if raw == "" {
+		return defaultValue
+	}
+	switch raw {
+	case "1", "true", "t", "yes", "y", "on":
+		return true
+	case "0", "false", "f", "no", "n", "off":
+		return false
+	default:
+		return defaultValue
+	}
+}
+
+func copilotElectronCommandArgs(shimPath string) []string {
+	args := []string{
+		"--no-sandbox",
+		"--disable-gpu",
+		"--headless=new",
+		"--disable-software-rasterizer",
+		"--disable-dev-shm-usage",
+	}
+	if envTruthy("COPILOT_ELECTRON_DISABLE_HTTP2", true) {
+		args = append(args, "--disable-http2")
+	}
+	if envTruthy("COPILOT_ELECTRON_FORCE_DIRECT", false) {
+		args = append(args, "--no-proxy-server")
+	}
+	if netlogPath := strings.TrimSpace(os.Getenv("COPILOT_ELECTRON_NETLOG_PATH")); netlogPath != "" {
+		args = append(args, "--log-net-log="+netlogPath)
+	}
+	args = append(args, shimPath)
+	return args
+}
+
+func formatElectronTelemetry(meta copilotElectronResponseMeta) string {
+	var parts []string
+	if msg := strings.TrimSpace(meta.Message); msg != "" {
+		parts = append(parts, "message="+msg)
+	}
+	if phase := strings.TrimSpace(meta.Phase); phase != "" {
+		parts = append(parts, "phase="+phase)
+	}
+	if meta.Attempt > 0 {
+		if meta.MaxAttempts > 0 {
+			parts = append(parts, fmt.Sprintf("attempt=%d/%d", meta.Attempt, meta.MaxAttempts))
+		} else {
+			parts = append(parts, fmt.Sprintf("attempt=%d", meta.Attempt))
+		}
+	}
+	if proxy := strings.TrimSpace(meta.ResolvedProxy); proxy != "" {
+		parts = append(parts, "resolved_proxy="+proxy)
+	}
+	if host := strings.TrimSpace(meta.URLHost); host != "" {
+		parts = append(parts, "url_host="+host)
+	}
+	if meta.BytesReceived > 0 {
+		parts = append(parts, fmt.Sprintf("bytes=%d", meta.BytesReceived))
+	}
+	if meta.ChunksEmitted > 0 {
+		parts = append(parts, fmt.Sprintf("chunks=%d", meta.ChunksEmitted))
+	}
+	if meta.IdleMsSinceLastByte > 0 {
+		parts = append(parts, fmt.Sprintf("idle_ms=%d", meta.IdleMsSinceLastByte))
+	}
+	if meta.ElapsedMs > 0 {
+		parts = append(parts, fmt.Sprintf("elapsed_ms=%d", meta.ElapsedMs))
+	}
+	return strings.Join(parts, " ")
+}
+
 func httpResponseFromElectron(ctx context.Context, req *http.Request, proxyURL string) (*http.Response, error) {
 	electronPath, err := findElectronBinary()
 	if err != nil {
@@ -157,14 +244,7 @@ func httpResponseFromElectron(ctx context.Context, req *http.Request, proxyURL s
 	}
 	raw, _ := json.Marshal(payload)
 
-	cmd := exec.CommandContext(ctx, electronPath,
-		"--no-sandbox",
-		"--disable-gpu",
-		"--headless=new",
-		"--disable-software-rasterizer",
-		"--disable-dev-shm-usage",
-		shimPath,
-	)
+	cmd := exec.CommandContext(ctx, electronPath, copilotElectronCommandArgs(shimPath)...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("electron transport: stdin pipe: %w", err)
@@ -204,12 +284,28 @@ func httpResponseFromElectron(ctx context.Context, req *http.Request, proxyURL s
 	}
 	if meta.Type == "error" {
 		_ = cmd.Wait()
-		return nil, fmt.Errorf("electron transport: upstream error: %s", strings.TrimSpace(meta.Message))
+		detail := strings.TrimSpace(formatElectronTelemetry(meta))
+		if detail == "" {
+			return nil, fmt.Errorf("electron transport: upstream error")
+		}
+		return nil, fmt.Errorf("electron transport: upstream error: %s", detail)
 	}
 	if meta.Type != "meta" {
 		_ = cmd.Wait()
 		return nil, fmt.Errorf("electron transport: unexpected first message type %q", meta.Type)
 	}
+	log.Debugf(
+		"copilot electron transport: status=%d proxy=%q host=%q attempt=%d/%d t_headers_ms=%d versions={electron:%s chromium:%s node:%s}",
+		meta.Status,
+		meta.ResolvedProxy,
+		meta.URLHost,
+		meta.Attempt,
+		meta.MaxAttempts,
+		meta.THeadersMs,
+		meta.Electron,
+		meta.Chromium,
+		meta.Node,
+	)
 
 	pr, pw := io.Pipe()
 	go func() {
@@ -217,7 +313,12 @@ func httpResponseFromElectron(ctx context.Context, req *http.Request, proxyURL s
 		for {
 			line, err := reader.ReadBytes('\n')
 			if err != nil {
-				_ = pw.CloseWithError(err)
+				_ = cmd.Wait()
+				if errors.Is(err, io.EOF) {
+					_ = pw.CloseWithError(fmt.Errorf("electron transport: unexpected EOF before end marker (stderr=%s)", strings.TrimSpace(stderr.String())))
+					return
+				}
+				_ = pw.CloseWithError(fmt.Errorf("electron transport: read chunk: %w (stderr=%s)", err, strings.TrimSpace(stderr.String())))
 				return
 			}
 			var msg copilotElectronResponseMeta
@@ -251,7 +352,11 @@ func httpResponseFromElectron(ctx context.Context, req *http.Request, proxyURL s
 				_ = cmd.Wait()
 				return
 			case "error":
-				_ = pw.CloseWithError(fmt.Errorf("electron transport: upstream error: %s", strings.TrimSpace(msg.Message)))
+				detail := strings.TrimSpace(formatElectronTelemetry(msg))
+				if detail == "" {
+					detail = "upstream error"
+				}
+				_ = pw.CloseWithError(fmt.Errorf("electron transport: upstream error: %s", detail))
 				_ = cmd.Wait()
 				return
 			default:
@@ -277,4 +382,3 @@ func httpResponseFromElectron(ctx context.Context, req *http.Request, proxyURL s
 	}
 	return resp, nil
 }
-

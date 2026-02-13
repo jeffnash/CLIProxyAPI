@@ -55,9 +55,12 @@ The startup script automatically detects existing credentials and skips `AUTH_BU
 - `COPILOT_ELECTRON_VERSION` (default `40.4.0`) - pinned Electron version installed by `scripts/railway_start.sh` when `INSTALL_ELECTRON=1`.
   - This avoids non-deterministic `electron@latest` drift across deploys.
 - `COPILOT_ELECTRON_MAX_ATTEMPTS` (default `2`) - in-shim retries for pre-response transient Electron transport errors (`ERR_CONNECTION_CLOSED`, `ERR_TIMED_OUT`, etc.).
+- `COPILOT_ELECTRON_DISABLE_HTTP2` (default `1`) - when truthy, forces Electron to disable HTTP/2 (`--disable-http2`) for SSE stability.
+- `COPILOT_ELECTRON_FORCE_DIRECT` (default `0`) - when truthy, forces Electron direct egress (`--no-proxy-server`) for A/B diagnostics against proxy path failures.
+- `COPILOT_ELECTRON_NETLOG_PATH` (default unset) - optional Chromium netlog path passed to Electron (`--log-net-log=/path/file.json`) for low-level transport forensics.
 - `COPILOT_STREAM_MAX_ATTEMPTS` (default `2`) - app-layer stream retry attempts in the Copilot executor.
   - Retries only happen before any stream payload has been emitted, to avoid duplicate partial output.
-- `COPILOT_STREAM_IDLE_BUDGET_MS` (default `45000`) - idle budget for SSE lines in app-layer stream handling.
+- `COPILOT_STREAM_IDLE_BUDGET_MS` (default `0`) - idle budget for SSE lines in app-layer stream handling.
   - If no SSE line arrives within this budget, the executor closes and retries the request (pre-output only).
   - Set to `0` to disable idle-budget retries.
 - `INSTALL_GO` (default `1`) - when the script needs to rebuild `./cli-proxy-api` and `go` is missing on `PATH`, it will attempt to install `golang-go` via `apt-get` at container start.
