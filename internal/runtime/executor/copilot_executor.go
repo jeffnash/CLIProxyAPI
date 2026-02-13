@@ -58,7 +58,7 @@ type sharedModelCacheEntry struct {
 const sharedModelCacheTTL = 30 * time.Minute
 const defaultCopilotStreamReadBufferSize = 64 * 1024
 const defaultCopilotStreamMaxAttempts = 2
-const defaultCopilotStreamIdleBudget = 45 * time.Second
+const defaultCopilotStreamIdleBudget = 0
 
 // NewCopilotExecutor creates a new CopilotExecutor instance.
 
