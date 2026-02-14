@@ -60,6 +60,10 @@ func TestStripCodexPrefix(t *testing.T) {
 		{"codex-gpt-5.3-codex-medium", "gpt-5.3-codex-medium"},
 		{"codex-gpt-5.3-codex-high", "gpt-5.3-codex-high"},
 		{"codex-gpt-5.3-codex-xhigh", "gpt-5.3-codex-xhigh"},
+		{"codex-gpt-5.3-codex-spark-low", "gpt-5.3-codex-spark-low"},
+		{"codex-gpt-5.3-codex-spark-medium", "gpt-5.3-codex-spark-medium"},
+		{"codex-gpt-5.3-codex-spark-high", "gpt-5.3-codex-spark-high"},
+		{"codex-gpt-5.3-codex-spark-xhigh", "gpt-5.3-codex-spark-xhigh"},
 
 		// Models without codex- prefix should pass through unchanged.
 		{"gpt-5", "gpt-5"},
@@ -135,6 +139,30 @@ func TestCodexExecutor_CodexPrefixStrippedInUpstreamRequest(t *testing.T) {
 		{
 			requestModel:  "gpt-5.2-xhigh",
 			wantModel:     "gpt-5.2",
+			wantEffort:    "xhigh",
+			wantHasEffort: true,
+		},
+		{
+			requestModel:  "gpt-5.3-codex-spark-low",
+			wantModel:     "gpt-5.3-codex-spark",
+			wantEffort:    "low",
+			wantHasEffort: true,
+		},
+		{
+			requestModel:  "gpt-5.3-codex-spark-medium",
+			wantModel:     "gpt-5.3-codex-spark",
+			wantEffort:    "medium",
+			wantHasEffort: true,
+		},
+		{
+			requestModel:  "gpt-5.3-codex-spark-high",
+			wantModel:     "gpt-5.3-codex-spark",
+			wantEffort:    "high",
+			wantHasEffort: true,
+		},
+		{
+			requestModel:  "gpt-5.3-codex-spark-xhigh",
+			wantModel:     "gpt-5.3-codex-spark",
 			wantEffort:    "xhigh",
 			wantHasEffort: true,
 		},

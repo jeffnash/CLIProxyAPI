@@ -101,6 +101,34 @@ func TestResolveCodexAlias(t *testing.T) {
 			wantEffort:    "xhigh",
 			wantOk:        true,
 		},
+		{
+			name:          "gpt-5.3-codex-spark-low",
+			modelName:     "gpt-5.3-codex-spark-low",
+			wantBaseModel: "gpt-5.3-codex-spark",
+			wantEffort:    "low",
+			wantOk:        true,
+		},
+		{
+			name:          "gpt-5.3-codex-spark-medium",
+			modelName:     "gpt-5.3-codex-spark-medium",
+			wantBaseModel: "gpt-5.3-codex-spark",
+			wantEffort:    "medium",
+			wantOk:        true,
+		},
+		{
+			name:          "gpt-5.3-codex-spark-high",
+			modelName:     "gpt-5.3-codex-spark-high",
+			wantBaseModel: "gpt-5.3-codex-spark",
+			wantEffort:    "high",
+			wantOk:        true,
+		},
+		{
+			name:          "gpt-5.3-codex-spark-xhigh",
+			modelName:     "gpt-5.3-codex-spark-xhigh",
+			wantBaseModel: "gpt-5.3-codex-spark",
+			wantEffort:    "xhigh",
+			wantOk:        true,
+		},
 		// Non-alias models should return false
 		{
 			name:          "base gpt-5 (not an alias)",
