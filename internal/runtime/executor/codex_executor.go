@@ -580,6 +580,14 @@ func resolveCodexAlias(modelName string) (baseModel, effort string, ok bool) {
 		return "gpt-5.3-codex", "high", true
 	case "gpt-5.3-codex-xhigh":
 		return "gpt-5.3-codex", "xhigh", true
+	case "gpt-5.3-codex-spark-low":
+		return "gpt-5.3-codex-spark", "low", true
+	case "gpt-5.3-codex-spark-medium":
+		return "gpt-5.3-codex-spark", "medium", true
+	case "gpt-5.3-codex-spark-high":
+		return "gpt-5.3-codex-spark", "high", true
+	case "gpt-5.3-codex-spark-xhigh":
+		return "gpt-5.3-codex-spark", "xhigh", true
 	default:
 		return "", "", false
 	}
