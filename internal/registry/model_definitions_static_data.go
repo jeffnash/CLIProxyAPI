@@ -1232,6 +1232,20 @@ func GetOpenAIModels() []*ModelInfo {
 			SupportedParameters: []string{"tools"},
 			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}},
 		},
+		{
+			ID:                  "gpt-5.3-codex-spark",
+			Object:              "model",
+			Created:             1770912000,
+			OwnedBy:             "openai",
+			Type:                "openai",
+			Version:             "gpt-5.3",
+			DisplayName:         "GPT 5.3 Codex Spark",
+			Description:         "Ultra-fast coding model.",
+			ContextLength:       128000,
+			MaxCompletionTokens: 128000,
+			SupportedParameters: []string{"tools"},
+			Thinking:            &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}},
+		},
 	}
 }
 
@@ -1304,6 +1318,7 @@ func GetIFlowModels() []*ModelInfo {
 		{ID: "kimi-k2-0905", DisplayName: "Kimi-K2-Instruct-0905", Description: "Moonshot Kimi K2 instruct 0905", Created: 1757030400},
 		{ID: "glm-4.6", DisplayName: "GLM-4.6", Description: "Zhipu GLM 4.6 general model", Created: 1759190400, Thinking: iFlowThinkingSupport},
 		{ID: "glm-4.7", DisplayName: "GLM-4.7", Description: "Zhipu GLM 4.7 general model", Created: 1766448000, Thinking: iFlowThinkingSupport},
+		{ID: "glm-5", DisplayName: "GLM-5", Description: "Zhipu GLM 5 general model", Created: 1770768000, Thinking: iFlowThinkingSupport},
 		{ID: "kimi-k2", DisplayName: "Kimi-K2", Description: "Moonshot Kimi K2 general model", Created: 1752192000},
 		{ID: "kimi-k2-thinking", DisplayName: "Kimi-K2-Thinking", Description: "Moonshot Kimi K2 thinking model", Created: 1762387200},
 		{ID: "deepseek-v3.2-chat", DisplayName: "DeepSeek-V3.2", Description: "DeepSeek V3.2 Chat", Created: 1764576000},
@@ -1318,6 +1333,7 @@ func GetIFlowModels() []*ModelInfo {
 		{ID: "qwen3-235b", DisplayName: "Qwen3-235B-A22B", Description: "Qwen3 235B A22B", Created: 1753401600},
 		{ID: "minimax-m2", DisplayName: "MiniMax-M2", Description: "MiniMax M2", Created: 1758672000, Thinking: iFlowThinkingSupport},
 		{ID: "minimax-m2.1", DisplayName: "MiniMax-M2.1", Description: "MiniMax M2.1", Created: 1766448000, Thinking: iFlowThinkingSupport},
+		{ID: "minimax-m2.5", DisplayName: "MiniMax-M2.5", Description: "MiniMax M2.5", Created: 1770825600, Thinking: iFlowThinkingSupport},
 		{ID: "iflow-rome-30ba3b", DisplayName: "iFlow-ROME", Description: "iFlow Rome 30BA3B model", Created: 1736899200},
 		{ID: "kimi-k2.5", DisplayName: "Kimi-K2.5", Description: "Moonshot Kimi K2.5", Created: 1769443200, Thinking: iFlowThinkingSupport},
 	}
@@ -1356,7 +1372,7 @@ func GetAntigravityModelConfig() map[string]*AntigravityModelConfig {
 		"gemini-3-flash":             {Thinking: &ThinkingSupport{Min: 128, Max: 32768, ZeroAllowed: false, DynamicAllowed: true, Levels: []string{"minimal", "low", "medium", "high"}}},
 		"claude-sonnet-4-5-thinking": {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
 		"claude-opus-4-5-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
-		"claude-opus-4-6-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 128000},
+		"claude-opus-4-6-thinking":   {Thinking: &ThinkingSupport{Min: 1024, Max: 128000, ZeroAllowed: true, DynamicAllowed: true}, MaxCompletionTokens: 64000},
 		"claude-sonnet-4-5":          {MaxCompletionTokens: 64000},
 		"gpt-oss-120b-medium":        {},
 		"tab_flash_lite_preview":     {},
