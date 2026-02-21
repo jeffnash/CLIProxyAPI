@@ -553,10 +553,11 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 		Config: &config.Config{
 			CodexKey: []config.CodexKey{
 				{
-					APIKey:   "codex-key-123",
-					Prefix:   "dev",
-					BaseURL:  "https://api.openai.com",
-					ProxyURL: "http://proxy.local",
+					APIKey:     "codex-key-123",
+					Prefix:     "dev",
+					BaseURL:    "https://api.openai.com",
+					ProxyURL:   "http://proxy.local",
+					Websockets: true,
 				},
 			},
 		},
@@ -580,6 +581,9 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 	}
 	if auths[0].ProxyURL != "http://proxy.local" {
 		t.Errorf("expected proxy_url http://proxy.local, got %s", auths[0].ProxyURL)
+	}
+	if auths[0].Attributes["websockets"] != "true" {
+		t.Errorf("expected websockets=true, got %s", auths[0].Attributes["websockets"])
 	}
 }
 

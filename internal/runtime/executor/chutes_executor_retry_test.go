@@ -206,11 +206,11 @@ func TestChutesExecutorExecuteStream_RetriesOn429ThenSucceeds(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		ch, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "m", Payload: []byte(`{"model":"m","messages":[]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
+		streamResult, err := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "m", Payload: []byte(`{"model":"m","messages":[]}`)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai")})
 		if err != nil {
 			t.Fatalf("expected success, got error: %v", err)
 		}
-		for range ch {
+		for range streamResult.Chunks {
 			// drain
 		}
 		if calls != 2 {

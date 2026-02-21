@@ -726,6 +726,18 @@ func GetCopilotModels() []*ModelInfo {
 			SupportedParameters: paramsWithTools,
 		},
 		{
+			ID:                  "claude-sonnet-4.6",
+			Object:              "model",
+			Created:             now,
+			OwnedBy:             "copilot",
+			Type:                "copilot",
+			DisplayName:         "Claude Sonnet 4.6",
+			Description:         "Anthropic model via GitHub Copilot",
+			ContextLength:       144000,
+			MaxCompletionTokens: 32000,
+			SupportedParameters: paramsWithTools,
+		},
+		{
 			ID:                  "claude-opus-4.5",
 			Object:              "model",
 			Created:             now,

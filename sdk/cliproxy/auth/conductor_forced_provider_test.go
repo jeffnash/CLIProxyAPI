@@ -301,10 +301,10 @@ func (m *mockProviderExecutor) Execute(ctx context.Context, auth *Auth, req clip
 	return cliproxyexecutor.Response{}, nil
 }
 
-func (m *mockProviderExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (<-chan cliproxyexecutor.StreamChunk, error) {
+func (m *mockProviderExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	ch := make(chan cliproxyexecutor.StreamChunk)
 	close(ch)
-	return ch, nil
+	return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
 }
 
 func (m *mockProviderExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
