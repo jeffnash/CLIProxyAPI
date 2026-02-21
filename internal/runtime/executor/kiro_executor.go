@@ -634,7 +634,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 // ExecuteStream handles streaming requests to Kiro API.
 // Supports automatic token refresh on 401/403 errors and quota fallback on 429.
-func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (stream <-chan cliproxyexecutor.StreamChunk, err error) {
+func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
 	accessToken, profileArn := kiroCredentials(auth)
 	if accessToken == "" {
 		return nil, fmt.Errorf("kiro: access token not found in auth")
@@ -673,7 +673,11 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	// Execute stream with retry on 401/403 and 429 (quota exhausted)
 	// Note: currentOrigin and kiroPayload are built inside executeStreamWithRetry for each endpoint
-	return e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, reporter, "", kiroModelID, isAgentic, isChatOnly)
+	stream, streamErr := e.executeStreamWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, reporter, "", kiroModelID, isAgentic, isChatOnly)
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	return &cliproxyexecutor.StreamResult{Chunks: stream}, nil
 }
 
 // executeStreamWithRetry performs the streaming HTTP request with automatic retry on auth errors.

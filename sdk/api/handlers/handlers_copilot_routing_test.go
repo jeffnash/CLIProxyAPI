@@ -221,8 +221,8 @@ func TestGetRequestDetails_MetadataForCopilotPrefixOnly(t *testing.T) {
 	handler := &BaseAPIHandler{}
 
 	testCases := []struct {
-		model          string
-		expectForced   bool
+		model        string
+		expectForced bool
 	}{
 		{"copilot-gpt-5", true},
 		{"copilot-claude-sonnet-4", true},
@@ -247,5 +247,23 @@ func TestGetRequestDetails_MetadataForCopilotPrefixOnly(t *testing.T) {
 				t.Errorf("expected forced_provider=%v for model %s, got %v", tc.expectForced, tc.model, forced)
 			}
 		})
+	}
+}
+
+func TestGetRequestDetails_CodexPrefixRouting(t *testing.T) {
+	handler := &BaseAPIHandler{}
+	providers, normalizedModel, metadata, err := handler.getRequestDetails("codex-gpt-5.3-codex-spark-high")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(providers) != 1 || providers[0] != "codex" {
+		t.Fatalf("expected providers=[codex], got %v", providers)
+	}
+	if normalizedModel != "gpt-5.3-codex-spark-high" {
+		t.Fatalf("expected stripped codex model, got %q", normalizedModel)
+	}
+	forced, _ := metadata["forced_provider"].(bool)
+	if !forced {
+		t.Fatalf("expected forced_provider=true, got %v", metadata["forced_provider"])
 	}
 }

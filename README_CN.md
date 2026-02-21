@@ -171,6 +171,15 @@ Windows 托盘应用，基于 PowerShell 脚本实现，不依赖任何第三方
 4. 推送到分支（`git push origin feature/amazing-feature`）
 5. 打开 Pull Request
 
+### [OmniRoute](https://github.com/diegosouzapw/OmniRoute)
+
+代码不止，创新不停。智能路由至免费及低成本 AI 模型，并支持自动故障转移。
+
+OmniRoute 是一个面向多供应商大语言模型的 AI 网关：它提供兼容 OpenAI 的端点，具备智能路由、负载均衡、重试及回退机制。通过添加策略、速率限制、缓存和可观测性，确保推理过程既可靠又具备成本意识。
+
+> [!NOTE]  
+> 如果你开发了 CLIProxyAPI 的移植或衍生项目，请提交 PR 将其添加到此列表中。
+
 ## 许可证
 
 此项目根据 MIT 许可证授权 - 有关详细信息，请参阅 [LICENSE](LICENSE) 文件。

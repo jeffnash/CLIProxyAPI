@@ -238,7 +238,7 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 }
 
 // ExecuteStream performs a streaming chat completion request.
-func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (stream <-chan cliproxyexecutor.StreamChunk, err error) {
+func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
 	apiKey, baseURL := chutesCreds(auth, e.cfg)
 	if apiKey == "" {
 		return nil, fmt.Errorf("chutes executor: missing api key")
@@ -384,7 +384,7 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		reporter.ensurePublished(ctx)
 	}()
 
-	return out, nil
+	return &cliproxyexecutor.StreamResult{Chunks: out}, nil
 }
 
 // Refresh - Chutes uses static API keys, no refresh needed.

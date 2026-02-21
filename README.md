@@ -285,6 +285,15 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
+### [OmniRoute](https://github.com/diegosouzapw/OmniRoute)
+
+Never stop coding. Smart routing to FREE & low-cost AI models with automatic fallback.
+
+OmniRoute is an AI gateway for multi-provider LLMs: an OpenAI-compatible endpoint with smart routing, load balancing, retries, and fallbacks. Add policies, rate limits, caching, and observability for reliable, cost-aware inference.
+
+> [!NOTE]  
+> If you have developed a port of CLIProxyAPI or a project inspired by it, please open a PR to add it to this list.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

@@ -29,10 +29,10 @@ func (e *metadataAssertingExecutor) Execute(ctx context.Context, auth *coreauth.
 	return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
 }
 
-func (e *metadataAssertingExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (<-chan coreexecutor.StreamChunk, error) {
+func (e *metadataAssertingExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	ch := make(chan coreexecutor.StreamChunk)
 	close(ch)
-	return ch, nil
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
 }
 
 func (e *metadataAssertingExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
@@ -67,7 +67,7 @@ func TestExecuteWithAuthManager_ForcedProviderMetadataPropagates(t *testing.T) {
 	})
 
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
-	if _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", "copilot-gpt-5", []byte(`{"model":"copilot-gpt-5"}`), ""); errMsg != nil {
+	if _, _, errMsg := handler.ExecuteWithAuthManager(context.Background(), "openai", "copilot-gpt-5", []byte(`{"model":"copilot-gpt-5"}`), ""); errMsg != nil {
 		t.Fatalf("ExecuteWithAuthManager(): %v", errMsg)
 	}
 }
