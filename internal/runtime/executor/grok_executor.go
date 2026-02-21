@@ -213,7 +213,7 @@ func (e *GrokExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	return resp, nil
 }
 
-func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (stream <-chan cliproxyexecutor.StreamChunk, err error) {
+func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result *cliproxyexecutor.StreamResult, err error) {
 	ssoToken, cfClearance, proxyURL := grokCreds(auth)
 	if strings.TrimSpace(ssoToken) == "" {
 		err = statusErr{code: http.StatusUnauthorized, msg: "grok executor: missing sso token"}
@@ -300,7 +300,6 @@ func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
-	stream = out
 	go func() {
 		defer close(out)
 		defer cancel()
@@ -357,7 +356,7 @@ func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			}
 		}
 	}()
-	return stream, nil
+	return &cliproxyexecutor.StreamResult{Chunks: out}, nil
 }
 
 func (e *GrokExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
