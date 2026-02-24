@@ -203,7 +203,13 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 
 	meta := map[string]any{idempotencyKeyMetadataKey: key}
-	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
+	pinnedAuthID := pinnedAuthIDFromContext(ctx)
+	if pinnedAuthID == "" && ctx != nil {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+			pinnedAuthID = strings.TrimSpace(ginCtx.GetHeader("X-Pinned-Auth-Id"))
+		}
+	}
+	if pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
