@@ -267,3 +267,39 @@ func TestGetRequestDetails_CodexPrefixRouting(t *testing.T) {
 		t.Fatalf("expected forced_provider=true, got %v", metadata["forced_provider"])
 	}
 }
+
+func TestGetRequestDetails_KimiPrefixRouting(t *testing.T) {
+	handler := &BaseAPIHandler{}
+	providers, normalizedModel, metadata, err := handler.getRequestDetails("kimi-k2.5")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(providers) != 1 || providers[0] != "kimi" {
+		t.Fatalf("expected providers=[kimi], got %v", providers)
+	}
+	if normalizedModel != "kimi-k2.5" {
+		t.Fatalf("expected kimi model unchanged, got %q", normalizedModel)
+	}
+	forced, _ := metadata["forced_provider"].(bool)
+	if !forced {
+		t.Fatalf("expected forced_provider=true, got %v", metadata["forced_provider"])
+	}
+}
+
+func TestGetRequestDetails_IFlowPrefixRouting(t *testing.T) {
+	handler := &BaseAPIHandler{}
+	providers, normalizedModel, metadata, err := handler.getRequestDetails("iflow-rome-30ba3b")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(providers) != 1 || providers[0] != "iflow" {
+		t.Fatalf("expected providers=[iflow], got %v", providers)
+	}
+	if normalizedModel != "iflow-rome-30ba3b" {
+		t.Fatalf("expected iflow model unchanged, got %q", normalizedModel)
+	}
+	forced, _ := metadata["forced_provider"].(bool)
+	if !forced {
+		t.Fatalf("expected forced_provider=true, got %v", metadata["forced_provider"])
+	}
+}
