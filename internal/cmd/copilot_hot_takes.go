@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -133,6 +134,57 @@ func extractAssistantText(respBytes []byte) string {
 	return strings.TrimSpace(string(respBytes))
 }
 
+func listCopilotAuthIDs(ctx context.Context, cfg *config.Config) ([]string, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("nil config")
+	}
+	if len(cfg.APIKeys) == 0 {
+		return nil, fmt.Errorf("no api-keys configured")
+	}
+	u := fmt.Sprintf("http://127.0.0.1:%d/v0/management/auth-files", cfg.Port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKeys[0])
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("auth-files status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var parsed struct {
+		Files []struct {
+			ID       string `json:"id"`
+			Provider string `json:"provider"`
+			Type     string `json:"type"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0)
+	for _, f := range parsed.Files {
+		provider := strings.ToLower(strings.TrimSpace(f.Provider))
+		if provider == "" {
+			provider = strings.ToLower(strings.TrimSpace(f.Type))
+		}
+		if provider != "copilot" {
+			continue
+		}
+		id := strings.TrimSpace(f.ID)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
 func doCopilotHotTakesOnce(ctx context.Context, cfg *config.Config) error {
 	if cfg == nil {
 		return fmt.Errorf("nil config")
@@ -186,31 +238,61 @@ func doCopilotHotTakesOnce(ctx context.Context, cfg *config.Config) error {
 		"stream": false,
 	}
 	raw, _ := json.Marshal(payload)
-
 	localURL := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", cfg.Port)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, localURL, bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKeys[0])
-	// Override initiator for this background job.
-	req.Header.Set("force-copilot-initiator", "user")
-
 	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(req)
+
+	authIDs, err := listCopilotAuthIDs(ctx, cfg)
 	if err != nil {
-		return err
+		log.Warnf("copilot hot takes: list copilot auths failed, falling back to unpinned call: %v", err)
+		authIDs = []string{""}
 	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("copilot hot takes: local call status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	if len(authIDs) == 0 {
+		log.Warn("copilot hot takes: no copilot auths found; running single unpinned call")
+		authIDs = []string{""}
 	}
 
-	out := extractAssistantText(body)
-	log.Infof("[copilot hot takes] model=%s stories=%d\n%s", hotTakesModel(), len(titles), out)
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i, authID := range authIDs {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, localURL, bytes.NewReader(raw))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKeys[0])
+		// Override initiator for this background job.
+		req.Header.Set("force-copilot-initiator", "user")
+		if authID != "" {
+			req.Header.Set("X-Pinned-Auth-Id", authID)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Warnf("copilot hot takes: call %d/%d auth=%q failed: %v", i+1, len(authIDs), authID, err)
+		} else {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+			_ = resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				log.Warnf("copilot hot takes: call %d/%d auth=%q status %d: %s", i+1, len(authIDs), authID, resp.StatusCode, strings.TrimSpace(string(body)))
+			} else {
+				out := extractAssistantText(body)
+				log.Infof("[copilot hot takes] call=%d/%d auth=%q model=%s stories=%d\n%s", i+1, len(authIDs), authID, hotTakesModel(), len(titles), out)
+			}
+		}
+
+		if i < len(authIDs)-1 {
+			// Space per-account calls: 30s ± 3s.
+			j := time.Duration(r.Int63n(int64(6*time.Second)+1)) - 3*time.Second
+			sleep := 30*time.Second + j
+			if sleep < 1*time.Second {
+				sleep = 1 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(sleep):
+			}
+		}
+	}
 	return nil
 }
 
