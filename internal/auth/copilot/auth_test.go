@@ -35,3 +35,17 @@ func TestCredentialIndexForID_EmptyIDReturnsZero(t *testing.T) {
 		t.Fatalf("blank id index = %d, want 0", got)
 	}
 }
+
+func TestGitHubCredentialFingerprint_DeterministicAndTrimmed(t *testing.T) {
+	first := githubCredentialFingerprint(" token-abc ")
+	second := githubCredentialFingerprint("token-abc")
+	if first == "" {
+		t.Fatal("expected non-empty fingerprint")
+	}
+	if first != second {
+		t.Fatalf("fingerprint mismatch: %q != %q", first, second)
+	}
+	if got := githubCredentialFingerprint("   "); got != "" {
+		t.Fatalf("blank token fingerprint = %q, want empty", got)
+	}
+}
