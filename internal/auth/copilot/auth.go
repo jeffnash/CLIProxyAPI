@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
@@ -61,6 +62,28 @@ type CopilotAuth struct {
 	vsCodeVersion string
 	proxyURL      string
 	noProxy       string
+}
+
+var (
+	githubCredentialIndexMu   = make(chan struct{}, 1)
+	githubCredentialIndexByID = map[string]int{}
+	nextGitHubCredentialIndex = 1
+)
+
+func credentialIndexForID(id string) int {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return 0
+	}
+	githubCredentialIndexMu <- struct{}{}
+	defer func() { <-githubCredentialIndexMu }()
+	if idx, ok := githubCredentialIndexByID[id]; ok {
+		return idx
+	}
+	idx := nextGitHubCredentialIndex
+	nextGitHubCredentialIndex++
+	githubCredentialIndexByID[id] = idx
+	return idx
 }
 
 // NewCopilotAuth creates a new CopilotAuth service instance.
@@ -120,6 +143,7 @@ func (a *CopilotAuth) GetDeviceCode(ctx context.Context) (*DeviceCodeResponse, e
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
 
+	log.Infof("copilot github call: endpoint=%s credential=<device-flow>", DeviceCodePath)
 	req, err := http.NewRequestWithContext(ctx, "POST", GitHubBaseURL+DeviceCodePath, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, NewAuthenticationError(ErrDeviceCodeFailed, err)
@@ -210,6 +234,7 @@ func (a *CopilotAuth) tryGetAccessToken(ctx context.Context, deviceCode string) 
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
 
+	log.Infof("copilot github call: endpoint=%s credential=<device-code>", AccessTokenPath)
 	req, err := http.NewRequestWithContext(ctx, "POST", GitHubBaseURL+AccessTokenPath, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", err
@@ -268,6 +293,12 @@ func (a *CopilotAuth) GetCopilotToken(ctx context.Context, githubToken string) (
 		return nil, ErrNoGitHubToken
 	}
 
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(githubToken))
+	credID := fmt.Sprintf("gh_%x", h.Sum64())
+	credIndex := credentialIndexForID(credID)
+	log.Infof("copilot github call: endpoint=%s credential=%s index=%d", CopilotTokenPath, credID, credIndex)
+
 	req, err := http.NewRequestWithContext(ctx, "GET", GitHubAPIBaseURL+CopilotTokenPath, nil)
 	if err != nil {
 		return nil, NewAuthenticationError(ErrCopilotTokenFailed, err)
@@ -311,6 +342,12 @@ func (a *CopilotAuth) GetGitHubUser(ctx context.Context, githubToken string) (*G
 	if githubToken == "" {
 		return nil, ErrNoGitHubToken
 	}
+
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(githubToken))
+	credID := fmt.Sprintf("gh_%x", h.Sum64())
+	credIndex := credentialIndexForID(credID)
+	log.Infof("copilot github call: endpoint=%s credential=%s index=%d", UserInfoPath, credID, credIndex)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", GitHubAPIBaseURL+UserInfoPath, nil)
 	if err != nil {
