@@ -5,8 +5,6 @@ import (
 	"time"
 )
 
-const ChutesModelPrefix = "chutes-"
-
 // GenerateChutesAliases creates chutes- prefixed aliases for explicit routing.
 // Input models should already be deduplicated by root.
 func GenerateChutesAliases(models []*ModelInfo) []*ModelInfo {

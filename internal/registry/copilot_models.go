@@ -2,8 +2,6 @@ package registry
 
 import "time"
 
-const CopilotModelPrefix = "copilot-"
-
 // GenerateCopilotAliases creates copilot- prefixed aliases for explicit routing.
 // This allows users to explicitly route to Copilot when model names might conflict
 // with other providers (e.g., "copilot-gpt-4o" vs "gpt-4o").
