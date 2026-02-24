@@ -97,6 +97,9 @@ Provider & config matrix (fork-specific):
 | Copilot header behavior | `internal/runtime/executor/copilot_headers.go` | Implementation for request header shaping / agent-call behavior + optional header profile emulation. |
 | Copilot model registry | `internal/registry/copilot_models.go` | How Copilot models are enumerated/aliased. |
 | Force Copilot routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `copilot-<model>` to explicitly route to Copilot even if the model isn't registered; bypasses client model support filtering. |
+| Force Codex routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `codex-<model>` to explicitly route to Codex; sets `forced_provider=true` to bypass client model support filtering. |
+| Force Kimi routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `kimi-<model>` to explicitly route to Kimi; sets `forced_provider=true` to bypass client model support filtering. |
+| Force iFlow routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use `iflow-<model>` to explicitly route to iFlow; sets `forced_provider=true` to bypass client model support filtering. |
 | Copilot Hot Takes | `internal/cmd/copilot_hot_takes.go` / `docs/RAILWAY_GUIDE.md` | Optional background job controlled by `COPILOT_HOT_TAKES_INTERVAL_MINS` and `COPILOT_HOT_TAKES_MODEL`. |
 | Grok config schema | `internal/config/config.go` | `GrokKey` and `GrokConfig` sections define available knobs. |
 | Chutes support (env + YAML) | `internal/config/config.go` / `docs/RAILWAY_GUIDE.md` | Env vars: `CHUTES_API_KEY`, `CHUTES_BASE_URL`, `CHUTES_MODELS`, `CHUTES_MODELS_EXCLUDE`, `CHUTES_PRIORITY`, `CHUTES_TEE_PREFERENCE`, `CHUTES_PROXY_URL`, `CHUTES_MAX_RETRIES`. YAML: `chutes` section. |

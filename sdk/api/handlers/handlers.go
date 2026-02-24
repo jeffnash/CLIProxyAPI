@@ -792,6 +792,14 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	case strings.HasPrefix(lower, registry.ChutesModelPrefix):
 		rawModel = strings.TrimSpace(rawModel[len(registry.ChutesModelPrefix):])
 		forcedProvider = "chutes"
+	case strings.HasPrefix(lower, registry.KimiModelPrefix):
+		// Kimi model IDs are already provider-prefixed (e.g. kimi-k2.5),
+		// so keep the model name intact and only force provider selection.
+		forcedProvider = "kimi"
+	case strings.HasPrefix(lower, registry.IFlowModelPrefix):
+		// iFlow model IDs are already provider-prefixed (e.g. iflow-rome-30ba3b),
+		// so keep the model name intact and only force provider selection.
+		forcedProvider = "iflow"
 	}
 
 	// Parse and strip temperature suffix (-temp-x.x) before thinking suffix processing.

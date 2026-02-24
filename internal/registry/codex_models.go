@@ -1,7 +1,5 @@
 package registry
 
-const CodexModelPrefix = "codex-"
-
 // GenerateCodexAliases creates codex- prefixed aliases for explicit routing.
 // This allows users to explicitly route to Codex when model names might conflict
 // with other providers (e.g., "codex-gpt-5.2-xhigh" vs "gpt-5.2-xhigh").
