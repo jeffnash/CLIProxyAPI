@@ -1475,7 +1475,7 @@ func GetIFlowModels() []*ModelInfo {
 			Thinking:    entry.Thinking,
 		})
 	}
-	return models
+	return GenerateIFlowAliases(models)
 }
 
 // AntigravityModelConfig captures static antigravity model overrides, including
@@ -1850,7 +1850,7 @@ func GetKiroModels() []*ModelInfo {
 
 // GetKimiModels returns the standard Kimi (Moonshot AI) model definitions
 func GetKimiModels() []*ModelInfo {
-	return []*ModelInfo{
+	models := []*ModelInfo{
 		{
 			ID:                  "kimi-k2",
 			Object:              "model",
@@ -1887,6 +1887,7 @@ func GetKimiModels() []*ModelInfo {
 			Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
 		},
 	}
+	return GenerateKimiAliases(models)
 }
 
 // GetAmazonQModels returns the Amazon Q (AWS CodeWhisperer) model definitions.

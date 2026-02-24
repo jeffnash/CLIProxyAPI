@@ -793,12 +793,10 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 		rawModel = strings.TrimSpace(rawModel[len(registry.ChutesModelPrefix):])
 		forcedProvider = "chutes"
 	case strings.HasPrefix(lower, registry.KimiModelPrefix):
-		// Kimi model IDs are already provider-prefixed (e.g. kimi-k2.5),
-		// so keep the model name intact and only force provider selection.
+		rawModel = strings.TrimSpace(rawModel[len(registry.KimiModelPrefix):])
 		forcedProvider = "kimi"
 	case strings.HasPrefix(lower, registry.IFlowModelPrefix):
-		// iFlow model IDs are already provider-prefixed (e.g. iflow-rome-30ba3b),
-		// so keep the model name intact and only force provider selection.
+		rawModel = strings.TrimSpace(rawModel[len(registry.IFlowModelPrefix):])
 		forcedProvider = "iflow"
 	}
 
