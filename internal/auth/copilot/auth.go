@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -65,7 +66,7 @@ type CopilotAuth struct {
 }
 
 var (
-	githubCredentialIndexMu   = make(chan struct{}, 1)
+	githubCredentialIndexMu   sync.Mutex
 	githubCredentialIndexByID = map[string]int{}
 	nextGitHubCredentialIndex = 1
 )
@@ -75,15 +76,28 @@ func credentialIndexForID(id string) int {
 	if id == "" {
 		return 0
 	}
-	githubCredentialIndexMu <- struct{}{}
-	defer func() { <-githubCredentialIndexMu }()
+
+	githubCredentialIndexMu.Lock()
+	defer githubCredentialIndexMu.Unlock()
+
 	if idx, ok := githubCredentialIndexByID[id]; ok {
 		return idx
 	}
+
 	idx := nextGitHubCredentialIndex
 	nextGitHubCredentialIndex++
 	githubCredentialIndexByID[id] = idx
 	return idx
+}
+
+func githubCredentialFingerprint(token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ""
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(token))
+	return fmt.Sprintf("gh_%x", h.Sum64())
 }
 
 // NewCopilotAuth creates a new CopilotAuth service instance.
@@ -293,9 +307,7 @@ func (a *CopilotAuth) GetCopilotToken(ctx context.Context, githubToken string) (
 		return nil, ErrNoGitHubToken
 	}
 
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(githubToken))
-	credID := fmt.Sprintf("gh_%x", h.Sum64())
+	credID := githubCredentialFingerprint(githubToken)
 	credIndex := credentialIndexForID(credID)
 	log.Infof("copilot github call: endpoint=%s credential=%s index=%d", CopilotTokenPath, credID, credIndex)
 
@@ -343,9 +355,7 @@ func (a *CopilotAuth) GetGitHubUser(ctx context.Context, githubToken string) (*G
 		return nil, ErrNoGitHubToken
 	}
 
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(githubToken))
-	credID := fmt.Sprintf("gh_%x", h.Sum64())
+	credID := githubCredentialFingerprint(githubToken)
 	credIndex := credentialIndexForID(credID)
 	log.Infof("copilot github call: endpoint=%s credential=%s index=%d", UserInfoPath, credID, credIndex)
 
