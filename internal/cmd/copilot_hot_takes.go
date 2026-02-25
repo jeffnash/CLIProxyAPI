@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,9 @@ import (
 const (
 	hnTopStoriesURL = "https://hacker-news.firebaseio.com/v0/topstories.json"
 	hnItemURLFmt    = "https://hacker-news.firebaseio.com/v0/item/%d.json"
+
+	hotTakesPerAuthBaseDelay   = 30 * time.Second
+	hotTakesPerAuthDelayJitter = 3 * time.Second
 )
 
 func hotTakesInterval() (time.Duration, bool) {
@@ -193,6 +197,47 @@ func listCopilotAuthIDs(ctx context.Context, cfg *config.Config, managementKey s
 	return ids, nil
 }
 
+func listCopilotAuthIDsFromDisk(cfg *config.Config) ([]string, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("nil config")
+	}
+	authDir := strings.TrimSpace(cfg.AuthDir)
+	if authDir == "" {
+		return nil, fmt.Errorf("auth dir is empty")
+	}
+
+	entries, err := os.ReadDir(authDir)
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make([]string, 0)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(e.Name())
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+
+		full := filepath.Join(authDir, name)
+		data, errRead := os.ReadFile(full)
+		if errRead != nil || len(data) == 0 {
+			continue
+		}
+
+		provider := strings.ToLower(strings.TrimSpace(gjson.GetBytes(data, "type").String()))
+		if provider != "copilot" {
+			continue
+		}
+		ids = append(ids, name)
+	}
+
+	sort.Strings(ids)
+	return ids, nil
+}
+
 func doCopilotHotTakesOnce(ctx context.Context, cfg *config.Config, managementKey string) error {
 	if cfg == nil {
 		return fmt.Errorf("nil config")
@@ -251,12 +296,16 @@ func doCopilotHotTakesOnce(ctx context.Context, cfg *config.Config, managementKe
 
 	authIDs, err := listCopilotAuthIDs(ctx, cfg, managementKey)
 	if err != nil {
-		log.Warnf("copilot hot takes: list copilot auths failed, falling back to unpinned call: %v", err)
-		authIDs = []string{""}
+		// Management routes may be disabled (e.g. no management secret configured).
+		// Fall back to scanning auth files directly so we can still pin one call per Copilot auth.
+		log.Warnf("copilot hot takes: list copilot auths via management failed, falling back to auth-dir scan: %v", err)
+		authIDs, err = listCopilotAuthIDsFromDisk(cfg)
+		if err != nil {
+			return fmt.Errorf("list copilot auths failed (management and disk): %w", err)
+		}
 	}
 	if len(authIDs) == 0 {
-		log.Warn("copilot hot takes: no copilot auths found; running single unpinned call")
-		authIDs = []string{""}
+		return fmt.Errorf("no copilot auths found")
 	}
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -289,8 +338,9 @@ func doCopilotHotTakesOnce(ctx context.Context, cfg *config.Config, managementKe
 
 		if i < len(authIDs)-1 {
 			// Space per-account calls: 30s ± 3s.
-			j := time.Duration(r.Int63n(int64(6*time.Second)+1)) - 3*time.Second
-			sleep := 30*time.Second + j
+			jitterRange := int64(2*hotTakesPerAuthDelayJitter) + 1
+			jitter := time.Duration(r.Int63n(jitterRange)) - hotTakesPerAuthDelayJitter
+			sleep := hotTakesPerAuthBaseDelay + jitter
 			if sleep < 1*time.Second {
 				sleep = 1 * time.Second
 			}
