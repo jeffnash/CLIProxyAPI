@@ -951,8 +951,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = registry.GenerateCodexAliases(models)
 	case "copilot":
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		models = executor.NewCopilotExecutor(s.cfg).FetchModels(ctx, a, s.cfg)
+		var fetchErr error
+		models, fetchErr = executor.NewCopilotExecutor(s.cfg).FetchModels(ctx, a, s.cfg)
 		cancel()
+		if fetchErr != nil {
+			log.Warnf("copilot: dynamic model fetch failed for auth %s: %v", a.ID, fetchErr)
+		}
 		if len(models) == 0 {
 			log.Warnf("copilot: using static fallback models for auth %s", a.ID)
 			models = registry.GetCopilotModels()
