@@ -137,6 +137,13 @@ type Config struct {
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
+	// OAuthProxyPool defines per-provider proxy pools for OAuth/file-backed auth entries.
+	// Values are CSV proxy URLs. Assignment is deterministic and alphabetical by auth ID.
+	// Example:
+	//   oauth-proxy-pool:
+	//     copilot: "http://p1:8080,http://p2:8080"
+	OAuthProxyPool map[string]string `yaml:"oauth-proxy-pool,omitempty" json:"oauth-proxy-pool,omitempty"`
+
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
 	// These aliases affect both model listing and model routing for supported channels:
 	// gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow.
@@ -1014,6 +1021,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
+	// Normalize OAuth proxy pools.
+	cfg.OAuthProxyPool = NormalizeOAuthProxyPool(cfg.OAuthProxyPool)
+
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
@@ -1531,6 +1541,41 @@ func NormalizeOAuthExcludedModels(entries map[string][]string) map[string][]stri
 			continue
 		}
 		out[key] = normalized
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// NormalizeOAuthProxyPool cleans provider -> proxy CSV mappings.
+// It normalizes provider keys, trims entries, removes empties, and deduplicates URLs while preserving order.
+func NormalizeOAuthProxyPool(entries map[string]string) map[string]string {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(entries))
+	for provider, csv := range entries {
+		key := strings.ToLower(strings.TrimSpace(provider))
+		if key == "" {
+			continue
+		}
+		parts := splitAndTrim(csv)
+		if len(parts) == 0 {
+			continue
+		}
+		seen := make(map[string]struct{}, len(parts))
+		normalized := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if _, ok := seen[part]; ok {
+				continue
+			}
+			seen[part] = struct{}{}
+			normalized = append(normalized, part)
+		}
+		if len(normalized) > 0 {
+			out[key] = strings.Join(normalized, ",")
+		}
 	}
 	if len(out) == 0 {
 		return nil

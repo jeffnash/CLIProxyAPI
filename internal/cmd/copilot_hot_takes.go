@@ -134,19 +134,27 @@ func extractAssistantText(respBytes []byte) string {
 	return strings.TrimSpace(string(respBytes))
 }
 
-func listCopilotAuthIDs(ctx context.Context, cfg *config.Config) ([]string, error) {
+func listCopilotAuthIDs(ctx context.Context, cfg *config.Config, managementKey string) ([]string, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("nil config")
 	}
-	if len(cfg.APIKeys) == 0 {
-		return nil, fmt.Errorf("no api-keys configured")
+	managementKey = strings.TrimSpace(managementKey)
+	if managementKey == "" {
+		// Fall back to the first API key, which may work if the management secret
+		// is also set to the same value or if allow-remote is enabled.
+		if len(cfg.APIKeys) > 0 {
+			managementKey = cfg.APIKeys[0]
+		}
+	}
+	if managementKey == "" {
+		return nil, fmt.Errorf("no management key available")
 	}
 	u := fmt.Sprintf("http://127.0.0.1:%d/v0/management/auth-files", cfg.Port)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKeys[0])
+	req.Header.Set("Authorization", "Bearer "+managementKey)
 	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 	if err != nil {
 		return nil, err
@@ -185,7 +193,7 @@ func listCopilotAuthIDs(ctx context.Context, cfg *config.Config) ([]string, erro
 	return ids, nil
 }
 
-func doCopilotHotTakesOnce(ctx context.Context, cfg *config.Config) error {
+func doCopilotHotTakesOnce(ctx context.Context, cfg *config.Config, managementKey string) error {
 	if cfg == nil {
 		return fmt.Errorf("nil config")
 	}
@@ -241,7 +249,7 @@ func doCopilotHotTakesOnce(ctx context.Context, cfg *config.Config) error {
 	localURL := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", cfg.Port)
 	client := &http.Client{Timeout: 120 * time.Second}
 
-	authIDs, err := listCopilotAuthIDs(ctx, cfg)
+	authIDs, err := listCopilotAuthIDs(ctx, cfg, managementKey)
 	if err != nil {
 		log.Warnf("copilot hot takes: list copilot auths failed, falling back to unpinned call: %v", err)
 		authIDs = []string{""}
@@ -392,7 +400,7 @@ func waitForCopilotAuthReady(ctx context.Context, cfg *config.Config) error {
 	}
 }
 
-func StartCopilotHotTakesLoop(ctx context.Context, cfg *config.Config) {
+func StartCopilotHotTakesLoop(ctx context.Context, cfg *config.Config, managementKey string) {
 	interval, ok := hotTakesInterval()
 	if !ok {
 		return
@@ -415,7 +423,7 @@ func StartCopilotHotTakesLoop(ctx context.Context, cfg *config.Config) {
 		}
 
 		// Run once immediately, then on the interval.
-		if err := doCopilotHotTakesOnce(ctx, cfg); err != nil {
+		if err := doCopilotHotTakesOnce(ctx, cfg, managementKey); err != nil {
 			log.Warnf("copilot hot takes: run failed: %v", err)
 		}
 
@@ -438,7 +446,7 @@ func StartCopilotHotTakesLoop(ctx context.Context, cfg *config.Config) {
 			case <-time.After(sleep):
 			}
 			runCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-			err := doCopilotHotTakesOnce(runCtx, cfg)
+			err := doCopilotHotTakesOnce(runCtx, cfg, managementKey)
 			cancel()
 			if err != nil {
 				log.Warnf("copilot hot takes: run failed: %v", err)

@@ -3,12 +3,15 @@ package synthesizer
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -125,10 +128,12 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 			}
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
+		applyDeterministicOAuthProxy(cfg, a)
 		if provider == "gemini-cli" {
 			if virtuals := SynthesizeGeminiVirtualAuths(a, metadata, now); len(virtuals) > 0 {
 				for _, v := range virtuals {
 					ApplyAuthExcludedModelsMeta(v, cfg, perAccountExcluded, "oauth")
+					applyDeterministicOAuthProxy(cfg, v)
 				}
 				out = append(out, a)
 				out = append(out, virtuals...)
@@ -262,6 +267,61 @@ func buildGeminiVirtualID(baseID, projectID string) string {
 
 // extractExcludedModelsFromMetadata reads per-account excluded models from the OAuth JSON metadata.
 // Supports both "excluded_models" and "excluded-models" keys, and accepts both []string and []interface{}.
+func applyDeterministicOAuthProxy(cfg *config.Config, a *coreauth.Auth) {
+	if cfg == nil || a == nil {
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(a.Provider))
+	if provider == "" || cfg.OAuthProxyPool == nil {
+		return
+	}
+	csv, ok := cfg.OAuthProxyPool[provider]
+	if !ok {
+		return
+	}
+	parts := splitAndTrimCSV(csv)
+	if len(parts) == 0 {
+		return
+	}
+	sort.Strings(parts)
+	seed := strings.ToLower(strings.TrimSpace(a.ID))
+	if seed == "" {
+		seed = strings.ToLower(strings.TrimSpace(a.Label))
+	}
+	if seed == "" {
+		return
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(seed))
+	idx := int(h.Sum32() % uint32(len(parts)))
+	a.ProxyURL = parts[idx]
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+	a.Metadata["proxy_assignment_mode"] = "deterministic_pool"
+	a.Metadata["proxy_assignment_key"] = seed
+	a.Metadata["proxy_assignment_index"] = idx
+	a.Metadata["proxy_assignment_pool_size"] = len(parts)
+}
+
+func splitAndTrimCSV(csv string) []string {
+	csv = strings.TrimSpace(csv)
+	if csv == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func extractExcludedModelsFromMetadata(metadata map[string]any) []string {
 	if metadata == nil {
 		return nil

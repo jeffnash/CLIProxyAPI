@@ -371,6 +371,13 @@ nonstream-keepalive-interval: 0
 #     - name: "kimi-k2.5"
 #       alias: "k2.5"
 
+# OAuth deterministic proxy pool (per provider)
+# Values are CSV proxy URLs. Assignment is deterministic using auth identity hash,
+# so each OAuth account sticks to one proxy unless pool/provider/account changes.
+# oauth-proxy-pool:
+#   copilot: "http://proxy-a:8080,http://proxy-b:8080,socks5://proxy-c:1080"
+#   codex: "http://proxy-x:8080,http://proxy-y:8080"
+#
 # OAuth provider excluded models
 # oauth-excluded-models:
 #   gemini-cli:
