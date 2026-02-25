@@ -1021,6 +1021,38 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
+	// Load OAuth proxy pools from env (useful for Railway deployments).
+	//
+	// OAUTH_PROXY_POOL is a semicolon-separated list of provider=urls pairs.
+	// Each pair maps a provider name to a CSV list of proxy URLs.
+	//
+	// Format: "provider1=url1,url2;provider2=url3,url4"
+	// Example: "copilot=http://p1:8080,http://p2:8080;codex=http://p3:8080"
+	//
+	// Env entries are merged into any existing YAML oauth-proxy-pool values;
+	// env wins on provider key collision.
+	if env := strings.TrimSpace(os.Getenv("OAUTH_PROXY_POOL")); env != "" {
+		if cfg.OAuthProxyPool == nil {
+			cfg.OAuthProxyPool = make(map[string]string)
+		}
+		pairs := strings.Split(env, ";")
+		for _, pair := range pairs {
+			pair = strings.TrimSpace(pair)
+			if pair == "" {
+				continue
+			}
+			eqIdx := strings.Index(pair, "=")
+			if eqIdx < 0 {
+				continue
+			}
+			key := strings.ToLower(strings.TrimSpace(pair[:eqIdx]))
+			val := strings.TrimSpace(pair[eqIdx+1:])
+			if key != "" && val != "" {
+				cfg.OAuthProxyPool[key] = val
+			}
+		}
+	}
+
 	// Normalize OAuth proxy pools.
 	cfg.OAuthProxyPool = NormalizeOAuthProxyPool(cfg.OAuthProxyPool)
 
