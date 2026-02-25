@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -343,6 +344,18 @@ func (a *Auth) AccountInfo() (string, string) {
 					return "oauth", email
 				}
 			}
+		}
+	}
+
+	// For Copilot, use the filename (without extension) as the account identifier.
+	if strings.ToLower(a.Provider) == "copilot" {
+		name := strings.TrimSpace(a.FileName)
+		if name == "" {
+			name = strings.TrimSpace(filepath.Base(a.ID))
+		}
+		if name != "" {
+			name = strings.TrimSuffix(name, filepath.Ext(name))
+			return "oauth", name
 		}
 	}
 
