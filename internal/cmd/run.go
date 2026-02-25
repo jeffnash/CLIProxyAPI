@@ -50,7 +50,7 @@ func StartService(cfg *config.Config, configPath string, localPassword string) {
 	}
 
 	// Background opt-in job (disabled unless COPILOT_HOT_TAKES_INTERVAL_MINS is set).
-	StartCopilotHotTakesLoop(runCtx, cfg)
+	StartCopilotHotTakesLoop(runCtx, cfg, localPassword)
 
 	err = service.Run(runCtx)
 	if err != nil && !errors.Is(err, context.Canceled) {
