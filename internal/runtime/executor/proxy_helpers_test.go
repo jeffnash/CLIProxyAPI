@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -53,10 +54,14 @@ func TestNewProxyAwareHTTPClient_DoesNotCacheTimeout_WithProxy(t *testing.T) {
 	}
 
 	httpClientCacheMutex.RLock()
-	cached := httpClientCache["http://example.com:8080"]
+	cacheKey := "http://example.com:8080"
+	if noProxyRaw := noProxyEnvRaw(); noProxyRaw != "" {
+		cacheKey = cacheKey + "|no_proxy=" + strings.ToLower(noProxyRaw)
+	}
+	cached := httpClientCache[cacheKey]
 	httpClientCacheMutex.RUnlock()
 	if cached == nil {
-		t.Fatalf("expected cached base client for proxy key")
+		t.Fatalf("expected cached base client for proxy key %q", cacheKey)
 	}
 	if cached.Timeout != 0 {
 		t.Fatalf("expected cached Timeout=0, got %v", cached.Timeout)

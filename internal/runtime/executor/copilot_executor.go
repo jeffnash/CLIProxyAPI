@@ -48,6 +48,9 @@ type cachedToken struct {
 var (
 	sharedModelCacheMu sync.Mutex
 	sharedModelCache   = make(map[string]*sharedModelCacheEntry)
+
+	copilotAuthLockMapMu sync.Mutex
+	copilotAuthLocks     = make(map[string]*sync.Mutex)
 )
 
 type sharedModelCacheEntry struct {
@@ -994,25 +997,27 @@ func (e *CopilotExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) 
 		return nil, statusErr{code: 500, msg: "copilot executor: auth is nil (copilot_refresh_auth_nil)"}
 	}
 
-	var githubToken string
-	if auth.Metadata != nil {
-		if v, ok := auth.Metadata["github_token"].(string); ok && v != "" {
-			githubToken = v
-		}
-	}
-	// Fallback to storage if metadata is missing github_token
-	if githubToken == "" {
-		if storage, ok := auth.Storage.(*copilotauth.CopilotTokenStorage); ok && storage != nil {
-			githubToken = storage.GitHubToken
-		}
-	}
+	unlock := lockCopilotAuth(auth)
+	defer unlock()
 
+	copilotauth.EnsureMetadataHydrated(auth)
+	githubToken := copilotauth.ResolveGitHubToken(auth)
 	if githubToken == "" {
 		log.Debug("copilot executor: no github_token in metadata, skipping refresh")
 		return auth, nil
 	}
 
+	if token, valid := e.getValidCachedToken(githubToken); valid {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		auth.Metadata["copilot_token"] = token
+		log.Debug("copilot executor: refresh skipped, valid cached token already available")
+		return auth, nil
+	}
+
 	authSvc := copilotauth.NewCopilotAuth(e.cfg)
+	credentialFingerprint, credentialIndex := copilotCredentialLogFields(githubToken)
 	tokenResp, err := authSvc.GetCopilotToken(ctx, githubToken)
 	if err != nil {
 		// Classify error: auth issues get 401, transient issues get 503.
@@ -1043,25 +1048,29 @@ func (e *CopilotExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) 
 			}
 		}
 
-		log.Warnf("copilot executor: token refresh failed [cause: %s]: %v", cause, err)
+		log.Warnf("copilot executor: token refresh failed auth_id=%s credential=%s index=%d cause=%s err=%v",
+			auth.ID,
+			credentialFingerprint,
+			credentialIndex,
+			cause,
+			err,
+		)
 		return nil, statusErr{code: code, msg: fmt.Sprintf("copilot token refresh failed (%s): %v", cause, err)}
 	}
 
-	// Update in-memory cache
+	expiresAt := time.Unix(tokenResp.ExpiresAt, 0)
 	e.tokenMu.Lock()
 	e.tokenCache[githubToken] = &cachedToken{
 		token:     tokenResp.Token,
-		expiresAt: time.Unix(tokenResp.ExpiresAt, 0),
+		expiresAt: expiresAt,
 	}
 	e.tokenMu.Unlock()
 
-	// We no longer rely on metadata for token caching, but we update it
-	// for the current session in case other components need it.
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
 	auth.Metadata["copilot_token"] = tokenResp.Token
-	auth.Metadata["copilot_token_expiry"] = time.Unix(tokenResp.ExpiresAt, 0).Format(time.RFC3339)
+	auth.Metadata["copilot_token_expiry"] = expiresAt.Format(time.RFC3339)
 	auth.Metadata["type"] = "copilot"
 
 	log.Debug("Copilot token refreshed successfully")
@@ -1212,6 +1221,45 @@ func setCachedCopilotModels(authID string, models []*registry.ModelInfo) {
 	}
 }
 
+func copilotAuthLockKey(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return id
+	}
+	if fp := strings.TrimSpace(copilotauth.GitHubCredentialFingerprint(copilotauth.ResolveGitHubToken(auth))); fp != "" {
+		return fp
+	}
+	return ""
+}
+
+func lockCopilotAuth(auth *cliproxyauth.Auth) func() {
+	key := copilotAuthLockKey(auth)
+	if key == "" {
+		return func() {}
+	}
+
+	copilotAuthLockMapMu.Lock()
+	mu, ok := copilotAuthLocks[key]
+	if !ok {
+		mu = &sync.Mutex{}
+		copilotAuthLocks[key] = mu
+	}
+	copilotAuthLockMapMu.Unlock()
+
+	mu.Lock()
+	return func() {
+		mu.Unlock()
+	}
+}
+
+func copilotCredentialLogFields(githubToken string) (string, int) {
+	credentialFingerprint := copilotauth.GitHubCredentialFingerprint(githubToken)
+	credentialIndex := copilotauth.GitHubCredentialIndex(credentialFingerprint)
+	return credentialFingerprint, credentialIndex
+}
+
 // EvictCopilotModelCache removes cached models for an auth ID when the auth is removed.
 func EvictCopilotModelCache(authID string) {
 	if authID == "" {
@@ -1222,56 +1270,78 @@ func EvictCopilotModelCache(authID string) {
 	sharedModelCacheMu.Unlock()
 }
 
-func (e *CopilotExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) []*registry.ModelInfo {
-	// 1. Check Cache
+func (e *CopilotExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) ([]*registry.ModelInfo, error) {
+	if auth == nil {
+		return nil, fmt.Errorf("copilot executor: auth is nil")
+	}
+
+	unlock := lockCopilotAuth(auth)
+	defer unlock()
+
+	// 1. Re-check cache after lock acquisition.
 	if models := getCachedCopilotModels(auth.ID); models != nil {
-		return models
+		return models, nil
 	}
 
-	// 2. Resolve Tokens
 	copilotauth.EnsureMetadataHydrated(auth)
-	copilotToken, _, _ := copilotauth.ResolveCopilotToken(auth)
+	githubToken := copilotauth.ResolveGitHubToken(auth)
+	credFingerprint := copilotauth.GitHubCredentialFingerprint(githubToken)
+	credIndex := copilotauth.GitHubCredentialIndex(credFingerprint)
+	accountType := copilotauth.ResolveAccountType(auth)
 
-	// 3. Fetch (auto-refresh if 401)
-	authSvc := copilotauth.NewCopilotAuth(cfg)
-	var modelsResp *copilotauth.CopilotModelsResponse
-	var err error
-
-	if copilotToken != "" {
-		modelsResp, err = authSvc.GetModels(ctx, copilotToken, copilotauth.ResolveAccountType(auth))
+	// 2. Resolve token and fetch models.
+	copilotToken, copilotExpiry, hasCopilotToken := copilotauth.ResolveCopilotToken(auth)
+	if hasCopilotToken && !time.Now().Before(copilotExpiry) {
+		copilotToken = ""
 	}
-
-	if (copilotToken == "" || err != nil) && copilotauth.ResolveGitHubToken(auth) != "" {
-		// Attempt refresh
-		if _, refreshErr := e.Refresh(ctx, auth); refreshErr == nil {
-			copilotToken, _, _ = copilotauth.ResolveCopilotToken(auth)
-			modelsResp, err = authSvc.GetModels(ctx, copilotToken, copilotauth.ResolveAccountType(auth))
+	if copilotToken == "" {
+		if githubToken == "" {
+			err := fmt.Errorf("copilot executor: no valid copilot token and no github token")
+			log.Warnf("copilot executor: model fetch skipped auth_id=%s credential=%s index=%d cause=no_valid_token err=%v", auth.ID, credFingerprint, credIndex, err)
+			return nil, err
 		}
+		// Inline refresh while per-auth lock is held.
+		authSvc := copilotauth.NewCopilotAuth(e.cfg)
+		tokenResp, refreshErr := authSvc.GetCopilotToken(ctx, githubToken)
+		if refreshErr != nil {
+			log.Warnf("copilot executor: model fetch refresh failed auth_id=%s credential=%s index=%d cause=refresh_failed err=%v", auth.ID, credFingerprint, credIndex, refreshErr)
+			return nil, fmt.Errorf("copilot executor: refresh failed for auth %s: %w", auth.ID, refreshErr)
+		}
+
+		expiresAt := time.Unix(tokenResp.ExpiresAt, 0)
+		e.tokenMu.Lock()
+		e.tokenCache[githubToken] = &cachedToken{token: tokenResp.Token, expiresAt: expiresAt}
+		e.tokenMu.Unlock()
+
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		auth.Metadata["copilot_token"] = tokenResp.Token
+		auth.Metadata["copilot_token_expiry"] = expiresAt.Format(time.RFC3339)
+		auth.Metadata["type"] = "copilot"
+		copilotToken = tokenResp.Token
 	}
 
+	authSvc := copilotauth.NewCopilotAuth(cfg)
+	modelsResp, err := authSvc.GetModels(ctx, copilotToken, accountType)
 	if err != nil || modelsResp == nil {
-		log.Warnf("copilot executor: failed to fetch models for auth %s: %v", auth.ID, err)
-		return nil
+		cause := "models_fetch_failed"
+		if err == nil {
+			err = fmt.Errorf("copilot executor: empty models response")
+			cause = "models_empty_response"
+		}
+		log.Warnf("copilot executor: failed to fetch models auth_id=%s credential=%s index=%d cause=%s err=%v", auth.ID, credFingerprint, credIndex, cause, err)
+		return nil, fmt.Errorf("copilot executor: failed to fetch models for auth %s: %w", auth.ID, err)
 	}
 
-	// 4. Process and Cache
+	// 3. Process and cache.
 	now := time.Now().Unix()
 	models := make([]*registry.ModelInfo, 0, len(modelsResp.Data))
-
 	for _, m := range modelsResp.Data {
 		if !m.ModelPickerEnabled {
 			continue
 		}
-		modelInfo := &registry.ModelInfo{
-			ID:          m.ID,
-			Name:        m.Name,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     "copilot",
-			Type:        "copilot",
-			DisplayName: m.Name,
-			Version:     m.Version,
-		}
+		modelInfo := &registry.ModelInfo{ID: m.ID, Name: m.Name, Object: "model", Created: now, OwnedBy: "copilot", Type: "copilot", DisplayName: m.Name, Version: m.Version}
 		if m.Capabilities.Limits.MaxContextWindowTokens > 0 {
 			modelInfo.ContextLength = m.Capabilities.Limits.MaxContextWindowTokens
 		}
@@ -1291,20 +1361,22 @@ func (e *CopilotExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Au
 		models = append(models, modelInfo)
 	}
 
-	// 5. Merge essential models that Copilot supports but may not return in /models
 	models = mergeEssentialCopilotModels(models, now)
-
 	models = registry.GenerateCopilotAliases(models)
 	setCachedCopilotModels(auth.ID, models)
-	return models
+	if len(models) == 0 {
+		err = fmt.Errorf("copilot executor: no models after processing")
+		log.Warnf("copilot executor: no valid models obtained auth_id=%s credential=%s index=%d cause=no_models err=%v", auth.ID, credFingerprint, credIndex, err)
+		return nil, err
+	}
+	return models, nil
 }
 
 // FetchCopilotModels retrieves available models from the Copilot API using the supplied auth.
 // Uses shared cache that persists across executor instances.
-func FetchCopilotModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) []*registry.ModelInfo {
-	// Use shared cache - check before creating executor
+func FetchCopilotModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) ([]*registry.ModelInfo, error) {
 	if models := getCachedCopilotModels(auth.ID); models != nil {
-		return models
+		return models, nil
 	}
 	e := NewCopilotExecutor(cfg)
 	return e.FetchModels(ctx, auth, cfg)

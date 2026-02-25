@@ -100,6 +100,16 @@ func githubCredentialFingerprint(token string) string {
 	return fmt.Sprintf("gh_%x", h.Sum64())
 }
 
+// GitHubCredentialFingerprint returns a stable, non-reversible credential fingerprint for logging.
+func GitHubCredentialFingerprint(token string) string {
+	return githubCredentialFingerprint(token)
+}
+
+// GitHubCredentialIndex returns a stable in-process index for a credential fingerprint.
+func GitHubCredentialIndex(fingerprint string) int {
+	return credentialIndexForID(fingerprint)
+}
+
 // NewCopilotAuth creates a new CopilotAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
 func NewCopilotAuth(cfg *config.Config) *CopilotAuth {
