@@ -2265,9 +2265,6 @@ func logEntryWithRequestID(ctx context.Context) *log.Entry {
 }
 
 func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model string) {
-	if !log.IsLevelEnabled(log.DebugLevel) {
-		return
-	}
 	if entry == nil || auth == nil {
 		return
 	}
@@ -2279,10 +2276,10 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 	}
 	switch accountType {
 	case "api_key":
-		entry.Debugf("Use API key %s for model %s%s", util.HideAPIKey(accountInfo), model, suffix)
+		entry.Infof("Use API key %s for model %s%s", util.HideAPIKey(accountInfo), model, suffix)
 	case "oauth":
 		ident := formatOauthIdentity(auth, provider, accountInfo)
-		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
+		entry.Infof("Use OAuth %s for model %s%s", ident, model, suffix)
 	}
 }
 
