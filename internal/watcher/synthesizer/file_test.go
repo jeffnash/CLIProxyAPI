@@ -252,6 +252,44 @@ func TestFileSynthesizer_Synthesize_RelativeID(t *testing.T) {
 	}
 }
 
+func TestApplyDeterministicOAuthProxy_AssignsFromAlphabeticalPool(t *testing.T) {
+	cfg := &config.Config{
+		OAuthProxyPool: map[string]string{
+			"copilot": "http://z-proxy:8080,http://a-proxy:8080,http://m-proxy:8080",
+		},
+	}
+	a := &coreauth.Auth{ID: "copilot-1771912484612.json", Provider: "copilot", Label: "copilot@example.com"}
+	applyDeterministicOAuthProxy(cfg, a)
+	if a.ProxyURL == "" {
+		t.Fatalf("expected proxy assignment, got empty proxy_url")
+	}
+	allowed := map[string]bool{
+		"http://a-proxy:8080": true,
+		"http://m-proxy:8080": true,
+		"http://z-proxy:8080": true,
+	}
+	if !allowed[a.ProxyURL] {
+		t.Fatalf("assigned proxy %q not in pool", a.ProxyURL)
+	}
+	if mode, _ := a.Metadata["proxy_assignment_mode"].(string); mode != "deterministic_pool" {
+		t.Fatalf("expected proxy_assignment_mode=deterministic_pool, got %v", a.Metadata["proxy_assignment_mode"])
+	}
+}
+
+func TestApplyDeterministicOAuthProxy_IsStableForSameAuth(t *testing.T) {
+	cfg := &config.Config{OAuthProxyPool: map[string]string{"copilot": "http://b:8080,http://a:8080"}}
+	a1 := &coreauth.Auth{ID: "copilot-a.json", Provider: "copilot"}
+	a2 := &coreauth.Auth{ID: "copilot-a.json", Provider: "copilot"}
+	applyDeterministicOAuthProxy(cfg, a1)
+	applyDeterministicOAuthProxy(cfg, a2)
+	if a1.ProxyURL == "" || a2.ProxyURL == "" {
+		t.Fatalf("expected both proxies assigned")
+	}
+	if a1.ProxyURL != a2.ProxyURL {
+		t.Fatalf("expected stable deterministic assignment, got %q vs %q", a1.ProxyURL, a2.ProxyURL)
+	}
+}
+
 func TestFileSynthesizer_Synthesize_PrefixValidation(t *testing.T) {
 	tests := []struct {
 		name       string
