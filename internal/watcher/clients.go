@@ -263,18 +263,12 @@ func (w *Watcher) computePerPathUpdatesLocked(oldByID, newByID map[string]*corea
 }
 
 func authSliceToMap(auths []*coreauth.Auth) map[string]*coreauth.Auth {
-	if len(auths) == 0 {
-		return nil
-	}
 	byID := make(map[string]*coreauth.Auth, len(auths))
 	for _, a := range auths {
 		if a == nil || strings.TrimSpace(a.ID) == "" {
 			continue
 		}
 		byID[a.ID] = a
-	}
-	if len(byID) == 0 {
-		return nil
 	}
 	return byID
 }

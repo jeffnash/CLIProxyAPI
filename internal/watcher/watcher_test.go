@@ -489,17 +489,17 @@ func TestAuthSliceToMap(t *testing.T) {
 		{
 			name: "nil input",
 			in:   nil,
-			want: nil,
+			want: map[string]*coreauth.Auth{},
 		},
 		{
 			name: "empty input",
 			in:   []*coreauth.Auth{},
-			want: nil,
+			want: map[string]*coreauth.Auth{},
 		},
 		{
 			name: "filters invalid auths",
 			in:   []*coreauth.Auth{nil, empty},
-			want: nil,
+			want: map[string]*coreauth.Auth{},
 		},
 		{
 			name: "keeps valid auths",
@@ -519,8 +519,11 @@ func TestAuthSliceToMap(t *testing.T) {
 			t.Parallel()
 			got := authSliceToMap(tc.in)
 			if len(tc.want) == 0 {
-				if got != nil {
-					t.Fatalf("expected nil map, got %#v", got)
+				if got == nil {
+					t.Fatal("expected empty map, got nil")
+				}
+				if len(got) != 0 {
+					t.Fatalf("expected empty map, got %#v", got)
 				}
 				return
 			}
