@@ -96,6 +96,43 @@ func ConvertBudgetToLevel(budget int) (string, bool) {
 	}
 }
 
+// HasLevel reports whether the given target level exists in the levels slice.
+// Matching is case-insensitive with leading/trailing whitespace trimmed.
+func HasLevel(levels []string, target string) bool {
+	for _, level := range levels {
+		if strings.EqualFold(strings.TrimSpace(level), target) {
+			return true
+		}
+	}
+	return false
+}
+
+// MapToClaudeEffort maps a generic thinking level string to a Claude adaptive
+// thinking effort value (low/medium/high/max).
+//
+// supportsMax indicates whether the target model supports "max" effort.
+// Returns the mapped effort and true if the level is valid, or ("", false) otherwise.
+func MapToClaudeEffort(level string, supportsMax bool) (string, bool) {
+	level = strings.ToLower(strings.TrimSpace(level))
+	switch level {
+	case "":
+		return "", false
+	case "minimal":
+		return "low", true
+	case "low", "medium", "high":
+		return level, true
+	case "xhigh", "max":
+		if supportsMax {
+			return "max", true
+		}
+		return "high", true
+	case "auto":
+		return "high", true
+	default:
+		return "", false
+	}
+}
+
 // ModelCapability describes the thinking format support of a model.
 type ModelCapability int
 

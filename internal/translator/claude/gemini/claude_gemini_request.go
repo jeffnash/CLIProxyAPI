@@ -116,37 +116,9 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		// Include thoughts configuration for reasoning process visibility
 		// Translator only does format conversion, ApplyThinking handles model capability validation.
 		if thinkingConfig := genConfig.Get("thinkingConfig"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
-			hasLevel := func(levels []string, target string) bool {
-				for _, level := range levels {
-					if strings.EqualFold(strings.TrimSpace(level), target) {
-						return true
-					}
-				}
-				return false
-			}
 			mi := registry.LookupModelInfo(modelName, "claude")
 			supportsAdaptive := mi != nil && mi.Thinking != nil && len(mi.Thinking.Levels) > 0
-			supportsMax := supportsAdaptive && hasLevel(mi.Thinking.Levels, "max")
-			mapToEffort := func(level string) (string, bool) {
-				level = strings.ToLower(strings.TrimSpace(level))
-				switch level {
-				case "":
-					return "", false
-				case "minimal":
-					return "low", true
-				case "low", "medium", "high":
-					return level, true
-				case "xhigh", "max":
-					if supportsMax {
-						return "max", true
-					}
-					return "high", true
-				case "auto":
-					return "high", true
-				default:
-					return "", false
-				}
-			}
+			supportsMax := supportsAdaptive && thinking.HasLevel(mi.Thinking.Levels, string(thinking.LevelMax))
 
 			thinkingLevel := thinkingConfig.Get("thinkingLevel")
 			if !thinkingLevel.Exists() {
@@ -162,7 +134,7 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						out, _ = sjson.Delete(out, "thinking.budget_tokens")
 						out, _ = sjson.Delete(out, "output_config.effort")
 					default:
-						effort, ok := mapToEffort(level)
+						effort, ok := thinking.MapToClaudeEffort(level, supportsMax)
 						if ok {
 							out, _ = sjson.Set(out, "thinking.type", "adaptive")
 							out, _ = sjson.Delete(out, "thinking.budget_tokens")
@@ -201,7 +173,7 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						default:
 							level, ok := thinking.ConvertBudgetToLevel(budget)
 							if ok {
-								effort, ok := mapToEffort(level)
+								effort, ok := thinking.MapToClaudeEffort(level, supportsMax)
 								if ok {
 									out, _ = sjson.Set(out, "thinking.type", "adaptive")
 									out, _ = sjson.Delete(out, "thinking.budget_tokens")

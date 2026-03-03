@@ -69,17 +69,9 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	if v := root.Get("reasoning_effort"); v.Exists() {
 		effort := strings.ToLower(strings.TrimSpace(v.String()))
 		if effort != "" {
-			hasLevel := func(levels []string, target string) bool {
-				for _, level := range levels {
-					if strings.EqualFold(strings.TrimSpace(level), target) {
-						return true
-					}
-				}
-				return false
-			}
 			mi := registry.LookupModelInfo(modelName, "claude")
 			supportsAdaptive := mi != nil && mi.Thinking != nil && len(mi.Thinking.Levels) > 0
-			supportsMax := supportsAdaptive && hasLevel(mi.Thinking.Levels, "max")
+			supportsMax := supportsAdaptive && thinking.HasLevel(mi.Thinking.Levels, string(thinking.LevelMax))
 
 			// Claude 4.6 supports adaptive thinking with output_config.effort.
 			if supportsAdaptive {
@@ -94,19 +86,8 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					out, _ = sjson.Delete(out, "output_config.effort")
 				default:
 					// Map non-Claude effort levels into Claude 4.6 effort vocabulary.
-					switch effort {
-					case "minimal":
-						effort = "low"
-					case "xhigh":
-						if supportsMax {
-							effort = "max"
-						} else {
-							effort = "high"
-						}
-					case "max":
-						if !supportsMax {
-							effort = "high"
-						}
+					if mapped, ok := thinking.MapToClaudeEffort(effort, supportsMax); ok {
+						effort = mapped
 					}
 					out, _ = sjson.Set(out, "thinking.type", "adaptive")
 					out, _ = sjson.Delete(out, "thinking.budget_tokens")
