@@ -120,6 +120,8 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 			supportsAdaptive := mi != nil && mi.Thinking != nil && len(mi.Thinking.Levels) > 0
 			supportsMax := supportsAdaptive && thinking.HasLevel(mi.Thinking.Levels, string(thinking.LevelMax))
 
+			// MapToClaudeEffort normalizes levels (e.g. minimal→low, xhigh→high) to avoid
+			// validation errors since validate treats same-provider unsupported levels as errors.
 			thinkingLevel := thinkingConfig.Get("thinkingLevel")
 			if !thinkingLevel.Exists() {
 				thinkingLevel = thinkingConfig.Get("thinking_level")
@@ -134,12 +136,12 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						out, _ = sjson.Delete(out, "thinking.budget_tokens")
 						out, _ = sjson.Delete(out, "output_config.effort")
 					default:
-						effort, ok := thinking.MapToClaudeEffort(level, supportsMax)
-						if ok {
-							out, _ = sjson.Set(out, "thinking.type", "adaptive")
-							out, _ = sjson.Delete(out, "thinking.budget_tokens")
-							out, _ = sjson.Set(out, "output_config.effort", effort)
+						if mapped, ok := thinking.MapToClaudeEffort(level, supportsMax); ok {
+							level = mapped
 						}
+						out, _ = sjson.Set(out, "thinking.type", "adaptive")
+						out, _ = sjson.Delete(out, "thinking.budget_tokens")
+						out, _ = sjson.Set(out, "output_config.effort", level)
 					}
 				} else {
 					switch level {
@@ -173,12 +175,12 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						default:
 							level, ok := thinking.ConvertBudgetToLevel(budget)
 							if ok {
-								effort, ok := thinking.MapToClaudeEffort(level, supportsMax)
-								if ok {
-									out, _ = sjson.Set(out, "thinking.type", "adaptive")
-									out, _ = sjson.Delete(out, "thinking.budget_tokens")
-									out, _ = sjson.Set(out, "output_config.effort", effort)
+								if mapped, okM := thinking.MapToClaudeEffort(level, supportsMax); okM {
+									level = mapped
 								}
+								out, _ = sjson.Set(out, "thinking.type", "adaptive")
+								out, _ = sjson.Delete(out, "thinking.budget_tokens")
+								out, _ = sjson.Set(out, "output_config.effort", level)
 							}
 						}
 					} else {

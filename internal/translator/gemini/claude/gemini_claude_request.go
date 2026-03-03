@@ -164,19 +164,15 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			}
 		case "adaptive", "auto":
 			// For adaptive thinking:
-			// - If output_config.effort is explicitly present, map it to thinkingLevel.
+			// - If output_config.effort is explicitly present, pass through as thinkingLevel.
 			// - Otherwise, treat it as "enabled with target-model maximum" and emit thinkingBudget=max.
+			// ApplyThinking handles clamping to target model's supported levels.
 			effort := ""
 			if v := gjson.GetBytes(rawJSON, "output_config.effort"); v.Exists() && v.Type == gjson.String {
 				effort = strings.ToLower(strings.TrimSpace(v.String()))
 			}
 			if effort != "" {
-				level := effort
-				switch level {
-				case "xhigh", "max":
-					level = "high"
-				}
-				out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingLevel", level)
+				out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingLevel", effort)
 			} else {
 				maxBudget := 0
 				if mi := registry.LookupModelInfo(modelName, "gemini"); mi != nil && mi.Thinking != nil {

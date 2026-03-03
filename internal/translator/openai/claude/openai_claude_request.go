@@ -77,19 +77,14 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				}
 			case "adaptive", "auto":
 				// Adaptive thinking can carry an explicit effort in output_config.effort (Claude 4.6).
-				// Preserve it when present; otherwise keep the previous "max capacity" sentinel.
+				// Pass through directly; ApplyThinking handles clamping to target model's levels.
 				effort := ""
 				if v := root.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
 					effort = strings.ToLower(strings.TrimSpace(v.String()))
 				}
-				switch effort {
-				case "minimal", "low", "medium", "high":
+				if effort != "" {
 					out, _ = sjson.Set(out, "reasoning_effort", effort)
-				case "max":
-					out, _ = sjson.Set(out, "reasoning_effort", string(thinking.LevelXHigh))
-				default:
-					// Keep adaptive/auto as a high level sentinel; ApplyThinking resolves it
-					// to model-specific max capability.
+				} else {
 					out, _ = sjson.Set(out, "reasoning_effort", string(thinking.LevelXHigh))
 				}
 			case "disabled":
