@@ -238,7 +238,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				effort = strings.ToLower(strings.TrimSpace(v.String()))
 			}
 			switch effort {
-			case "low", "medium", "high":
+			case "minimal", "low", "medium", "high":
 				reasoningEffort = effort
 			case "max":
 				reasoningEffort = string(thinking.LevelXHigh)

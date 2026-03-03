@@ -83,7 +83,7 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 					effort = strings.ToLower(strings.TrimSpace(v.String()))
 				}
 				switch effort {
-				case "low", "medium", "high":
+				case "minimal", "low", "medium", "high":
 					out, _ = sjson.Set(out, "reasoning_effort", effort)
 				case "max":
 					out, _ = sjson.Set(out, "reasoning_effort", string(thinking.LevelXHigh))

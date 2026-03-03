@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -151,7 +152,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		}
 	}
 
-	// Map Anthropic thinking -> Gemini thinkingBudget/include_thoughts when enabled
+	// Map Anthropic thinking -> Gemini thinking config when enabled
 	// Translator only does format conversion, ApplyThinking handles model capability validation.
 	if t := gjson.GetBytes(rawJSON, "thinking"); t.Exists() && t.IsObject() {
 		switch t.Get("type").String() {
@@ -162,9 +163,31 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				out, _ = sjson.Set(out, "generationConfig.thinkingConfig.includeThoughts", true)
 			}
 		case "adaptive", "auto":
-			// Keep adaptive/auto as a high level sentinel; ApplyThinking resolves it
-			// to model-specific max capability.
-			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingLevel", "high")
+			// For adaptive thinking:
+			// - If output_config.effort is explicitly present, map it to thinkingLevel.
+			// - Otherwise, treat it as "enabled with target-model maximum" and emit thinkingBudget=max.
+			effort := ""
+			if v := gjson.GetBytes(rawJSON, "output_config.effort"); v.Exists() && v.Type == gjson.String {
+				effort = strings.ToLower(strings.TrimSpace(v.String()))
+			}
+			if effort != "" {
+				level := effort
+				switch level {
+				case "xhigh", "max":
+					level = "high"
+				}
+				out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingLevel", level)
+			} else {
+				maxBudget := 0
+				if mi := registry.LookupModelInfo(modelName, "gemini"); mi != nil && mi.Thinking != nil {
+					maxBudget = mi.Thinking.Max
+				}
+				if maxBudget > 0 {
+					out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingBudget", maxBudget)
+				} else {
+					out, _ = sjson.Set(out, "generationConfig.thinkingConfig.thinkingLevel", "high")
+				}
+			}
 			out, _ = sjson.Set(out, "generationConfig.thinkingConfig.includeThoughts", true)
 		}
 	}
