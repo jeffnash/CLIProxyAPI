@@ -231,9 +231,17 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				}
 			}
 		case "adaptive", "auto":
-			// Claude adaptive/auto means "enable with max capacity"; keep it as highest level
-			// and let ApplyThinking normalize per target model capability.
-			reasoningEffort = string(thinking.LevelXHigh)
+			// Adaptive thinking can carry an explicit effort in output_config.effort (Claude 4.6).
+			// Pass through directly; ApplyThinking handles clamping to target model's levels.
+			effort := ""
+			if v := rootResult.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
+				effort = strings.ToLower(strings.TrimSpace(v.String()))
+			}
+			if effort != "" {
+				reasoningEffort = effort
+			} else {
+				reasoningEffort = string(thinking.LevelXHigh)
+			}
 		case "disabled":
 			if effort, ok := thinking.ConvertBudgetToLevel(0); ok && effort != "" {
 				reasoningEffort = effort
