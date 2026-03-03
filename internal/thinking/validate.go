@@ -335,18 +335,11 @@ func normalizeLevels(levels []string) []string {
 	return out
 }
 
-func isBudgetBasedProvider(provider string) bool {
+// isBudgetCapableProvider returns true if the provider supports budget-based thinking.
+// These providers may also support level-based thinking (hybrid models).
+func isBudgetCapableProvider(provider string) bool {
 	switch provider {
 	case "gemini", "gemini-cli", "antigravity", "claude":
-		return true
-	default:
-		return false
-	}
-}
-
-func isLevelBasedProvider(provider string) bool {
-	switch provider {
-	case "openai", "openai-response", "codex":
 		return true
 	default:
 		return false

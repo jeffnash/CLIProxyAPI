@@ -293,7 +293,7 @@ func normalizeUserDefinedConfig(config ThinkingConfig, fromFormat, toFormat stri
 	if config.Mode != ModeLevel {
 		return config
 	}
-	if !isBudgetBasedProvider(toFormat) || !isLevelBasedProvider(fromFormat) {
+	if !isBudgetCapableProvider(toFormat) {
 		return config
 	}
 	budget, ok := ConvertLevelToBudget(string(config.Level))
