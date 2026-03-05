@@ -35,6 +35,10 @@ type Watcher struct {
 	clientsMutex      sync.RWMutex
 	configReloadMu    sync.Mutex
 	configReloadTimer *time.Timer
+	serverUpdateMu    sync.Mutex
+	serverUpdateTimer *time.Timer
+	serverUpdateLast  time.Time
+	serverUpdatePend  bool
 	reloadCallback    func(*config.Config)
 	watcher           *fsnotify.Watcher
 	lastAuthHashes    map[string]string
@@ -76,6 +80,7 @@ const (
 	replaceCheckDelay        = 50 * time.Millisecond
 	configReloadDebounce     = 150 * time.Millisecond
 	authRemoveDebounceWindow = 1 * time.Second
+	serverUpdateDebounce     = 1 * time.Second
 )
 
 // NewWatcher creates a new file watcher instance
@@ -116,6 +121,7 @@ func (w *Watcher) Start(ctx context.Context) error {
 func (w *Watcher) Stop() error {
 	w.stopDispatch()
 	w.stopConfigReloadTimer()
+	w.stopServerUpdateTimer()
 	return w.watcher.Close()
 }
 
