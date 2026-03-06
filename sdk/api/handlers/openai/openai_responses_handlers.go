@@ -362,7 +362,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			if errMsg.Error != nil && errMsg.Error.Error() != "" {
 				errText = errMsg.Error.Error()
 			}
-			body := handlers.BuildErrorResponseBody(status, errText)
+			body := handlers.BuildOpenAIResponsesStreamErrorChunk(status, errText, 0)
 			// Write error as a well-formed SSE event without emitting a leading delimiter that could
 			// be interpreted as an empty event by downstream clients.
 			writeState.writeChunk(c.Writer, []byte("event: error\ndata: "+string(body)))

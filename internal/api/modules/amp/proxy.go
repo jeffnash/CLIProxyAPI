@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -76,6 +77,9 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 		req.Header.Del("Authorization")
 		req.Header.Del("X-Api-Key")
 		req.Header.Del("X-Goog-Api-Key")
+
+		// Remove proxy, client identity, and browser fingerprint headers
+		misc.ScrubProxyAndFingerprintHeaders(req)
 
 		// Remove query-based credentials if they match the authenticated client API key.
 		// This prevents leaking client auth material to the Amp upstream while avoiding
@@ -216,7 +220,7 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 		return nil
 	}
 
-	// Error handler for proxy failures with detailed error classification for diagnostics
+	// Error handler for proxy failures with detailed error classification for diagnostics.
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		// Classify the error type for better diagnostics
 		var errType string
@@ -232,13 +236,12 @@ func createReverseProxy(upstreamURL string, secretSource SecretSource) (*httputi
 			errType = "connection_error"
 		}
 
-		// Don't log as error for context canceled - it's usually client closing connection
+		// Client-side cancellations are common during polling or disconnects.
 		if errors.Is(err, context.Canceled) {
 			log.Debugf("amp upstream proxy [%s]: client canceled request for %s %s", errType, req.Method, req.URL.Path)
-		} else {
-			log.Errorf("amp upstream proxy error [%s] for %s %s: %v", errType, req.Method, req.URL.Path, err)
+			return
 		}
-
+		log.Errorf("amp upstream proxy error [%s] for %s %s: %v", errType, req.Method, req.URL.Path, err)
 		rw.Header().Set("Content-Type", "application/json")
 		rw.WriteHeader(http.StatusBadGateway)
 		_, _ = rw.Write([]byte(`{"error":"amp_upstream_proxy_error","message":"Failed to reach Amp upstream"}`))

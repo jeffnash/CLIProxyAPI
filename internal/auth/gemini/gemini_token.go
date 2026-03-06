@@ -33,12 +33,22 @@ type GeminiTokenStorage struct {
 
 	// Type indicates the authentication provider type, always "gemini" for this storage.
 	Type string `json:"type"`
+
+	// Metadata holds arbitrary key-value pairs injected via hooks.
+	// It is not exported to JSON directly to allow flattening during serialization.
+	Metadata map[string]any `json:"-"`
+}
+
+// SetMetadata allows external callers to inject metadata into the storage before saving.
+func (ts *GeminiTokenStorage) SetMetadata(meta map[string]any) {
+	ts.Metadata = meta
 }
 
 // SaveTokenToFile serializes the Gemini token storage to a JSON file.
 // This method creates the necessary directory structure and writes the token
 // data in JSON format to the specified file path for persistent storage.
-// Uses atomic write to prevent race conditions with file watchers.
+// It merges any injected metadata into the top-level JSON object and uses
+// atomic writes to avoid watcher races.
 //
 // Parameters:
 //   - authFilePath: The full path where the token file should be saved
@@ -49,17 +59,20 @@ func (ts *GeminiTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "gemini"
 
-	data, err := json.Marshal(ts)
+	// Merge metadata using helper
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return fmt.Errorf("failed to merge metadata: %w", errMerge)
+	}
+
+	raw, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal token: %w", err)
 	}
+	raw = append(raw, '\n')
 
-	// Append newline for consistency with encoder behavior
-	data = append(data, '\n')
-
-	// Use atomic write to prevent race conditions with file watcher
-	if err = util.AtomicWriteFile(authFilePath, data, 0o600); err != nil {
-		return fmt.Errorf("failed to write token file: %w", err)
+	if err = util.AtomicWriteFile(authFilePath, raw, 0o600); err != nil {
+		return fmt.Errorf("failed to write token to file: %w", err)
 	}
 	return nil
 }
