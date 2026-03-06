@@ -377,6 +377,18 @@ func resolveCopilotAlias(modelName string) (baseModel, effort string, ok bool) {
 		return "gpt-5.2", "xhigh", true
 	}
 
+	// gpt-5.4 variants (supports xhigh)
+	switch m {
+	case "gpt-5.4-low":
+		return "gpt-5.4", "low", true
+	case "gpt-5.4-medium":
+		return "gpt-5.4", "medium", true
+	case "gpt-5.4-high":
+		return "gpt-5.4", "high", true
+	case "gpt-5.4-xhigh":
+		return "gpt-5.4", "xhigh", true
+	}
+
 	// gpt-5.1-codex-max variants (supports xhigh)
 	switch m {
 	case "gpt-5.1-codex-max-low":
@@ -459,6 +471,21 @@ func resolveCopilotAlias(modelName string) (baseModel, effort string, ok bool) {
 		return "gpt-5-mini", "medium", true
 	case "gpt-5-mini-high":
 		return "gpt-5-mini", "high", true
+	}
+
+	for _, effort := range []string{"xhigh", "high", "medium", "low", "minimal", "none"} {
+		suffix := "-" + effort
+		if !strings.HasSuffix(m, suffix) {
+			continue
+		}
+		baseModel := strings.TrimSuffix(m, suffix)
+		if !strings.HasPrefix(baseModel, "gpt-5") {
+			continue
+		}
+		if registry.LookupModelInfo(m, "copilot") == nil && registry.LookupModelInfo(m) == nil {
+			continue
+		}
+		return baseModel, effort, true
 	}
 
 	return "", "", false
