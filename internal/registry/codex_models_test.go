@@ -154,6 +154,13 @@ func TestGenerateCodexAliases_SpecificModelFamilies(t *testing.T) {
 		"codex-gpt-5.3-codex-medium",
 		"codex-gpt-5.3-codex-high",
 		"codex-gpt-5.3-codex-xhigh",
+
+		// gpt-5.4 base + effort aliases
+		"codex-gpt-5.4",
+		"codex-gpt-5.4-low",
+		"codex-gpt-5.4-medium",
+		"codex-gpt-5.4-high",
+		"codex-gpt-5.4-xhigh",
 	}
 
 	models := GetOpenAIModels()

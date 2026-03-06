@@ -129,6 +129,13 @@ func TestResolveCodexAlias(t *testing.T) {
 			wantEffort:    "xhigh",
 			wantOk:        true,
 		},
+		{
+			name:          "gpt-5.4-xhigh",
+			modelName:     "gpt-5.4-xhigh",
+			wantBaseModel: "gpt-5.4",
+			wantEffort:    "xhigh",
+			wantOk:        true,
+		},
 		// Non-alias models should return false
 		{
 			name:          "base gpt-5 (not an alias)",

@@ -127,6 +127,12 @@ func TestCodexExecutor_AliasSetsSparkModelAndEffortInUpstreamRequest(t *testing.
 			wantModel:  "gpt-5.3-codex-spark",
 			wantEffort: "low",
 		},
+		{
+			name:       "gpt-5.4-xhigh",
+			model:      "gpt-5.4-xhigh",
+			wantModel:  "gpt-5.4",
+			wantEffort: "xhigh",
+		},
 	}
 
 	opts := cliproxyexecutor.Options{

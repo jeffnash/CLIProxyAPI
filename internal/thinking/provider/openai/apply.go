@@ -40,7 +40,6 @@ func clampReasoningEffort(level string) string {
 	}).Debug("openai: reasoning_effort clamped to default value")
 	return string(thinking.LevelMedium)
 }
-
 // Applier implements thinking.ProviderApplier for OpenAI models.
 //
 // OpenAI-specific behavior:
@@ -92,7 +91,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	effort := ""
 	support := modelInfo.Thinking
 	if config.Budget == 0 {
-		if support.ZeroAllowed || hasLevel(support.Levels, string(thinking.LevelNone)) {
+		if support.ZeroAllowed || thinking.HasLevel(support.Levels, string(thinking.LevelNone)) {
 			effort = string(thinking.LevelNone)
 		}
 	}
@@ -141,15 +140,6 @@ func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig) ([]byte,
 		return body, nil
 	}
 
-	result, _ := sjson.SetBytes(body, "reasoning_effort", clampReasoningEffort(effort))
+	result, _ := sjson.SetBytes(body, "reasoning_effort", effort)
 	return result, nil
-}
-
-func hasLevel(levels []string, target string) bool {
-	for _, level := range levels {
-		if strings.EqualFold(strings.TrimSpace(level), target) {
-			return true
-		}
-	}
-	return false
 }

@@ -303,7 +303,9 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		auth.LastError = existing.LastError
 		auth.StatusMessage = existing.StatusMessage
 		auth.Quota = existing.Quota
-		auth.ModelStates = existing.ModelStates
+		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+			auth.ModelStates = existing.ModelStates
+		}
 		op = "update"
 		_, err = s.coreManager.Update(ctx, auth)
 	} else {
@@ -355,7 +357,7 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 		return
 	}
 	maxInterval := time.Duration(cfg.MaxRetryInterval) * time.Second
-	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval)
+	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
 }
 
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
@@ -909,9 +911,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "vertex":
 		// Vertex AI Gemini supports the same model identifiers as Gemini.
 		models = registry.GetGeminiVertexModels()
-		if authKind == "apikey" {
-			if entry := s.resolveConfigVertexCompatKey(a); entry != nil && len(entry.Models) > 0 {
+		if entry := s.resolveConfigVertexCompatKey(a); entry != nil {
+			if len(entry.Models) > 0 {
 				models = buildVertexCompatConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
 			}
 		}
 		models = applyExcludedModels(models, excluded)
@@ -1072,6 +1077,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			key = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
 		GlobalModelRegistry().RegisterClient(a.ID, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		if provider == "antigravity" {
+			s.backfillAntigravityModels(a, models)
+		}
 		return
 	}
 
@@ -1214,6 +1222,56 @@ func (s *Service) oauthExcludedModels(provider, authKind string) []string {
 		return nil
 	}
 	return cfg.OAuthExcludedModels[providerKey]
+}
+
+func (s *Service) backfillAntigravityModels(source *coreauth.Auth, primaryModels []*ModelInfo) {
+	if s == nil || s.coreManager == nil || len(primaryModels) == 0 {
+		return
+	}
+
+	sourceID := ""
+	if source != nil {
+		sourceID = strings.TrimSpace(source.ID)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	for _, candidate := range s.coreManager.List() {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		candidateID := strings.TrimSpace(candidate.ID)
+		if candidateID == "" || candidateID == sourceID {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "antigravity") {
+			continue
+		}
+		if len(reg.GetModelsForClient(candidateID)) > 0 {
+			continue
+		}
+
+		authKind := strings.ToLower(strings.TrimSpace(candidate.Attributes["auth_kind"]))
+		if authKind == "" {
+			if kind, _ := candidate.AccountInfo(); strings.EqualFold(kind, "api_key") {
+				authKind = "apikey"
+			}
+		}
+		excluded := s.oauthExcludedModels("antigravity", authKind)
+		if candidate.Attributes != nil {
+			if val, ok := candidate.Attributes["excluded_models"]; ok && strings.TrimSpace(val) != "" {
+				excluded = strings.Split(val, ",")
+			}
+		}
+
+		models := applyExcludedModels(primaryModels, excluded)
+		models = applyOAuthModelAlias(s.cfg, "antigravity", authKind, models)
+		if len(models) == 0 {
+			continue
+		}
+
+		reg.RegisterClient(candidateID, "antigravity", applyModelPrefixes(models, candidate.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
+		log.Debugf("antigravity models backfilled for auth %s using primary model list", candidateID)
+	}
 }
 
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {

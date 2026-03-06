@@ -20,24 +20,36 @@ type IFlowTokenStorage struct {
 	Scope        string `json:"scope"`
 	Cookie       string `json:"cookie"`
 	Type         string `json:"type"`
+
+	// Metadata holds arbitrary key-value pairs injected via hooks.
+	// It is not exported to JSON directly to allow flattening during serialization.
+	Metadata map[string]any `json:"-"`
+}
+
+// SetMetadata allows external callers to inject metadata into the storage before saving.
+func (ts *IFlowTokenStorage) SetMetadata(meta map[string]any) {
+	ts.Metadata = meta
 }
 
 // SaveTokenToFile serialises the token storage to disk.
-// Uses atomic write to prevent race conditions with file watchers.
+// It flattens injected metadata into the top-level JSON and uses atomic writes.
 func (ts *IFlowTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "iflow"
 
-	data, err := json.Marshal(ts)
+	// Merge metadata using helper
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return fmt.Errorf("failed to merge metadata: %w", errMerge)
+	}
+
+	raw, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("iflow token: marshal failed: %w", err)
 	}
+	raw = append(raw, '\n')
 
-	// Append newline for consistency with encoder behavior
-	data = append(data, '\n')
-
-	// Use atomic write to prevent race conditions with file watcher
-	if err = util.AtomicWriteFile(authFilePath, data, 0o600); err != nil {
+	if err = util.AtomicWriteFile(authFilePath, raw, 0o600); err != nil {
 		return fmt.Errorf("iflow token: write file failed: %w", err)
 	}
 	return nil
