@@ -195,6 +195,11 @@ type PassthruRoute struct {
 	// APIKey is the upstream credential (optional if Headers provides auth).
 	APIKey string `yaml:"api-key,omitempty" json:"api-key,omitempty"`
 
+	// APIKeys is an array of upstream credentials that support fallback.
+	// When one key fails (e.g., 429 or other errors), the system will try the next key.
+	// If APIKey is also provided, it is treated as the first element in this list.
+	APIKeys []string `yaml:"api-keys,omitempty" json:"api-keys,omitempty"`
+
 	// ProxyURL optionally overrides the global proxy for this passthru route.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 
