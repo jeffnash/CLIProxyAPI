@@ -434,12 +434,19 @@ nonstream-keepalive-interval: 0
 #     protocol: "openai"
 #     base-url: "https://api.z.ai/v1"
 #     api-key: "za-..."
+#     # api-keys support multiple API keys for fallback (when one is rate-limited or fails)
+#     # If api-key is also provided, it is treated as the first key in the fallback list
+#     # api-keys:
+#     #   - "za-..."
+#     #   - "za-backup-..."
 #     upstream-model: "glm-4.7"
 #     headers:
 #       X-Custom-Header: "custom-value"
 #
-# Railway-friendly env var:
+# Railway-friendly env var (supports both api-key and api-keys):
 #   PASSTHRU_MODELS_JSON='[{"model":"glm-4.7","protocol":"openai","base-url":"https://api.z.ai/v1","api-key":"za-...","upstream-model":"glm-4.7","proxy-url":"socks5://proxy.example.com:1080","headers":{"X-Custom-Header":"custom-value"}}]'
+# For multiple API keys (fallback support):
+#   PASSTHRU_MODELS_JSON='[{"model":"glm-4.7","protocol":"openai","base-url":"https://api.z.ai/v1","api-keys":["za-primary","za-backup"],"upstream-model":"glm-4.7"}]'
 #
 #   default: # Default rules only set parameters when they are missing in the payload.
 #     - models:
