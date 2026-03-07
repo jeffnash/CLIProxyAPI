@@ -1138,7 +1138,7 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 			result["max_completion_tokens"] = model.MaxCompletionTokens
 		}
 		if len(model.SupportedParameters) > 0 {
-			result["supported_parameters"] = model.SupportedParameters
+			result["supported_parameters"] = append([]string(nil), model.SupportedParameters...)
 		}
 		return result
 
@@ -1182,13 +1182,13 @@ func (r *ModelRegistry) convertModelToMap(model *ModelInfo, handlerType string) 
 			result["outputTokenLimit"] = model.OutputTokenLimit
 		}
 		if len(model.SupportedGenerationMethods) > 0 {
-			result["supportedGenerationMethods"] = model.SupportedGenerationMethods
+			result["supportedGenerationMethods"] = append([]string(nil), model.SupportedGenerationMethods...)
 		}
 		if len(model.SupportedInputModalities) > 0 {
-			result["supportedInputModalities"] = model.SupportedInputModalities
+			result["supportedInputModalities"] = append([]string(nil), model.SupportedInputModalities...)
 		}
 		if len(model.SupportedOutputModalities) > 0 {
-			result["supportedOutputModalities"] = model.SupportedOutputModalities
+			result["supportedOutputModalities"] = append([]string(nil), model.SupportedOutputModalities...)
 		}
 		return result
 
