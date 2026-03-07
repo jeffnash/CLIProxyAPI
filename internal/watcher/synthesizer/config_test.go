@@ -1,6 +1,7 @@
 package synthesizer
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -473,6 +474,195 @@ func TestConfigSynthesizer_PassthruRoutes_RateLimitOmitted(t *testing.T) {
 	// Metadata should be nil when no rate-limit is configured
 	if a.Metadata != nil {
 		t.Errorf("expected nil Metadata when no rate-limit, got %v", a.Metadata)
+	}
+}
+
+// TestConfigSynthesizer_PassthruRoutes_SingleAPIKey creates one auth from APIKey field
+func TestConfigSynthesizer_PassthruRoutes_SingleAPIKey(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:    "test-model",
+					Protocol: "openai",
+					BaseURL:  "https://api.example.com/v1",
+					APIKey:   "single-key",
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+
+	a := auths[0]
+	if a.Attributes["api_key"] != "single-key" {
+		t.Errorf("expected api_key single-key, got %s", a.Attributes["api_key"])
+	}
+	if a.Attributes["passthru_key_index"] != "0" {
+		t.Errorf("expected passthru_key_index 0, got %s", a.Attributes["passthru_key_index"])
+	}
+	if a.Attributes["passthru_total_keys"] != "1" {
+		t.Errorf("expected passthru_total_keys 1, got %s", a.Attributes["passthru_total_keys"])
+	}
+}
+
+// TestConfigSynthesizer_PassthruRoutes_MultipleAPIKeys creates multiple auths for fallback
+func TestConfigSynthesizer_PassthruRoutes_MultipleAPIKeys(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:    "test-model",
+					Protocol: "openai",
+					BaseURL:  "https://api.example.com/v1",
+					APIKeys:  []string{"key-1", "key-2", "key-3"},
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 3 {
+		t.Fatalf("expected 3 auths, got %d", len(auths))
+	}
+
+	expectedKeys := []string{"key-1", "key-2", "key-3"}
+	for i, a := range auths {
+		if a.Attributes["api_key"] != expectedKeys[i] {
+			t.Errorf("auth[%d]: expected api_key %s, got %s", i, expectedKeys[i], a.Attributes["api_key"])
+		}
+		if a.Attributes["passthru_key_index"] != fmt.Sprintf("%d", i) {
+			t.Errorf("auth[%d]: expected passthru_key_index %d, got %s", i, i, a.Attributes["passthru_key_index"])
+		}
+		if a.Attributes["passthru_total_keys"] != "3" {
+			t.Errorf("auth[%d]: expected passthru_total_keys 3, got %s", i, a.Attributes["passthru_total_keys"])
+		}
+	}
+}
+
+// TestConfigSynthesizer_PassthruRoutes_APIKeyAndAPIKeysMerged combines both fields
+func TestConfigSynthesizer_PassthruRoutes_APIKeyAndAPIKeysMerged(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:    "test-model",
+					Protocol: "openai",
+					BaseURL:  "https://api.example.com/v1",
+					APIKey:   "primary-key",
+					APIKeys:  []string{"backup-1", "backup-2"},
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 3 {
+		t.Fatalf("expected 3 auths (1 from APIKey + 2 from APIKeys), got %d", len(auths))
+	}
+
+	// Primary key (from APIKey field) should be first
+	if auths[0].Attributes["api_key"] != "primary-key" {
+		t.Errorf("expected first key to be primary-key, got %s", auths[0].Attributes["api_key"])
+	}
+	if auths[1].Attributes["api_key"] != "backup-1" {
+		t.Errorf("expected second key to be backup-1, got %s", auths[1].Attributes["api_key"])
+	}
+	if auths[2].Attributes["api_key"] != "backup-2" {
+		t.Errorf("expected third key to be backup-2, got %s", auths[2].Attributes["api_key"])
+	}
+}
+
+// TestConfigSynthesizer_PassthruRoutes_DeduplicatesAPIKeys removes duplicates
+func TestConfigSynthesizer_PassthruRoutes_DeduplicatesAPIKeys(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:   "test-model",
+					BaseURL: "https://api.example.com/v1",
+					// APIKey duplicates one in APIKeys - should only appear once
+					APIKey:  "shared-key",
+					APIKeys: []string{"shared-key", "unique-key"},
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("expected 2 auths (duplicate removed), got %d", len(auths))
+	}
+
+	expectedKeys := []string{"shared-key", "unique-key"}
+	for i, a := range auths {
+		if a.Attributes["api_key"] != expectedKeys[i] {
+			t.Errorf("auth[%d]: expected api_key %s, got %s", i, expectedKeys[i], a.Attributes["api_key"])
+		}
+	}
+}
+
+// TestConfigSynthesizer_PassthruRoutes_NoAPIKey creates single auth without api_key
+func TestConfigSynthesizer_PassthruRoutes_NoAPIKey(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:    "test-model",
+					Protocol: "openai",
+					BaseURL:  "https://api.example.com/v1",
+					// No APIKey or APIKeys - for auth via headers
+					Headers:  map[string]string{"Authorization": "Bearer token"},
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth (empty key placeholder), got %d", len(auths))
+	}
+
+	a := auths[0]
+	// api_key should not be set
+	if _, ok := a.Attributes["api_key"]; ok {
+		t.Errorf("expected no api_key attribute, got %s", a.Attributes["api_key"])
+	}
+	if a.Attributes["passthru_total_keys"] != "1" {
+		t.Errorf("expected passthru_total_keys 1, got %s", a.Attributes["passthru_total_keys"])
 	}
 }
 

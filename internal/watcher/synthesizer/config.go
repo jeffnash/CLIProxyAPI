@@ -72,90 +72,118 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 		if base == "" {
 			continue
 		}
-		apiKey := strings.TrimSpace(r.APIKey)
 		proxyURL := strings.TrimSpace(r.ProxyURL)
 		upstreamModel := strings.TrimSpace(r.UpstreamModel)
 
-		idKind := fmt.Sprintf("passthru:%s", protocol)
-		id, token := idGen.Next(idKind, routingModel, base, upstreamModel, proxyURL)
-		attrs := map[string]string{
-			"source":              fmt.Sprintf("config:passthru[%s]", token),
-			"base_url":            base,
-			"passthru":            "true",
-			"passthru_model":      model,
-			"passthru_routing_name": routingModel,
-		}
-		if apiKey != "" {
-			attrs["api_key"] = apiKey
-		}
-		// Ensure upstream_model is set so executors know which model to send upstream.
-		// Priority: explicit UpstreamModel > Model (when routing name differs) > unset
-		if upstreamModel != "" {
-			attrs["upstream_model"] = upstreamModel
-		} else if routingModel != model {
-			// When routing name differs from model, use the original model as upstream
-			attrs["upstream_model"] = model
-		}
-		// Add context window and max tokens for /v1/models metadata
-		if r.ContextWindow > 0 {
-			attrs["context_window"] = fmt.Sprintf("%d", r.ContextWindow)
-		}
-		if r.MaxTokens > 0 {
-			attrs["max_tokens"] = fmt.Sprintf("%d", r.MaxTokens)
-		}
-		// Store model override as JSON for model registration to apply
-		if r.ModelOverride != nil {
-			if overrideJSON, err := json.Marshal(r.ModelOverride); err == nil {
-				attrs["model_override"] = string(overrideJSON)
-			}
-		}
-		addConfigHeadersToAttrs(r.Headers, attrs)
+		// Collect all unique API keys for fallback support
+		// APIKey (single) comes first, then APIKeys array elements
+		apiKeys := make([]string, 0)
+		seenKeys := make(map[string]bool)
 
-		providerName := protocol
-		// Map protocol to existing executor provider identifiers.
-		// - openai -> openai compat executor
-		// - claude -> claude executor
-		// - codex -> codex executor
-		switch protocol {
-		case "openai", "openai-chat", "openai_compat", "openai-compat", "openai-compatibility":
-			providerName = "openai-compatibility"
-			attrs["provider_key"] = "openai-compatibility"
-		case "claude":
-			providerName = "claude"
-		case "codex", "responses":
-			providerName = "codex"
-		default:
-			// Unknown protocol: default to openai-compatible executor.
-			providerName = "openai-compatibility"
-			attrs["provider_key"] = "openai-compatibility"
+		singleKey := strings.TrimSpace(r.APIKey)
+		if singleKey != "" {
+			apiKeys = append(apiKeys, singleKey)
+			seenKeys[singleKey] = true
+		}
+		for _, key := range r.APIKeys {
+			trimmedKey := strings.TrimSpace(key)
+			if trimmedKey != "" && !seenKeys[trimmedKey] {
+				apiKeys = append(apiKeys, trimmedKey)
+				seenKeys[trimmedKey] = true
+			}
 		}
 
-		a := &coreauth.Auth{
-			ID:         id,
-			Provider:   providerName,
-			Label:      fmt.Sprintf("passthru:%s", routingModel),
-			Prefix:     "",
-			Status:     coreauth.StatusActive,
-			ProxyURL:   proxyURL,
-			Attributes: attrs,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+		// If no API keys provided, create a single auth entry with no api_key
+		if len(apiKeys) == 0 {
+			apiKeys = append(apiKeys, "")
 		}
-		// Populate auth Metadata from rate-limit config so the conductor's
-		// per-auth override system (RequestRetryOverride, DisableCoolingOverride) applies.
-		if r.RateLimit != nil {
-			if a.Metadata == nil {
-				a.Metadata = make(map[string]any)
+
+		// Create one Auth entry per API key for fallback support
+		for keyIndex, apiKey := range apiKeys {
+			idKind := fmt.Sprintf("passthru:%s", protocol)
+			// Include key index in ID generation to ensure unique IDs per key
+			id, token := idGen.Next(idKind, routingModel, base, upstreamModel, proxyURL, fmt.Sprintf("key:%d", keyIndex))
+			attrs := map[string]string{
+				"source":                 fmt.Sprintf("config:passthru[%s]", token),
+				"base_url":               base,
+				"passthru":               "true",
+				"passthru_model":         model,
+				"passthru_routing_name":  routingModel,
+				"passthru_key_index":     fmt.Sprintf("%d", keyIndex),
+				"passthru_total_keys":    fmt.Sprintf("%d", len(apiKeys)),
 			}
-			if r.RateLimit.RequestRetry != nil {
-				a.Metadata["request_retry"] = *r.RateLimit.RequestRetry
+			if apiKey != "" {
+				attrs["api_key"] = apiKey
 			}
-			if r.RateLimit.DisableCooling != nil {
-				a.Metadata["disable_cooling"] = *r.RateLimit.DisableCooling
+			// Ensure upstream_model is set so executors know which model to send upstream.
+			// Priority: explicit UpstreamModel > Model (when routing name differs) > unset
+			if upstreamModel != "" {
+				attrs["upstream_model"] = upstreamModel
+			} else if routingModel != model {
+				// When routing name differs from model, use the original model as upstream
+				attrs["upstream_model"] = model
 			}
+			// Add context window and max tokens for /v1/models metadata
+			if r.ContextWindow > 0 {
+				attrs["context_window"] = fmt.Sprintf("%d", r.ContextWindow)
+			}
+			if r.MaxTokens > 0 {
+				attrs["max_tokens"] = fmt.Sprintf("%d", r.MaxTokens)
+			}
+			// Store model override as JSON for model registration to apply
+			if r.ModelOverride != nil {
+				if overrideJSON, err := json.Marshal(r.ModelOverride); err == nil {
+					attrs["model_override"] = string(overrideJSON)
+				}
+			}
+			addConfigHeadersToAttrs(r.Headers, attrs)
+
+			providerName := protocol
+			// Map protocol to existing executor provider identifiers.
+			// - openai -> openai compat executor
+			// - claude -> claude executor
+			// - codex -> codex executor
+			switch protocol {
+			case "openai", "openai-chat", "openai_compat", "openai-compat", "openai-compatibility":
+				providerName = "openai-compatibility"
+				attrs["provider_key"] = "openai-compatibility"
+			case "claude":
+				providerName = "claude"
+			case "codex", "responses":
+				providerName = "codex"
+			default:
+				// Unknown protocol: default to openai-compatible executor.
+				providerName = "openai-compatibility"
+				attrs["provider_key"] = "openai-compatibility"
+			}
+
+			a := &coreauth.Auth{
+				ID:         id,
+				Provider:   providerName,
+				Label:      fmt.Sprintf("passthru:%s", routingModel),
+				Prefix:     "",
+				Status:     coreauth.StatusActive,
+				ProxyURL:   proxyURL,
+				Attributes: attrs,
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			}
+			// Populate auth Metadata from rate-limit config so the conductor's
+			// per-auth override system (RequestRetryOverride, DisableCoolingOverride) applies.
+			if r.RateLimit != nil {
+				if a.Metadata == nil {
+					a.Metadata = make(map[string]any)
+				}
+				if r.RateLimit.RequestRetry != nil {
+					a.Metadata["request_retry"] = *r.RateLimit.RequestRetry
+				}
+				if r.RateLimit.DisableCooling != nil {
+					a.Metadata["disable_cooling"] = *r.RateLimit.DisableCooling
+				}
+			}
+			ApplyAuthExcludedModelsMeta(a, cfg, nil, "passthru")
+			out = append(out, a)
 		}
-		ApplyAuthExcludedModelsMeta(a, cfg, nil, "passthru")
-		out = append(out, a)
 	}
 	return out
 }

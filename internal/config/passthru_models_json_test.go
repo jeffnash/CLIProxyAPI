@@ -120,3 +120,114 @@ func TestLoadConfigOptional_PassthruModelsJSON_InvalidJSON_NonOptionalErrors(t *
 		t.Fatal("expected error for invalid PASSTHRU_MODELS_JSON")
 	}
 }
+
+func TestLoadConfigOptional_PassthruModelsJSON_ApiKeysArray_MergesRoutes(t *testing.T) {
+	// Ensure env var is cleared after test
+	old := os.Getenv("PASSTHRU_MODELS_JSON")
+	t.Cleanup(func() {
+		_ = os.Setenv("PASSTHRU_MODELS_JSON", old)
+	})
+
+	// Minimal config file content (no passthru routes defined in file)
+	tmp := t.TempDir()
+	path := tmp + "/config.yaml"
+	cfgYAML := []byte("port: 8317\n")
+	if err := os.WriteFile(path, cfgYAML, 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	// Provide routes via env with api-keys array for fallback support
+	jsonValue := `[
+  {
+    "model": "gpt-4",
+    "protocol": "openai",
+    "base-url": "https://api.example.com/v1",
+    "api-keys": ["key-primary", "key-backup-1", "key-backup-2"],
+    "upstream-model": "gpt-4-turbo"
+  }
+]`
+	if err := os.Setenv("PASSTHRU_MODELS_JSON", jsonValue); err != nil {
+		t.Fatalf("failed to set env: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected cfg")
+	}
+	if len(cfg.Passthru) != 1 {
+		t.Fatalf("expected 1 passthru route, got %d", len(cfg.Passthru))
+	}
+	r := cfg.Passthru[0]
+	if r.Model != "gpt-4" {
+		t.Fatalf("expected model gpt-4, got %q", r.Model)
+	}
+	if len(r.APIKeys) != 3 {
+		t.Fatalf("expected 3 api-keys, got %d", len(r.APIKeys))
+	}
+	expectedKeys := []string{"key-primary", "key-backup-1", "key-backup-2"}
+	for i, key := range r.APIKeys {
+		if key != expectedKeys[i] {
+			t.Fatalf("expected api-key[%d] to be %q, got %q", i, expectedKeys[i], key)
+		}
+	}
+	if r.UpstreamModel != "gpt-4-turbo" {
+		t.Fatalf("expected upstream-model gpt-4-turbo, got %q", r.UpstreamModel)
+	}
+}
+
+func TestLoadConfigOptional_PassthruModelsJSON_ApiKeyAndApiKeys_Combined(t *testing.T) {
+	// Ensure env var is cleared after test
+	old := os.Getenv("PASSTHRU_MODELS_JSON")
+	t.Cleanup(func() {
+		_ = os.Setenv("PASSTHRU_MODELS_JSON", old)
+	})
+
+	// Minimal config file content
+	tmp := t.TempDir()
+	path := tmp + "/config.yaml"
+	cfgYAML := []byte("port: 8317\n")
+	if err := os.WriteFile(path, cfgYAML, 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	// Provide routes via env with both api-key (single) and api-keys (array)
+	jsonValue := `[
+  {
+    "model": "claude-3-opus",
+    "protocol": "claude",
+    "base-url": "https://api.anthropic.com",
+    "api-key": "sk-primary",
+    "api-keys": ["sk-backup-1"],
+    "upstream-model": "claude-3-opus-20240229"
+  }
+]`
+	if err := os.Setenv("PASSTHRU_MODELS_JSON", jsonValue); err != nil {
+		t.Fatalf("failed to set env: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected cfg")
+	}
+	if len(cfg.Passthru) != 1 {
+		t.Fatalf("expected 1 passthru route, got %d", len(cfg.Passthru))
+	}
+	r := cfg.Passthru[0]
+	// Single api-key should be preserved
+	if r.APIKey != "sk-primary" {
+		t.Fatalf("expected api-key sk-primary, got %q", r.APIKey)
+	}
+	// api-keys array should also be preserved
+	if len(r.APIKeys) != 1 {
+		t.Fatalf("expected 1 api-key in api-keys array, got %d", len(r.APIKeys))
+	}
+	if r.APIKeys[0] != "sk-backup-1" {
+		t.Fatalf("expected api-keys[0] to be sk-backup-1, got %q", r.APIKeys[0])
+	}
+}
