@@ -15,8 +15,7 @@ import (
 )
 
 const (
-	modelsFetchTimeout    = 30 * time.Second
-	modelsRefreshInterval = 3 * time.Hour
+	modelsFetchTimeout = 30 * time.Second
 )
 
 var modelsURLs = []string{
@@ -43,8 +42,8 @@ func init() {
 	}
 }
 
-// StartModelsUpdater starts the background models refresh goroutine.
-// It immediately attempts to fetch models from network, then refreshes every 3 hours.
+// StartModelsUpdater starts a one-time models refresh on startup.
+// It attempts to fetch models from network once, then exits.
 // Safe to call multiple times; only one updater will be started.
 func StartModelsUpdater(ctx context.Context) {
 	updaterOnce.Do(func() {
@@ -53,20 +52,9 @@ func StartModelsUpdater(ctx context.Context) {
 }
 
 func runModelsUpdater(ctx context.Context) {
-	// Immediately try network fetch once
+	// Try network fetch once on startup, then stop.
+	// Periodic refresh is disabled - models are only refreshed at startup.
 	tryRefreshModels(ctx)
-
-	ticker := time.NewTicker(modelsRefreshInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			tryRefreshModels(ctx)
-		}
-	}
 }
 
 func tryRefreshModels(ctx context.Context) {
