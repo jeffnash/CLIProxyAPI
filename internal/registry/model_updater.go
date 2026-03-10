@@ -42,12 +42,13 @@ func init() {
 	}
 }
 
-// StartModelsUpdater starts a one-time models refresh on startup.
-// It attempts to fetch models from network once, then exits.
-// Safe to call multiple times; only one updater will be started.
+// StartModelsUpdater runs a one-time models refresh on startup.
+// It blocks until the startup fetch attempt finishes so service initialization
+// can wait for the refreshed catalog before registering auth-backed models.
+// Safe to call multiple times; only one refresh will run.
 func StartModelsUpdater(ctx context.Context) {
 	updaterOnce.Do(func() {
-		go runModelsUpdater(ctx)
+		runModelsUpdater(ctx)
 	})
 }
 
