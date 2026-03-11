@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -186,4 +187,17 @@ func contextWithGinHeaders(headers map[string]string) context.Context {
 		ginCtx.Request.Header.Set(key, value)
 	}
 	return context.WithValue(context.Background(), "gin", ginCtx)
+}
+
+func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
+	t.Parallel()
+
+	dialer := newProxyAwareWebsocketDialer(
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"}},
+		&cliproxyauth.Auth{ProxyURL: "direct"},
+	)
+
+	if dialer.Proxy != nil {
+		t.Fatal("expected websocket proxy function to be nil for direct mode")
+	}
 }
