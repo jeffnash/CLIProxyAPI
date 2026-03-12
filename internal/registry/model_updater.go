@@ -100,7 +100,7 @@ func tryRefreshModels(ctx context.Context) {
 		log.Infof("models updated from %s", url)
 		return
 	}
-	log.Warn("models refresh failed from all URLs, using current data")
+	log.Warn("models refresh failed from all URLs, using local data")
 }
 
 func loadModelsFromBytes(data []byte, source string) error {
