@@ -1,7 +1,6 @@
 package chat_completions
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -623,14 +622,9 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 		t.Fatal("no tools found in output")
 	}
 
-	// look for "search" tool
 	found := false
 	for _, tool := range tools {
-		name := tool.Get("name").String()
-		if name == "" {
-			name = tool.Get("function.name").String()
-		}
-		if strings.Contains(name, "search") {
+		if tool.Get("name").String() == "search" {
 			found = true
 			break
 		}
