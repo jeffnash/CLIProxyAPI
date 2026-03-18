@@ -95,13 +95,17 @@ func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
 		for i := 0; i < len(toolArray); i++ {
 			typePath := fmt.Sprintf("tools.%d.type", i)
 			if gjson.GetBytes(result, typePath).String() == "web_search_preview" {
-				result, _ = sjson.SetBytes(result, typePath, "web_search")
+				if updated, err := sjson.SetBytes(result, typePath, "web_search"); err == nil {
+					result = updated
+				}
 			}
 		}
 	}
 
 	if gjson.GetBytes(result, "tool_choice.type").String() == "web_search_preview" {
-		result, _ = sjson.SetBytes(result, "tool_choice.type", "web_search")
+		if updated, err := sjson.SetBytes(result, "tool_choice.type", "web_search"); err == nil {
+			result = updated
+		}
 	}
 
 	return result
