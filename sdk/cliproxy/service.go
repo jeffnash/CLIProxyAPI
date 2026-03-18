@@ -78,6 +78,9 @@ type Service struct {
 	// authQueueStop cancels the auth update queue processing.
 	authQueueStop context.CancelFunc
 
+	// chutesRefreshCancel stops the periodic Chutes model refresh loop.
+	chutesRefreshCancel context.CancelFunc
+
 	// authManager handles legacy authentication operations.
 	authManager *sdkAuth.Manager
 
@@ -598,24 +601,7 @@ func (s *Service) Run(ctx context.Context) error {
 			providerSet[strings.ToLower(strings.TrimSpace(p))] = true
 		}
 
-		auths := s.coreManager.List()
-		refreshed := 0
-		for _, item := range auths {
-			if item == nil || item.ID == "" {
-				continue
-			}
-			auth, ok := s.coreManager.GetByID(item.ID)
-			if !ok || auth == nil || auth.Disabled {
-				continue
-			}
-			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-			if !providerSet[provider] {
-				continue
-			}
-			if s.refreshModelRegistrationForAuth(auth) {
-				refreshed++
-			}
-		}
+		refreshed := s.refreshModelRegistrationsForProviders(providerSet)
 
 		if refreshed > 0 {
 			log.Infof("re-registered models for %d auth(s) due to model catalog changes: %v", refreshed, changedProviders)
@@ -718,6 +704,7 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+		s.startChutesModelAutoRefresh(context.Background(), interval)
 	}
 
 	select {
@@ -752,6 +739,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 
 		if s.watcherCancel != nil {
 			s.watcherCancel()
+		}
+		if s.chutesRefreshCancel != nil {
+			s.chutesRefreshCancel()
+			s.chutesRefreshCancel = nil
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
@@ -1180,6 +1171,65 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	s.registerModelsForAuth(latest)
 	s.coreManager.RefreshSchedulerEntry(current.ID)
 	return true
+}
+
+func (s *Service) startChutesModelAutoRefresh(parent context.Context, interval time.Duration) {
+	if s == nil || s.coreManager == nil || interval <= 0 {
+		return
+	}
+	if s.chutesRefreshCancel != nil {
+		return
+	}
+
+	refreshCtx, cancel := context.WithCancel(parent)
+	s.chutesRefreshCancel = cancel
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		log.Infof("chutes model auto-refresh started (interval=%s)", interval)
+		for {
+			select {
+			case <-refreshCtx.Done():
+				return
+			case <-ticker.C:
+				refreshed := s.refreshModelRegistrationsForProviders(map[string]bool{"chutes": true})
+				if refreshed > 0 {
+					log.Infof("refreshed Chutes models for %d auth(s)", refreshed)
+				}
+			}
+		}
+	}()
+}
+
+func (s *Service) refreshModelRegistrationsForProviders(providerSet map[string]bool) int {
+	if s == nil || s.coreManager == nil || len(providerSet) == 0 {
+		return 0
+	}
+
+	if providerSet["chutes"] {
+		executor.EvictChutesModelCache()
+	}
+
+	auths := s.coreManager.List()
+	refreshed := 0
+	for _, item := range auths {
+		if item == nil || item.ID == "" {
+			continue
+		}
+		auth, ok := s.coreManager.GetByID(item.ID)
+		if !ok || auth == nil || auth.Disabled {
+			continue
+		}
+		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if !providerSet[provider] {
+			continue
+		}
+		if s.refreshModelRegistrationForAuth(auth) {
+			refreshed++
+		}
+	}
+	return refreshed
 }
 
 // latestAuthForModelRegistration returns the latest auth snapshot regardless of
