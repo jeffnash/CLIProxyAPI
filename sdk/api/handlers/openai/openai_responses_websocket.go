@@ -34,6 +34,8 @@ const (
 	wsTurnStateHeader    = "x-codex-turn-state"
 	wsRequestBodyKey     = "REQUEST_BODY_OVERRIDE"
 	wsPayloadLogMaxSize  = 2048
+	wsBodyLogMaxSize     = 64 * 1024
+	wsBodyLogTruncated   = "\n[websocket log truncated]\n"
 )
 
 var responsesWebsocketUpgrader = websocket.Upgrader{
@@ -175,7 +177,17 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
 		} else {
 			cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
-				pinnedAuthID = strings.TrimSpace(authID)
+				authID = strings.TrimSpace(authID)
+				if authID == "" || h == nil || h.AuthManager == nil {
+					return
+				}
+				selectedAuth, ok := h.AuthManager.GetByID(authID)
+				if !ok || selectedAuth == nil {
+					return
+				}
+				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
+					pinnedAuthID = authID
+				}
 			})
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
@@ -825,18 +837,71 @@ func appendWebsocketEvent(builder *strings.Builder, eventType string, payload []
 	if builder == nil {
 		return
 	}
+	if builder.Len() >= wsBodyLogMaxSize {
+		return
+	}
 	trimmedPayload := bytes.TrimSpace(payload)
 	if len(trimmedPayload) == 0 {
 		return
 	}
 	if builder.Len() > 0 {
-		builder.WriteString("\n")
+		if !appendWebsocketLogString(builder, "\n") {
+			return
+		}
 	}
-	builder.WriteString("websocket.")
-	builder.WriteString(eventType)
-	builder.WriteString("\n")
-	builder.Write(trimmedPayload)
-	builder.WriteString("\n")
+	if !appendWebsocketLogString(builder, "websocket.") {
+		return
+	}
+	if !appendWebsocketLogString(builder, eventType) {
+		return
+	}
+	if !appendWebsocketLogString(builder, "\n") {
+		return
+	}
+	if !appendWebsocketLogBytes(builder, trimmedPayload, len(wsBodyLogTruncated)) {
+		appendWebsocketLogString(builder, wsBodyLogTruncated)
+		return
+	}
+	appendWebsocketLogString(builder, "\n")
+}
+
+func appendWebsocketLogString(builder *strings.Builder, value string) bool {
+	if builder == nil {
+		return false
+	}
+	remaining := wsBodyLogMaxSize - builder.Len()
+	if remaining <= 0 {
+		return false
+	}
+	if len(value) <= remaining {
+		builder.WriteString(value)
+		return true
+	}
+	builder.WriteString(value[:remaining])
+	return false
+}
+
+func appendWebsocketLogBytes(builder *strings.Builder, value []byte, reserveForSuffix int) bool {
+	if builder == nil {
+		return false
+	}
+	remaining := wsBodyLogMaxSize - builder.Len()
+	if remaining <= 0 {
+		return false
+	}
+	if len(value) <= remaining {
+		builder.Write(value)
+		return true
+	}
+	limit := remaining - reserveForSuffix
+	if limit < 0 {
+		limit = 0
+	}
+	if limit > len(value) {
+		limit = len(value)
+	}
+	builder.Write(value[:limit])
+	return false
 }
 
 func websocketPayloadEventType(payload []byte) string {

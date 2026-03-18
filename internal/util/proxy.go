@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/proxy"
 )
@@ -86,9 +87,6 @@ func ShouldBypassProxy(host string, patterns []string) bool {
 
 // SetProxyForService configures the provided HTTP client with proxy settings from the configuration,
 // but only when the proxy is enabled for the given service via OUTBOUND_PROXY_SERVICES / proxy-services.
-//
-// It supports SOCKS5, HTTP, and HTTPS proxies. The function modifies the client's transport
-// to route requests through the configured proxy server.
 func SetProxyForService(cfg *config.SDKConfig, service string, httpClient *http.Client) *http.Client {
 	if cfg == nil || httpClient == nil {
 		return httpClient
@@ -101,54 +99,58 @@ func SetProxyForService(cfg *config.SDKConfig, service string, httpClient *http.
 		return httpClient
 	}
 
-	noProxyRaw := NoProxyEnvRaw()
-	noProxyList := ParseNoProxyList(noProxyRaw)
+	setting, errParse := proxyutil.Parse(proxyURLRaw)
+	if errParse != nil {
+		log.Errorf("%v", errParse)
+		return httpClient
+	}
 
+	switch setting.Mode {
+	case proxyutil.ModeDirect:
+		httpClient.Transport = proxyutil.NewDirectTransport()
+		return httpClient
+	case proxyutil.ModeProxy:
+	case proxyutil.ModeInherit:
+		return httpClient
+	default:
+		return httpClient
+	}
+
+	noProxyList := ParseNoProxyList(NoProxyEnvRaw())
 	var transport *http.Transport
-	// Attempt to parse the proxy URL from the configuration.
-	proxyURL, errParse := url.Parse(proxyURLRaw)
-	if errParse == nil {
-		// Handle different proxy schemes.
-		if proxyURL.Scheme == "socks5" {
-			// Configure SOCKS5 proxy with optional authentication.
-			var proxyAuth *proxy.Auth
-			if proxyURL.User != nil {
-				username := proxyURL.User.Username()
-				password, _ := proxyURL.User.Password()
-				proxyAuth = &proxy.Auth{User: username, Password: password}
-			}
-			dialer, errSOCKS5 := proxy.SOCKS5("tcp", proxyURL.Host, proxyAuth, proxy.Direct)
-			if errSOCKS5 != nil {
-				log.Errorf("create SOCKS5 dialer failed: %v", errSOCKS5)
-				return httpClient
-			}
-			// Set up a custom transport using the SOCKS5 dialer.
-			direct := &net.Dialer{}
-			transport = &http.Transport{
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					// addr is host:port
-					if ShouldBypassProxy(addr, noProxyList) {
-						return direct.DialContext(ctx, network, addr)
-					}
-					return dialer.Dial(network, addr)
-				},
-			}
-		} else if proxyURL.Scheme == "http" || proxyURL.Scheme == "https" {
-			// Configure HTTP or HTTPS proxy with NO_PROXY bypass support.
-			transport = &http.Transport{
-				Proxy: func(req *http.Request) (*url.URL, error) {
-					if req != nil && req.URL != nil {
-						host := req.URL.Hostname()
-						if ShouldBypassProxy(host, noProxyList) {
-							return nil, nil
-						}
-					}
-					return proxyURL, nil
-				},
-			}
+
+	if setting.URL.Scheme == "socks5" {
+		var proxyAuth *proxy.Auth
+		if setting.URL.User != nil {
+			username := setting.URL.User.Username()
+			password, _ := setting.URL.User.Password()
+			proxyAuth = &proxy.Auth{User: username, Password: password}
+		}
+		dialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, proxy.Direct)
+		if errSOCKS5 != nil {
+			log.Errorf("create SOCKS5 dialer failed: %v", errSOCKS5)
+			return httpClient
+		}
+		direct := &net.Dialer{}
+		transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if ShouldBypassProxy(addr, noProxyList) {
+					return direct.DialContext(ctx, network, addr)
+				}
+				return dialer.Dial(network, addr)
+			},
+		}
+	} else if setting.URL.Scheme == "http" || setting.URL.Scheme == "https" {
+		transport = &http.Transport{
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				if req != nil && req.URL != nil && ShouldBypassProxy(req.URL.Hostname(), noProxyList) {
+					return nil, nil
+				}
+				return setting.URL, nil
+			},
 		}
 	}
-	// If a new transport was created, apply it to the HTTP client.
+
 	if transport != nil {
 		httpClient.Transport = transport
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/proxy"
 )
@@ -240,24 +241,31 @@ func buildProxyTransport(proxyURL string, noProxyList []string, service string) 
 		return nil
 	}
 
-	parsedURL, errParse := url.Parse(proxyURL)
+	setting, errParse := proxyutil.Parse(proxyURL)
 	if errParse != nil {
-		log.Errorf("parse proxy URL failed: %v", errParse)
+		log.Errorf("%v", errParse)
+		return nil
+	}
+	switch setting.Mode {
+	case proxyutil.ModeDirect:
+		return proxyutil.NewDirectTransport()
+	case proxyutil.ModeProxy:
+	default:
 		return nil
 	}
 
 	var transport *http.Transport
 
 	// Handle different proxy schemes
-	if parsedURL.Scheme == "socks5" {
+	if setting.URL.Scheme == "socks5" {
 		// Configure SOCKS5 proxy with optional authentication
 		var proxyAuth *proxy.Auth
-		if parsedURL.User != nil {
-			username := parsedURL.User.Username()
-			password, _ := parsedURL.User.Password()
+		if setting.URL.User != nil {
+			username := setting.URL.User.Username()
+			password, _ := setting.URL.User.Password()
 			proxyAuth = &proxy.Auth{User: username, Password: password}
 		}
-		dialer, errSOCKS5 := proxy.SOCKS5("tcp", parsedURL.Host, proxyAuth, proxy.Direct)
+		dialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, proxy.Direct)
 		if errSOCKS5 != nil {
 			log.Errorf("create SOCKS5 dialer failed: %v", errSOCKS5)
 			return nil
@@ -279,7 +287,7 @@ func buildProxyTransport(proxyURL string, noProxyList []string, service string) 
 				return dialer.Dial(network, addr)
 			},
 		}
-	} else if parsedURL.Scheme == "http" || parsedURL.Scheme == "https" {
+	} else if setting.URL.Scheme == "http" || setting.URL.Scheme == "https" {
 		// Configure HTTP or HTTPS proxy with NO_PROXY bypass support.
 		transport = &http.Transport{
 			Proxy: func(req *http.Request) (*url.URL, error) {
@@ -295,13 +303,12 @@ func buildProxyTransport(proxyURL string, noProxyList []string, service string) 
 						return nil, nil
 					}
 				}
-				return parsedURL, nil
+				return setting.URL, nil
 			},
 		}
 	} else {
-		log.Errorf("unsupported proxy scheme: %s", parsedURL.Scheme)
+		log.Errorf("unsupported proxy scheme: %s", setting.URL.Scheme)
 		return nil
 	}
-
 	return transport
 }

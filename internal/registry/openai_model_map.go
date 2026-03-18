@@ -24,6 +24,21 @@ func ToOpenAIModelMap(info *ModelInfo) map[string]any {
 		"created":  info.Created,
 		"owned_by": info.OwnedBy,
 	}
+	if info.Type != "" {
+		result["type"] = info.Type
+	}
+	if info.DisplayName != "" {
+		result["display_name"] = info.DisplayName
+	}
+	if info.Version != "" {
+		result["version"] = info.Version
+	}
+	if info.Description != "" {
+		result["description"] = info.Description
+	}
+	if len(info.SupportedParameters) > 0 {
+		result["supported_parameters"] = append([]string(nil), info.SupportedParameters...)
+	}
 
 	// OpenAI-style limits (preferred) with provider-native fallbacks.
 	contextLength := info.ContextLength

@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
 func resetProxyHTTPClientCacheForTest() {
@@ -56,7 +58,7 @@ func TestNewProxyAwareHTTPClient_DoesNotCacheTimeout_WithProxy(t *testing.T) {
 	httpClientCacheMutex.RLock()
 	cacheKey := "http://example.com:8080"
 	if noProxyRaw := noProxyEnvRaw(); noProxyRaw != "" {
-		cacheKey = cacheKey + "|no_proxy=" + strings.ToLower(noProxyRaw)
+		cacheKey += "|no_proxy=" + strings.ToLower(noProxyRaw)
 	}
 	cached := httpClientCache[cacheKey]
 	httpClientCacheMutex.RUnlock()
@@ -65,5 +67,30 @@ func TestNewProxyAwareHTTPClient_DoesNotCacheTimeout_WithProxy(t *testing.T) {
 	}
 	if cached.Timeout != 0 {
 		t.Fatalf("expected cached Timeout=0, got %v", cached.Timeout)
+	}
+
+	client := newProxyAwareHTTPClient(ctx, nil, auth, 0, "test")
+	if client.Timeout != 0 {
+		t.Fatalf("expected client Timeout=0, got %v", client.Timeout)
+	}
+}
+
+func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	client := newProxyAwareHTTPClient(
+		context.Background(),
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"}},
+		&cliproxyauth.Auth{ProxyURL: "direct"},
+		0,
+		"test",
+	)
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("expected direct transport to disable proxy function")
 	}
 }
