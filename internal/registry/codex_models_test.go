@@ -161,6 +161,16 @@ func TestGenerateCodexAliases_SpecificModelFamilies(t *testing.T) {
 		"codex-gpt-5.4-medium",
 		"codex-gpt-5.4-high",
 		"codex-gpt-5.4-xhigh",
+		"codex-gpt-5.4-mini",
+		"codex-gpt-5.4-mini-low",
+		"codex-gpt-5.4-mini-medium",
+		"codex-gpt-5.4-mini-high",
+		"codex-gpt-5.4-mini-xhigh",
+		"codex-gpt-5.4-nano",
+		"codex-gpt-5.4-nano-low",
+		"codex-gpt-5.4-nano-medium",
+		"codex-gpt-5.4-nano-high",
+		"codex-gpt-5.4-nano-xhigh",
 	}
 
 	models := GetOpenAIModels()

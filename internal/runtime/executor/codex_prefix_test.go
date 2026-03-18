@@ -69,6 +69,16 @@ func TestStripCodexPrefix(t *testing.T) {
 		{"codex-gpt-5.4-medium", "gpt-5.4-medium"},
 		{"codex-gpt-5.4-high", "gpt-5.4-high"},
 		{"codex-gpt-5.4-xhigh", "gpt-5.4-xhigh"},
+		{"codex-gpt-5.4-mini", "gpt-5.4-mini"},
+		{"codex-gpt-5.4-mini-low", "gpt-5.4-mini-low"},
+		{"codex-gpt-5.4-mini-medium", "gpt-5.4-mini-medium"},
+		{"codex-gpt-5.4-mini-high", "gpt-5.4-mini-high"},
+		{"codex-gpt-5.4-mini-xhigh", "gpt-5.4-mini-xhigh"},
+		{"codex-gpt-5.4-nano", "gpt-5.4-nano"},
+		{"codex-gpt-5.4-nano-low", "gpt-5.4-nano-low"},
+		{"codex-gpt-5.4-nano-medium", "gpt-5.4-nano-medium"},
+		{"codex-gpt-5.4-nano-high", "gpt-5.4-nano-high"},
+		{"codex-gpt-5.4-nano-xhigh", "gpt-5.4-nano-xhigh"},
 
 		// Models without codex- prefix should pass through unchanged.
 		{"gpt-5", "gpt-5"},
@@ -175,6 +185,18 @@ func TestCodexExecutor_CodexPrefixStrippedInUpstreamRequest(t *testing.T) {
 			requestModel:  "codex-gpt-5.4-xhigh",
 			wantModel:     "gpt-5.4",
 			wantEffort:    "xhigh",
+			wantHasEffort: true,
+		},
+		{
+			requestModel:  "codex-gpt-5.4-mini-xhigh",
+			wantModel:     "gpt-5.4-mini",
+			wantEffort:    "xhigh",
+			wantHasEffort: true,
+		},
+		{
+			requestModel:  "codex-gpt-5.4-nano-low",
+			wantModel:     "gpt-5.4-nano",
+			wantEffort:    "low",
 			wantHasEffort: true,
 		},
 	}
