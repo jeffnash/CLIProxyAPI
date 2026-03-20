@@ -329,18 +329,7 @@ waitForCallback:
 				return nil, err
 			default:
 			}
-			inputCh := make(chan string, 1)
-			inputErrCh := make(chan error, 1)
-			go func() {
-				input, err := opts.Prompt("Paste the Gemini callback URL (or press Enter to keep waiting): ")
-				if err != nil {
-					inputErrCh <- err
-					return
-				}
-				inputCh <- input
-			}()
-			manualInputCh = inputCh
-			manualInputErrCh = inputErrCh
+			manualInputCh, manualInputErrCh = misc.AsyncPrompt(opts.Prompt, "Paste the Gemini callback URL (or press Enter to keep waiting): ")
 			continue
 		case input := <-manualInputCh:
 			manualInputCh = nil

@@ -118,18 +118,7 @@ waitForCallback:
 				break waitForCallback
 			default:
 			}
-			inputCh := make(chan string, 1)
-			inputErrCh := make(chan error, 1)
-			go func() {
-				input, errPrompt := opts.Prompt("Paste the antigravity callback URL (or press Enter to keep waiting): ")
-				if errPrompt != nil {
-					inputErrCh <- errPrompt
-					return
-				}
-				inputCh <- input
-			}()
-			manualInputCh = inputCh
-			manualInputErrCh = inputErrCh
+			manualInputCh, manualInputErrCh = misc.AsyncPrompt(opts.Prompt, "Paste the antigravity callback URL (or press Enter to keep waiting): ")
 			continue
 		case input := <-manualInputCh:
 			manualInputCh = nil
