@@ -170,15 +170,33 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 			}
 			// Populate auth Metadata from rate-limit config so the conductor's
 			// per-auth override system (RequestRetryOverride, DisableCoolingOverride) applies.
-			if r.RateLimit != nil {
-				if a.Metadata == nil {
-					a.Metadata = make(map[string]any)
+			if a.Metadata == nil {
+				a.Metadata = make(map[string]any)
+			}
+
+			// Apply lenient settings first (they become defaults if RateLimit not set)
+			if r.Lenient {
+				if a.Metadata["disable_model_suspend"] == nil {
+					a.Metadata["disable_model_suspend"] = true
 				}
+				if a.Metadata["disable_provider_suspend"] == nil {
+					a.Metadata["disable_provider_suspend"] = true
+				}
+			}
+
+			// Apply explicit RateLimit settings (override lenient defaults)
+			if r.RateLimit != nil {
 				if r.RateLimit.RequestRetry != nil {
 					a.Metadata["request_retry"] = *r.RateLimit.RequestRetry
 				}
 				if r.RateLimit.DisableCooling != nil {
 					a.Metadata["disable_cooling"] = *r.RateLimit.DisableCooling
+				}
+				if r.RateLimit.DisableModelSuspend != nil {
+					a.Metadata["disable_model_suspend"] = *r.RateLimit.DisableModelSuspend
+				}
+				if r.RateLimit.DisableProviderSuspend != nil {
+					a.Metadata["disable_provider_suspend"] = *r.RateLimit.DisableProviderSuspend
 				}
 			}
 			ApplyAuthExcludedModelsMeta(a, cfg, nil, "passthru")

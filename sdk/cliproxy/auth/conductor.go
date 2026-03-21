@@ -83,6 +83,40 @@ func quotaCooldownDisabledForAuth(auth *Auth) bool {
 	return quotaCooldownDisabled.Load()
 }
 
+// modelSuspendDisabledForAuth returns true if automatic model suspension is disabled for this auth.
+// This is used by passthru routes that want to remain available despite upstream errors.
+func modelSuspendDisabledForAuth(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Metadata == nil {
+		return false
+	}
+	if val, ok := auth.Metadata["disable_model_suspend"]; ok {
+		if b, ok := val.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
+// providerSuspendDisabledForAuth returns true if automatic provider suspension is disabled for this auth.
+// This prevents cascade suspension when passthru routes encounter errors.
+func providerSuspendDisabledForAuth(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Metadata == nil {
+		return false
+	}
+	if val, ok := auth.Metadata["disable_provider_suspend"]; ok {
+		if b, ok := val.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
 // Result captures execution outcome used to adjust auth state.
 type Result struct {
 	// AuthID references the auth that produced this result.
@@ -1625,22 +1659,30 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 
 				statusCode := statusCodeFromResult(result.Error)
+				// Check if model suspension is disabled for this auth (e.g., passthru lenient routes)
+				suspendDisabled := modelSuspendDisabledForAuth(auth)
 				switch statusCode {
 				case 401:
 					next := now.Add(30 * time.Minute)
 					state.NextRetryAfter = next
 					suspendReason = "unauthorized"
-					shouldSuspendModel = true
+					if !suspendDisabled {
+						shouldSuspendModel = true
+					}
 				case 402, 403:
 					next := now.Add(30 * time.Minute)
 					state.NextRetryAfter = next
 					suspendReason = "payment_required"
-					shouldSuspendModel = true
+					if !suspendDisabled {
+						shouldSuspendModel = true
+					}
 				case 404:
 					next := now.Add(12 * time.Hour)
 					state.NextRetryAfter = next
 					suspendReason = "not_found"
-					shouldSuspendModel = true
+					if !suspendDisabled {
+						shouldSuspendModel = true
+					}
 				case 429:
 					var next time.Time
 					backoffLevel := state.Quota.BackoffLevel
@@ -1661,7 +1703,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						BackoffLevel:  backoffLevel,
 					}
 					suspendReason = "quota"
-					shouldSuspendModel = true
+					if !suspendDisabled {
+						shouldSuspendModel = true
+					}
 					setModelQuota = true
 				case 408, 500, 502, 503, 504:
 					if quotaCooldownDisabledForAuth(auth) {
