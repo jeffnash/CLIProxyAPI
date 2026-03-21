@@ -468,6 +468,17 @@ nonstream-keepalive-interval: 0
 #     upstream-model: "glm-4.7"
 #     headers:
 #       X-Custom-Header: "custom-value"
+#     # Lenient mode: disable automatic model/provider suspension on upstream errors.
+#     # This is useful for routes where the upstream may legitimately reject specific
+#     # requests (e.g., unsupported input formats like images for text-only models)
+#     # but the model remains available for other requests.
+#     lenient: true
+#     # Alternatively, use explicit rate-limit settings for more granular control:
+#     # rate-limit:
+#     #   request-retry: 3
+#     #   disable-cooling: false
+#     #   disable-model-suspend: true   # Don't suspend model on 401/402/403/404/429
+#     #   disable-provider-suspend: true # Don't cascade errors to provider level
 #
 # Railway-friendly env var (supports both api-key and api-keys):
 #   PASSTHRU_MODELS_JSON='[{"model":"glm-4.7","protocol":"openai","base-url":"https://api.z.ai/v1","api-key":"za-...","upstream-model":"glm-4.7","proxy-url":"socks5://proxy.example.com:1080","headers":{"X-Custom-Header":"custom-value"}}]'
