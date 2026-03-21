@@ -236,6 +236,12 @@ type PassthruRoute struct {
 	//
 	// Example: {"request-retry": 3, "disable-cooling": false}
 	RateLimit *PassthruRateLimit `yaml:"rate-limit,omitempty" json:"rate-limit,omitempty"`
+
+	// Lenient makes this passthru route more tolerant of upstream errors by disabling
+	// automatic suspension of the model and provider on certain error types.
+	// When true, sets DisableModelSuspend=true and DisableProviderSuspend=true on RateLimit.
+	// Default is false (normal strict behavior).
+	Lenient bool `yaml:"lenient,omitempty" json:"lenient,omitempty"`
 }
 
 // PassthruRateLimit configures per-route retry and cooldown behavior.
@@ -249,6 +255,17 @@ type PassthruRateLimit struct {
 	// DisableCooling disables exponential backoff cooldown on 429s for this route.
 	// When omitted, the global disable-cooling config applies.
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// DisableModelSuspend prevents automatic suspension of this passthru model when
+	// upstream returns errors like 404 (not found), 401 (unauthorized), 402/403 (payment).
+	// This is useful for routes where the upstream may legitimately reject specific
+	// requests (e.g., unsupported input formats) but the model remains available.
+	DisableModelSuspend *bool `yaml:"disable-model-suspend,omitempty" json:"disable-model-suspend,omitempty"`
+
+	// DisableProviderSuspend prevents automatic suspension of the entire passthru provider
+	// when this route encounters errors. By default, provider suspension cascades to all
+	// models using that provider; setting this prevents that behavior for this route.
+	DisableProviderSuspend *bool `yaml:"disable-provider-suspend,omitempty" json:"disable-provider-suspend,omitempty"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests
