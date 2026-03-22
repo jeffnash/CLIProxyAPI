@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -298,6 +299,8 @@ func SanitizedToolNameMap(rawJSON []byte) map[string]string {
 		}
 		if _, exists := out[sanitized]; !exists {
 			out[sanitized] = name
+		} else {
+			log.Warnf("sanitized tool name collision: %q and %q both map to %q, keeping first", out[sanitized], name, sanitized)
 		}
 		return true
 	})

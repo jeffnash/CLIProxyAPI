@@ -75,15 +75,12 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 			HasFirstResponse: false,
 			ResponseType:     0,
 			ResponseIndex:    0,
+			ToolNameMap:      util.SanitizedToolNameMap(originalRequestRawJSON),
 		}
 	}
 	modelName := gjson.GetBytes(requestRawJSON, "model").String()
 
 	params := (*param).(*Params)
-
-	if params.ToolNameMap == nil {
-		params.ToolNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
-	}
 
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
 		output := make([]byte, 0, 256)

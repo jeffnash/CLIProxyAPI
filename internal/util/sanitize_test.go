@@ -93,6 +93,20 @@ func TestSanitizedToolNameMap(t *testing.T) {
 			t.Error("expected nil for nil input")
 		}
 	})
+
+	t.Run("collision keeps first mapping", func(t *testing.T) {
+		raw := []byte(`{"tools":[
+			{"name":"read/file","input_schema":{}},
+			{"name":"read@file","input_schema":{}}
+		]}`)
+		m := SanitizedToolNameMap(raw)
+		if m == nil {
+			t.Fatal("expected non-nil map")
+		}
+		if m["read_file"] != "read/file" {
+			t.Errorf("expected first mapping read/file, got %q", m["read_file"])
+		}
+	})
 }
 
 func TestRestoreSanitizedToolName(t *testing.T) {
