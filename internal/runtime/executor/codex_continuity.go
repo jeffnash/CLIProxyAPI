@@ -14,8 +14,6 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-const codexAuthAffinityMetadataKey = "auth_affinity_key"
-
 type codexContinuity struct {
 	Key    string
 	Source string

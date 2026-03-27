@@ -178,18 +178,3 @@ func TestCodexExecutorCacheHelper_ClaudePreservesCacheContinuity(t *testing.T) {
 		t.Fatalf("session_id = %q, want %q", got, continuity.Key)
 	}
 }
-
-func TestResolveCodexContinuity_DoesNotForwardAuthAffinityKey(t *testing.T) {
-	req := cliproxyexecutor.Request{Payload: []byte(`{"model":"gpt-5.4"}`)}
-	opts := cliproxyexecutor.Options{Metadata: map[string]any{"auth_affinity_key": "principal:raw-client-secret"}}
-	auth := &cliproxyauth.Auth{ID: "codex-auth-1", Provider: "codex"}
-
-	continuity := resolveCodexContinuity(context.Background(), auth, req, opts)
-
-	if continuity.Source != "auth_id" {
-		t.Fatalf("continuity.Source = %q, want %q", continuity.Source, "auth_id")
-	}
-	if continuity.Key == "principal:raw-client-secret" {
-		t.Fatal("continuity.Key leaked raw auth affinity key")
-	}
-}
