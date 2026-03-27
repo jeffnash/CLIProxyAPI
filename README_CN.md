@@ -73,11 +73,11 @@ CLIProxyAPI 已内置对 [Amp CLI](https://ampcode.com) 和 Amp IDE 扩展的支
 - 智能模型回退与自动路由
 - 以安全为先的设计，管理端点仅限 localhost
 
-当你需要确定地命中某个后端执行器时，优先使用 provider-specific 路径，而不是合并后的 OpenAI 兼容 `/v1/...` 端点：
+当你需要确定地命中某个后端执行器时，优先使用 provider-specific 路径，而不是合并后的 `/v1/...` 端点：
 
-- 使用 `/api/provider/anthropic/v1/messages` 强制走 Anthropic 执行器。
-- 使用 `/api/provider/google/v1beta/models/...` 强制走 Gemini/Google 执行器。
-- 使用 `/api/provider/openai/v1/chat/completions` 强制走 OpenAI 兼容执行器。
+- 对于 messages 风格的后端，使用 `/api/provider/{provider}/v1/messages`。
+- 对于按模型路径暴露生成接口的后端，使用 `/api/provider/{provider}/v1beta/models/...`。
+- 对于 chat-completions 风格的后端，使用 `/api/provider/{provider}/v1/chat/completions`。
 
 这一点在 `oauth-model-alias`、alias 池或 model fallback 让多个后端复用同一个客户端可见模型名时尤其重要。此时 `/v1/models` 可能展示的是合并后的别名视图，而不是你真正想命中的执行器。对于后端选择，请以 provider-specific 的请求路径为准。
 

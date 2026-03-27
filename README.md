@@ -74,11 +74,11 @@ CLIProxyAPI includes integrated support for [Amp CLI](https://ampcode.com) and A
 - **Model mapping** to route unavailable models to alternatives (e.g., `claude-opus-4.5` → `claude-sonnet-4`)
 - Security-first design with localhost-only management endpoints
 
-When routing needs to stay deterministic, prefer the provider-specific paths over the merged OpenAI-compatible `/v1/...` endpoints:
+When routing needs to stay deterministic, prefer the provider-specific paths over the merged `/v1/...` endpoints:
 
-- Use `/api/provider/anthropic/v1/messages` to force the Anthropic executor.
-- Use `/api/provider/google/v1beta/models/...` to force the Gemini/Google executor.
-- Use `/api/provider/openai/v1/chat/completions` for OpenAI-compatible executors.
+- Use `/api/provider/{provider}/v1/messages` for messages-style backends.
+- Use `/api/provider/{provider}/v1beta/models/...` for model-scoped generate endpoints.
+- Use `/api/provider/{provider}/v1/chat/completions` for chat-completions backends.
 
 This matters when `oauth-model-alias`, alias pools, or fallback mappings reuse the same client-visible model name across multiple backends. In those cases, `/v1/models` may show the merged alias view instead of the executor you intend to hit. Treat the provider-specific request path as the source of truth for backend selection.
 
