@@ -45,32 +45,13 @@ type ClaudeExecutor struct {
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
 
-// Anthropic-compatible upstreams may reject or even crash when dynamically
-// registered Claude models omit max_tokens. Use a conservative default.
+// Anthropic-compatible upstreams may reject or even crash when Claude models
+// omit max_tokens. Prefer registered model metadata before using a fallback.
 const defaultModelMaxTokens = 1024
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
-
-func ensureModelMaxTokens(body []byte, modelID string) []byte {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
-		return body
-	}
-
-	if maxTokens := gjson.GetBytes(body, "max_tokens"); maxTokens.Exists() {
-		return body
-	}
-
-	for _, provider := range registry.GetGlobalRegistry().GetModelProviders(strings.TrimSpace(modelID)) {
-		if strings.EqualFold(provider, "claude") {
-			body, _ = sjson.SetBytes(body, "max_tokens", defaultModelMaxTokens)
-			return body
-		}
-	}
-
-	return body
-}
 
 // PrepareRequest injects Claude credentials into the outgoing HTTP request.
 func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
@@ -1905,4 +1886,27 @@ func injectSystemCacheControl(payload []byte) []byte {
 	}
 
 	return payload
+}
+
+func ensureModelMaxTokens(body []byte, modelID string) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+
+	if maxTokens := gjson.GetBytes(body, "max_tokens"); maxTokens.Exists() {
+		return body
+	}
+
+	for _, provider := range registry.GetGlobalRegistry().GetModelProviders(strings.TrimSpace(modelID)) {
+		if strings.EqualFold(provider, "claude") {
+			maxTokens := defaultModelMaxTokens
+			if info := registry.GetGlobalRegistry().GetModelInfo(strings.TrimSpace(modelID), "claude"); info != nil && info.MaxCompletionTokens > 0 {
+				maxTokens = info.MaxCompletionTokens
+			}
+			body, _ = sjson.SetBytes(body, "max_tokens", maxTokens)
+			return body
+		}
+	}
+
+	return body
 }
