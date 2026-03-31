@@ -114,9 +114,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = normalizeCodexInstructions(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -314,9 +312,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = normalizeCodexInstructions(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -419,9 +415,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "stream", false)
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = normalizeCodexInstructions(body)
 
 	enc, err := tokenizerForCodexModel(baseModel)
 	if err != nil {
@@ -697,6 +691,14 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func normalizeCodexInstructions(body []byte) []byte {
+	instructions := gjson.GetBytes(body, "instructions")
+	if !instructions.Exists() || instructions.Type == gjson.Null {
+		body, _ = sjson.SetBytes(body, "instructions", "")
+	}
+	return body
 }
 
 func isCodexModelCapacityError(errorBody []byte) bool {
