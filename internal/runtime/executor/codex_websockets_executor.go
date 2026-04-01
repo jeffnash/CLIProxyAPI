@@ -46,8 +46,16 @@ const (
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
 
-	sessMu   sync.Mutex
+	store *codexWebsocketSessionStore
+}
+
+type codexWebsocketSessionStore struct {
+	mu       sync.Mutex
 	sessions map[string]*codexWebsocketSession
+}
+
+var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
+	sessions: make(map[string]*codexWebsocketSession),
 }
 
 type codexWebsocketSession struct {
@@ -73,7 +81,7 @@ type codexWebsocketSession struct {
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	return &CodexWebsocketsExecutor{
 		CodexExecutor: NewCodexExecutor(cfg),
-		sessions:      make(map[string]*codexWebsocketSession),
+		store:         globalCodexWebsocketSessionStore,
 	}
 }
 
@@ -1058,16 +1066,23 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	if sessionID == "" {
 		return nil
 	}
-	e.sessMu.Lock()
-	defer e.sessMu.Unlock()
-	if e.sessions == nil {
-		e.sessions = make(map[string]*codexWebsocketSession)
+	if e == nil {
+		return nil
 	}
-	if sess, ok := e.sessions[sessionID]; ok && sess != nil {
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.sessions == nil {
+		store.sessions = make(map[string]*codexWebsocketSession)
+	}
+	if sess, ok := store.sessions[sessionID]; ok && sess != nil {
 		return sess
 	}
 	sess := &codexWebsocketSession{sessionID: sessionID}
-	e.sessions[sessionID] = sess
+	store.sessions[sessionID] = sess
 	return sess
 }
 
@@ -1213,14 +1228,20 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 		return
 	}
 	if sessionID == cliproxyauth.CloseAllExecutionSessionsID {
-		e.closeAllExecutionSessions("executor_replaced")
+		// Executor replacement can happen during hot reload (config/credential changes).
+		// Do not force-close upstream websocket sessions here, otherwise in-flight
+		// downstream websocket requests get interrupted.
 		return
 	}
 
-	e.sessMu.Lock()
-	sess := e.sessions[sessionID]
-	delete(e.sessions, sessionID)
-	e.sessMu.Unlock()
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sess := store.sessions[sessionID]
+	delete(store.sessions, sessionID)
+	store.mu.Unlock()
 
 	e.closeExecutionSession(sess, "session_closed")
 }
@@ -1230,15 +1251,19 @@ func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
 		return
 	}
 
-	e.sessMu.Lock()
-	sessions := make([]*codexWebsocketSession, 0, len(e.sessions))
-	for sessionID, sess := range e.sessions {
-		delete(e.sessions, sessionID)
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sessions := make([]*codexWebsocketSession, 0, len(store.sessions))
+	for sessionID, sess := range store.sessions {
+		delete(store.sessions, sessionID)
 		if sess != nil {
 			sessions = append(sessions, sess)
 		}
 	}
-	e.sessMu.Unlock()
+	store.mu.Unlock()
 
 	for i := range sessions {
 		e.closeExecutionSession(sessions[i], reason)
@@ -1246,6 +1271,10 @@ func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
 }
 
 func (e *CodexWebsocketsExecutor) closeExecutionSession(sess *codexWebsocketSession, reason string) {
+	closeCodexWebsocketSession(sess, reason)
+}
+
+func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	if sess == nil {
 		return
 	}
@@ -1284,6 +1313,69 @@ func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string
 		return
 	}
 	log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
+}
+
+// CloseCodexWebsocketSessionsForAuthID closes all active Codex upstream websocket sessions
+// associated with the supplied auth ID.
+func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "auth_removed"
+	}
+
+	store := globalCodexWebsocketSessionStore
+	if store == nil {
+		return
+	}
+
+	type sessionItem struct {
+		sessionID string
+		sess      *codexWebsocketSession
+	}
+
+	store.mu.Lock()
+	items := make([]sessionItem, 0, len(store.sessions))
+	for sessionID, sess := range store.sessions {
+		items = append(items, sessionItem{sessionID: sessionID, sess: sess})
+	}
+	store.mu.Unlock()
+
+	matches := make([]sessionItem, 0)
+	for i := range items {
+		sess := items[i].sess
+		if sess == nil {
+			continue
+		}
+		sess.connMu.Lock()
+		sessAuthID := strings.TrimSpace(sess.authID)
+		sess.connMu.Unlock()
+		if sessAuthID == authID {
+			matches = append(matches, items[i])
+		}
+	}
+	if len(matches) == 0 {
+		return
+	}
+
+	toClose := make([]*codexWebsocketSession, 0, len(matches))
+	store.mu.Lock()
+	for i := range matches {
+		current, ok := store.sessions[matches[i].sessionID]
+		if !ok || current == nil || current != matches[i].sess {
+			continue
+		}
+		delete(store.sessions, matches[i].sessionID)
+		toClose = append(toClose, current)
+	}
+	store.mu.Unlock()
+
+	for i := range toClose {
+		closeCodexWebsocketSession(toClose[i], reason)
+	}
 }
 
 // CodexAutoExecutor routes Codex requests to the websocket transport only when:
