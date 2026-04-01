@@ -33,8 +33,6 @@ const (
 	wsDoneMarker         = "[DONE]"
 	wsTurnStateHeader    = "x-codex-turn-state"
 	wsRequestBodyKey     = "REQUEST_BODY_OVERRIDE"
-	wsBodyLogMaxSize     = 32 * 1024
-	wsBodyLogTruncated   = "\n...[truncated]\n"
 )
 
 var responsesWebsocketUpgrader = websocket.Upgrader{
@@ -945,53 +943,18 @@ func appendWebsocketEvent(builder *strings.Builder, eventType string, payload []
 	if builder == nil {
 		return
 	}
-	if builder.Len() >= wsBodyLogMaxSize {
-		return
-	}
 	trimmedPayload := bytes.TrimSpace(payload)
 	if len(trimmedPayload) == 0 {
 		return
 	}
-
-	separator := []byte{}
 	if builder.Len() > 0 {
-		separator = []byte("\n")
+		builder.WriteString("\n")
 	}
-	header := []byte("websocket." + eventType + "\n")
-	footer := []byte("\n")
-	entryLen := len(separator) + len(header) + len(trimmedPayload) + len(footer)
-	remaining := wsBodyLogMaxSize - builder.Len()
-
-	if entryLen <= remaining {
-		builder.Write(separator)
-		builder.Write(header)
-		builder.Write(trimmedPayload)
-		builder.Write(footer)
-		return
-	}
-
-	marker := []byte(wsBodyLogTruncated)
-	if len(marker) > remaining {
-		builder.Write(marker[:remaining])
-		return
-	}
-
-	allowed := remaining - len(marker)
-	parts := [][]byte{separator, header, trimmedPayload, footer}
-	for _, part := range parts {
-		if allowed <= 0 {
-			break
-		}
-		if len(part) <= allowed {
-			builder.Write(part)
-			allowed -= len(part)
-			continue
-		}
-		builder.Write(part[:allowed])
-		allowed = 0
-		break
-	}
-	builder.Write(marker)
+	builder.WriteString("websocket.")
+	builder.WriteString(eventType)
+	builder.WriteString("\n")
+	builder.Write(trimmedPayload)
+	builder.WriteString("\n")
 }
 
 func websocketPayloadEventType(payload []byte) string {
