@@ -55,6 +55,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	}
 	passthroughSessionID := uuid.NewString()
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
+	retainResponsesWebsocketToolCaches(downstreamSessionKey)
 	clientRemoteAddr := ""
 	if c != nil && c.Request != nil {
 		clientRemoteAddr = strings.TrimSpace(c.Request.RemoteAddr)
@@ -63,6 +64,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	var wsTerminateErr error
 	var wsBodyLog strings.Builder
 	defer func() {
+		releaseResponsesWebsocketToolCaches(downstreamSessionKey)
 		if wsTerminateErr != nil {
 			// log.Infof("responses websocket: session closing id=%s reason=%v", passthroughSessionID, wsTerminateErr)
 		} else {
