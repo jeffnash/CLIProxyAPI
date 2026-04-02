@@ -247,10 +247,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		return resp, errDial
 	}
-	if respHS != nil {
-		helps.RecordAPIWebsocketHandshake(ctx, e.cfg, respHS.StatusCode, respHS.Header.Clone())
-	}
-	closeHTTPResponseBody(respHS, "codex websockets executor: close handshake response body error")
+	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
 		defer func() {
@@ -279,7 +276,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			// Retry once with a fresh websocket connection. This is mainly to handle
 			// upstream closing the socket between sequential requests within the same
 			// execution session.
-			connRetry, _, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry == nil && connRetry != nil {
 				wsReqBodyRetry := buildCodexWebsocketRequestBody(body)
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
@@ -293,6 +290,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					AuthType:  authType,
 					AuthValue: authValue,
 				})
+				recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 				if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry == nil {
 					conn = connRetry
 					wsReqBody = wsReqBodyRetry
@@ -302,6 +300,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					return resp, errSendRetry
 				}
 			} else {
+				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				return resp, errDialRetry
 			}
@@ -449,10 +448,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 		return nil, errDial
 	}
-	if respHS != nil {
-		helps.RecordAPIWebsocketHandshake(ctx, e.cfg, respHS.StatusCode, respHS.Header.Clone())
-	}
-	closeHTTPResponseBody(respHS, "codex websockets executor: close handshake response body error")
+	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
@@ -470,8 +466,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 
 			// Retry once with a new websocket connection for the same execution session.
-			connRetry, _, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry != nil || connRetry == nil {
+				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				sess.clearActive(readCh)
 				sess.reqMu.Unlock()
@@ -489,6 +486,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				AuthType:  authType,
 				AuthValue: authValue,
 			})
+			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 			if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
@@ -1042,6 +1040,14 @@ func websocketUpgradeRequestLog(info helps.UpstreamRequestLog) helps.UpstreamReq
 		upgradeInfo.Headers.Set("Upgrade", "websocket")
 	}
 	return upgradeInfo
+}
+
+func recordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	helps.RecordAPIWebsocketHandshake(ctx, cfg, resp.StatusCode, resp.Header.Clone())
+	closeHTTPResponseBody(resp, "codex websockets executor: close handshake response body error")
 }
 
 func websocketHandshakeBody(resp *http.Response) []byte {

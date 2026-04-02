@@ -570,6 +570,9 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 		return errWrite
 	}
 	if isWebsocketTranscript {
+		// Intentionally omit the generic downstream HTTP response section for websocket
+		// transcripts. The durable session exchange is captured in WEBSOCKET TIMELINE,
+		// and appending a one-off upgrade response snapshot would dilute that transcript.
 		return nil
 	}
 	return writeResponseSection(w, statusCode, true, responseHeaders, bytes.NewReader(response), decompressErr, true)
@@ -949,6 +952,8 @@ func (l *FileRequestLogger) formatLogContent(url, method string, headers map[str
 	}
 
 	if isWebsocketTranscript {
+		// Mirror writeNonStreamingLog: websocket transcripts end with the dedicated
+		// timeline sections instead of a generic downstream HTTP response block.
 		return content.String()
 	}
 
