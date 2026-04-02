@@ -9,6 +9,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,7 +69,7 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		f.pending = f.pending[:0]
 		return
 	}
-	if len(f.pending) == 0 || responsesSSENeedsMoreData(f.pending) {
+	if len(f.pending) == 0 || !responsesSSECanEmitWithoutDelimiter(f.pending) {
 		return
 	}
 	writeResponsesSSEChunk(w, f.pending)
@@ -83,7 +84,7 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 		f.pending = f.pending[:0]
 		return
 	}
-	if responsesSSENeedsMoreData(f.pending) {
+	if !responsesSSECanEmitWithoutDelimiter(f.pending) {
 		f.pending = f.pending[:0]
 		return
 	}
@@ -121,13 +122,54 @@ func responsesSSENeedsMoreData(chunk []byte) bool {
 }
 
 func responsesSSEHasField(chunk []byte, prefix []byte) bool {
-	for _, line := range bytes.Split(chunk, []byte("\n")) {
+	s := chunk
+	for len(s) > 0 {
+		line := s
+		if i := bytes.IndexByte(s, '\n'); i >= 0 {
+			line = s[:i]
+			s = s[i+1:]
+		} else {
+			s = nil
+		}
 		line = bytes.TrimSpace(line)
 		if bytes.HasPrefix(line, prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+func responsesSSECanEmitWithoutDelimiter(chunk []byte) bool {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 || responsesSSENeedsMoreData(trimmed) || !responsesSSEHasField(trimmed, []byte("data:")) {
+		return false
+	}
+	return responsesSSEDataLinesValid(trimmed)
+}
+
+func responsesSSEDataLinesValid(chunk []byte) bool {
+	s := chunk
+	for len(s) > 0 {
+		line := s
+		if i := bytes.IndexByte(s, '\n'); i >= 0 {
+			line = s[:i]
+			s = s[i+1:]
+		} else {
+			s = nil
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[len("data:"):])
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		if !json.Valid(data) {
+			return false
+		}
+	}
+	return true
 }
 
 func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
@@ -137,9 +179,12 @@ func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
 	if bytes.HasSuffix(pending, []byte("\n")) || bytes.HasSuffix(pending, []byte("\r")) {
 		return false
 	}
-	trimmed := bytes.TrimSpace(chunk)
+	if chunk[0] == '\n' || chunk[0] == '\r' {
+		return false
+	}
+	trimmed := bytes.TrimLeft(chunk, " \t")
 	if len(trimmed) == 0 {
-		return true
+		return false
 	}
 	for _, prefix := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
 		if bytes.HasPrefix(trimmed, prefix) {
