@@ -78,6 +78,128 @@ func TestLoadConfigOptional_PassthruModelsJSON_MergesRoutes(t *testing.T) {
 	}
 }
 
+func TestLoadConfigOptional_PassthruModelsJSON_AddsPayloadRules(t *testing.T) {
+	old := os.Getenv("PASSTHRU_MODELS_JSON")
+	t.Cleanup(func() {
+		_ = os.Setenv("PASSTHRU_MODELS_JSON", old)
+	})
+
+	tmp := t.TempDir()
+	path := tmp + "/config.yaml"
+	cfgYAML := []byte("port: 8317\n")
+	if err := os.WriteFile(path, cfgYAML, 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	jsonValue := `[
+	  {
+	    "model": "deepseek-v4-pro-xhigh",
+	    "protocol": "openai",
+	    "base-url": "https://api.deepseek.com",
+	    "api-key": "sk-test",
+	    "upstream-model": "deepseek-v4-pro",
+	    "payload": {
+	      "override": {
+	        "thinking.type": "enabled",
+	        "reasoning_effort": "xhigh"
+	      },
+	      "filter": ["temperature", "top_p"]
+	    }
+	  }
+	]`
+	if err := os.Setenv("PASSTHRU_MODELS_JSON", jsonValue); err != nil {
+		t.Fatalf("failed to set env: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Passthru) != 1 {
+		t.Fatalf("expected 1 passthru route, got %d", len(cfg.Passthru))
+	}
+	route := cfg.Passthru[0]
+	if route.Payload == nil {
+		t.Fatal("expected route payload to be set")
+	}
+	if got := route.Payload.Override["thinking.type"]; got != "enabled" {
+		t.Fatalf("expected route payload thinking.type enabled, got %#v", got)
+	}
+	if len(cfg.Payload.Override) != 1 {
+		t.Fatalf("expected 1 expanded override rule, got %d", len(cfg.Payload.Override))
+	}
+	override := cfg.Payload.Override[0]
+	if len(override.Models) != 1 {
+		t.Fatalf("expected 1 model rule, got %d", len(override.Models))
+	}
+	if override.Models[0].Name != "deepseek-v4-pro-xhigh" {
+		t.Fatalf("expected model rule deepseek-v4-pro-xhigh, got %q", override.Models[0].Name)
+	}
+	if override.Models[0].Protocol != "openai" {
+		t.Fatalf("expected model rule protocol openai, got %q", override.Models[0].Protocol)
+	}
+	if got := override.Params["reasoning_effort"]; got != "xhigh" {
+		t.Fatalf("expected reasoning_effort xhigh, got %#v", got)
+	}
+	if len(cfg.Payload.Filter) != 1 {
+		t.Fatalf("expected 1 expanded filter rule, got %d", len(cfg.Payload.Filter))
+	}
+	if got := cfg.Payload.Filter[0].Params[0]; got != "temperature" {
+		t.Fatalf("expected filter param temperature, got %q", got)
+	}
+}
+
+func TestLoadConfigOptional_PassthruModelsJSON_PayloadRulesIncludeRoutingName(t *testing.T) {
+	old := os.Getenv("PASSTHRU_MODELS_JSON")
+	t.Cleanup(func() {
+		_ = os.Setenv("PASSTHRU_MODELS_JSON", old)
+	})
+
+	tmp := t.TempDir()
+	path := tmp + "/config.yaml"
+	cfgYAML := []byte("port: 8317\n")
+	if err := os.WriteFile(path, cfgYAML, 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	jsonValue := `[
+	  {
+	    "model": "deepseek-v4-pro",
+	    "model-routing-name": "deepseek-v4-pro-high",
+	    "protocol": "openai-compatibility",
+	    "base-url": "https://api.deepseek.com",
+	    "api-key": "sk-test",
+	    "payload": {
+	      "override": {
+	        "thinking.type": "enabled",
+	        "reasoning_effort": "high"
+	      }
+	    }
+	  }
+	]`
+	if err := os.Setenv("PASSTHRU_MODELS_JSON", jsonValue); err != nil {
+		t.Fatalf("failed to set env: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Payload.Override) != 1 {
+		t.Fatalf("expected 1 expanded override rule, got %d", len(cfg.Payload.Override))
+	}
+	models := cfg.Payload.Override[0].Models
+	if len(models) != 2 {
+		t.Fatalf("expected route model and routing name rules, got %d", len(models))
+	}
+	if models[0].Name != "deepseek-v4-pro" || models[1].Name != "deepseek-v4-pro-high" {
+		t.Fatalf("unexpected expanded model rules: %#v", models)
+	}
+	if models[0].Protocol != "openai" || models[1].Protocol != "openai" {
+		t.Fatalf("expected openai normalized protocols, got %#v", models)
+	}
+}
+
 func TestLoadConfigOptional_PassthruModelsJSON_InvalidJSON_OptionalConfigDoesNotError(t *testing.T) {
 	old := os.Getenv("PASSTHRU_MODELS_JSON")
 	t.Cleanup(func() {
