@@ -73,3 +73,41 @@ func TestRepairMissingReasoningContentForToolCalls_OptInOnly(t *testing.T) {
 		t.Fatalf("reasoning_content should not be added without opt-in; payload=%s", got)
 	}
 }
+
+func TestRepairMissingReasoningContentForToolCalls_FallbackWhenCacheMisses(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "auth-fallback",
+		Attributes: map[string]string{
+			"preserve_reasoning_content": "true",
+			"base_url":                   "https://api.deepseek.com",
+			"passthru_routing_name":      "deepseek-v4-pro-high",
+			"upstream_model":             "deepseek-v4-pro",
+		},
+	}
+
+	request := []byte(`{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"call_old","type":"function","function":{"name":"read","arguments":"{}"}}]}]}`)
+	got := RepairMissingReasoningContentForToolCalls(auth, request)
+
+	if gotReasoning := gjson.GetBytes(got, "messages.0.reasoning_content").String(); gotReasoning != "[reasoning unavailable]" {
+		t.Fatalf("reasoning_content = %q, want fallback; payload=%s", gotReasoning, got)
+	}
+}
+
+func TestRepairMissingReasoningContentForToolCalls_FallbackUsesAssistantContent(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "auth-content-fallback",
+		Attributes: map[string]string{
+			"preserve_reasoning_content": "true",
+			"base_url":                   "https://api.deepseek.com",
+			"passthru_routing_name":      "deepseek-v4-pro-high",
+			"upstream_model":             "deepseek-v4-pro",
+		},
+	}
+
+	request := []byte(`{"messages":[{"role":"assistant","content":"I need to inspect the file.","tool_calls":[{"id":"call_old","type":"function","function":{"name":"read","arguments":"{}"}}]}]}`)
+	got := RepairMissingReasoningContentForToolCalls(auth, request)
+
+	if gotReasoning := gjson.GetBytes(got, "messages.0.reasoning_content").String(); gotReasoning != "I need to inspect the file." {
+		t.Fatalf("reasoning_content = %q, want assistant content fallback; payload=%s", gotReasoning, got)
+	}
+}

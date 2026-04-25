@@ -176,7 +176,7 @@ func repairMissingReasoningContentForToolCalls(scope string, payload []byte) []b
 		}
 		reasoning := reasoningContentForToolCalls(scope, toolCalls)
 		if reasoning == "" {
-			continue
+			reasoning = fallbackReasoningContent(msg)
 		}
 		updated, errSet := sjson.SetBytes(out, fmt.Sprintf("messages.%d.reasoning_content", i), reasoning)
 		if errSet == nil {
@@ -205,6 +205,14 @@ func reasoningContentForToolCalls(scope string, toolCalls gjson.Result) string {
 		parts = append(parts, value)
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+func fallbackReasoningContent(msg gjson.Result) string {
+	content := strings.TrimSpace(msg.Get("content").String())
+	if content != "" {
+		return content
+	}
+	return "[reasoning unavailable]"
 }
 
 func reasoningContentScope(auth *cliproxyauth.Auth) string {
