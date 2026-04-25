@@ -501,6 +501,16 @@ nonstream-keepalive-interval: 0
 #     upstream-model: "glm-4.7"
 #     headers:
 #       X-Custom-Header: "custom-value"
+#     # Route-scoped payload rules are expanded into the shared payload rule engine.
+#     # Use override for provider-required fields, default for optional fallbacks, and
+#     # filter for request fields the upstream ignores or rejects.
+#     payload:
+#       override:
+#         "thinking.type": "enabled"
+#         "reasoning_effort": "high"
+#       filter:
+#         - "temperature"
+#         - "top_p"
 #     # Lenient mode: disable automatic model/provider suspension on upstream errors.
 #     # This is useful for routes where the upstream may legitimately reject specific
 #     # requests (e.g., unsupported input formats like images for text-only models)
@@ -517,6 +527,8 @@ nonstream-keepalive-interval: 0
 #   PASSTHRU_MODELS_JSON='[{"model":"glm-4.7","protocol":"openai","base-url":"https://api.z.ai/v1","api-key":"za-...","upstream-model":"glm-4.7","proxy-url":"socks5://proxy.example.com:1080","headers":{"X-Custom-Header":"custom-value"}}]'
 # For multiple API keys (fallback support):
 #   PASSTHRU_MODELS_JSON='[{"model":"glm-4.7","protocol":"openai","base-url":"https://api.z.ai/v1","api-keys":["za-primary","za-backup"],"upstream-model":"glm-4.7"}]'
+# For route-scoped payload params (for example, DeepSeek thinking aliases):
+#   PASSTHRU_MODELS_JSON='[{"model":"deepseek-v4-pro-xhigh","protocol":"openai","base-url":"https://api.deepseek.com","api-key":"sk-...","upstream-model":"deepseek-v4-pro","payload":{"override":{"thinking.type":"enabled","reasoning_effort":"xhigh"},"filter":["temperature","top_p","presence_penalty","frequency_penalty"]}}]'
 #
 #   default: # Default rules only set parameters when they are missing in the payload.
 #     - models:

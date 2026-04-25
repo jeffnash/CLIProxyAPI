@@ -197,8 +197,23 @@ type PassthruRoute struct {
 	ContextWindow    int                 `yaml:"context-window,omitempty" json:"context-window,omitempty"`
 	MaxTokens        int                 `yaml:"max-tokens,omitempty" json:"max-tokens,omitempty"`
 	ModelOverride    *registry.ModelInfo `yaml:"model-override,omitempty" json:"model-override,omitempty"`
+	Payload          *PassthruPayload    `yaml:"payload,omitempty" json:"payload,omitempty"`
 	RateLimit        *PassthruRateLimit  `yaml:"rate-limit,omitempty" json:"rate-limit,omitempty"`
 	Lenient          bool                `yaml:"lenient,omitempty" json:"lenient,omitempty"`
+}
+
+// PassthruPayload defines route-scoped payload parameter rules.
+type PassthruPayload struct {
+	// Default sets parameters only when they are missing in the request payload.
+	Default map[string]any `yaml:"default,omitempty" json:"default,omitempty"`
+	// DefaultRaw sets raw JSON values only when they are missing.
+	DefaultRaw map[string]any `yaml:"default-raw,omitempty" json:"default-raw,omitempty"`
+	// Override always sets parameters, overwriting any existing values.
+	Override map[string]any `yaml:"override,omitempty" json:"override,omitempty"`
+	// OverrideRaw always sets raw JSON values, overwriting any existing values.
+	OverrideRaw map[string]any `yaml:"override-raw,omitempty" json:"override-raw,omitempty"`
+	// Filter removes parameters from the request payload by JSON path.
+	Filter []string `yaml:"filter,omitempty" json:"filter,omitempty"`
 }
 
 // PassthruRateLimit configures per-route retry and cooldown behavior.
@@ -1077,6 +1092,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
 
+	// Expand route-scoped passthru payload rules into the shared payload rule set.
+	cfg.AddPassthruPayloadRules()
+
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
@@ -1128,6 +1146,134 @@ func mergePassthruRoutes(existing, incoming []PassthruRoute) []PassthruRoute {
 		byModel[m] = len(out)
 		out = append(out, r)
 	}
+	return out
+}
+
+// AddPassthruPayloadRules expands per-route passthru payload settings into the
+// shared payload rule engine used by provider executors.
+func (cfg *Config) AddPassthruPayloadRules() {
+	if cfg == nil || len(cfg.Passthru) == 0 {
+		return
+	}
+	defaultRules := make([]PayloadRule, 0)
+	defaultRawRules := make([]PayloadRule, 0)
+	overrideRules := make([]PayloadRule, 0)
+	overrideRawRules := make([]PayloadRule, 0)
+	filterRules := make([]PayloadFilterRule, 0)
+	for i := range cfg.Passthru {
+		route := &cfg.Passthru[i]
+		if route.Payload == nil || passthruPayloadEmpty(*route.Payload) {
+			continue
+		}
+		models := passthruPayloadModelRules(route)
+		if len(models) == 0 {
+			continue
+		}
+		payload := route.Payload
+		if len(payload.Default) > 0 {
+			defaultRules = append(defaultRules, PayloadRule{
+				Models: models,
+				Params: clonePayloadParams(payload.Default),
+			})
+		}
+		if len(payload.DefaultRaw) > 0 {
+			defaultRawRules = append(defaultRawRules, PayloadRule{
+				Models: models,
+				Params: clonePayloadParams(payload.DefaultRaw),
+			})
+		}
+		if len(payload.Override) > 0 {
+			overrideRules = append(overrideRules, PayloadRule{
+				Models: models,
+				Params: clonePayloadParams(payload.Override),
+			})
+		}
+		if len(payload.OverrideRaw) > 0 {
+			overrideRawRules = append(overrideRawRules, PayloadRule{
+				Models: models,
+				Params: clonePayloadParams(payload.OverrideRaw),
+			})
+		}
+		if len(payload.Filter) > 0 {
+			filterRules = append(filterRules, PayloadFilterRule{
+				Models: models,
+				Params: cloneStringSlice(payload.Filter),
+			})
+		}
+	}
+	// Route-scoped defaults should beat broad global defaults; route-scoped
+	// overrides should run after broad global overrides.
+	cfg.Payload.Default = append(defaultRules, cfg.Payload.Default...)
+	cfg.Payload.DefaultRaw = append(defaultRawRules, cfg.Payload.DefaultRaw...)
+	cfg.Payload.Override = append(cfg.Payload.Override, overrideRules...)
+	cfg.Payload.OverrideRaw = append(cfg.Payload.OverrideRaw, overrideRawRules...)
+	cfg.Payload.Filter = append(cfg.Payload.Filter, filterRules...)
+}
+
+func passthruPayloadEmpty(payload PassthruPayload) bool {
+	return len(payload.Default) == 0 &&
+		len(payload.DefaultRaw) == 0 &&
+		len(payload.Override) == 0 &&
+		len(payload.OverrideRaw) == 0 &&
+		len(payload.Filter) == 0
+}
+
+func passthruPayloadModelRules(route *PassthruRoute) []PayloadModelRule {
+	if route == nil {
+		return nil
+	}
+	protocol := normalizePassthruPayloadProtocol(route.Protocol)
+	seen := make(map[string]struct{}, 2)
+	models := make([]PayloadModelRule, 0, 2)
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		models = append(models, PayloadModelRule{Name: name, Protocol: protocol})
+	}
+	add(route.Model)
+	add(route.ModelRoutingName)
+	return models
+}
+
+func normalizePassthruPayloadProtocol(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "", "openai", "openai-chat", "openai_compat", "openai-compat", "openai-compatibility":
+		return "openai"
+	case "claude":
+		return "claude"
+	case "codex":
+		return "codex"
+	case "responses":
+		return "codex"
+	default:
+		return "openai"
+	}
+}
+
+func clonePayloadParams(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneStringSlice(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
 	return out
 }
 
