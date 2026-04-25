@@ -511,6 +511,9 @@ nonstream-keepalive-interval: 0
 #       filter:
 #         - "temperature"
 #         - "top_p"
+#     # Preserve assistant reasoning_content across tool-call turns for clients
+#     # that drop it. Required by some thinking upstreams such as DeepSeek v4.
+#     preserve-reasoning-content: true
 #     # Lenient mode: disable automatic model/provider suspension on upstream errors.
 #     # This is useful for routes where the upstream may legitimately reject specific
 #     # requests (e.g., unsupported input formats like images for text-only models)
@@ -528,7 +531,7 @@ nonstream-keepalive-interval: 0
 # For multiple API keys (fallback support):
 #   PASSTHRU_MODELS_JSON='[{"model":"glm-4.7","protocol":"openai","base-url":"https://api.z.ai/v1","api-keys":["za-primary","za-backup"],"upstream-model":"glm-4.7"}]'
 # For route-scoped payload params (for example, DeepSeek thinking aliases):
-#   PASSTHRU_MODELS_JSON='[{"model":"deepseek-v4-pro-xhigh","protocol":"openai","base-url":"https://api.deepseek.com","api-key":"sk-...","upstream-model":"deepseek-v4-pro","payload":{"override":{"thinking.type":"enabled","reasoning_effort":"xhigh"},"filter":["temperature","top_p","presence_penalty","frequency_penalty"]}}]'
+#   PASSTHRU_MODELS_JSON='[{"model":"deepseek-v4-pro-xhigh","protocol":"openai","base-url":"https://api.deepseek.com","api-key":"sk-...","upstream-model":"deepseek-v4-pro","preserve-reasoning-content":true,"payload":{"override":{"thinking.type":"enabled","reasoning_effort":"xhigh"},"filter":["temperature","top_p","presence_penalty","frequency_penalty"]}}]'
 #
 #   default: # Default rules only set parameters when they are missing in the payload.
 #     - models:
