@@ -5,6 +5,14 @@ import (
 	"testing"
 )
 
+func byteChunksToStrings(chunks [][]byte) []string {
+	out := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		out = append(out, string(chunk))
+	}
+	return out
+}
+
 // TestPassthroughGeminiResponseStream_DataHandling validates that
 // the translator correctly handles various input types.
 func TestPassthroughGeminiResponseStream_DataHandling(t *testing.T) {
@@ -86,7 +94,7 @@ func TestPassthroughGeminiResponseStream_DataHandling(t *testing.T) {
 				return
 			}
 
-			if tc.wantLen > 0 && result[0] != tc.wantOutput {
+			if tc.wantLen > 0 && string(result[0]) != tc.wantOutput {
 				t.Errorf("expected output %q, got %q", tc.wantOutput, result[0])
 			}
 		})
@@ -111,7 +119,7 @@ func TestPassthroughGeminiResponseStream_DataPrefixStripping(t *testing.T) {
 		t.Fatalf("expected 1 result, got %d", len(result))
 	}
 
-	if result[0] != expected {
+	if string(result[0]) != expected {
 		t.Errorf("expected data prefix to be stripped\ngot:  %s\nwant: %s", result[0], expected)
 	}
 }
@@ -124,13 +132,13 @@ func TestPassthroughGeminiResponseStream_SSEStreamSimulation(t *testing.T) {
 	// The handler adds proper SSE framing
 	streamChunks := []string{
 		`data: {"candidates":[{"content":{"parts":[{"text":""}]}}]}`,
-		"data: ",                    // empty payload (should be filtered)
+		"data: ", // empty payload (should be filtered)
 		`data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}`,
-		"data:   ",                  // whitespace only (should be filtered)
+		"data:   ", // whitespace only (should be filtered)
 		`data: {"candidates":[{"content":{"parts":[{"text":" world"}]}}]}`,
-		"",                          // empty string (should be filtered)
+		"", // empty string (should be filtered)
 		`data: {"candidates":[{"content":{"parts":[{"text":"!"}]}}],"usageMetadata":{}}`,
-		"data: [DONE]",              // DONE marker (should be filtered)
+		"data: [DONE]", // DONE marker (should be filtered)
 	}
 
 	var validResults []string
@@ -142,7 +150,7 @@ func TestPassthroughGeminiResponseStream_SSEStreamSimulation(t *testing.T) {
 			[]byte(chunk),
 			nil,
 		)
-		validResults = append(validResults, result...)
+		validResults = append(validResults, byteChunksToStrings(result)...)
 	}
 
 	// We expect 4 valid JSON results to pass through
@@ -175,7 +183,7 @@ func TestPassthroughGeminiResponseNonStream(t *testing.T) {
 		nil,
 	)
 
-	if result != input {
+	if string(result) != input {
 		t.Errorf("expected passthrough to return input unchanged\ngot:  %s\nwant: %s", result, input)
 	}
 }
@@ -185,7 +193,7 @@ func TestGeminiTokenCount(t *testing.T) {
 	result := GeminiTokenCount(context.Background(), 42)
 	expected := `{"totalTokens":42,"promptTokensDetails":[{"modality":"TEXT","tokenCount":42}]}`
 
-	if result != expected {
+	if string(result) != expected {
 		t.Errorf("unexpected token count response\ngot:  %s\nwant: %s", result, expected)
 	}
 }

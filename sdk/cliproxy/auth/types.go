@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -404,30 +403,6 @@ func (a *Auth) AccountInfo() (string, string) {
 				}
 				return "oauth", email
 			}
-		}
-	}
-
-	// For iFlow provider, prioritize OAuth type if email is present
-	if strings.ToLower(a.Provider) == "iflow" {
-		if a.Metadata != nil {
-			if email, ok := a.Metadata["email"].(string); ok {
-				email = strings.TrimSpace(email)
-				if email != "" {
-					return "oauth", email
-				}
-			}
-		}
-	}
-
-	// For Copilot, use the filename (without extension) as the account identifier.
-	if strings.ToLower(a.Provider) == "copilot" {
-		name := strings.TrimSpace(a.FileName)
-		if name == "" {
-			name = strings.TrimSpace(filepath.Base(a.ID))
-		}
-		if name != "" {
-			name = strings.TrimSuffix(name, filepath.Ext(name))
-			return "oauth", name
 		}
 	}
 

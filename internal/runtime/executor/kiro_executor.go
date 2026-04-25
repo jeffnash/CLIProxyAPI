@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	kiroclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/claude"
 	kirocommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/common"
 	kiroopenai "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/openai"
@@ -290,7 +291,7 @@ func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "kiro")
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "kiro")
 	return httpClient.Do(httpReq)
 }
 
@@ -302,8 +303,8 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, fmt.Errorf("kiro: access token not found in auth")
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	// Check if token is expired before making request
 	if e.isTokenExpired(accessToken) {
@@ -325,7 +326,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
+	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	kiroModelID := e.mapModelToKiro(req.Model)
 
@@ -344,7 +345,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 // - Amazon Q endpoint (CLI origin) uses Amazon Q Developer quota
 // - CodeWhisperer endpoint (AI_EDITOR origin) uses Kiro IDE quota
 // Also supports multi-endpoint fallback similar to Antigravity implementation.
-func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from, to sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool) (cliproxyexecutor.Response, error) {
+func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from, to sdktranslator.Format, reporter *helps.UsageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool) (cliproxyexecutor.Response, error) {
 	var resp cliproxyexecutor.Response
 	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
 	endpointConfigs := getKiroEndpointConfigs(auth)
@@ -404,7 +405,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				authLabel = auth.Label
 				authType, authValue = auth.AccountInfo()
 			}
-			recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+			helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       url,
 				Method:    http.MethodPost,
 				Headers:   httpReq.Header.Clone(),
@@ -418,26 +419,26 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			// Do not set http.Client.Timeout for streaming responses; it applies while reading the body
 			// and can terminate long-lived event-stream responses mid-flight.
-			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "kiro")
+			httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "kiro")
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
-				recordAPIResponseError(ctx, e.cfg, err)
+				helps.RecordAPIResponseError(ctx, e.cfg, err)
 				return resp, err
 			}
-			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+			helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
 			// Handle 429 errors (quota exhausted) - try next endpoint
 			// Each endpoint has its own quota pool, so we can try different endpoints
 			if httpResp.StatusCode == 429 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 
 				log.Warnf("kiro: %s endpoint quota exhausted (429), will try next endpoint, body: %s",
-					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+					endpointConfig.Name, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
 				// Break inner retry loop to try next endpoint (which has different quota)
 				break
@@ -447,7 +448,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				if attempt < maxRetries {
 					// Exponential backoff: 1s, 2s, 4s... (max 30s)
@@ -468,7 +469,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			if httpResp.StatusCode == 401 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				if attempt < maxRetries {
 					log.Warnf("kiro: received 401 error, attempting token refresh and retry (attempt %d/%d)", attempt+1, maxRetries+1)
@@ -494,7 +495,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					}
 				}
 
-				log.Warnf("kiro request error, status: 401, body: %s", summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+				log.Warnf("kiro request error, status: 401, body: %s", helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 				return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 			}
 
@@ -502,7 +503,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			if httpResp.StatusCode == 402 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				log.Warnf("kiro: received 402 (monthly limit). Upstream body: %s", string(respBody))
 
@@ -515,10 +516,10 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			if httpResp.StatusCode == 403 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				// Log the 403 error details for debugging
-				log.Warnf("kiro: received 403 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+				log.Warnf("kiro: received 403 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
 				respBodyStr := string(respBody)
 
@@ -564,8 +565,8 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 				b, _ := io.ReadAll(httpResp.Body)
-				appendAPIResponseChunk(ctx, e.cfg, b)
-				log.Debugf("kiro request error, status: %d, body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+				helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+				log.Debugf("kiro request error, status: %d, body: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 				err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 				if errClose := httpResp.Body.Close(); errClose != nil {
 					log.Errorf("response body close error: %v", errClose)
@@ -581,20 +582,20 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			content, toolUses, usageInfo, stopReason, err := e.parseEventStream(httpResp.Body)
 			if err != nil {
-				recordAPIResponseError(ctx, e.cfg, err)
+				helps.RecordAPIResponseError(ctx, e.cfg, err)
 				return resp, err
 			}
 
 			// Fallback for usage if missing from upstream
 			if usageInfo.TotalTokens == 0 {
-				if enc, encErr := getTokenizer(req.Model); encErr == nil {
-					if inp, countErr := countOpenAIChatTokens(enc, opts.OriginalRequest); countErr == nil {
+				if enc, encErr := helps.GetTokenizer(req.Model); encErr == nil {
+					if inp, countErr := helps.CountOpenAIChatTokens(enc, opts.OriginalRequest); countErr == nil {
 						usageInfo.InputTokens = inp
 					}
 				}
 				if len(content) > 0 {
 					// Use tiktoken for more accurate output token calculation
-					if enc, encErr := getTokenizer(req.Model); encErr == nil {
+					if enc, encErr := helps.GetTokenizer(req.Model); encErr == nil {
 						if tokenCount, countErr := enc.Count(content); countErr == nil {
 							usageInfo.OutputTokens = int64(tokenCount)
 						}
@@ -610,8 +611,8 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				usageInfo.TotalTokens = usageInfo.InputTokens + usageInfo.OutputTokens
 			}
 
-			appendAPIResponseChunk(ctx, e.cfg, []byte(content))
-			reporter.publish(ctx, usageInfo)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, []byte(content))
+			reporter.Publish(ctx, usageInfo)
 
 			// Build response in Claude format for Kiro translator
 			// stopReason is extracted from upstream response by parseEventStream
@@ -640,8 +641,8 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, fmt.Errorf("kiro: access token not found in auth")
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	// Check if token is expired before making request
 	if e.isTokenExpired(accessToken) {
@@ -663,7 +664,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
+	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	kiroModelID := e.mapModelToKiro(req.Model)
 
@@ -685,7 +686,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 // - Amazon Q endpoint (CLI origin) uses Amazon Q Developer quota
 // - CodeWhisperer endpoint (AI_EDITOR origin) uses Kiro IDE quota
 // Also supports multi-endpoint fallback similar to Antigravity implementation.
-func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from sdktranslator.Format, reporter *usageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool) (<-chan cliproxyexecutor.StreamChunk, error) {
+func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, profileArn string, kiroPayload, body []byte, from sdktranslator.Format, reporter *helps.UsageReporter, currentOrigin, kiroModelID string, isAgentic, isChatOnly bool) (<-chan cliproxyexecutor.StreamChunk, error) {
 	maxRetries := 2 // Allow retries for token refresh + endpoint fallback
 	endpointConfigs := getKiroEndpointConfigs(auth)
 	var last429Err error
@@ -744,7 +745,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				authLabel = auth.Label
 				authType, authValue = auth.AccountInfo()
 			}
-			recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+			helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       url,
 				Method:    http.MethodPost,
 				Headers:   httpReq.Header.Clone(),
@@ -756,26 +757,26 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				AuthValue: authValue,
 			})
 
-			httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "kiro")
+			httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "kiro")
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
-				recordAPIResponseError(ctx, e.cfg, err)
+				helps.RecordAPIResponseError(ctx, e.cfg, err)
 				return nil, err
 			}
-			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+			helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
 			// Handle 429 errors (quota exhausted) - try next endpoint
 			// Each endpoint has its own quota pool, so we can try different endpoints
 			if httpResp.StatusCode == 429 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				// Preserve last 429 so callers can correctly backoff when all endpoints are exhausted
 				last429Err = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 
 				log.Warnf("kiro: stream %s endpoint quota exhausted (429), will try next endpoint, body: %s",
-					endpointConfig.Name, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+					endpointConfig.Name, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
 				// Break inner retry loop to try next endpoint (which has different quota)
 				break
@@ -785,7 +786,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			if httpResp.StatusCode >= 500 && httpResp.StatusCode < 600 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				if attempt < maxRetries {
 					// Exponential backoff: 1s, 2s, 4s... (max 30s)
@@ -806,9 +807,9 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			if httpResp.StatusCode == 400 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
-				log.Warnf("kiro: received 400 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
+				log.Warnf("kiro: received 400 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
 				// 400 errors indicate request validation issues - return immediately without retry
 				return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
@@ -819,7 +820,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			if httpResp.StatusCode == 401 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				if attempt < maxRetries {
 					log.Warnf("kiro: stream received 401 error, attempting token refresh and retry (attempt %d/%d)", attempt+1, maxRetries+1)
@@ -853,7 +854,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			if httpResp.StatusCode == 402 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				log.Warnf("kiro: stream received 402 (monthly limit). Upstream body: %s", string(respBody))
 
@@ -866,7 +867,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			if httpResp.StatusCode == 403 {
 				respBody, _ := io.ReadAll(httpResp.Body)
 				_ = httpResp.Body.Close()
-				appendAPIResponseChunk(ctx, e.cfg, respBody)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, respBody)
 
 				// Log the 403 error details for debugging
 				log.Warnf("kiro: stream received 403 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, string(respBody))
@@ -915,7 +916,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 				b, _ := io.ReadAll(httpResp.Body)
-				appendAPIResponseChunk(ctx, e.cfg, b)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 				log.Debugf("kiro stream error, status: %d, body: %s", httpResp.StatusCode, string(b))
 				if errClose := httpResp.Body.Close(); errClose != nil {
 					log.Errorf("response body close error: %v", errClose)
@@ -1943,7 +1944,7 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 // Implements duplicate content filtering using lastContentEvent detection (based on AIClient-2-API).
 // Extracts stop_reason from upstream events when available.
 // thinkingEnabled controls whether <thinking> tags are parsed - only parse when request enabled thinking.
-func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, reporter *usageReporter, thinkingEnabled bool) {
+func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, reporter *helps.UsageReporter, thinkingEnabled bool) {
 	reader := bufio.NewReaderSize(body, 20*1024*1024) // 20MB buffer to match other providers
 	var totalUsage usage.Detail
 	var hasToolUses bool          // Track if any tool uses were emitted
@@ -1989,15 +1990,15 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 	// Pre-calculate input tokens from request if possible
 	// Kiro uses Claude format, so try Claude format first, then OpenAI format, then fallback
-	if enc, err := getTokenizer(model); err == nil {
+	if enc, err := helps.GetTokenizer(model); err == nil {
 		var inputTokens int64
 		var countMethod string
 
 		// Try Claude format first (Kiro uses Claude API format)
-		if inp, err := countClaudeChatTokens(enc, claudeBody); err == nil && inp > 0 {
+		if inp, err := helps.CountClaudeChatTokens(enc, claudeBody); err == nil && inp > 0 {
 			inputTokens = inp
 			countMethod = "claude"
-		} else if inp, err := countOpenAIChatTokens(enc, originalReq); err == nil && inp > 0 {
+		} else if inp, err := helps.CountOpenAIChatTokens(enc, originalReq); err == nil && inp > 0 {
 			// Fallback to OpenAI format (for OpenAI-compatible requests)
 			inputTokens = inp
 			countMethod = "openai"
@@ -2022,7 +2023,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 	// Ensure usage is published even on early return
 	defer func() {
-		reporter.publish(ctx, totalUsage)
+		reporter.Publish(ctx, totalUsage)
 	}()
 
 	for {
@@ -2061,8 +2062,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", currentToolUse.ToolUseID, currentToolUse.Name)
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 				for _, chunk := range sseData {
-					if chunk != "" {
-						out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+					if len(chunk) != 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 					}
 				}
 
@@ -2071,8 +2072,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(inputBytes), contentBlockIndex)
 				sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
 				for _, chunk := range sseData {
-					if chunk != "" {
-						out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+					if len(chunk) != 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 					}
 				}
 
@@ -2080,8 +2081,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
 				sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 				for _, chunk := range sseData {
-					if chunk != "" {
-						out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+					if len(chunk) != 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 					}
 				}
 
@@ -2101,7 +2102,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 		if len(payload) == 0 {
 			continue
 		}
-		appendAPIResponseChunk(ctx, e.cfg, payload)
+		helps.AppendAPIResponseChunk(ctx, e.cfg, payload)
 
 		var event map[string]interface{}
 		if err := json.Unmarshal(payload, &event); err != nil {
@@ -2152,8 +2153,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			msgStart := kiroclaude.BuildClaudeMessageStartEvent(model, totalUsage.InputTokens)
 			sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, msgStart, &translatorParam)
 			for _, chunk := range sseData {
-				if chunk != "" {
-					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+				if len(chunk) != 0 {
+					out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 				}
 			}
 			messageStartSent = true
@@ -2368,7 +2369,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				if shouldSendUsageUpdate {
 					// Calculate current output tokens using tiktoken
 					var currentOutputTokens int64
-					if enc, encErr := getTokenizer(model); encErr == nil {
+					if enc, encErr := helps.GetTokenizer(model); encErr == nil {
 						if tokenCount, countErr := enc.Count(accumulatedContent.String()); countErr == nil {
 							currentOutputTokens = int64(tokenCount)
 						}
@@ -2388,8 +2389,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 						pingEvent := kiroclaude.BuildClaudePingEventWithUsage(totalUsage.InputTokens, currentOutputTokens)
 						sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, pingEvent, &translatorParam)
 						for _, chunk := range sseData {
-							if chunk != "" {
-								out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+							if len(chunk) != 0 {
+								out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 							}
 						}
 
@@ -2425,8 +2426,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 									blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(thinkingBlockIndex, "thinking", "", "")
 									sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 									for _, chunk := range sseData {
-										if chunk != "" {
-											out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+										if len(chunk) != 0 {
+											out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 										}
 									}
 								}
@@ -2434,8 +2435,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 								thinkingEvent := kiroclaude.BuildClaudeThinkingDeltaEvent(thinkingText, thinkingBlockIndex)
 								sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, thinkingEvent, &translatorParam)
 								for _, chunk := range sseData {
-									if chunk != "" {
-										out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+									if len(chunk) != 0 {
+										out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 									}
 								}
 								accumulatedThinkingContent.WriteString(thinkingText)
@@ -2445,8 +2446,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 								blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
 								sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 								for _, chunk := range sseData {
-									if chunk != "" {
-										out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+									if len(chunk) != 0 {
+										out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 									}
 								}
 								isThinkingBlockOpen = false
@@ -2476,16 +2477,16 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 										blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(thinkingBlockIndex, "thinking", "", "")
 										sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 										for _, chunk := range sseData {
-											if chunk != "" {
-												out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+											if len(chunk) != 0 {
+												out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 											}
 										}
 									}
 									thinkingEvent := kiroclaude.BuildClaudeThinkingDeltaEvent(processContent, thinkingBlockIndex)
 									sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, thinkingEvent, &translatorParam)
 									for _, chunk := range sseData {
-										if chunk != "" {
-											out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+										if len(chunk) != 0 {
+											out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 										}
 									}
 									accumulatedThinkingContent.WriteString(processContent)
@@ -2505,8 +2506,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 									blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
 									sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 									for _, chunk := range sseData {
-										if chunk != "" {
-											out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+										if len(chunk) != 0 {
+											out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 										}
 									}
 									isThinkingBlockOpen = false
@@ -2518,8 +2519,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 									blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "text", "", "")
 									sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 									for _, chunk := range sseData {
-										if chunk != "" {
-											out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+										if len(chunk) != 0 {
+											out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 										}
 									}
 								}
@@ -2527,8 +2528,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 								claudeEvent := kiroclaude.BuildClaudeStreamEvent(textBefore, contentBlockIndex)
 								sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, claudeEvent, &translatorParam)
 								for _, chunk := range sseData {
-									if chunk != "" {
-										out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+									if len(chunk) != 0 {
+										out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 									}
 								}
 							}
@@ -2537,8 +2538,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 								blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
 								sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 								for _, chunk := range sseData {
-									if chunk != "" {
-										out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+									if len(chunk) != 0 {
+										out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 									}
 								}
 								isTextBlockOpen = false
@@ -2567,16 +2568,16 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 										blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "text", "", "")
 										sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 										for _, chunk := range sseData {
-											if chunk != "" {
-												out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+											if len(chunk) != 0 {
+												out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 											}
 										}
 									}
 									claudeEvent := kiroclaude.BuildClaudeStreamEvent(processContent, contentBlockIndex)
 									sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, claudeEvent, &translatorParam)
 									for _, chunk := range sseData {
-										if chunk != "" {
-											out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+										if len(chunk) != 0 {
+											out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 										}
 									}
 								}
@@ -2605,8 +2606,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
 					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 					for _, chunk := range sseData {
-						if chunk != "" {
-							out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+						if len(chunk) != 0 {
+							out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 						}
 					}
 					isTextBlockOpen = false
@@ -2618,8 +2619,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", toolUseID, toolName)
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 				for _, chunk := range sseData {
-					if chunk != "" {
-						out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+					if len(chunk) != 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 					}
 				}
 
@@ -2633,8 +2634,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 						inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(inputJSON), contentBlockIndex)
 						sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
 						for _, chunk := range sseData {
-							if chunk != "" {
-								out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+							if len(chunk) != 0 {
+								out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 							}
 						}
 					}
@@ -2644,8 +2645,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
 				sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 				for _, chunk := range sseData {
-					if chunk != "" {
-						out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+					if len(chunk) != 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 					}
 				}
 			}
@@ -2685,8 +2686,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
 					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 					for _, chunk := range sseData {
-						if chunk != "" {
-							out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+						if len(chunk) != 0 {
+							out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 						}
 					}
 					isTextBlockOpen = false
@@ -2700,8 +2701,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 					blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(thinkingBlockIndex, "thinking", "", "")
 					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 					for _, chunk := range sseData {
-						if chunk != "" {
-							out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+						if len(chunk) != 0 {
+							out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 						}
 					}
 				}
@@ -2710,8 +2711,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				thinkingEvent := kiroclaude.BuildClaudeThinkingDeltaEvent(thinkingText, thinkingBlockIndex)
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, thinkingEvent, &translatorParam)
 				for _, chunk := range sseData {
-					if chunk != "" {
-						out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+					if len(chunk) != 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 					}
 				}
 
@@ -2738,8 +2739,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
 					sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 					for _, chunk := range sseData {
-						if chunk != "" {
-							out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+						if len(chunk) != 0 {
+							out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 						}
 					}
 					isTextBlockOpen = false
@@ -2750,8 +2751,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "tool_use", tu.ToolUseID, tu.Name)
 				sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStart, &translatorParam)
 				for _, chunk := range sseData {
-					if chunk != "" {
-						out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+					if len(chunk) != 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 					}
 				}
 
@@ -2763,8 +2764,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 						inputDelta := kiroclaude.BuildClaudeInputJsonDeltaEvent(string(inputJSON), contentBlockIndex)
 						sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, inputDelta, &translatorParam)
 						for _, chunk := range sseData {
-							if chunk != "" {
-								out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+							if len(chunk) != 0 {
+								out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 							}
 						}
 					}
@@ -2773,8 +2774,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
 				sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 				for _, chunk := range sseData {
-					if chunk != "" {
-						out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+					if len(chunk) != 0 {
+						out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 					}
 				}
 			}
@@ -2962,8 +2963,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 		blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
 		sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
 		for _, chunk := range sseData {
-			if chunk != "" {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+			if len(chunk) != 0 {
+				out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 			}
 		}
 	}
@@ -2972,7 +2973,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	// Only use local estimation if server didn't provide usage (server-side usage takes priority)
 	if totalUsage.OutputTokens == 0 && accumulatedContent.Len() > 0 {
 		// Try to use tiktoken for accurate counting
-		if enc, err := getTokenizer(model); err == nil {
+		if enc, err := helps.GetTokenizer(model); err == nil {
 			if tokenCount, countErr := enc.Count(accumulatedContent.String()); countErr == nil {
 				totalUsage.OutputTokens = int64(tokenCount)
 				log.Debugf("kiro: streamToChannel calculated output tokens using tiktoken: %d", totalUsage.OutputTokens)
@@ -3049,8 +3050,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	msgDelta := kiroclaude.BuildClaudeMessageDeltaEvent(stopReason, totalUsage)
 	sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, msgDelta, &translatorParam)
 	for _, chunk := range sseData {
-		if chunk != "" {
-			out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+		if len(chunk) != 0 {
+			out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 		}
 	}
 
@@ -3058,8 +3059,8 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	msgStop := kiroclaude.BuildClaudeMessageStopOnlyEvent()
 	sseData = sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, msgStop, &translatorParam)
 	for _, chunk := range sseData {
-		if chunk != "" {
-			out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunk + "\n\n")}
+		if len(chunk) != 0 {
+			out <- cliproxyexecutor.StreamChunk{Payload: append(append([]byte{}, chunk...), '\n', '\n')}
 		}
 	}
 	// reporter.publish is called via defer
@@ -3072,7 +3073,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 // This provides approximate token counts for client requests.
 func (e *KiroExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	// Use tiktoken for local token counting
-	enc, err := getTokenizer(req.Model)
+	enc, err := helps.GetTokenizer(req.Model)
 	if err != nil {
 		log.Warnf("kiro: CountTokens failed to get tokenizer: %v, falling back to estimate", err)
 		// Fallback: estimate from payload size (roughly 4 chars per token)
@@ -3089,7 +3090,7 @@ func (e *KiroExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth,
 	var totalTokens int64
 
 	// Try OpenAI chat format first
-	if tokens, countErr := countOpenAIChatTokens(enc, req.Payload); countErr == nil && tokens > 0 {
+	if tokens, countErr := helps.CountOpenAIChatTokens(enc, req.Payload); countErr == nil && tokens > 0 {
 		totalTokens = tokens
 		log.Debugf("kiro: CountTokens counted %d tokens using OpenAI chat format", totalTokens)
 	} else {

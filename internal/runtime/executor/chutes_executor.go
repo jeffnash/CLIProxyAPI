@@ -10,14 +10,15 @@ import (
 	"io"
 	"net/http"
 	"regexp"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -118,8 +119,8 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return resp, fmt.Errorf("chutes executor: missing api key")
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	// Resolve model ID for Chutes API (strip chutes- prefix & consult cache)
 	apiModel := resolveChutesModel(req.Model)
@@ -134,7 +135,7 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	to := sdktranslator.FromString("openai")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 	body, _ = sjson.SetBytes(body, "model", apiModel)
-	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
+	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	endpoint := strings.TrimSuffix(baseURL, "/") + chutesChatEndpoint
 
@@ -157,14 +158,14 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		applyChutesHeaders(httpReq, apiKey, false)
 		logChutesRequestHeaders(httpReq)
 
-		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "chutes")
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "chutes")
 		httpResp, errDo := httpClient.Do(httpReq)
 		if errDo != nil {
 			log.WithFields(log.Fields{
-				"attempt":   attempt + 1,
-				"duration":  time.Since(start).String(),
-				"model":     req.Model,
-				"endpoint":  endpoint,
+				"attempt":    attempt + 1,
+				"duration":   time.Since(start).String(),
+				"model":      req.Model,
+				"endpoint":   endpoint,
 				"http_error": errDo.Error(),
 			}).Warn("chutes: request error")
 			// Network errors are treated as transient; retry if we still have attempts.
@@ -177,7 +178,7 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			return resp, errDo
 		}
 		// Always record upstream status/headers for request logging (including happy paths).
-		recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
 		func() {
 			defer httpResp.Body.Close()
@@ -191,7 +192,7 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 					"response_headers": formatChutesResponseHeaders(httpResp.Header),
 					"body":             sanitizeResponseBody(data),
 				}).Info("chutes: upstream non-2xx")
-				appendAPIResponseChunk(ctx, e.cfg, data)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 			} else {
 				log.WithFields(log.Fields{
 					"attempt":  attempt + 1,
@@ -229,8 +230,8 @@ func (e *ChutesExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	// Repair malformed tool_calls arguments in non-streaming response
 	data = repairChutesNonStreamToolCallArguments(data)
-	reporter.publish(ctx, parseOpenAIUsage(data))
-	reporter.ensurePublished(ctx)
+	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
+	reporter.EnsurePublished(ctx)
 
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, data, &param)
@@ -244,8 +245,8 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, fmt.Errorf("chutes executor: missing api key")
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	apiModel := resolveChutesModel(req.Model)
 
@@ -253,7 +254,7 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	to := sdktranslator.FromString("openai")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 	body, _ = sjson.SetBytes(body, "model", apiModel)
-	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
+	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	endpoint := strings.TrimSuffix(baseURL, "/") + chutesChatEndpoint
 
@@ -276,14 +277,14 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		applyChutesHeaders(httpReq, apiKey, true)
 		logChutesRequestHeaders(httpReq)
 
-		httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "chutes")
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "chutes")
 		resp, errDo := httpClient.Do(httpReq)
 		if errDo != nil {
 			log.WithFields(log.Fields{
-				"attempt":   attempt + 1,
-				"duration":  time.Since(start).String(),
-				"model":     req.Model,
-				"endpoint":  endpoint,
+				"attempt":    attempt + 1,
+				"duration":   time.Since(start).String(),
+				"model":      req.Model,
+				"endpoint":   endpoint,
 				"http_error": errDo.Error(),
 			}).Warn("chutes: stream bootstrap error")
 			if attempt < attempts-1 {
@@ -295,7 +296,7 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return nil, errDo
 		}
 		// Always record upstream status/headers for request logging (including happy paths).
-		recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			httpResp = resp
@@ -313,7 +314,7 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			"response_headers": formatChutesResponseHeaders(resp.Header),
 			"body":             sanitizeResponseBody(data),
 		}).Info("chutes: stream bootstrap non-2xx")
-		appendAPIResponseChunk(ctx, e.cfg, data)
+		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 
 		if chutesIsRetryableStatus(resp.StatusCode) && attempt < attempts-1 {
 			// Optional: respect upstream Retry-After, but cap to a short cooldown to avoid
@@ -367,10 +368,10 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			line = repairChutesToolCallArguments(line)
 			if loggedLines < 8 {
 				loggedLines++
-				appendAPIResponseChunk(ctx, e.cfg, line)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			}
-			if detail, ok := parseOpenAIStreamUsage(line); ok {
-				reporter.publish(ctx, detail)
+			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
+				reporter.Publish(ctx, detail)
 			}
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
 			for i := range chunks {
@@ -378,10 +379,10 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			reporter.publishFailure(ctx)
+			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		}
-		reporter.ensurePublished(ctx)
+		reporter.EnsurePublished(ctx)
 	}()
 
 	return &cliproxyexecutor.StreamResult{Chunks: out}, nil
@@ -398,17 +399,17 @@ func (e *ChutesExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	to := sdktranslator.FromString("openai")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 
-	enc, err := tokenizerForModel(req.Model)
+	enc, err := helps.TokenizerForModel(req.Model)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("chutes executor: tokenizer init failed: %w", err)
 	}
 
-	count, err := countOpenAIChatTokens(enc, body)
+	count, err := helps.CountOpenAIChatTokens(enc, body)
 	if err != nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("chutes executor: token counting failed: %w", err)
 	}
 
-	usageJSON := buildOpenAIUsageJSON(count)
+	usageJSON := helps.BuildOpenAIUsageJSON(count)
 	translated := sdktranslator.TranslateTokenCount(ctx, to, from, count, usageJSON)
 	return cliproxyexecutor.Response{Payload: []byte(translated)}, nil
 }
@@ -426,7 +427,7 @@ func (e *ChutesExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "chutes")
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "chutes")
 	return httpClient.Do(httpReq)
 }
 
@@ -457,7 +458,7 @@ func (e *ChutesExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	httpClient := newProxyAwareHTTPClient(ctx, cfg, auth, 15*time.Second, "chutes")
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, cfg, auth, 15*time.Second, "chutes")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Warnf("chutes: failed to fetch models: %v", err)

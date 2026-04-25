@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	grokauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/grok"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -245,29 +244,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}
-	// Provider-specific normalization
-	switch strings.ToLower(provider) {
-	case "grok":
-		storage := &grokauth.GrokTokenStorage{
-			SSOToken:              grokauth.NormalizeSSOToken(stringField(metadata, "sso_token")),
-			CFClearance:           stringField(metadata, "cf_clearance"),
-			TokenType:             strings.ToLower(stringField(metadata, "token_type")),
-			Status:                stringField(metadata, "status"),
-			FailedCount:           intField(metadata, "failed_count"),
-			RemainingQueries:      intField(metadata, "remaining_queries"),
-			HeavyRemainingQueries: intField(metadata, "heavy_remaining_queries"),
-			Note:                  stringField(metadata, "note"),
-			Type:                  "grok",
-		}
-		auth.Storage = storage
-		if auth.Attributes == nil {
-			auth.Attributes = make(map[string]string)
-		}
-		auth.Attributes["sso_token"] = storage.SSOToken
-		auth.Attributes["cf_clearance"] = storage.CFClearance
-		auth.Attributes["token_type"] = storage.TokenType
-		auth.Attributes["proxy_url"] = stringField(metadata, "proxy_url")
-	}
+	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
 }
 

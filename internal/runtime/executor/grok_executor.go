@@ -14,6 +14,7 @@ import (
 	grokauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/grok"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	grokchat "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/grok/openai/chat-completions"
 	groktranslator "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/grok"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -117,8 +118,8 @@ func (e *GrokExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		}
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	ctx = grokchat.WithGrokConfig(ctx, e.cfg)
 	maskedToken := grokauth.MaskToken(ssoToken)
@@ -146,7 +147,7 @@ func (e *GrokExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       grokauth.GrokAPIEndpoint,
 		Method:    http.MethodPost,
 		Headers:   httpHeaders.Clone(),
@@ -160,7 +161,7 @@ func (e *GrokExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	httpResp, err := client.Post(ctx, grokauth.GrokAPIEndpoint, headers, body)
 	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 	defer func() {
@@ -171,11 +172,11 @@ func (e *GrokExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		}
 	}()
 
-	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
-		appendAPIResponseChunk(ctx, e.cfg, b)
-		log.Debugf("grok executor: request error, status: %d, token=%s, body: %s", httpResp.StatusCode, maskedToken, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		log.Debugf("grok executor: request error, status: %d, token=%s, body: %s", httpResp.StatusCode, maskedToken, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if storage != nil {
 			err = e.handleError(httpResp.StatusCode, b, storage, maskedToken)
 		} else {
@@ -186,25 +187,25 @@ func (e *GrokExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
-	appendAPIResponseChunk(ctx, e.cfg, data)
+	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	if storage != nil {
 		storage.FailedCount = 0
 	}
 
 	finalPayload, err := e.extractFinalJSONLine(data)
 	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FromString("grok"), opts.SourceFormat, req.Model, bytes.Clone(opts.OriginalRequest), body, finalPayload, &param)
 	resp = cliproxyexecutor.Response{Payload: []byte(out)}
-	reporter.ensurePublished(ctx)
-	reporter.publish(ctx, usage.Detail{})
+	reporter.EnsurePublished(ctx)
+	reporter.Publish(ctx, usage.Detail{})
 	if storage != nil && e.auth != nil {
 		if _, rateErr := e.auth.CheckRateLimits(ctx, storage, req.Model); rateErr != nil {
 			log.Debugf("grok executor: rate-limit refresh failed for token=%s: %v", maskedToken, rateErr)
@@ -230,8 +231,8 @@ func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), req.Model, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	ctx = grokchat.WithGrokConfig(ctx, e.cfg)
 	maskedToken := grokauth.MaskToken(ssoToken)
@@ -259,7 +260,7 @@ func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       grokauth.GrokAPIEndpoint,
 		Method:    http.MethodPost,
 		Headers:   httpHeaders.Clone(),
@@ -274,19 +275,19 @@ func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	streamCtx, cancel := context.WithCancel(ctx)
 	httpResp, err := client.PostStream(streamCtx, grokauth.GrokAPIEndpoint, headers, body)
 	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		cancel()
 		return nil, err
 	}
-	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		var data []byte
 		if httpResp.Body != nil {
 			data, _ = io.ReadAll(httpResp.Body)
 			_ = httpResp.Body.Close()
 		}
-		appendAPIResponseChunk(ctx, e.cfg, data)
-		log.Debugf("grok executor: streaming request error, status: %d, token=%s, body: %s", httpResp.StatusCode, maskedToken, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+		log.Debugf("grok executor: streaming request error, status: %d, token=%s, body: %s", httpResp.StatusCode, maskedToken, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		if storage != nil {
 			err = e.handleError(httpResp.StatusCode, data, storage, maskedToken)
 		} else {
@@ -327,7 +328,7 @@ func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				continue
 			}
 			timeoutTracker.MarkChunk()
-			appendAPIResponseChunk(ctx, e.cfg, line)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			chunks := sdktranslator.TranslateStream(streamCtx, sdktranslator.FromString("grok"), opts.SourceFormat, req.Model, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
@@ -343,13 +344,13 @@ func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			if timeoutReason == "" {
-				recordAPIResponseError(ctx, e.cfg, errScan)
-				reporter.publishFailure(ctx)
+				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+				reporter.PublishFailure(ctx)
 				out <- cliproxyexecutor.StreamChunk{Err: errScan}
 				return
 			}
 		}
-		reporter.ensurePublished(ctx)
+		reporter.EnsurePublished(ctx)
 		if storage != nil && e.auth != nil {
 			if _, rateErr := e.auth.CheckRateLimits(ctx, storage, req.Model); rateErr != nil {
 				log.Debugf("grok executor: rate-limit refresh failed for token=%s: %v", maskedToken, rateErr)
@@ -404,7 +405,7 @@ func (e *GrokExecutor) buildGrokPayload(ctx context.Context, req cliproxyexecuto
 	}
 	body, _ = sjson.SetBytes(body, "model", apiModel)
 	body = e.applyGrokConfigToPayload(body)
-	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
+	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	return body, headerOpts, nil
 }

@@ -70,6 +70,10 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
+	// When <= 0, the default worker count is used.
+	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
+
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
@@ -86,6 +90,13 @@ type Config struct {
 
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
+
+	// AntigravitySignatureCacheEnabled controls whether signature cache validation is enabled for thinking blocks.
+	// When true (default), cached signatures are preferred and validated.
+	// When false, client signatures are used directly after normalization (bypass mode).
+	AntigravitySignatureCacheEnabled *bool `yaml:"antigravity-signature-cache-enabled,omitempty" json:"antigravity-signature-cache-enabled,omitempty"`
+
+	AntigravitySignatureBypassStrict *bool `yaml:"antigravity-signature-bypass-strict,omitempty" json:"antigravity-signature-bypass-strict,omitempty"`
 
 	// GeminiKey defines Gemini API key configurations with optional routing overrides.
 	GeminiKey []GeminiKey `yaml:"gemini-api-key" json:"gemini-api-key"`
@@ -153,7 +164,7 @@ type Config struct {
 
 	// OAuthModelAlias defines global model name aliases for OAuth/file-backed auth channels.
 	// These aliases affect both model listing and model routing for supported channels:
-	// gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow.
+	// gemini-cli, vertex, aistudio, antigravity, claude, codex, kimi.
 	//
 	// NOTE: This does not apply to existing per-credential model alias features under:
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.
@@ -171,110 +182,47 @@ type Config struct {
 }
 
 // PassthruRoute maps a local model name to an upstream provider endpoint.
-// These routes synthesize runtime Auth entries (like other config API keys),
-// so they participate in normal selection, retries, proxies, and logging.
+// These routes synthesize runtime Auth entries, so they participate in normal
+// selection, retries, proxies, and logging.
 type PassthruRoute struct {
-	// Model is the local model name clients will request (e.g., "glm-4.7").
-	Model string `yaml:"model" json:"model"`
-
-	// ModelRoutingName is an optional unique local model name used ONLY for routing.
-	// When set, clients should request this name (e.g., "zai-glm-4.7") to avoid collisions
-	// with OAuth-backed providers advertising the same model.
-	// If empty, defaults to Model.
-	ModelRoutingName string `yaml:"model-routing-name,omitempty" json:"model-routing-name,omitempty"`
-
-	// Protocol selects the executor/translator protocol used to talk to the upstream.
-	// Supported: "openai" (OpenAI-compatible /chat/completions), "claude" (Anthropic messages API), "codex" (OpenAI Responses).
-	Protocol string `yaml:"protocol" json:"protocol"`
-
-	// UpstreamModel overrides the model identifier sent to the upstream (optional).
-	UpstreamModel string `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
-
-	// BaseURL is the upstream API base URL.
-	// For protocol=openai, the executor calls {base-url}/chat/completions.
-	// For protocol=claude, the executor calls {base-url}/v1/messages.
-	// For protocol=codex, the executor calls {base-url}/responses.
-	BaseURL string `yaml:"base-url" json:"base-url"`
-
-	// APIKey is the upstream credential (optional if Headers provides auth).
-	APIKey string `yaml:"api-key,omitempty" json:"api-key,omitempty"`
-
-	// APIKeys is an array of upstream credentials that support fallback.
-	// When one key fails (e.g., 429 or other errors), the system will try the next key.
-	// If APIKey is also provided, it is treated as the first element in this list.
-	APIKeys []string `yaml:"api-keys,omitempty" json:"api-keys,omitempty"`
-
-	// ProxyURL optionally overrides the global proxy for this passthru route.
-	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
-
-	// Headers optionally adds extra HTTP headers for upstream requests.
-	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-
-	// ContextWindow specifies the model's context window size (optional).
-	// Used for /v1/models metadata. Defaults to 128000 if not set.
-	ContextWindow int `yaml:"context-window,omitempty" json:"context-window,omitempty"`
-
-	// MaxTokens specifies the model's max output tokens (optional).
-	// Used for /v1/models metadata. Defaults to 32000 if not set.
-	MaxTokens int `yaml:"max-tokens,omitempty" json:"max-tokens,omitempty"`
-
-	// ModelOverride optionally provides explicit model capability metadata for this passthru model.
-	// Fields set here override any auto-resolved values from static model definitions.
-	// Unset fields fall back to static resolution (by upstream model name) or defaults.
-	//
-	// Use this when the upstream model is too new for the static registry, or when
-	// the passthru route's capabilities differ from the static definition (e.g.,
-	// a model accessed via claude protocol may have different thinking config than
-	// the same model accessed via iflow).
-	//
-	// Example: {"thinking": {"min": 1024, "max": 128000, "zero_allowed": true}, "max_completion_tokens": 64000}
-	ModelOverride *registry.ModelInfo `yaml:"model-override,omitempty" json:"model-override,omitempty"`
-
-	// RateLimit optionally configures retry and cooldown behavior for this passthru model.
-	// These map to per-auth overrides already supported by the conductor.
-	// When omitted, global request-retry and cooling settings apply.
-	//
-	// Example: {"request-retry": 3, "disable-cooling": false}
-	RateLimit *PassthruRateLimit `yaml:"rate-limit,omitempty" json:"rate-limit,omitempty"`
-
-	// Lenient makes this passthru route more tolerant of upstream errors by disabling
-	// automatic suspension of the model and provider on certain error types.
-	// When true, sets DisableModelSuspend=true and DisableProviderSuspend=true on RateLimit.
-	// Default is false (normal strict behavior).
-	Lenient bool `yaml:"lenient,omitempty" json:"lenient,omitempty"`
+	Model            string              `yaml:"model" json:"model"`
+	ModelRoutingName string              `yaml:"model-routing-name,omitempty" json:"model-routing-name,omitempty"`
+	Protocol         string              `yaml:"protocol" json:"protocol"`
+	UpstreamModel    string              `yaml:"upstream-model,omitempty" json:"upstream-model,omitempty"`
+	BaseURL          string              `yaml:"base-url" json:"base-url"`
+	APIKey           string              `yaml:"api-key,omitempty" json:"api-key,omitempty"`
+	APIKeys          []string            `yaml:"api-keys,omitempty" json:"api-keys,omitempty"`
+	ProxyURL         string              `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+	Headers          map[string]string   `yaml:"headers,omitempty" json:"headers,omitempty"`
+	ContextWindow    int                 `yaml:"context-window,omitempty" json:"context-window,omitempty"`
+	MaxTokens        int                 `yaml:"max-tokens,omitempty" json:"max-tokens,omitempty"`
+	ModelOverride    *registry.ModelInfo `yaml:"model-override,omitempty" json:"model-override,omitempty"`
+	RateLimit        *PassthruRateLimit  `yaml:"rate-limit,omitempty" json:"rate-limit,omitempty"`
+	Lenient          bool                `yaml:"lenient,omitempty" json:"lenient,omitempty"`
 }
 
 // PassthruRateLimit configures per-route retry and cooldown behavior.
 // Pointer fields allow distinguishing "not set" from zero values.
 type PassthruRateLimit struct {
-	// RequestRetry is the max number of retry attempts on failure.
-	// When omitted, the global request-retry config applies.
-	// Set to 0 to disable retries for this route.
-	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
-
-	// DisableCooling disables exponential backoff cooldown on 429s for this route.
-	// When omitted, the global disable-cooling config applies.
-	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
-
-	// DisableModelSuspend prevents automatic suspension of this passthru model when
-	// upstream returns errors like 404 (not found), 401 (unauthorized), 402/403 (payment).
-	// This is useful for routes where the upstream may legitimately reject specific
-	// requests (e.g., unsupported input formats) but the model remains available.
-	DisableModelSuspend *bool `yaml:"disable-model-suspend,omitempty" json:"disable-model-suspend,omitempty"`
-
-	// DisableProviderSuspend prevents automatic suspension of the entire passthru provider
-	// when this route encounters errors. By default, provider suspension cascades to all
-	// models using that provider; setting this prevents that behavior for this route.
+	RequestRetry           *int  `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
+	DisableCooling         *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+	DisableModelSuspend    *bool `yaml:"disable-model-suspend,omitempty" json:"disable-model-suspend,omitempty"`
 	DisableProviderSuspend *bool `yaml:"disable-provider-suspend,omitempty" json:"disable-provider-suspend,omitempty"`
 }
 
-// ClaudeHeaderDefaults configures default header values injected into Claude API requests
-// when the client does not send them. Update these when Claude Code releases a new version.
+// ClaudeHeaderDefaults configures default header values injected into Claude API requests.
+// In legacy mode, UserAgent/PackageVersion/RuntimeVersion/Timeout act as fallbacks when
+// the client omits them, while OS/Arch remain runtime-derived. When stabilized device
+// profiles are enabled, OS/Arch become the pinned platform baseline, while
+// UserAgent/PackageVersion/RuntimeVersion seed the upgradeable software fingerprint.
 type ClaudeHeaderDefaults struct {
-	UserAgent      string `yaml:"user-agent" json:"user-agent"`
-	PackageVersion string `yaml:"package-version" json:"package-version"`
-	RuntimeVersion string `yaml:"runtime-version" json:"runtime-version"`
-	Timeout        string `yaml:"timeout" json:"timeout"`
+	UserAgent              string `yaml:"user-agent" json:"user-agent"`
+	PackageVersion         string `yaml:"package-version" json:"package-version"`
+	RuntimeVersion         string `yaml:"runtime-version" json:"runtime-version"`
+	OS                     string `yaml:"os" json:"os"`
+	Arch                   string `yaml:"arch" json:"arch"`
+	Timeout                string `yaml:"timeout" json:"timeout"`
+	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
 }
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
@@ -311,6 +259,9 @@ type RemoteManagement struct {
 	SecretKey string `yaml:"secret-key"`
 	// DisableControlPanel skips serving and syncing the bundled management UI when true.
 	DisableControlPanel bool `yaml:"disable-control-panel"`
+	// DisableAutoUpdatePanel disables automatic periodic background updates of the management panel asset from GitHub.
+	// When false (the default), the background updater remains enabled; when true, the panel is only downloaded on first access if missing.
+	DisableAutoUpdatePanel bool `yaml:"disable-auto-update-panel"`
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
@@ -324,6 +275,11 @@ type QuotaExceeded struct {
 
 	// SwitchPreviewModel indicates whether to automatically switch to a preview model when a quota is exceeded.
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
+
+	// AntigravityCredits enables credits-based last-resort fallback for Claude models.
+	// When all free-tier auths are exhausted (429/503), the conductor retries with
+	// an auth that has available Google One AI credits.
+	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -331,6 +287,22 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// ClaudeCodeSessionAffinity enables session-sticky routing for Claude Code clients.
+	// When enabled, requests with the same session ID (extracted from metadata.user_id)
+	// are routed to the same auth credential when available.
+	// Deprecated: Use SessionAffinity instead for universal session support.
+	ClaudeCodeSessionAffinity bool `yaml:"claude-code-session-affinity,omitempty" json:"claude-code-session-affinity,omitempty"`
+
+	// SessionAffinity enables universal session-sticky routing for all clients.
+	// Session IDs are extracted from multiple sources:
+	// X-Session-ID header, Idempotency-Key, metadata.user_id, conversation_id, or message hash.
+	// Automatic failover is always enabled when bound auth becomes unavailable.
+	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
+
+	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
+	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
+	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
 }
 
 // ChutesConfig holds Chutes API configuration.
@@ -392,8 +364,8 @@ type AmpCode struct {
 	UpstreamAPIKey string `yaml:"upstream-api-key" json:"upstream-api-key"`
 
 	// UpstreamAPIKeys maps client API keys (from top-level api-keys) to upstream API keys.
-	// When a client authenticates with a key that matches an entry, that upstream key is used.
-	// If no match is found, falls back to UpstreamAPIKey (default behavior).
+	// When a request is authenticated with one of the APIKeys, the corresponding UpstreamAPIKey
+	// is used for the upstream Amp request.
 	UpstreamAPIKeys []AmpUpstreamAPIKeyEntry `yaml:"upstream-api-keys,omitempty" json:"upstream-api-keys,omitempty"`
 
 	// RestrictManagementToLocalhost restricts Amp management routes (/api/user, /api/threads, etc.)
@@ -515,6 +487,11 @@ type ClaudeKey struct {
 
 	// Cloak configures request cloaking for non-Claude-Code clients.
 	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
+
+	// ExperimentalCCHSigning enables opt-in final-body cch signing for cloaked
+	// Claude /v1/messages requests. It is disabled by default so upstream seed
+	// changes do not alter the proxy's legacy behavior.
+	ExperimentalCCHSigning bool `yaml:"experimental-cch-signing,omitempty" json:"experimental-cch-signing,omitempty"`
 }
 
 func (k ClaudeKey) GetAPIKey() string  { return k.APIKey }
@@ -788,6 +765,10 @@ type OpenAICompatibilityModel struct {
 
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// Thinking configures the thinking/reasoning capability for this model.
+	// If nil, the model defaults to level-based reasoning with levels ["low", "medium", "high"].
+	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
 func (m OpenAICompatibilityModel) GetName() string  { return m.Name }
@@ -956,6 +937,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
+
+	// Sanitize Claude header defaults.
+	cfg.SanitizeClaudeHeaderDefaults()
 
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
@@ -1212,6 +1196,20 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
 
+// SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
+// configured Claude fingerprint baseline values.
+func (cfg *Config) SanitizeClaudeHeaderDefaults() {
+	if cfg == nil {
+		return
+	}
+	cfg.ClaudeHeaderDefaults.UserAgent = strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent)
+	cfg.ClaudeHeaderDefaults.PackageVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion)
+	cfg.ClaudeHeaderDefaults.RuntimeVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion)
+	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
+	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
+	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
+}
+
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
 // It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
 // allows multiple aliases per upstream name, and ensures aliases are unique within each channel.
@@ -1436,6 +1434,7 @@ func (cfg *Config) SanitizeKiroKeys() {
 }
 
 // SanitizeGeminiKeys deduplicates and normalizes Gemini credentials.
+// It uses API key + base URL as the uniqueness key.
 func (cfg *Config) SanitizeGeminiKeys() {
 	if cfg == nil {
 		return
@@ -1454,10 +1453,11 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
-		if _, exists := seen[entry.APIKey]; exists {
+		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		if _, exists := seen[uniqueKey]; exists {
 			continue
 		}
-		seen[entry.APIKey] = struct{}{}
+		seen[uniqueKey] = struct{}{}
 		out = append(out, entry)
 	}
 	cfg.GeminiKey = out

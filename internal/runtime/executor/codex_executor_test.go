@@ -6,6 +6,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -279,7 +280,7 @@ func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministic(t *testing.T) {
 	raw := []byte(`{"model":"gpt-5","input":[],"instructions":""}`)
 
 	key := fmt.Sprintf("%s-%s", req.Model, "u1")
-	deleteCodexCache(key)
+	helps.DeleteCodexCache(key)
 
 	httpReq1, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
 	if err != nil {
@@ -301,7 +302,7 @@ func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministic(t *testing.T) {
 	}
 
 	// Simulate a cache miss (e.g., restart/eviction) and ensure the ID is still stable.
-	deleteCodexCache(key)
+	helps.DeleteCodexCache(key)
 
 	httpReq2, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
 	if err != nil {

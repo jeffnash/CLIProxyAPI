@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
@@ -32,9 +33,9 @@ func TestIsGPT5Model(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.model, func(t *testing.T) {
-			got := isGPT5Model(tt.model)
+			got := helps.IsGPT5Model(tt.model)
 			if got != tt.want {
-				t.Errorf("isGPT5Model(%q) = %v, want %v", tt.model, got, tt.want)
+				t.Errorf("helps.IsGPT5Model(%q) = %v, want %v", tt.model, got, tt.want)
 			}
 		})
 	}
@@ -43,7 +44,7 @@ func TestIsGPT5Model(t *testing.T) {
 func TestApplyTemperatureSuffix_NoMetadata(t *testing.T) {
 	body := []byte(`{"model":"test","messages":[]}`)
 	opts := cliproxyexecutor.Options{}
-	result := applyTemperatureSuffix(body, "test", opts, "openai")
+	result := helps.ApplyTemperatureSuffix(body, "test", opts, "openai")
 	if string(result) != string(body) {
 		t.Errorf("expected body unchanged, got %s", string(result))
 	}
@@ -54,7 +55,7 @@ func TestApplyTemperatureSuffix_NoTempKey(t *testing.T) {
 	opts := cliproxyexecutor.Options{
 		Metadata: map[string]any{"other_key": "value"},
 	}
-	result := applyTemperatureSuffix(body, "test", opts, "openai")
+	result := helps.ApplyTemperatureSuffix(body, "test", opts, "openai")
 	if string(result) != string(body) {
 		t.Errorf("expected body unchanged, got %s", string(result))
 	}
@@ -67,7 +68,7 @@ func TestApplyTemperatureSuffix_OpenAI(t *testing.T) {
 			cliproxyexecutor.TemperatureSuffixMetadataKey: float64(0.7),
 		},
 	}
-	result := applyTemperatureSuffix(body, "claude-sonnet-4-5", opts, "openai")
+	result := helps.ApplyTemperatureSuffix(body, "claude-sonnet-4-5", opts, "openai")
 
 	temp := gjson.GetBytes(result, "temperature")
 	if !temp.Exists() {
@@ -85,7 +86,7 @@ func TestApplyTemperatureSuffix_Claude(t *testing.T) {
 			cliproxyexecutor.TemperatureSuffixMetadataKey: float64(0.3),
 		},
 	}
-	result := applyTemperatureSuffix(body, "claude-sonnet-4-5", opts, "claude")
+	result := helps.ApplyTemperatureSuffix(body, "claude-sonnet-4-5", opts, "claude")
 
 	temp := gjson.GetBytes(result, "temperature")
 	if !temp.Exists() {
@@ -103,7 +104,7 @@ func TestApplyTemperatureSuffix_Gemini(t *testing.T) {
 			cliproxyexecutor.TemperatureSuffixMetadataKey: float64(1.2),
 		},
 	}
-	result := applyTemperatureSuffix(body, "gemini-2.5-pro", opts, "gemini")
+	result := helps.ApplyTemperatureSuffix(body, "gemini-2.5-pro", opts, "gemini")
 
 	temp := gjson.GetBytes(result, "generationConfig.temperature")
 	if !temp.Exists() {
@@ -127,7 +128,7 @@ func TestApplyTemperatureSuffix_GeminiCLI(t *testing.T) {
 			cliproxyexecutor.TemperatureSuffixMetadataKey: float64(0.9),
 		},
 	}
-	result := applyTemperatureSuffix(body, "gemini-2.5-pro", opts, "gemini-cli")
+	result := helps.ApplyTemperatureSuffix(body, "gemini-2.5-pro", opts, "gemini-cli")
 
 	temp := gjson.GetBytes(result, "request.generationConfig.temperature")
 	if !temp.Exists() {
@@ -145,7 +146,7 @@ func TestApplyTemperatureSuffix_Antigravity(t *testing.T) {
 			cliproxyexecutor.TemperatureSuffixMetadataKey: float64(0.5),
 		},
 	}
-	result := applyTemperatureSuffix(body, "gemini-2.5-pro", opts, "antigravity")
+	result := helps.ApplyTemperatureSuffix(body, "gemini-2.5-pro", opts, "antigravity")
 
 	temp := gjson.GetBytes(result, "request.generationConfig.temperature")
 	if !temp.Exists() {
@@ -178,7 +179,7 @@ func TestApplyTemperatureSuffix_GPT5_Skipped(t *testing.T) {
 					cliproxyexecutor.TemperatureSuffixMetadataKey: float64(0.7),
 				},
 			}
-			result := applyTemperatureSuffix(body, tt.model, opts, "openai")
+			result := helps.ApplyTemperatureSuffix(body, tt.model, opts, "openai")
 
 			temp := gjson.GetBytes(result, "temperature")
 			if temp.Exists() {
@@ -208,7 +209,7 @@ func TestApplyTemperatureSuffix_NonGPT5_Applied(t *testing.T) {
 					cliproxyexecutor.TemperatureSuffixMetadataKey: float64(0.7),
 				},
 			}
-			result := applyTemperatureSuffix(body, tt.model, opts, "openai")
+			result := helps.ApplyTemperatureSuffix(body, tt.model, opts, "openai")
 
 			temp := gjson.GetBytes(result, "temperature")
 			if !temp.Exists() {
@@ -228,7 +229,7 @@ func TestApplyTemperatureSuffix_OverridesExisting(t *testing.T) {
 			cliproxyexecutor.TemperatureSuffixMetadataKey: float64(0.3),
 		},
 	}
-	result := applyTemperatureSuffix(body, "test", opts, "openai")
+	result := helps.ApplyTemperatureSuffix(body, "test", opts, "openai")
 
 	temp := gjson.GetBytes(result, "temperature")
 	if !temp.Exists() {
@@ -246,7 +247,7 @@ func TestApplyTemperatureSuffix_ZeroTemperature(t *testing.T) {
 			cliproxyexecutor.TemperatureSuffixMetadataKey: float64(0.0),
 		},
 	}
-	result := applyTemperatureSuffix(body, "test", opts, "openai")
+	result := helps.ApplyTemperatureSuffix(body, "test", opts, "openai")
 
 	temp := gjson.GetBytes(result, "temperature")
 	if !temp.Exists() {
@@ -264,7 +265,7 @@ func TestApplyTemperatureSuffix_WrongMetadataType(t *testing.T) {
 			cliproxyexecutor.TemperatureSuffixMetadataKey: "not-a-float",
 		},
 	}
-	result := applyTemperatureSuffix(body, "test", opts, "openai")
+	result := helps.ApplyTemperatureSuffix(body, "test", opts, "openai")
 
 	// Should return body unchanged if metadata value is wrong type
 	temp := gjson.GetBytes(result, "temperature")
@@ -280,7 +281,7 @@ func TestApplyTemperatureSuffix_Codex(t *testing.T) {
 			cliproxyexecutor.TemperatureSuffixMetadataKey: float64(0.8),
 		},
 	}
-	result := applyTemperatureSuffix(body, "o3-pro", opts, "codex")
+	result := helps.ApplyTemperatureSuffix(body, "o3-pro", opts, "codex")
 
 	temp := gjson.GetBytes(result, "temperature")
 	if !temp.Exists() {
@@ -299,7 +300,7 @@ func TestApplyTemperatureSuffix_Copilot(t *testing.T) {
 		},
 	}
 	// Copilot uses OpenAI format
-	result := applyTemperatureSuffix(body, "gpt-4o", opts, "openai")
+	result := helps.ApplyTemperatureSuffix(body, "gpt-4o", opts, "openai")
 
 	temp := gjson.GetBytes(result, "temperature")
 	if !temp.Exists() {
@@ -318,7 +319,7 @@ func TestApplyTemperatureSuffix_Iflow(t *testing.T) {
 		},
 	}
 	// iFlow uses OpenAI format
-	result := applyTemperatureSuffix(body, "deepseek-r1", opts, "openai")
+	result := helps.ApplyTemperatureSuffix(body, "deepseek-r1", opts, "openai")
 
 	temp := gjson.GetBytes(result, "temperature")
 	if !temp.Exists() {
