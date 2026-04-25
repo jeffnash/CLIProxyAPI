@@ -3,6 +3,7 @@ package registry
 import "strings"
 
 const codex54Created = 1772668800
+const codex55Created = 1776902400
 
 func enrichCodexModels(models []*ModelInfo) []*ModelInfo {
 	base := cloneModelInfos(models)
@@ -43,6 +44,22 @@ func forkAdditionalCodexModels() []*ModelInfo {
 			Version:             "gpt-5.4-nano",
 			Description:         "Lightweight GPT 5.4 model for low-latency coding and agentic tasks.",
 			ContextLength:       400000,
+			MaxCompletionTokens: 128000,
+			SupportedParameters: []string{"tools"},
+			Thinking: &ThinkingSupport{
+				Levels: []string{"low", "medium", "high", "xhigh"},
+			},
+		},
+		{
+			ID:                  "gpt-5.5",
+			Object:              "model",
+			Created:             codex55Created,
+			OwnedBy:             "openai",
+			Type:                "openai",
+			DisplayName:         "GPT 5.5",
+			Version:             "gpt-5.5",
+			Description:         "Frontier model for complex coding, research, and real-world work.",
+			ContextLength:       272000,
 			MaxCompletionTokens: 128000,
 			SupportedParameters: []string{"tools"},
 			Thinking: &ThinkingSupport{

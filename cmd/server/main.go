@@ -75,10 +75,6 @@ func main() {
 	var copilotLogin bool
 	var codexDeviceLogin bool
 	var claudeLogin bool
-	var grokLogin bool
-	var qwenLogin bool
-	var iflowLogin bool
-	var iflowCookie bool
 	var noBrowser bool
 	var oauthCallbackPort int
 	var antigravityLogin bool
@@ -91,12 +87,14 @@ func main() {
 	var kimiLogin bool
 	var projectID string
 	var vertexImport string
+	var vertexImportPrefix string
 	var configPath string
 	var password string
 	var noIncognito bool
 	var useIncognito bool
 	var tuiMode bool
 	var standalone bool
+	var localModel bool
 
 	// Define command-line flags for different operation modes.
 	flag.BoolVar(&login, "login", false, "Login Google Account")
@@ -104,10 +102,6 @@ func main() {
 	flag.BoolVar(&copilotLogin, "copilot-login", false, "Login to GitHub Copilot using device code flow")
 	flag.BoolVar(&codexDeviceLogin, "codex-device-login", false, "Login to Codex using device code flow")
 	flag.BoolVar(&claudeLogin, "claude-login", false, "Login to Claude using OAuth")
-	flag.BoolVar(&grokLogin, "grok-login", false, "Login to Grok using SSO JWT (browser cookie)")
-	flag.BoolVar(&qwenLogin, "qwen-login", false, "Login to Qwen using OAuth")
-	flag.BoolVar(&iflowLogin, "iflow-login", false, "Login to iFlow using OAuth")
-	flag.BoolVar(&iflowCookie, "iflow-cookie", false, "Login to iFlow using Cookie")
 	flag.BoolVar(&noBrowser, "no-browser", false, "Don't open browser automatically for OAuth")
 	flag.BoolVar(&useIncognito, "incognito", false, "Open browser in incognito/private mode for OAuth (useful for multiple accounts)")
 	flag.BoolVar(&noIncognito, "no-incognito", false, "Force disable incognito mode (uses existing browser session)")
@@ -123,9 +117,11 @@ func main() {
 	flag.StringVar(&projectID, "project_id", "", "Project ID (Gemini only, not required)")
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
+	flag.StringVar(&vertexImportPrefix, "vertex-import-prefix", "", "Prefix for Vertex model namespacing (use with -vertex-import)")
 	flag.StringVar(&password, "password", "", "")
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
+	flag.BoolVar(&localModel, "local-model", false, "Use embedded model catalog only, skip remote model fetching")
 
 	flag.CommandLine.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -171,6 +167,7 @@ func main() {
 		gitStoreRemoteURL    string
 		gitStoreUser         string
 		gitStorePassword     string
+		gitStoreBranch       string
 		gitStoreLocalPath    string
 		gitStoreInst         *store.GitTokenStore
 		gitStoreRoot         string
@@ -239,6 +236,9 @@ func main() {
 	}
 	if value, ok := lookupEnv("GITSTORE_LOCAL_PATH", "gitstore_local_path"); ok {
 		gitStoreLocalPath = value
+	}
+	if value, ok := lookupEnv("GITSTORE_GIT_BRANCH", "gitstore_git_branch"); ok {
+		gitStoreBranch = value
 	}
 	if value, ok := lookupEnv("OBJECTSTORE_ENDPOINT", "objectstore_endpoint"); ok {
 		useObjectStore = true
@@ -374,7 +374,7 @@ func main() {
 		}
 		gitStoreRoot = filepath.Join(gitStoreLocalPath, "gitstore")
 		authDir := filepath.Join(gitStoreRoot, "auths")
-		gitStoreInst = store.NewGitTokenStore(gitStoreRemoteURL, gitStoreUser, gitStorePassword)
+		gitStoreInst = store.NewGitTokenStore(gitStoreRemoteURL, gitStoreUser, gitStorePassword, gitStoreBranch)
 		gitStoreInst.SetBaseDir(authDir)
 		if errRepo := gitStoreInst.EnsureRepository(); errRepo != nil {
 			log.Errorf("failed to prepare git token store: %v", errRepo)
@@ -493,7 +493,7 @@ func main() {
 
 	if vertexImport != "" {
 		// Handle Vertex service account import
-		cmd.DoVertexImport(cfg, vertexImport)
+		cmd.DoVertexImport(cfg, vertexImport, vertexImportPrefix)
 	} else if login {
 		// Handle Google/Gemini login
 		cmd.DoLogin(cfg, projectID, options)
@@ -515,39 +515,6 @@ func main() {
 	} else if claudeLogin {
 		// Handle Claude login
 		cmd.DoClaudeLogin(cfg, options)
-	} else if grokLogin {
-		// Handle Grok SSO login
-		cmd.DoGrokLogin(cfg, options)
-	} else if qwenLogin {
-		cmd.DoQwenLogin(cfg, options)
-	} else if iflowLogin {
-		cmd.DoIFlowLogin(cfg, options)
-	} else if iflowCookie {
-		cmd.DoIFlowCookieAuth(cfg, options)
-	} else if kiroLogin {
-		// For Kiro auth, default to incognito mode for multi-account support
-		// Users can explicitly override with --no-incognito
-		// Note: This config mutation is safe - auth commands exit after completion
-		// and don't share config with StartService (which is in the else branch)
-		setKiroIncognitoMode(cfg, useIncognito, noIncognito)
-		cmd.DoKiroLogin(cfg, options)
-	} else if kiroGoogleLogin {
-		// For Kiro auth, default to incognito mode for multi-account support
-		// Users can explicitly override with --no-incognito
-		// Note: This config mutation is safe - auth commands exit after completion
-		setKiroIncognitoMode(cfg, useIncognito, noIncognito)
-		cmd.DoKiroGoogleLogin(cfg, options)
-	} else if kiroAWSLogin {
-		// For Kiro auth, default to incognito mode for multi-account support
-		// Users can explicitly override with --no-incognito
-		setKiroIncognitoMode(cfg, useIncognito, noIncognito)
-		cmd.DoKiroAWSLogin(cfg, options)
-	} else if kiroAWSAuthCode {
-		// For Kiro auth with authorization code flow (better UX)
-		setKiroIncognitoMode(cfg, useIncognito, noIncognito)
-		cmd.DoKiroAWSAuthCodeLogin(cfg, options)
-	} else if kiroImport {
-		cmd.DoKiroImport(cfg, options)
 	} else if kimiLogin {
 		cmd.DoKimiLogin(cfg, options)
 	} else {
@@ -557,11 +524,17 @@ func main() {
 			cmd.WaitForCloudDeploy()
 			return
 		}
+		if localModel && (!tuiMode || standalone) {
+			log.Info("Local model mode: using embedded model catalog, remote model updates disabled")
+		}
 		if tuiMode {
 			if standalone {
 				// Standalone mode: start an embedded local server and connect TUI client to it.
 				managementasset.StartAutoUpdater(context.Background(), configFilePath)
-				registry.StartModelsUpdater(context.Background())
+				misc.StartAntigravityVersionUpdater(context.Background())
+				if !localModel {
+					registry.StartModelsUpdater(context.Background())
+				}
 				hook := tui.NewLogHook(2000)
 				hook.SetFormatter(&logging.LogFormatter{})
 				log.AddHook(hook)
@@ -634,7 +607,10 @@ func main() {
 		} else {
 			// Start the main proxy service
 			managementasset.StartAutoUpdater(context.Background(), configFilePath)
-			registry.StartModelsUpdater(context.Background())
+			misc.StartAntigravityVersionUpdater(context.Background())
+			if !localModel {
+				registry.StartModelsUpdater(context.Background())
+			}
 			cmd.StartService(cfg, configFilePath, password)
 		}
 	}

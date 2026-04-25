@@ -2,6 +2,8 @@
 package openai
 
 import (
+	"context"
+
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/translator"
@@ -13,8 +15,17 @@ func init() {
 		Kiro,   // target format
 		ConvertOpenAIRequestToKiro,
 		interfaces.TranslateResponse{
-			Stream:    ConvertKiroStreamToOpenAI,
-			NonStream: ConvertKiroNonStreamToOpenAI,
+			Stream: func(ctx context.Context, model string, originalRequest, request, rawResponse []byte, param *any) [][]byte {
+				out := ConvertKiroStreamToOpenAI(ctx, model, originalRequest, request, rawResponse, param)
+				chunks := make([][]byte, 0, len(out))
+				for _, chunk := range out {
+					chunks = append(chunks, []byte(chunk))
+				}
+				return chunks
+			},
+			NonStream: func(ctx context.Context, model string, originalRequest, request, rawResponse []byte, param *any) []byte {
+				return []byte(ConvertKiroNonStreamToOpenAI(ctx, model, originalRequest, request, rawResponse, param))
+			},
 		},
 	)
 }

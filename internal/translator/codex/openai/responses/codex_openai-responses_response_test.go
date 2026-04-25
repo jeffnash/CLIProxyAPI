@@ -6,6 +6,14 @@ import (
 	"testing"
 )
 
+func byteChunksToStrings(chunks [][]byte) []string {
+	out := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		out = append(out, string(chunk))
+	}
+	return out
+}
+
 // TestConvertCodexResponseToOpenAIResponses_SSELineHandling validates the translator's
 // stateful handling of various SSE line types. It should:
 // - Filter empty "data:" payloads (to prevent JSON parse errors)
@@ -17,13 +25,13 @@ func TestConvertCodexResponseToOpenAIResponses_SSELineHandling(t *testing.T) {
 		var param any
 		var out []string
 		for _, line := range lines {
-			out = append(out, ConvertCodexResponseToOpenAIResponses(
+			out = append(out, byteChunksToStrings(ConvertCodexResponseToOpenAIResponses(
 				context.Background(),
 				"test-model",
 				nil, nil,
 				[]byte(line),
 				&param,
-			)...)
+			))...)
 		}
 		return out
 	}
@@ -80,26 +88,26 @@ func TestConvertCodexResponseToOpenAIResponses_SSELineHandling(t *testing.T) {
 
 func TestConvertCodexResponseToOpenAIResponses_NilParamState_PassthroughFraming(t *testing.T) {
 	t.Run("event line passes through when param is nil", func(t *testing.T) {
-		got := ConvertCodexResponseToOpenAIResponses(
+		got := byteChunksToStrings(ConvertCodexResponseToOpenAIResponses(
 			context.Background(),
 			"test-model",
 			nil, nil,
 			[]byte("event: response.created"),
 			nil,
-		)
+		))
 		if len(got) != 1 || got[0] != "event: response.created" {
 			t.Fatalf("unexpected output: %v", got)
 		}
 	})
 
 	t.Run("blank delimiter passes through when param is nil", func(t *testing.T) {
-		got := ConvertCodexResponseToOpenAIResponses(
+		got := byteChunksToStrings(ConvertCodexResponseToOpenAIResponses(
 			context.Background(),
 			"test-model",
 			nil, nil,
 			[]byte(""),
 			nil,
-		)
+		))
 		if len(got) != 1 || got[0] != "" {
 			t.Fatalf("unexpected output: %v", got)
 		}
@@ -169,7 +177,7 @@ func TestConvertCodexResponseToOpenAIResponses_InstructionsPassthrough(t *testin
 				t.Fatalf("expected 1 result, got %d", len(result))
 			}
 
-			hasOriginal := strings.Contains(result[0], "original instructions from user")
+			hasOriginal := strings.Contains(string(result[0]), "original instructions from user")
 			if tc.wantEchoed && !hasOriginal {
 				t.Errorf("expected original instructions to be echoed, got: %s", result[0])
 			}
@@ -183,18 +191,18 @@ func TestConvertCodexResponseToOpenAIResponses_InstructionsPassthrough(t *testin
 func TestConvertCodexResponseToOpenAIResponses_SSEStreamSimulation(t *testing.T) {
 	// Simulate a real SSE stream as it would arrive from upstream
 	sseLines := []string{
-		"",                                                                     // empty line (SSE separator)
-		"event: response.created",                                              // event type line
-		`data: {"type":"response.created","response":{"id":"resp_123"}}`,       // data line
-		"",                                                                     // empty line
-		"event: response.output_text.delta",                                    // event type line
-		`data: {"type":"response.output_text.delta","delta":"Hello"}`,          // data line
-		"",                                                                     // empty line
-		": keepalive comment",                                                  // SSE comment
-		"event: response.completed",                                            // event type line
-		`data: {"type":"response.completed","response":{"id":"resp_123"}}`,     // data line
-		"",                                                                     // empty line
-		"data: [DONE]",                                                         // done marker
+		"",                        // empty line (SSE separator)
+		"event: response.created", // event type line
+		`data: {"type":"response.created","response":{"id":"resp_123"}}`, // data line
+		"",                                  // empty line
+		"event: response.output_text.delta", // event type line
+		`data: {"type":"response.output_text.delta","delta":"Hello"}`, // data line
+		"",                          // empty line
+		": keepalive comment",       // SSE comment
+		"event: response.completed", // event type line
+		`data: {"type":"response.completed","response":{"id":"resp_123"}}`, // data line
+		"",             // empty line
+		"data: [DONE]", // done marker
 	}
 
 	var allResults []string
@@ -207,7 +215,7 @@ func TestConvertCodexResponseToOpenAIResponses_SSEStreamSimulation(t *testing.T)
 			[]byte(line),
 			&param,
 		)
-		allResults = append(allResults, result...)
+		allResults = append(allResults, byteChunksToStrings(result)...)
 	}
 
 	// Count by type
@@ -255,8 +263,8 @@ func TestConvertCodexResponseToOpenAIResponses_EmptyDataFiltering(t *testing.T) 
 	// Simulate a stream with an empty data: line (would cause JSONDecodeError)
 	sseLines := []string{
 		"event: some_event",
-		"data: ",              // Empty data payload - should be filtered!
-		"",                    // SSE delimiter
+		"data: ", // Empty data payload - should be filtered!
+		"",       // SSE delimiter
 		`data: {"valid":true}`,
 		"",
 	}
@@ -271,7 +279,7 @@ func TestConvertCodexResponseToOpenAIResponses_EmptyDataFiltering(t *testing.T) 
 			[]byte(line),
 			&param,
 		)
-		allResults = append(allResults, result...)
+		allResults = append(allResults, byteChunksToStrings(result)...)
 	}
 
 	// Should have: data line, empty line = 2 results.

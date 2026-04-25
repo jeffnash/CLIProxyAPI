@@ -17,6 +17,7 @@ import (
 	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -110,8 +111,8 @@ func (e *CopilotExecutor) logOutboundProxyDecision(httpReq *http.Request, auth *
 	noProxyRaw := ""
 	noProxyList := []string(nil)
 	if proxyURL != "" {
-		noProxyRaw = noProxyEnvRaw()
-		noProxyList = parseNoProxyList(noProxyRaw)
+		noProxyRaw = helps.NoProxyEnvRaw()
+		noProxyList = helps.ParseNoProxyList(noProxyRaw)
 	}
 
 	used := false
@@ -122,7 +123,7 @@ func (e *CopilotExecutor) logOutboundProxyDecision(httpReq *http.Request, auth *
 		} else {
 			reason = "not_configured"
 		}
-	} else if host != "" && shouldBypassProxy(host, noProxyList) {
+	} else if host != "" && helps.ShouldBypassProxy(host, noProxyList) {
 		reason = "NO_PROXY"
 	} else {
 		used = true
@@ -131,7 +132,7 @@ func (e *CopilotExecutor) logOutboundProxyDecision(httpReq *http.Request, auth *
 
 	if used {
 		log.Infof("copilot outbound: proxy_used=true proxy=%s source=%s host=%s no_proxy=%q transport=%s",
-			maskProxyURL(proxyURL),
+			helps.MaskProxyURL(proxyURL),
 			proxySource,
 			host,
 			noProxyRaw,
@@ -201,19 +202,19 @@ func (e *CopilotExecutor) copilotDoRequest(ctx context.Context, auth *cliproxyau
 				proxySource = "global"
 			}
 		} else if proxyURL == "" && e != nil && e.cfg != nil && strings.TrimSpace(e.cfg.ProxyURL) != "" && !e.cfg.SDKConfig.ProxyEnabledFor("copilot") {
-			logProxyOnce(
+			helps.LogProxyOnce(
 				"proxy.disabled.copilot.electron",
 				"proxy: service=copilot disabled by OUTBOUND_PROXY_SERVICES (proxy configured but not enabled for service)",
 			)
 		}
 
 		if proxyURL != "" {
-			noProxyRaw := noProxyEnvRaw()
-			noProxyList := parseNoProxyList(noProxyRaw)
+			noProxyRaw := helps.NoProxyEnvRaw()
+			noProxyList := helps.ParseNoProxyList(noProxyRaw)
 			if httpReq.URL != nil {
 				host := strings.TrimSpace(httpReq.URL.Hostname())
-				if shouldBypassProxy(host, noProxyList) {
-					logProxyOnce(
+				if helps.ShouldBypassProxy(host, noProxyList) {
+					helps.LogProxyOnce(
 						"proxy.bypass.copilot.electron."+strings.ToLower(host),
 						"proxy: service=copilot bypass host=%s reason=NO_PROXY transport=electron",
 						host,
@@ -222,10 +223,10 @@ func (e *CopilotExecutor) copilotDoRequest(ctx context.Context, auth *cliproxyau
 				}
 			}
 			if proxyURL != "" {
-				logProxyOnce(
-					"proxy.enabled.copilot.electron."+maskProxyURL(proxyURL),
+				helps.LogProxyOnce(
+					"proxy.enabled.copilot.electron."+helps.MaskProxyURL(proxyURL),
 					"proxy: service=copilot enabled proxy=%s source=%s no_proxy=%q transport=electron",
-					maskProxyURL(proxyURL),
+					helps.MaskProxyURL(proxyURL),
 					proxySource,
 					noProxyRaw,
 				)
@@ -246,7 +247,7 @@ func (e *CopilotExecutor) copilotDoRequest(ctx context.Context, auth *cliproxyau
 	// Per-request proxy log (no dedupe) for Go net/http transport.
 	e.logOutboundProxyDecision(httpReq, auth, "go")
 
-	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "copilot")
+	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, "copilot")
 	return httpClient.Do(httpReq)
 }
 
@@ -543,15 +544,15 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 		translatorModel = "copilot-" + apiModel
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), apiModel, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), apiModel, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 
-	requestedModel := payloadRequestedModel(opts, req.Model)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body := sdktranslator.TranslateRequest(from, to, apiModel, bytes.Clone(req.Payload), false)
-	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", false)
 
@@ -565,7 +566,7 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	if strings.HasPrefix(strings.ToLower(apiModel), "gemini") {
 		body = e.reasoningCache(auth).InjectReasoning(body)
 	}
-	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
+	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	baseURL := copilotauth.CopilotBaseURL(accountType)
 	url := baseURL + "/chat/completions"
@@ -583,7 +584,7 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       url,
 		Method:    http.MethodPost,
 		Headers:   httpReq.Header.Clone(),
@@ -597,7 +598,7 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 
 	httpResp, err := e.copilotDoRequest(ctx, auth, httpReq)
 	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 	defer func() {
@@ -606,25 +607,25 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 		}
 	}()
 
-	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
-		appendAPIResponseChunk(ctx, e.cfg, b)
-		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = copilotStatusErr(httpResp.StatusCode, string(b))
 		return resp, err
 	}
 
 	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
-	appendAPIResponseChunk(ctx, e.cfg, data)
+	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 
 	// Parse usage from response
-	reporter.publish(ctx, parseOpenAIUsage(data))
+	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, translatorModel, bytes.Clone(opts.OriginalRequest), body, data, &param)
@@ -652,15 +653,15 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 		translatorModel = "copilot-" + apiModel
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), apiModel, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), apiModel, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 
-	requestedModel := payloadRequestedModel(opts, req.Model)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body := sdktranslator.TranslateRequest(from, to, apiModel, bytes.Clone(req.Payload), true)
-	body = applyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 
@@ -674,7 +675,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 	if strings.HasPrefix(strings.ToLower(apiModel), "gemini") {
 		body = e.reasoningCache(auth).InjectReasoning(body)
 	}
-	body = applyTemperatureSuffix(body, req.Model, opts, "openai")
+	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, "openai")
 
 	baseURL := copilotauth.CopilotBaseURL(accountType)
 	url := baseURL + "/chat/completions"
@@ -698,13 +699,13 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
 			httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 			if reqErr != nil {
-				reporter.publishFailure(ctx)
+				reporter.PublishFailure(ctx)
 				out <- cliproxyexecutor.StreamChunk{Err: reqErr}
 				return
 			}
 			e.applyCopilotHeaders(httpReq, copilotToken, req.Payload, opts.Headers)
 
-			recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+			helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       url,
 				Method:    http.MethodPost,
 				Headers:   httpReq.Header.Clone(),
@@ -718,17 +719,17 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 
 			httpResp, reqErr := e.copilotDoRequest(ctx, auth, httpReq)
 			if reqErr != nil {
-				recordAPIResponseError(ctx, e.cfg, reqErr)
+				helps.RecordAPIResponseError(ctx, e.cfg, reqErr)
 				if !emittedAnyPayload && attempt < maxAttempts && isRecoverableCopilotStreamErr(reqErr) && sleepWithContext(ctx, copilotStreamRetryBackoff(attempt)) {
 					log.Warnf("copilot executor: retrying stream request after transport error (attempt %d/%d): %v", attempt, maxAttempts, reqErr)
 					continue
 				}
-				reporter.publishFailure(ctx)
+				reporter.PublishFailure(ctx)
 				out <- cliproxyexecutor.StreamChunk{Err: reqErr}
 				return
 			}
 
-			recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+			helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
 			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 				data, readErr := io.ReadAll(httpResp.Body)
@@ -736,32 +737,32 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 					log.Errorf("copilot executor: close response body error: %v", errClose)
 				}
 				if readErr != nil {
-					recordAPIResponseError(ctx, e.cfg, readErr)
-					reporter.publishFailure(ctx)
+					helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+					reporter.PublishFailure(ctx)
 					out <- cliproxyexecutor.StreamChunk{Err: readErr}
 					return
 				}
-				appendAPIResponseChunk(ctx, e.cfg, data)
-				log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+				helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+				log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 				status := copilotStatusErr(httpResp.StatusCode, string(data))
 				if !emittedAnyPayload && attempt < maxAttempts && isRetryableCopilotStatus(status.code) && sleepWithContext(ctx, copilotStreamRetryBackoff(attempt)) {
 					log.Warnf("copilot executor: retrying stream request after upstream status %d (attempt %d/%d)", status.code, attempt, maxAttempts)
 					continue
 				}
-				reporter.publishFailure(ctx)
+				reporter.PublishFailure(ctx)
 				out <- cliproxyexecutor.StreamChunk{Err: status}
 				return
 			}
 
 			var param any
 			errRead := e.streamCopilotSSELinesWithIdleBudget(ctx, httpResp.Body, idleBudget, func(line []byte) {
-				appendAPIResponseChunk(ctx, e.cfg, line)
+				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
 				// Parse usage from final chunk if present
 				if bytes.HasPrefix(line, dataTag) {
 					data := bytes.TrimSpace(line[5:])
 					if gjson.GetBytes(data, "usage").Exists() {
-						reporter.publish(ctx, parseOpenAIUsage(data))
+						reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 					}
 
 					// Cache Gemini reasoning data for subsequent requests
@@ -784,13 +785,13 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 				return
 			}
 
-			recordAPIResponseError(ctx, e.cfg, errRead)
+			helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 			if !emittedAnyPayload && attempt < maxAttempts && isRecoverableCopilotStreamErr(errRead) && sleepWithContext(ctx, copilotStreamRetryBackoff(attempt)) {
 				log.Warnf("copilot executor: retrying stream after pre-output stream drop (attempt %d/%d): %v", attempt, maxAttempts, errRead)
 				continue
 			}
 
-			reporter.publishFailure(ctx)
+			reporter.PublishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errRead}
 			return
 		}

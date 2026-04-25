@@ -6,6 +6,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -15,7 +16,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -191,25 +191,19 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 
 func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
-	// It is forwarded as execution metadata; when absent we generate a UUID.
+	// Only include it if the client explicitly provides it.
 	key := ""
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
 		}
 	}
-	if key == "" {
-		key = uuid.NewString()
-	}
 
-	meta := map[string]any{idempotencyKeyMetadataKey: key}
-	pinnedAuthID := pinnedAuthIDFromContext(ctx)
-	if pinnedAuthID == "" && ctx != nil {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
-			pinnedAuthID = strings.TrimSpace(ginCtx.GetHeader("X-Pinned-Auth-Id"))
-		}
+	meta := make(map[string]any)
+	if key != "" {
+		meta[idempotencyKeyMetadataKey] = key
 	}
-	if pinnedAuthID != "" {
+	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
@@ -350,12 +344,13 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		}
 	}
 	newCtx, cancel := context.WithCancel(parentCtx)
+	cancelCtx := newCtx
 	if requestCtx != nil && requestCtx != parentCtx {
 		go func() {
 			select {
 			case <-requestCtx.Done():
 				cancel()
-			case <-newCtx.Done():
+			case <-cancelCtx.Done():
 			}
 		}()
 	}
@@ -511,6 +506,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
+		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
 			if code := se.StatusCode(); code > 0 {
@@ -566,6 +562,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
+		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
 			if code := se.StatusCode(); code > 0 {
@@ -625,6 +622,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
+		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -734,7 +732,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 								chunks = retryResult.Chunks
 								continue outer
 							}
-							streamErr = retryErr
+							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
 						}
 					}
 
@@ -870,22 +868,29 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
 
+	if strings.EqualFold(baseModel, "gpt-image-2") {
+		return nil, "", nil, &interfaces.ErrorMessage{
+			StatusCode: http.StatusServiceUnavailable,
+			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
+		}
+	}
+
 	if forcedProvider != "" {
+		providers = []string{forcedProvider}
 		if metadata == nil {
 			metadata = make(map[string]any, 1)
 		}
 		metadata["forced_provider"] = true
-		return []string{forcedProvider}, resolvedModelName, metadata, nil
-	}
-
-	providers = util.GetProviderName(baseModel)
-	// Fallback: if baseModel has no provider but differs from resolvedModelName,
-	// try using the full model name (supports custom models registered with suffixes).
-	if len(providers) == 0 && baseModel != resolvedModelName {
-		providers = util.GetProviderName(resolvedModelName)
-	}
-	if len(providers) == 0 {
-		return nil, "", nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
+	} else {
+		providers = util.GetProviderName(baseModel)
+		// Fallback: if baseModel has no provider but differs from resolvedModelName,
+		// try using the full model name (supports custom models registered with suffixes).
+		if len(providers) == 0 && baseModel != resolvedModelName {
+			providers = util.GetProviderName(resolvedModelName)
+		}
+		if len(providers) == 0 {
+			return nil, "", nil, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
+		}
 	}
 
 	return providers, resolvedModelName, metadata, nil
@@ -936,6 +941,54 @@ func replaceHeader(dst http.Header, src http.Header) {
 	}
 	for key, values := range src {
 		dst[key] = append([]string(nil), values...)
+	}
+}
+
+func enrichAuthSelectionError(err error, providers []string, model string) error {
+	if err == nil {
+		return nil
+	}
+
+	var authErr *coreauth.Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return err
+	}
+
+	code := strings.TrimSpace(authErr.Code)
+	if code != "auth_not_found" && code != "auth_unavailable" {
+		return err
+	}
+
+	providerText := strings.Join(providers, ",")
+	if providerText == "" {
+		providerText = "unknown"
+	}
+	modelText := strings.TrimSpace(model)
+	if modelText == "" {
+		modelText = "unknown"
+	}
+
+	baseMessage := strings.TrimSpace(authErr.Message)
+	if baseMessage == "" {
+		baseMessage = "no auth available"
+	}
+	detail := fmt.Sprintf("%s (providers=%s, model=%s)", baseMessage, providerText, modelText)
+
+	// Clarify the most common alias confusion between Anthropic route names and internal provider keys.
+	if strings.Contains(","+providerText+",", ",claude,") {
+		detail += "; check Claude auth/key session and cooldown state via /v0/management/auth-files"
+	}
+
+	status := authErr.HTTPStatus
+	if status <= 0 {
+		status = http.StatusServiceUnavailable
+	}
+
+	return &coreauth.Error{
+		Code:       authErr.Code,
+		Message:    detail,
+		Retryable:  authErr.Retryable,
+		HTTPStatus: status,
 	}
 }
 

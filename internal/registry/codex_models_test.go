@@ -102,39 +102,6 @@ func TestGenerateCodexAliases_SpecificModelFamilies(t *testing.T) {
 	// Exhaustive list of model IDs we expect to exist as codex- aliases.
 	// These mirror the IDs in model_definitions_static_data.go GetOpenAIModels().
 	expectedAliases := []string{
-		// gpt-5 base + effort + codex sub-family
-		"codex-gpt-5",
-		"codex-gpt-5-minimal",
-		"codex-gpt-5-low",
-		"codex-gpt-5-medium",
-		"codex-gpt-5-high",
-		"codex-gpt-5-codex",
-		"codex-gpt-5-codex-low",
-		"codex-gpt-5-codex-medium",
-		"codex-gpt-5-codex-high",
-		"codex-gpt-5-codex-mini",
-		"codex-gpt-5-codex-mini-medium",
-		"codex-gpt-5-codex-mini-high",
-
-		// gpt-5.1 base + effort + codex sub-family + codex-max sub-family
-		"codex-gpt-5.1",
-		"codex-gpt-5.1-none",
-		"codex-gpt-5.1-low",
-		"codex-gpt-5.1-medium",
-		"codex-gpt-5.1-high",
-		"codex-gpt-5.1-codex",
-		"codex-gpt-5.1-codex-low",
-		"codex-gpt-5.1-codex-medium",
-		"codex-gpt-5.1-codex-high",
-		"codex-gpt-5.1-codex-mini",
-		"codex-gpt-5.1-codex-mini-medium",
-		"codex-gpt-5.1-codex-mini-high",
-		"codex-gpt-5.1-codex-max",
-		"codex-gpt-5.1-codex-max-low",
-		"codex-gpt-5.1-codex-max-medium",
-		"codex-gpt-5.1-codex-max-high",
-		"codex-gpt-5.1-codex-max-xhigh",
-
 		// gpt-5.2 base + effort + codex sub-family
 		"codex-gpt-5.2",
 		"codex-gpt-5.2-none",
@@ -142,11 +109,6 @@ func TestGenerateCodexAliases_SpecificModelFamilies(t *testing.T) {
 		"codex-gpt-5.2-medium",
 		"codex-gpt-5.2-high",
 		"codex-gpt-5.2-xhigh",
-		"codex-gpt-5.2-codex",
-		"codex-gpt-5.2-codex-low",
-		"codex-gpt-5.2-codex-medium",
-		"codex-gpt-5.2-codex-high",
-		"codex-gpt-5.2-codex-xhigh",
 
 		// gpt-5.3-codex family
 		"codex-gpt-5.3-codex",
@@ -171,6 +133,13 @@ func TestGenerateCodexAliases_SpecificModelFamilies(t *testing.T) {
 		"codex-gpt-5.4-nano-medium",
 		"codex-gpt-5.4-nano-high",
 		"codex-gpt-5.4-nano-xhigh",
+
+		// gpt-5.5 base + effort aliases
+		"codex-gpt-5.5",
+		"codex-gpt-5.5-low",
+		"codex-gpt-5.5-medium",
+		"codex-gpt-5.5-high",
+		"codex-gpt-5.5-xhigh",
 	}
 
 	models := GetOpenAIModels()
