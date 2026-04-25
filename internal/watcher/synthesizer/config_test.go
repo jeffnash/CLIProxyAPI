@@ -166,7 +166,7 @@ func TestConfigSynthesizer_PassthruRoutes_UsesRoutingNameForModelID(t *testing.T
 					Model:            "glm-4.7",
 					ModelRoutingName: "zai-glm-4.7",
 					Protocol:         "claude",
-					BaseURL:           "https://api.z.ai/api/anthropic",
+					BaseURL:          "https://api.z.ai/api/anthropic",
 					APIKey:           "za-123",
 					UpstreamModel:    "glm-4.7",
 				},
@@ -243,7 +243,7 @@ func TestConfigSynthesizer_PassthruRoutes_NoAutoUpstreamWhenSame(t *testing.T) {
 		Config: &config.Config{
 			Passthru: []config.PassthruRoute{
 				{
-					Model:    "glm-4.7",
+					Model: "glm-4.7",
 					// ModelRoutingName is empty, defaults to Model
 					Protocol: "claude",
 					BaseURL:  "https://api.z.ai/api/anthropic",
@@ -308,6 +308,36 @@ func TestConfigSynthesizer_PassthruRoutes_ContextWindowAndMaxTokens(t *testing.T
 	// Verify max_tokens is set
 	if v := a.Attributes["max_tokens"]; v != "64000" {
 		t.Fatalf("expected max_tokens 64000, got %q", v)
+	}
+}
+
+func TestConfigSynthesizer_PassthruRoutes_PreserveReasoningContent(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:                    "deepseek-v4-pro",
+					Protocol:                 "openai",
+					BaseURL:                  "https://api.deepseek.com",
+					APIKey:                   "sk-test",
+					PreserveReasoningContent: true,
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if got := auths[0].Attributes["preserve_reasoning_content"]; got != "true" {
+		t.Fatalf("preserve_reasoning_content = %q, want true", got)
 	}
 }
 
@@ -777,7 +807,7 @@ func TestConfigSynthesizer_PassthruRoutes_NoAPIKey(t *testing.T) {
 					Protocol: "openai",
 					BaseURL:  "https://api.example.com/v1",
 					// No APIKey or APIKeys - for auth via headers
-					Headers:  map[string]string{"Authorization": "Bearer token"},
+					Headers: map[string]string{"Authorization": "Bearer token"},
 				},
 			},
 		},

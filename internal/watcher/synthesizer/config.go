@@ -104,13 +104,13 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 			// Include key index in ID generation to ensure unique IDs per key
 			id, token := idGen.Next(idKind, routingModel, base, upstreamModel, proxyURL, fmt.Sprintf("key:%d", keyIndex))
 			attrs := map[string]string{
-				"source":                 fmt.Sprintf("config:passthru[%s]", token),
-				"base_url":               base,
-				"passthru":               "true",
-				"passthru_model":         model,
-				"passthru_routing_name":  routingModel,
-				"passthru_key_index":     fmt.Sprintf("%d", keyIndex),
-				"passthru_total_keys":    fmt.Sprintf("%d", len(apiKeys)),
+				"source":                fmt.Sprintf("config:passthru[%s]", token),
+				"base_url":              base,
+				"passthru":              "true",
+				"passthru_model":        model,
+				"passthru_routing_name": routingModel,
+				"passthru_key_index":    fmt.Sprintf("%d", keyIndex),
+				"passthru_total_keys":   fmt.Sprintf("%d", len(apiKeys)),
 			}
 			if apiKey != "" {
 				attrs["api_key"] = apiKey
@@ -135,6 +135,9 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 				if overrideJSON, err := json.Marshal(r.ModelOverride); err == nil {
 					attrs["model_override"] = string(overrideJSON)
 				}
+			}
+			if r.PreserveReasoningContent {
+				attrs["preserve_reasoning_content"] = "true"
 			}
 			addConfigHeadersToAttrs(r.Headers, attrs)
 

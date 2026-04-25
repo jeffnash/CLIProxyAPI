@@ -200,6 +200,45 @@ func TestLoadConfigOptional_PassthruModelsJSON_PayloadRulesIncludeRoutingName(t 
 	}
 }
 
+func TestLoadConfigOptional_PassthruModelsJSON_PreserveReasoningContent(t *testing.T) {
+	old := os.Getenv("PASSTHRU_MODELS_JSON")
+	t.Cleanup(func() {
+		_ = os.Setenv("PASSTHRU_MODELS_JSON", old)
+	})
+
+	tmp := t.TempDir()
+	path := tmp + "/config.yaml"
+	cfgYAML := []byte("port: 8317\n")
+	if err := os.WriteFile(path, cfgYAML, 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	jsonValue := `[
+	  {
+	    "model": "deepseek-v4-pro-high",
+	    "protocol": "openai",
+	    "base-url": "https://api.deepseek.com",
+	    "api-key": "sk-test",
+	    "upstream-model": "deepseek-v4-pro",
+	    "preserve-reasoning-content": true
+	  }
+	]`
+	if err := os.Setenv("PASSTHRU_MODELS_JSON", jsonValue); err != nil {
+		t.Fatalf("failed to set env: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Passthru) != 1 {
+		t.Fatalf("expected 1 passthru route, got %d", len(cfg.Passthru))
+	}
+	if !cfg.Passthru[0].PreserveReasoningContent {
+		t.Fatal("expected preserve-reasoning-content to be true")
+	}
+}
+
 func TestLoadConfigOptional_PassthruModelsJSON_InvalidJSON_OptionalConfigDoesNotError(t *testing.T) {
 	old := os.Getenv("PASSTHRU_MODELS_JSON")
 	t.Cleanup(func() {

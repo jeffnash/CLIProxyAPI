@@ -197,9 +197,12 @@ type PassthruRoute struct {
 	ContextWindow    int                 `yaml:"context-window,omitempty" json:"context-window,omitempty"`
 	MaxTokens        int                 `yaml:"max-tokens,omitempty" json:"max-tokens,omitempty"`
 	ModelOverride    *registry.ModelInfo `yaml:"model-override,omitempty" json:"model-override,omitempty"`
-	Payload          *PassthruPayload    `yaml:"payload,omitempty" json:"payload,omitempty"`
-	RateLimit        *PassthruRateLimit  `yaml:"rate-limit,omitempty" json:"rate-limit,omitempty"`
-	Lenient          bool                `yaml:"lenient,omitempty" json:"lenient,omitempty"`
+	// PreserveReasoningContent repairs clients that drop assistant reasoning_content
+	// between tool-call turns for upstreams that require it.
+	PreserveReasoningContent bool               `yaml:"preserve-reasoning-content,omitempty" json:"preserve-reasoning-content,omitempty"`
+	Payload                  *PassthruPayload   `yaml:"payload,omitempty" json:"payload,omitempty"`
+	RateLimit                *PassthruRateLimit `yaml:"rate-limit,omitempty" json:"rate-limit,omitempty"`
+	Lenient                  bool               `yaml:"lenient,omitempty" json:"lenient,omitempty"`
 }
 
 // PassthruPayload defines route-scoped payload parameter rules.
