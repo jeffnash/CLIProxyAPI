@@ -14,6 +14,9 @@ const RequestedModelMetadataKey = "requested_model"
 // suffix (e.g., "model-temp-0.7") in Options.Metadata. The value is a float64.
 const TemperatureSuffixMetadataKey = "temperature_suffix"
 
+// DisallowFreeAuthMetadataKey instructs auth selection to skip known free-tier credentials.
+const DisallowFreeAuthMetadataKey = "disallow_free_auth"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
