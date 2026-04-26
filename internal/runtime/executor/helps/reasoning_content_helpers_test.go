@@ -111,3 +111,22 @@ func TestRepairMissingReasoningContentForToolCalls_FallbackUsesAssistantContent(
 		t.Fatalf("reasoning_content = %q, want assistant content fallback; payload=%s", gotReasoning, got)
 	}
 }
+
+func TestRepairMissingReasoningContentForToolCalls_FillsAssistantWithoutToolCalls(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID: "auth-assistant-fallback",
+		Attributes: map[string]string{
+			"preserve_reasoning_content": "true",
+			"base_url":                   "https://api.deepseek.com",
+			"passthru_routing_name":      "deepseek-v4-pro-xhigh",
+			"upstream_model":             "deepseek-v4-pro",
+		},
+	}
+
+	request := []byte(`{"messages":[{"role":"assistant","content":"Earlier answer."},{"role":"user","content":"continue"}]}`)
+	got := RepairMissingReasoningContentForToolCalls(auth, request)
+
+	if gotReasoning := gjson.GetBytes(got, "messages.0.reasoning_content").String(); gotReasoning != "Earlier answer." {
+		t.Fatalf("reasoning_content = %q, want assistant content fallback; payload=%s", gotReasoning, got)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -163,6 +164,8 @@ func repairMissingReasoningContentForToolCalls(scope string, payload []byte) []b
 		return payload
 	}
 	out := payload
+	repaired := 0
+	fallbacks := 0
 	for i, msg := range messages.Array() {
 		if !strings.EqualFold(strings.TrimSpace(msg.Get("role").String()), "assistant") {
 			continue
@@ -171,17 +174,25 @@ func repairMissingReasoningContentForToolCalls(scope string, payload []byte) []b
 			continue
 		}
 		toolCalls := msg.Get("tool_calls")
-		if !toolCalls.IsArray() {
-			continue
+		reasoning := ""
+		if toolCalls.IsArray() {
+			reasoning = reasoningContentForToolCalls(scope, toolCalls)
 		}
-		reasoning := reasoningContentForToolCalls(scope, toolCalls)
 		if reasoning == "" {
 			reasoning = fallbackReasoningContent(msg)
+			fallbacks++
 		}
 		updated, errSet := sjson.SetBytes(out, fmt.Sprintf("messages.%d.reasoning_content", i), reasoning)
 		if errSet == nil {
 			out = updated
+			repaired++
 		}
+	}
+	if repaired > 0 {
+		log.WithFields(log.Fields{
+			"repaired":  repaired,
+			"fallbacks": fallbacks,
+		}).Debug("reasoning_content repair: filled missing assistant reasoning_content")
 	}
 	return out
 }
