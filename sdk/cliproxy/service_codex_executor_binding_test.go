@@ -3,6 +3,7 @@ package cliproxy
 import (
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
@@ -60,5 +61,26 @@ func TestEnsureExecutorsForAuthWithMode_CodexForceReplace(t *testing.T) {
 
 	if firstExecutor == secondExecutor {
 		t.Fatal("expected codex executor replacement in force mode")
+	}
+}
+
+func TestEnsureExecutorsForAuth_ChutesBindsChutesExecutor(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "chutes-auth-1",
+		Provider: "chutes",
+		Status:   coreauth.StatusActive,
+	}
+
+	service.ensureExecutorsForAuth(auth)
+	bound, ok := service.coreManager.Executor("chutes")
+	if !ok || bound == nil {
+		t.Fatal("expected chutes executor after bind")
+	}
+	if _, ok := bound.(*executor.ChutesExecutor); !ok {
+		t.Fatalf("expected *executor.ChutesExecutor, got %T", bound)
 	}
 }
