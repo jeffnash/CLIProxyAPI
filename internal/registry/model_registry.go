@@ -60,6 +60,12 @@ type ModelInfo struct {
 	// array (e.g., openai-compatibility.*.models[], *-api-key.models[]).
 	// UserDefined models have thinking configuration passed through without validation.
 	UserDefined bool `json:"-"`
+
+	// UpstreamID is the provider-native model identifier used for execution when
+	// it differs from the public registry ID. Chutes exposes stable roots such as
+	// nvidia/Gemma-4-31B-IT-NVFP4 while requiring variant IDs such as
+	// google/gemma-4-31B-turbo-TEE at request time.
+	UpstreamID string `json:"-"`
 }
 
 type availableModelsCacheEntry struct {
