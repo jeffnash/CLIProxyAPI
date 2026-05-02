@@ -84,6 +84,7 @@ var (
 
 type chutesModelCacheEntry struct {
 	models    []*registry.ModelInfo
+	aliases   map[string]string
 	fetchedAt time.Time
 }
 
@@ -438,6 +439,7 @@ func (e *ChutesExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Aut
 	chutesModelCacheMu.Lock()
 	if chutesModelCache != nil && time.Since(chutesModelCache.fetchedAt) < chutesModelCacheTTL {
 		models := chutesModelCache.models
+		restoreChutesAliasMap(chutesModelCache.aliases)
 		chutesModelCacheMu.Unlock()
 		return models
 	}
@@ -494,6 +496,7 @@ func (e *ChutesExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Aut
 	chutesModelCacheMu.Lock()
 	chutesModelCache = &chutesModelCacheEntry{
 		models:    models,
+		aliases:   snapshotChutesAliasMap(),
 		fetchedAt: time.Now(),
 	}
 	chutesModelCacheMu.Unlock()
@@ -582,6 +585,7 @@ func processChutesModels(raw []ChutesModel, teePref string, whitelist, blocklist
 				ContextLength:       sel.ContextLength,
 				MaxCompletionTokens: sel.MaxOutputLength,
 				SupportedParameters: mapChutesFeatures(sel.SupportedFeatures),
+				UpstreamID:          sel.ID,
 			}
 			models = append(models, info)
 		}
@@ -702,7 +706,36 @@ func resolveChutesModel(modelID string) string {
 	}
 	chutesAliasMapMu.RUnlock()
 
+	if info := registry.LookupModelInfo(stripped, "chutes"); info != nil && strings.TrimSpace(info.UpstreamID) != "" {
+		return strings.TrimSpace(info.UpstreamID)
+	}
+
 	return stripped
+}
+
+func snapshotChutesAliasMap() map[string]string {
+	chutesAliasMapMu.RLock()
+	defer chutesAliasMapMu.RUnlock()
+	if len(chutesAliasMap) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(chutesAliasMap))
+	for key, value := range chutesAliasMap {
+		out[key] = value
+	}
+	return out
+}
+
+func restoreChutesAliasMap(aliases map[string]string) {
+	if len(aliases) == 0 {
+		return
+	}
+	chutesAliasMapMu.Lock()
+	defer chutesAliasMapMu.Unlock()
+	chutesAliasMap = make(map[string]string, len(aliases))
+	for key, value := range aliases {
+		chutesAliasMap[key] = value
+	}
 }
 
 func applyChutesHeaders(r *http.Request, apiKey string, stream bool) {
