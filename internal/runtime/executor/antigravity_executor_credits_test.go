@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 func resetAntigravityCreditsRetryState() {
@@ -216,6 +216,11 @@ func TestAntigravityExecute_CreditsInjectedWhenConductorRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		_ = r.Body.Close()
+		if r.URL.Path == "/v1internal:loadCodeAssist" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"paidTier":{"id":"tier-1","availableCredits":[{"creditType":"GOOGLE_ONE_AI","creditAmount":"25000","minimumCreditAmountForUsage":"50"}]}}`))
+			return
+		}
 		requestBodies = append(requestBodies, string(body))
 
 		if !strings.Contains(string(body), `"enabledCreditTypes":["GOOGLE_ONE_AI"]`) {
@@ -269,6 +274,11 @@ func TestAntigravityExecute_NoCreditsWithoutConductorFlag(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		_ = r.Body.Close()
+		if r.URL.Path == "/v1internal:loadCodeAssist" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"paidTier":{"id":"tier-1","availableCredits":[{"creditType":"GOOGLE_ONE_AI","creditAmount":"25000","minimumCreditAmountForUsage":"50"}]}}`))
+			return
+		}
 		requestBodies = append(requestBodies, string(body))
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(`{"error":{"status":"RESOURCE_EXHAUSTED","message":"QUOTA_EXHAUSTED"}}`))
@@ -427,6 +437,42 @@ func TestEnsureAccessToken_WarmTokenLoadsCreditsHint(t *testing.T) {
 	if hint.CreditAmount != 25000 || hint.MinCreditAmount != 50 {
 		t.Fatalf("hint amounts = (%v, %v), want (25000, 50)", hint.CreditAmount, hint.MinCreditAmount)
 	}
+}
+
+func TestUpdateAntigravityCreditsBalance_LoadCodeAssistUserAgent(t *testing.T) {
+	resetAntigravityCreditsRetryState()
+	t.Cleanup(resetAntigravityCreditsRetryState)
+
+	exec := NewAntigravityExecutor(&config.Config{})
+	const configuredUserAgent = "antigravity/1.23.2 windows/amd64 google-api-nodejs-client/10.3.0"
+	const loadCodeAssistUserAgent = "antigravity/1.23.2 windows/amd64"
+	auth := &cliproxyauth.Auth{
+		ID:         "auth-load-code-assist-ua",
+		Attributes: map[string]string{"user_agent": configuredUserAgent},
+	}
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
+			t.Fatalf("unexpected request url %s", req.URL.String())
+		}
+		if got := req.Header.Get("User-Agent"); got != loadCodeAssistUserAgent {
+			t.Fatalf("User-Agent = %q, want %q", got, loadCodeAssistUserAgent)
+		}
+		if got := req.Header.Get("X-Goog-Api-Client"); got != "" {
+			t.Fatalf("X-Goog-Api-Client = %q, want empty", got)
+		}
+		body, _ := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if string(body) != `{"metadata":{"ideType":"ANTIGRAVITY"}}` {
+			t.Fatalf("loadCodeAssist body = %s", string(body))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"paidTier":{"id":"tier-1","availableCredits":[{"creditType":"GOOGLE_ONE_AI","creditAmount":"25000","minimumCreditAmountForUsage":"50"}]}}`)),
+		}, nil
+	}))
+
+	exec.updateAntigravityCreditsBalance(ctx, auth, "token")
 }
 
 func TestParseMetaFloat(t *testing.T) {

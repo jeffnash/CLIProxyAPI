@@ -8,8 +8,8 @@ package openai
 import (
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -40,6 +40,7 @@ func clampReasoningEffort(level string) string {
 	}).Debug("openai: reasoning_effort clamped to default value")
 	return string(thinking.LevelMedium)
 }
+
 // Applier implements thinking.ProviderApplier for OpenAI models.
 //
 // OpenAI-specific behavior:

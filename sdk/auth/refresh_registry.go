@@ -3,7 +3,7 @@ package auth
 import (
 	"time"
 
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func init() {
@@ -15,6 +15,7 @@ func init() {
 	registerRefreshLead("copilot", func() Authenticator { return NewCopilotAuthenticator() })
 	registerRefreshLead("kiro", func() Authenticator { return NewKiroAuthenticator() })
 	registerRefreshLead("kimi", func() Authenticator { return NewKimiAuthenticator() })
+	registerRefreshLead("xai", func() Authenticator { return NewXAIAuthenticator() })
 }
 
 func registerRefreshLead(provider string, factory func() Authenticator) {

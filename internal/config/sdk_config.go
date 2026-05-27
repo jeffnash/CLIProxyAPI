@@ -20,6 +20,23 @@ type SDKConfig struct {
 	// Typical values: "copilot", "codex", "openai", "anthropic", "google".
 	ProxyServices []string `yaml:"proxy-services,omitempty" json:"proxy-services,omitempty"`
 
+	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
+	//
+	// Supported values:
+	//   - false (default): image_generation is enabled everywhere (normal behavior).
+	//   - true: image_generation is disabled everywhere. The server stops injecting it, removes it from request payloads,
+	//     and returns 404 for /v1/images/generations and /v1/images/edits.
+	//   - "chat": disable image_generation injection for all non-images endpoints (e.g. /v1/responses, /v1/chat/completions),
+	//     while keeping /v1/images/generations and /v1/images/edits enabled and preserving image_generation there.
+	DisableImageGeneration DisableImageGenerationMode `yaml:"disable-image-generation" json:"disable-image-generation"`
+
+	// GPTImage2BaseModel sets the base (mainline) model used when proxying GPT Image 2
+	// requests via the hosted image_generation tool (e.g. Codex OAuth /v1/images/*).
+	//
+	// The value must start with "gpt-" (case-insensitive). If empty or invalid, the
+	// default base model ("gpt-5.4-mini") is used.
+	GPTImage2BaseModel string `yaml:"gpt-image-2-base-model,omitempty" json:"gpt-image-2-base-model,omitempty"`
+
 	// EnableGeminiCLIEndpoint controls whether Gemini CLI internal endpoints (/v1internal:*) are enabled.
 	// Default is false for safety; when false, /v1internal:* requests are rejected.
 	EnableGeminiCLIEndpoint bool `yaml:"enable-gemini-cli-endpoint" json:"enable-gemini-cli-endpoint"`
