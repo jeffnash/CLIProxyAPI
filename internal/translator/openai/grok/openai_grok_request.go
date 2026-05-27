@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	grokauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/grok"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	grokauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/grok"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"

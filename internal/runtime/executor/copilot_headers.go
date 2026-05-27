@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	copilotauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/copilot"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )

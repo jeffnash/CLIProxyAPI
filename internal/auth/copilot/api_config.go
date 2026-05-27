@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	copilotshared "github.com/router-for-me/CLIProxyAPI/v6/internal/copilot"
+	copilotshared "github.com/router-for-me/CLIProxyAPI/v7/internal/copilot"
 )
 
 const (

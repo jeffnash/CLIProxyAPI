@@ -8,7 +8,7 @@ import (
 
 	"github.com/imroc/req/v3"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 type GrokHTTPClient struct {
