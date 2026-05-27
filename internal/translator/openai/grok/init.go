@@ -3,10 +3,10 @@ package grok
 import (
 	"context"
 
-	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	grokchat "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/grok/openai/chat-completions"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/translator"
+	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	grokchat "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/grok/openai/chat-completions"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/translator"
 )
 
 func init() {

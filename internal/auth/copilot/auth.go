@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	copilotshared "github.com/router-for-me/CLIProxyAPI/v6/internal/copilot"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	copilotshared "github.com/router-for-me/CLIProxyAPI/v7/internal/copilot"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 )
 

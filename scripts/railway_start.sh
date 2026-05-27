@@ -379,7 +379,7 @@ fi
 
 BIN_PATH="${ROOT_DIR}/cli-proxy-api"
 FORCE_BUILD="${FORCE_BUILD:-0}"
-LDFLAGS_PKG="github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
+LDFLAGS_PKG="github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 INSTALL_GO="${INSTALL_GO:-1}"
 GO_INSTALL_METHOD="${GO_INSTALL_METHOD:-auto}" # auto|tarball|apt
 GO_TARBALL_VARIANT="${GO_TARBALL_VARIANT:-linux-amd64}" # Railway is typically amd64

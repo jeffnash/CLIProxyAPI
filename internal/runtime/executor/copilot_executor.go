@@ -14,14 +14,14 @@ import (
 	"sync"
 	"time"
 
-	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	copilotauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/copilot"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -552,7 +552,7 @@ func (e *CopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body := sdktranslator.TranslateRequest(from, to, apiModel, bytes.Clone(req.Payload), false)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel, "")
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", false)
 
@@ -661,7 +661,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body := sdktranslator.TranslateRequest(from, to, apiModel, bytes.Clone(req.Payload), true)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, apiModel, to.String(), "", body, nil, requestedModel, "")
 	body = sanitizeCopilotPayload(body, apiModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 
