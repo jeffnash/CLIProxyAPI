@@ -92,13 +92,10 @@ func main() {
 	var vertexImportPrefix string
 	var configPath string
 	var password string
-<<<<<<< HEAD
 	var noIncognito bool
 	var useIncognito bool
-=======
 	var homeJWT string
 	var homeDisableClusterDiscovery bool
->>>>>>> upstream/main
 	var tuiMode bool
 	var standalone bool
 	var localModel bool
