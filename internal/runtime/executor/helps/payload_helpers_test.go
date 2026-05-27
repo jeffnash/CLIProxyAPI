@@ -3,7 +3,7 @@ package helps
 import (
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/tidwall/gjson"
 )
 
@@ -27,7 +27,7 @@ func TestApplyPayloadConfigWithRoot_PassthruRoutePayload(t *testing.T) {
 	cfg.AddPassthruPayloadRules()
 
 	input := []byte(`{"model":"deepseek-v4-pro-xhigh","messages":[],"temperature":0.7,"top_p":0.9}`)
-	got := ApplyPayloadConfigWithRoot(cfg, "deepseek-v4-pro-xhigh", "openai", "", input, input, "")
+	got := ApplyPayloadConfigWithRoot(cfg, "deepseek-v4-pro-xhigh", "openai", "", input, input, "", "")
 
 	if gotValue := gjson.GetBytes(got, "thinking.type").String(); gotValue != "enabled" {
 		t.Fatalf("thinking.type = %q, want enabled; payload=%s", gotValue, got)

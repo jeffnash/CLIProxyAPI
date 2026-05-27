@@ -11,16 +11,16 @@ import (
 	"strings"
 	"time"
 
-	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -31,8 +31,9 @@ import (
 )
 
 const (
-	codexUserAgent  = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)"
-	codexOriginator = "codex-tui"
+	codexUserAgent             = "codex_cli_rs/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9"
+	codexOriginator            = "codex_cli_rs"
+	codexDefaultImageToolModel = "gpt-image-2"
 )
 
 var dataTag = []byte("data:")
@@ -100,6 +101,103 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 	return completedDataPatched
 }
 
+func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
+	eventType := gjson.GetBytes(eventData, "type").String()
+	var body []byte
+	switch eventType {
+	case "error":
+		body = codexTerminalErrorBody(eventData, "error")
+		if len(body) == 0 {
+			body = codexTerminalTopLevelErrorBody(eventData)
+		}
+	case "response.failed":
+		body = codexTerminalErrorBody(eventData, "response.error")
+		if len(body) == 0 {
+			body = codexTerminalErrorBody(eventData, "error")
+		}
+	default:
+		return statusErr{}, false
+	}
+	if len(body) == 0 {
+		return statusErr{}, false
+	}
+	if !codexTerminalErrorIsContextLength(body) {
+		return statusErr{}, false
+	}
+	return newCodexStatusErr(http.StatusBadRequest, body), true
+}
+
+func codexTerminalErrorBody(eventData []byte, path string) []byte {
+	errorResult := gjson.GetBytes(eventData, path)
+	if !errorResult.Exists() {
+		return nil
+	}
+	body := []byte(`{"error":{}}`)
+	if errorResult.Type == gjson.JSON {
+		body, _ = sjson.SetRawBytes(body, "error", []byte(errorResult.Raw))
+	} else if message := strings.TrimSpace(errorResult.String()); message != "" {
+		body, _ = sjson.SetBytes(body, "error.message", message)
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "error.message").String()) == "" {
+		if message := strings.TrimSpace(gjson.GetBytes(eventData, "response.error.message").String()); message != "" {
+			body, _ = sjson.SetBytes(body, "error.message", message)
+		}
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "error.message").String()) == "" {
+		if code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String()); code != "" {
+			body, _ = sjson.SetBytes(body, "error.message", code)
+		}
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "error.message").String()) == "" {
+		if errorType := strings.TrimSpace(gjson.GetBytes(body, "error.type").String()); errorType != "" {
+			body, _ = sjson.SetBytes(body, "error.message", errorType)
+		}
+	}
+	return body
+}
+
+func codexTerminalTopLevelErrorBody(eventData []byte) []byte {
+	message := strings.TrimSpace(gjson.GetBytes(eventData, "message").String())
+	code := strings.TrimSpace(gjson.GetBytes(eventData, "code").String())
+	errorType := strings.TrimSpace(gjson.GetBytes(eventData, "error_type").String())
+	param := strings.TrimSpace(gjson.GetBytes(eventData, "param").String())
+	if message == "" && code == "" && errorType == "" && param == "" {
+		return nil
+	}
+
+	body := []byte(`{"error":{}}`)
+	if message != "" {
+		body, _ = sjson.SetBytes(body, "error.message", message)
+	}
+	if code != "" {
+		body, _ = sjson.SetBytes(body, "error.code", code)
+	}
+	if errorType != "" {
+		body, _ = sjson.SetBytes(body, "error.type", errorType)
+	}
+	if param != "" {
+		body, _ = sjson.SetBytes(body, "error.param", param)
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "error.message").String()) == "" {
+		if code != "" {
+			body, _ = sjson.SetBytes(body, "error.message", code)
+		} else if errorType != "" {
+			body, _ = sjson.SetBytes(body, "error.message", errorType)
+		}
+	}
+	return body
+}
+
+func codexTerminalErrorIsContextLength(body []byte) bool {
+	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	message := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
+	return errorCode == "context_length_exceeded" ||
+		errorCode == "context_too_large" ||
+		strings.Contains(message, "context window") ||
+		strings.Contains(message, "context length") ||
+		strings.Contains(message, "too many tokens")
+}
+
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
@@ -154,6 +252,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
 	}
+	if isCodexOpenAIImageRequest(opts) {
+		return e.executeOpenAIImage(ctx, auth, req, opts)
+	}
 	baseModel := stripCodexPrefix(thinking.ParseSuffix(req.Model).ModelName)
 
 	apiKey, baseURL := codexCreds(auth)
@@ -202,7 +303,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, to.String())
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", modelForUpstream)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
@@ -210,7 +312,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
-	body = ensureImageGenerationTool(body, modelForUpstream, auth)
+	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+		body = ensureImageGenerationTool(body, modelForUpstream, auth)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -272,6 +376,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		eventData := bytes.TrimSpace(line[5:])
 		eventType := gjson.GetBytes(eventData, "type").String()
 
+		if streamErr, ok := codexTerminalStreamContextLengthErr(eventData); ok {
+			err = streamErr
+			return resp, err
+		}
+
 		if eventType == "response.output_item.done" {
 			itemResult := gjson.GetBytes(eventData, "item")
 			if !itemResult.Exists() || itemResult.Type != gjson.JSON {
@@ -293,6 +402,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		if detail, ok := helps.ParseCodexUsage(eventData); ok {
 			reporter.Publish(ctx, detail)
 		}
+		publishCodexImageToolUsage(ctx, reporter, body, eventData)
 
 		completedData := eventData
 		outputResult := gjson.GetBytes(completedData, "response.output")
@@ -374,11 +484,14 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, to.String())
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.SetBytes(body, "model", modelForUpstream)
 	body, _ = sjson.DeleteBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
-	body = ensureImageGenerationTool(body, modelForUpstream, auth)
+	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+		body = ensureImageGenerationTool(body, modelForUpstream, auth)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -440,6 +553,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
+	if isCodexOpenAIImageRequest(opts) {
+		return e.executeOpenAIImageStream(ctx, auth, req, opts)
+	}
 	baseModel := stripCodexPrefix(thinking.ParseSuffix(req.Model).ModelName)
 
 	apiKey, baseURL := codexCreds(auth)
@@ -487,14 +603,17 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, to.String())
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", modelForUpstream)
 	body = normalizeCodexInstructions(body)
-	body = ensureImageGenerationTool(body, modelForUpstream, auth)
+	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
+		body = ensureImageGenerationTool(body, modelForUpstream, auth)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -561,6 +680,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				if streamErr, ok := codexTerminalStreamContextLengthErr(data); ok {
+					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+					reporter.PublishFailure(ctx, streamErr)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				switch gjson.GetBytes(data, "type").String() {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
@@ -568,6 +696,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					}
+					publishCodexImageToolUsage(ctx, reporter, body, data)
 					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
 					translatedLine = append([]byte("data: "), data...)
 				}
@@ -575,13 +704,20 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			reporter.PublishFailure(ctx, errScan)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case <-ctx.Done():
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -885,6 +1021,9 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("codex executor: refresh called")
+	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
+		return refreshed, err
+	}
 	if auth == nil {
 		return nil, statusErr{code: 500, msg: "codex executor: auth is nil"}
 	}
@@ -1025,11 +1164,58 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
 	}
+	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func classifyCodexStatusError(statusCode int, body []byte) []byte {
+	code, errType, ok := codexStatusErrorClassification(statusCode, body)
+	if !ok {
+		return body
+	}
+	message := gjson.GetBytes(body, "error.message").String()
+	if message == "" {
+		message = gjson.GetBytes(body, "message").String()
+	}
+	if message == "" {
+		message = strings.TrimSpace(string(body))
+	}
+	if message == "" {
+		message = http.StatusText(statusCode)
+	}
+	out := []byte(`{"error":{}}`)
+	out, _ = sjson.SetBytes(out, "error.message", message)
+	out, _ = sjson.SetBytes(out, "error.type", errType)
+	out, _ = sjson.SetBytes(out, "error.code", code)
+	return out
+}
+
+func codexStatusErrorClassification(statusCode int, body []byte) (code string, errType string, ok bool) {
+	errorMessage := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
+	if errorMessage == "" {
+		errorMessage = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "message").String()))
+	}
+	lower := strings.ToLower(strings.TrimSpace(string(body)))
+	upstreamCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	upstreamType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
+	isInvalidRequest := upstreamType == "" || upstreamType == "invalid_request_error"
+
+	switch {
+	case statusCode == http.StatusRequestEntityTooLarge || upstreamCode == "context_length_exceeded" || upstreamCode == "context_too_large" || isInvalidRequest && (strings.Contains(errorMessage, "context length") || strings.Contains(errorMessage, "context_length") || strings.Contains(errorMessage, "maximum context") || strings.Contains(errorMessage, "too many tokens")):
+		return "context_too_large", "invalid_request_error", true
+	case strings.Contains(lower, "invalid signature in thinking block") || strings.Contains(lower, "invalid_encrypted_content"):
+		return "thinking_signature_invalid", "invalid_request_error", true
+	case upstreamCode == "previous_response_not_found" || strings.Contains(lower, "previous_response_not_found") || strings.Contains(lower, "previous_response_id") && strings.Contains(lower, "not found"):
+		return "previous_response_not_found", "invalid_request_error", true
+	case statusCode == http.StatusUnauthorized || upstreamType == "authentication_error" || upstreamCode == "invalid_api_key" || strings.Contains(lower, "invalid or expired token") || strings.Contains(lower, "refresh_token_reused"):
+		return "auth_unavailable", "authentication_error", true
+	default:
+		return "", "", false
+	}
 }
 
 func normalizeCodexInstructions(body []byte) []byte {
@@ -1073,6 +1259,31 @@ func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth
 	}
 	body, _ = sjson.SetRawBytes(body, "tools.-1", imageGenToolJSON)
 	return body
+}
+
+func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {
+	detail, ok := helps.ParseCodexImageToolUsage(completedData)
+	if !ok {
+		return
+	}
+	reporter.EnsurePublished(ctx)
+	reporter.PublishAdditionalModel(ctx, codexImageGenerationToolModel(body), detail)
+}
+
+func codexImageGenerationToolModel(body []byte) string {
+	tools := gjson.GetBytes(body, "tools")
+	if tools.IsArray() {
+		for _, tool := range tools.Array() {
+			if tool.Get("type").String() != "image_generation" {
+				continue
+			}
+			if model := strings.TrimSpace(tool.Get("model").String()); model != "" {
+				return model
+			}
+			break
+		}
+	}
+	return codexDefaultImageToolModel
 }
 
 func isCodexModelCapacityError(errorBody []byte) bool {

@@ -54,9 +54,13 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+<<<<<<< HEAD
 
 # Go
 .gocache
 
 # Ensure tracked SDK sources are not blocked by ignore rules
 !sdk/**
+=======
+.gocache/
+>>>>>>> upstream/main
