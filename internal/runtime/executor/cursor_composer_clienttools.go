@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -62,6 +64,23 @@ func resolveComposerBridgeURL(auth *cliproxyauth.Auth) string {
 		return env
 	}
 	return defaultComposerBridgeURL
+}
+
+// isLoopbackBridgeURL reports whether the bridge URL points at the local host (localhost / 127.0.0.0/8 /
+// ::1). Loopback bridge calls must bypass any configured outbound proxy (see postAgentTurn).
+func isLoopbackBridgeURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // resolveComposerBridgeToken returns the multi-tenant bridge auth token (sent as X-Bridge-Auth) for the
@@ -657,6 +676,19 @@ func composerToolResults(messages []gjson.Result) (results []map[string]any, tra
 	return nil, "", false
 }
 
+// composerMixedTurnError returns a clear error for a tool_results turn that ALSO carries trailing user text
+// (a mixed turn). Such turns cannot be cleanly continued: the @cursor/sdk has no mid-resume user-message
+// mechanism, and folding two logical turns into one response would break the inbound schema's
+// one-assistant-message-per-response contract. So we surface the limitation instead of silently dropping
+// the user's message OR pretending the sidecar consumed it (Comment 2). The trailingText carried by
+// composerInput is therefore an internal signal only — it is never sent to the bridge as if supported.
+func composerMixedTurnError(inp map[string]any) error {
+	if t, _ := inp["trailingText"].(string); strings.TrimSpace(t) != "" {
+		return fmt.Errorf("cursor composer: a tool_results turn that also carries trailing user text (a mixed turn) is not supported — send the user message as a separate turn")
+	}
+	return nil
+}
+
 func composerInput(oai []byte) map[string]any {
 	messages := gjson.GetBytes(oai, "messages").Array()
 	// Tool_results continuation detection (Comment 4): a continuation is the LAST assistant turn bearing
@@ -853,7 +885,7 @@ func oaiChunk(id, model string, choice map[string]any) []byte {
 // executeComposerStream drives one /agent/turn against the bridge and translates the
 // bridge SSE events into the client's streaming wire format.
 func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	model := resolveCursorModelName(req.Model)
+	model := resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
 	responseID := composerResponseID()
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth)
 
@@ -874,6 +906,10 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		advertise = nil // tool_choice=none: advertise nothing so the model cannot call tools
 	}
 	inp := composerInput(oai)
+	if errMixed := composerMixedTurnError(inp); errMixed != nil {
+		log.Errorf("[composer %s] STREAM mixed tool_results+text (-> error): %v", responseID, errMixed)
+		return nil, errMixed
+	}
 	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, extractComposerClientEnv(opts), composerConstraints(oai))
 	composerDebugf("[composer %s] STREAM sessionID=%s inputType=%v toolChoice=%q advertise=%d -> POST /agent/turn", responseID, sessionID, inp["type"], toolChoice, len(advertise))
 
@@ -1020,7 +1056,7 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 // executeComposer drives one /agent/turn and accumulates the bridge stream into a
 // single non-streaming response.
 func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	model := resolveCursorModelName(req.Model)
+	model := resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
 	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth)
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
@@ -1037,7 +1073,11 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 	if toolChoice == "none" {
 		advertise = nil // tool_choice=none: advertise nothing so the model cannot call tools
 	}
-	body := composerTurnBody(sessionID, model, composerInput(oai), advertise, toolChoice, extractComposerClientEnv(opts), composerConstraints(oai))
+	inp := composerInput(oai)
+	if errMixed := composerMixedTurnError(inp); errMixed != nil {
+		return cliproxyexecutor.Response{}, errMixed
+	}
+	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, extractComposerClientEnv(opts), composerConstraints(oai))
 
 	httpResp, err := e.postAgentTurn(ctx, auth, apiKey, body)
 	if err != nil {
@@ -1158,7 +1198,18 @@ func (e *CursorExecutor) postAgentTurn(ctx context.Context, auth *cliproxyauth.A
 	httpReq.Header.Set("Accept", "text/event-stream")
 	// No timeout on the established data path (AGENTS.md): a tool round-trip to the
 	// client can legitimately take minutes. The bridge keeps the upstream alive.
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	var httpClient *http.Client
+	if isLoopbackBridgeURL(url) {
+		// The bridge is local (default 127.0.0.1). NEVER route a loopback call through a configured OUTBOUND
+		// proxy: it would break localhost routing (the proxy cannot reach our loopback) AND leak the Cursor key
+		// (the Authorization bearer) to that proxy. Use a direct, proxy-free client. (Remote bridge URLs below
+		// keep proxy-aware behavior, if a deployment intentionally fronts the bridge through a proxy.)
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.Proxy = nil
+		httpClient = &http.Client{Transport: tr}
+	} else {
+		httpClient = helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	}
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		log.Errorf("[composer] postAgentTurn TRANSPORT ERROR to %s: %v", url, err)

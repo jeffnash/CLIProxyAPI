@@ -433,6 +433,138 @@ func TestPostAgentTurnBridgeAuthHeader(t *testing.T) {
 	}
 }
 
+// RC3: a client-facing model alias resolves to its configured upstream Cursor model name (via the auth's
+// model_aliases attribute) before the request is sent; unknown names pass through; normalization still applies.
+func TestResolveCursorModelAlias(t *testing.T) {
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"model_aliases": `{"my-fast":"composer-2.5-fast","big":"composer-2.5"}`}}
+	if got := resolveCursorModelAlias(auth, "my-fast"); got != "composer-2.5-fast" {
+		t.Fatalf("alias my-fast -> %q, want composer-2.5-fast", got)
+	}
+	if got := resolveCursorModelAlias(auth, "big"); got != "composer-2.5" {
+		t.Fatalf("alias big -> %q, want composer-2.5", got)
+	}
+	if got := resolveCursorModelAlias(auth, "composer-2.5"); got != "composer-2.5" {
+		t.Fatalf("unmapped name must pass through, got %q", got)
+	}
+	if got := resolveCursorModelAlias(&cliproxyauth.Auth{}, "anything"); got != "anything" {
+		t.Fatalf("no aliases configured -> passthrough, got %q", got)
+	}
+	// End-to-end with normalization: alias -> upstream -> normalized canonical id.
+	if got := resolveCursorModelName(resolveCursorModelAlias(auth, "my-fast")); got != "composer-2.5-fast" {
+		t.Fatalf("alias+normalize -> %q, want composer-2.5-fast", got)
+	}
+}
+
+// RC2: a mixed tool_results+text turn surfaces a clear error (not a silent drop); a pure tool_results turn
+// (no trailing text) is unaffected.
+func TestComposerMixedTurnErrors(t *testing.T) {
+	mixed := composerInput([]byte(`{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},{"role":"tool","tool_call_id":"tc_1","content":"R"},{"role":"user","content":"also do X"}]}`))
+	if mixed["type"] != "tool_results" {
+		t.Fatalf("mixed turn must still classify as tool_results, got %v", mixed["type"])
+	}
+	if composerMixedTurnError(mixed) == nil {
+		t.Fatalf("mixed tool_results+text must produce a clear error, got nil (inp=%v)", mixed)
+	}
+	pure := composerInput([]byte(`{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},{"role":"tool","tool_call_id":"tc_1","content":"R"}]}`))
+	if composerMixedTurnError(pure) != nil {
+		t.Fatalf("a pure tool_results turn must NOT error: %v", composerMixedTurnError(pure))
+	}
+}
+
+// RC4: re-translating an already-OpenAI payload through the source(claude)->openai translator CORRUPTS it
+// (the gated CURSOR_DIRECT path's double-translation bug — here it drops the tool name). The fix reuses the
+// single-translation result instead of re-translating; this test pins the hazard.
+func TestDirectPathDoubleTranslateCorrupts(t *testing.T) {
+	from := sdktranslator.FromString("claude")
+	to := sdktranslator.FromString("openai")
+	claudeReq := []byte(`{"model":"m","max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"tools":[{"name":"Read","input_schema":{"type":"object"}}]}`)
+	once := sdktranslator.TranslateRequest(from, to, "m", append([]byte(nil), claudeReq...), false)
+	twice := sdktranslator.TranslateRequest(from, to, "m", append([]byte(nil), once...), false)
+	if gjson.GetBytes(once, "tools.0.function.name").String() != "Read" {
+		t.Fatalf("single source->openai translation must preserve the tool name; got %s", once)
+	}
+	if gjson.GetBytes(twice, "tools.0.function.name").String() == "Read" {
+		t.Fatalf("double translation should have CORRUPTED the tool name (the direct path must NOT re-translate); got %s", twice)
+	}
+}
+
+// RC5: a bridge turn_end{stop_reason:error} (e.g. an unknown/expired session for a tool_results turn) must
+// surface to the client as a stream ERROR, never a successful empty turn that hides the lost continuation.
+func TestExecuteComposerStreamBridgeErrorSurfaces(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		write := func(s string) {
+			_, _ = w.Write([]byte("data: " + s + "\n\n"))
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		write(`{"type":"turn_end","stop_reason":"error","error":"unknown or expired session: continuation cannot be resumed"}`)
+		write("[DONE]")
+	}))
+	defer srv.Close()
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "t", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
+	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Read"}}]}`)}
+	sr, err := e.executeComposerStream(context.Background(), auth, "k", req,
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"err1"}}})
+	if err != nil {
+		t.Fatalf("stream setup: %v", err)
+	}
+	sawErr := false
+	for chunk := range sr.Chunks {
+		if chunk.Err != nil {
+			sawErr = true
+		}
+	}
+	if !sawErr {
+		t.Fatalf("a bridge turn_end{error} must surface as a stream error, not a clean/empty success")
+	}
+}
+
+// RC1: a loopback bridge call must bypass a configured outbound proxy (don't leak the Cursor bearer to the
+// proxy / break localhost routing). With an auth proxy set, a request to a 127.0.0.1 bridge must reach the
+// bridge DIRECTLY, never the proxy.
+func TestPostAgentTurnLoopbackBypassesProxy(t *testing.T) {
+	var bridgeHit, proxyHit bool
+	bridge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bridgeHit = true
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer bridge.Close()
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHit = true
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer proxy.Close()
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "t", ProxyURL: proxy.URL, Attributes: map[string]string{"composer_client_tools_bridge_url": bridge.URL}}
+	resp, err := e.postAgentTurn(context.Background(), auth, "CURSORKEY", []byte("{}"))
+	if err != nil {
+		t.Fatalf("postAgentTurn: %v", err)
+	}
+	_ = resp.Body.Close()
+	if !bridgeHit {
+		t.Fatalf("loopback bridge request did not reach the bridge directly")
+	}
+	if proxyHit {
+		t.Fatalf("loopback bridge request was routed through the outbound proxy — must bypass it (credential-leak)")
+	}
+	// Sanity: the helper detects loopback for the canonical defaults.
+	for _, u := range []string{"http://127.0.0.1:9798", "http://localhost:9798/agent/turn", "http://[::1]:9798"} {
+		if !isLoopbackBridgeURL(u) {
+			t.Fatalf("isLoopbackBridgeURL(%q) = false, want true", u)
+		}
+	}
+	if isLoopbackBridgeURL("https://bridge.example.com/agent/turn") {
+		t.Fatalf("remote bridge URL must NOT be treated as loopback")
+	}
+}
+
 func TestMapComposerToolCall(t *testing.T) {
 	defs := []cursorToolDefinition{{Name: "Read"}, {Name: "Bash"}}
 	// generic native name maps to the client's exact tool via resolveToolSpec.

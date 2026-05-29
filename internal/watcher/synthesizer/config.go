@@ -716,6 +716,26 @@ func (s *ConfigSynthesizer) synthesizeCursorKeys(ctx *SynthesisContext) []*corea
 				attrs["tool_aliases"] = string(b)
 			}
 		}
+		// Cursor model aliases (cursor-api-key[].models): record a hash so a config change re-registers
+		// /v1/models, and a client-facing alias -> upstream-name map the executor uses to route requests.
+		if hash := diff.ComputeCursorModelsHash(entry.Models); hash != "" {
+			attrs["models_hash"] = hash
+		}
+		if len(entry.Models) > 0 {
+			aliasMap := make(map[string]string, len(entry.Models))
+			for _, m := range entry.Models {
+				alias := strings.TrimSpace(m.Alias)
+				name := strings.TrimSpace(m.Name)
+				if alias != "" && name != "" && !strings.EqualFold(alias, name) {
+					aliasMap[alias] = name
+				}
+			}
+			if len(aliasMap) > 0 {
+				if b, errJSON := json.Marshal(aliasMap); errJSON == nil {
+					attrs["model_aliases"] = string(b)
+				}
+			}
+		}
 		addConfigHeadersToAttrs(entry.Headers, attrs)
 		a := &coreauth.Auth{
 			ID:         id,

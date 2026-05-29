@@ -99,7 +99,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if errMsg := cursorImageErrorMessage(chatPayload); errMsg != "" {
 		return resp, fmt.Errorf("cursor executor: %s", errMsg)
 	}
-	model := resolveCursorModelName(req.Model)
+	model := resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
 	requestID := generateUUID()
 	conversationID := cursorConversationID(req)
 	messageID := generateUUID()
@@ -227,7 +227,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if errMsg := cursorImageErrorMessage(chatPayload); errMsg != "" {
 		return nil, fmt.Errorf("cursor executor: %s", errMsg)
 	}
-	model := resolveCursorModelName(req.Model)
+	model := resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
 	requestID := generateUUID()
 	conversationID := cursorConversationID(req)
 	messageID := generateUUID()
@@ -246,7 +246,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
-	translatedReq := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+	// req.Payload was already normalized source->openai EXACTLY ONCE above (line ~222). Reuse that
+	// OpenAI-shaped request — do NOT translate again. Re-running the source->openai translator on an
+	// already-OpenAI payload double-translates and corrupts the request (Comment 4). Apply only model/stream.
+	// (from/to are still needed below for the RESPONSE stream translation back to the client format.)
+	translatedReq := bytes.Clone(req.Payload)
 	translatedReq, _ = sjson.SetBytes(translatedReq, "model", model)
 	translatedReq, _ = sjson.SetBytes(translatedReq, "stream", true)
 
@@ -2049,6 +2053,30 @@ func extractMessageContent(content any) string {
 }
 
 // resolveCursorModelName normalizes the model name for Cursor.
+// resolveCursorModelAlias maps a client-facing model name to its configured UPSTREAM Cursor model name
+// (from cursor-api-key[].models, carried in the auth's "model_aliases" attribute), applied BEFORE
+// normalization so a request for a configured alias routes to the real upstream model. Returns the input
+// unchanged when no alias matches.
+func resolveCursorModelAlias(auth *cliproxyauth.Auth, model string) string {
+	if auth == nil || auth.Attributes == nil {
+		return model
+	}
+	raw := strings.TrimSpace(auth.Attributes["model_aliases"])
+	if raw == "" {
+		return model
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return model
+	}
+	if up, ok := m[strings.TrimSpace(model)]; ok {
+		if up = strings.TrimSpace(up); up != "" {
+			return up
+		}
+	}
+	return model
+}
+
 func resolveCursorModelName(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {

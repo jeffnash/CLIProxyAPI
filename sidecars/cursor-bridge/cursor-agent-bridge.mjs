@@ -627,13 +627,17 @@ async function handleTurn(req, res, body, cursorKey) {
     // NEVER queue behind a new-user turn (that would hang the run until the abandonment watchdog).
     const session = sessions.get(sessionId);
     if (!session) {
-      // Forgiving degrade for an expired/unknown session (e.g. after a bridge restart or TTL eviction): the
-      // tool_results reference pending calls a fresh session never issued, so we CANNOT resume them. Do NOT
-      // 400 (clients retry-storm) and do NOT fake a re-seed (there is no matching pending). Emit a clean,
-      // well-formed terminal so the client's stream ends gracefully; the conversation continues next turn.
-      dbg("handleTurn tool_results -> unknown session (degrade to clean terminal)", sessionId);
+      // Unknown/expired session for a tool_results continuation (bridge restart or TTL eviction): the pending
+      // tool calls cannot be reconstructed, so the continuation is genuinely LOST. Comment 5: do NOT fake a
+      // successful empty turn — that hides the lost state and silently discards the client's tool work. Surface
+      // a clear stream ERROR (stop_reason:error) that the Go executor propagates to the caller as a real error,
+      // so the client/operator sees the continuation could not be applied rather than a misleading success.
+      dbg("handleTurn tool_results -> unknown session (surfacing lost continuation as error)", sessionId);
       res.writeHead(200, SSE_HEADERS);
-      try { res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "end_turn" })}\n\n`); res.write("data: [DONE]\n\n"); res.end(); } catch {}
+      try {
+        res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "error", error: "unknown or expired session: the tool call this result answers was not issued by this bridge (likely a restart or idle eviction); the continuation cannot be resumed" })}\n\n`);
+        res.write("data: [DONE]\n\n"); res.end();
+      } catch {}
       return;
     }
     // Comment 3: tool_results ingestion is NEVER 409'd. Resolving pending tool calls is just promise

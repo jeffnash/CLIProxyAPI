@@ -57,6 +57,22 @@ func ComputeClaudeModelsHash(models []config.ClaudeModel) string {
 	return hashJoined(keys)
 }
 
+// ComputeCursorModelsHash returns a stable hash for Cursor model aliases, so a config change to
+// cursor-api-key[].models triggers re-registration of /v1/models (mirrors the other API-key providers).
+func ComputeCursorModelsHash(models []config.CursorModel) string {
+	keys := normalizeModelPairs(func(out func(key string)) {
+		for _, model := range models {
+			name := strings.TrimSpace(model.Name)
+			alias := strings.TrimSpace(model.Alias)
+			if name == "" && alias == "" {
+				continue
+			}
+			out(strings.ToLower(name) + "|" + strings.ToLower(alias))
+		}
+	})
+	return hashJoined(keys)
+}
+
 // ComputeCodexModelsHash returns a stable hash for Codex model aliases.
 func ComputeCodexModelsHash(models []config.CodexModel) string {
 	keys := normalizeModelPairs(func(out func(key string)) {
