@@ -404,8 +404,9 @@ function headlessRequestContext(clientEnv) {
 //                           smartModeClassifierArgs (TODO: typed default-mode success, live-validate)
 //
 // ccErrorMessageText renders an isError result's content into a single human-readable failure message for
-// the `error: {message}` variant. The Go side may thread the failure reason as a plain string or a small
-// structured object; either way the model must SEE the failure (C01), never a fabricated success shape.
+// the `error: {error}` variant (the *Error oneof member's `error` string field; see fsErrorResult). The Go
+// side may thread the failure reason as a plain string or a small structured object; either way the model
+// must SEE the failure (C01), never a fabricated success shape.
 function ccErrorMessageText(c, fallback) {
   if (typeof c === "string" && c.trim()) return c;
   if (c && typeof c === "object") { try { return JSON.stringify(c); } catch { /* fall through */ } }
@@ -473,25 +474,42 @@ function buildWriteSuccess(c, s) {
   return r;
 }
 
+// agent.v1.{Read,Write,Delete,Ls,Grep,Fetch,...}Error all share a `result.error` oneof member of shape
+// { error: <message string>, ...optional context }. The failure text goes in the field literally named
+// `error` — there is NO `message` field and NO generic agent.v1.Error{message} in @cursor/sdk 1.0.14
+// (verified against the proto descriptors). Emitting { error: { message } } makes fromJson reject the result
+// ("key \"message\" is unknown"), which would fail EVERY native read/write/delete failure at runtime (caught
+// by selfTestResultSerialization / ADD-74). fsErrorResult builds the correct shape; `path` is included only
+// when present (it is an optional scalar on the fs *Error types, absent on grep/fetch/etc.).
+function fsErrorResult(message, path) {
+  const e = { error: String(message == null ? "" : message) };
+  if (path) e.path = String(path);
+  return { error: e };
+}
+
 // Native Cursor tool cases routed to CC. ccTool = generic name (CLIProxy maps to the client's exact tool
 // + arg schema). buildResult/buildChunks turn CC's tool_result content into the Cursor result toJson shape.
 // C01/BR8: every buildResult takes (content, state, isError). When the client marked the tool result FAILED
-// (isError), it MUST build a FAILURE shape — the result type's `error` oneof variant (agent.v1.Error =
-// {message}) — so a failed/cancelled/denied read/write/delete reaches the model AS a failure instead of a
-// fabricated native success (which would let the model continue from a false filesystem state). ReadResult /
-// WriteResult / DeleteResult each expose a `result` oneof with `success` plus `error`/`rejected`/typed error
-// variants (verified against @cursor/sdk 1.0.14 proto descriptors); the patched `fromJson` builds whichever
-// oneof key we emit. The shell cases already encode failure via a non-zero exitCode (their success variant is
-// the protocol's failure channel), so they keep their existing exit-code handling.
+// (isError), it MUST build a FAILURE shape — the result type's `error` oneof variant, which is { error:
+// <message string>, path?: <path> } (NOT {message}; see fsErrorResult) — so a failed/cancelled/denied
+// read/write/delete reaches the model AS a failure instead of a fabricated native success (which would let the
+// model continue from a false filesystem state). ReadResult / WriteResult / DeleteResult each expose a
+// `result` oneof with `success` plus `error`/`rejected`/typed error variants (verified against @cursor/sdk
+// 1.0.14 proto descriptors); the patched `fromJson` builds whichever oneof key we emit. The shell cases already
+// encode failure via a non-zero exitCode (their success variant is the protocol's failure channel), so they
+// keep their existing exit-code handling.
 // buildResult/buildChunks now take a trailing `ctx` ({ cwd }) so shell metadata reports the session's REAL
 // working directory (ADD-57) instead of a hard-coded "/workspace". Read/write delegate to the ADD-43 honest
 // builders (preserve structured truncated/range/actual-content; degrade to truncated:true for an unverifiable
 // bounded string read; never fabricate full-file success).
 const CC_CASES = {
-  readArgs:        { ccTool: "read",  stream: false, buildResult: (c, s, isError) => isError ? { error: { message: ccErrorMessageText(c, "read failed") } } : buildReadSuccess(c, s) },
-  redactedReadArgs:{ ccTool: "read",  stream: false, buildResult: (c, s, isError) => isError ? { error: { message: ccErrorMessageText(c, "read failed") } } : buildReadSuccess(c, s) },
-  writeArgs:       { ccTool: "write", stream: false, buildResult: (c, s, isError) => isError ? { error: { message: ccErrorMessageText(c, "write failed") } } : buildWriteSuccess(c, s) },
-  deleteArgs:      { ccTool: "delete", stream: false, buildResult: (c, s, isError) => isError ? { error: { message: ccErrorMessageText(c, "delete failed") } } : ({ success: { path: s && s.path, deletedFile: true, fileSize: "0" } }) },
+  readArgs:        { ccTool: "read",  stream: false, buildResult: (c, s, isError) => isError ? fsErrorResult(ccErrorMessageText(c, "read failed"), s && s.path) : buildReadSuccess(c, s) },
+  redactedReadArgs:{ ccTool: "read",  stream: false, buildResult: (c, s, isError) => isError ? fsErrorResult(ccErrorMessageText(c, "read failed"), s && s.path) : buildReadSuccess(c, s) },
+  writeArgs:       { ccTool: "write", stream: false, buildResult: (c, s, isError) => isError ? fsErrorResult(ccErrorMessageText(c, "write failed"), s && s.path) : buildWriteSuccess(c, s) },
+  // agent.v1.DeleteSuccess.deleted_file is a STRING scalar (not bool) and file_size is fabricated when the
+  // client returns no metadata, so we omit it rather than assert a false "0" size; deletedFile:"true" conveys
+  // the deletion in the correct type (a bool/number is rejected by fromJson).
+  deleteArgs:      { ccTool: "delete", stream: false, buildResult: (c, s, isError) => isError ? fsErrorResult(ccErrorMessageText(c, "delete failed"), s && s.path) : ({ success: { path: s && s.path, deletedFile: "true" } }) },
   // BR8/C5: when the client marked the native shell result as failed (isError) but the parsed exitCode is 0,
   // force a non-zero exit so the model sees the failure (a success exit would mask a failed/cancelled tool).
   // ADD-57: report ctx.cwd (the session's real processWorkingDirectory) in workingDirectory / exit.cwd.
@@ -508,10 +526,13 @@ const CONTROL_ALLOW = { shellAllowlistPrecheckArgs: 1, mcpAllowlistPrecheckArgs:
 // Server-proactive cases that may fire at turn start: answer with a benign TYPED result so the run
 // proceeds — a bare Error throw is a plausible desync/ERROR_BAD_REQUEST vector. If a shape is wrong,
 // fromJson throws and it degrades to the same exec error (no worse than rejecting).
-// diagnosticsArgs/canvasDiagnosticsArgs -> typed "rejected" (DiagnosticsResult has a rejected variant).
+// diagnosticsArgs -> typed "rejected" (DiagnosticsResult HAS a rejected variant). canvasDiagnosticsArgs ->
+// "success" with empty diagnostics: CanvasDiagnosticsResult exposes ONLY success/error (no rejected member),
+// so a "rejected" shape fails fromJson — an empty success ("checked, found nothing") is the benign typed
+// answer (verified against the @cursor/sdk 1.0.14 descriptors + selfTestResultSerialization).
 // TODO(validate-live): smartModeClassifierArgs needs its success shape (default mode) + subagent* a typed
 // error; left as deny-by-default reject until their shapes are derived and exercised against live Cursor.
-const CONTROL_TYPED = { diagnosticsArgs: { rejected: {} }, canvasDiagnosticsArgs: { rejected: {} } };
+const CONTROL_TYPED = { diagnosticsArgs: { rejected: {} }, canvasDiagnosticsArgs: { success: {} } };
 // H17: cases the bridge does NOT implement but whose RESULT type exposes an `error` oneof variant
 // (agent.v1.Error{message}, verified against the @cursor/sdk 1.0.14 proto descriptors). For these we return a
 // MODEL-VISIBLE typed unavailable result instead of fail-closing the whole run with a stream error — so the
@@ -533,7 +554,10 @@ const TYPED_UNAVAILABLE_U = new Set([
   "mcpStateExecArgs",         // McpStateExecResult.error
 ]);
 function typedUnavailableResult(cas) {
-  return { __ccJson: { error: { message: `tool '${cas}' is not available in this environment; use an alternative approach` } } };
+  // Each TYPED_UNAVAILABLE_U case maps to a <X>Result whose `error` oneof member is { error: <string>, ... }
+  // (grep/ls/fetch/backgroundShellSpawn/writeShellStdin/listMcpResources/readMcpResource/mcpState — all carry
+  // an `error` string field; extra context fields are optional). The message goes in `error`, never `message`.
+  return { __ccJson: { error: { error: `tool '${cas}' is not available in this environment; use an alternative approach` } } };
 }
 
 function ccArgsFor(cas, s) {
@@ -557,8 +581,8 @@ function blockedNativeResult(cas, s, cwd = "/workspace") {
       // ADD-57: report the session's real cwd here too (cosmetic — nothing executed — but consistent).
       return { __ccJson: { success: { command: s && s.command, workingDirectory: cwd, exitCode: 1, stdout: "", stderr: NATIVE_TOOL_DISABLED_MSG } } };
     default:
-      // read/write/delete/redactedRead -> the result type's `error` oneof variant (agent.v1.Error{message}).
-      return { __ccJson: { error: { message: NATIVE_TOOL_DISABLED_MSG } } };
+      // read/write/delete/redactedRead -> the result type's `error` oneof variant { error: <string>, path? }.
+      return { __ccJson: fsErrorResult(NATIVE_TOOL_DISABLED_MSG, s && s.path) };
   }
 }
 function caseOf(t) { return t && t.message && t.message.case; }
@@ -2223,38 +2247,65 @@ async function selfTestResultSerialization() {
   if (typeof factory !== "function") {
     throw new Error("self-test: patched SDK bundle did not install the result-serialization harness (__CC_SELFTEST_SERIALIZE) — patch missing/stale (ADD-74); refusing to start");
   }
-  // resultCase -> a representative __ccJson the bridge actually emits for it (success + error/oneof variants).
-  // The names are the ExecClientMessage RESULT oneof cases (not the *Args dispatch cases): readResult,
-  // writeResult, deleteResult, shellResult, shellStreamResult, mcpResult. Shapes mirror CC_CASES builders +
-  // blockedNativeResult/typedUnavailableResult/headlessRequestContext so a drift in ANY of them fails here.
-  const cases = [
-    ["readResult", { success: { path: "/x", content: "hi", totalLines: 1, fileSize: "2", truncated: false, rangeApplied: false } }],
-    ["readResult", { error: { message: "read failed" } }],
-    ["writeResult", { success: { path: "/x", linesCreated: 1, fileSize: "2" } }],
-    ["writeResult", { error: { message: "write failed" } }],
-    ["deleteResult", { success: { path: "/x", deletedFile: true, fileSize: "0" } }],
-    ["shellResult", { success: { command: "ls", workingDirectory: "/workspace", exitCode: 0, stdout: "o", stderr: "" } }],
-    ["mcpResult", { success: { isError: false, content: [{ text: { text: "ok" } }] } }],
-    ["mcpResult", { success: { isError: true, content: [{ text: { text: "tool failed" } }] } }],
-    ["requestContextResult", headlessRequestContext(null).__ccJson],
-  ];
-  for (const [resultCase, ccJson] of cases) {
+  // EXHAUSTIVE coverage (ADD-74 widened): rather than a hand-picked sample, ENUMERATE every result shape the
+  // bridge can emit over the seam — straight from CC_CASES / CONTROL_ALLOW / CONTROL_TYPED / TYPED_UNAVAILABLE_U
+  // and the blockedNative/typedUnavailable/MCP/requestContext builders — and drive each through the patched
+  // `$`/fromJson. Each is built by the SAME function the live run uses, so the test cannot drift from real
+  // traffic, and a new CC_CASES/CONTROL entry is covered automatically. This is the regression that shipped
+  // { error: { message } } for the no-such-field agent.v1.ReadError AND deleted_file:true (a bool where the
+  // proto wants a string) — both invisible until a real failed/delete tool hit the seam in production.
+  //
+  // resultCase mapping: the SDK serializes a dispatch case `<x>Args` as result case `<x>Result`
+  // (redactedReadArgs -> redactedReadResult, an alias of ReadResult; shellArgs -> shellResult). The streaming
+  // shell case is the lone exception: its chunks serialize as the `shellStream` case, not `shellStreamResult`.
+  const resultCaseFor = (cas) => cas.replace(/Args$/, "Result");
+  const st = { path: "/x", command: "ls", workingDirectory: "/workspace", fileText: "alpha\nbeta", offset: 0, limit: 20, returnFileContentAfterWrite: true };
+  const ctx = { cwd: "/workspace" };
+  const checks = []; // { case, label, ccJson }
+  const add = (rc, label, ccJson) => checks.push({ case: rc, label, ccJson });
+
+  // 1) Every unary CC_CASES builder: success AND error variant (fs tools build a real failure; shell encodes
+  //    failure via exitCode so isError just flips it). grep/ls carry buildResult:null (handled via H17 below).
+  for (const [cas, spec] of Object.entries(CC_CASES)) {
+    if (spec.stream || typeof spec.buildResult !== "function") continue;
+    const rc = resultCaseFor(cas);
+    add(rc, cas + ":success", spec.buildResult("alpha\nbeta", st, false, ctx));
+    add(rc, cas + ":error", spec.buildResult("the tool failed", st, true, ctx));
+  }
+  // 2) Shell STREAM chunks (stdout/stderr/exit) serialize as the `shellStream` case — success + aborted/error.
+  for (const chunk of CC_CASES.shellStreamArgs.buildChunks("output line\n", false, ctx)) add("shellStream", "shellStream:ok", chunk);
+  for (const chunk of CC_CASES.shellStreamArgs.buildChunks("boom", true, ctx)) add("shellStream", "shellStream:err", chunk);
+  // 3) blockedNativeResult (H08) for every native case the gate can block.
+  for (const cas of ["readArgs", "redactedReadArgs", "writeArgs", "deleteArgs", "shellArgs"]) add(resultCaseFor(cas), "blocked:" + cas, blockedNativeResult(cas, st, "/workspace").__ccJson);
+  // 4) CONTROL_ALLOW precheck cases answer { allowlisted: true }.
+  for (const cas of Object.keys(CONTROL_ALLOW)) add(resultCaseFor(cas), "allow:" + cas, { allowlisted: true });
+  // 5) CONTROL_TYPED proactive cases answer a typed value (e.g. { rejected: {} }).
+  for (const [cas, val] of Object.entries(CONTROL_TYPED)) add(resultCaseFor(cas), "typed:" + cas, val);
+  // 6) TYPED_UNAVAILABLE_U (H17): model-visible typed unavailable result for each.
+  for (const cas of TYPED_UNAVAILABLE_U) add(resultCaseFor(cas), "unavailable:" + cas, typedUnavailableResult(cas).__ccJson);
+  // 7) MCP dispatch wrap (handleMcp/mcpDispatch + the "tool not advertised" wrap): success isError false/true.
+  add("mcpResult", "mcp:ok", { success: { isError: false, content: [{ text: { text: "ok" } }] } });
+  add("mcpResult", "mcp:isError", { success: { isError: true, content: [{ text: { text: "tool failed" } }] } });
+  // 8) Headless request context (the SDK's first exec on every run).
+  add("requestContextResult", "requestContext", headlessRequestContext(null).__ccJson);
+
+  for (const c of checks) {
     let build;
-    try { build = factory(resultCase); } catch (e) {
-      throw new Error(`self-test: result-serialization factory threw constructing case '${resultCase}': ${(e && e.message) || e} — refusing to start`);
+    try { build = factory(c.case); } catch (e) {
+      throw new Error(`self-test: result-serialization factory threw constructing case '${c.case}' (${c.label}): ${(e && e.message) || e} — refusing to start`);
     }
     if (typeof build !== "function") {
-      throw new Error(`self-test: result-serialization factory did not return a builder for case '${resultCase}' — refusing to start`);
+      throw new Error(`self-test: result-serialization factory did not return a builder for case '${c.case}' (${c.label}) — refusing to start`);
     }
     try {
-      const out = build("selftest-serialize", { __ccJson: ccJson });
+      const out = build("selftest-serialize", { __ccJson: c.ccJson });
       if (out == null) throw new Error("builder returned null");
     } catch (e) {
-      // This is EXACTLY the failure a real first tool result would hit. Fail fast at startup instead.
-      throw new Error(`self-test: result '${resultCase}' could not serialize through the patched fromJson seam (ADD-74): ${(e && e.message) || e} — the sidecar result mapping is out of sync with the SDK; refusing to start`);
+      // This is EXACTLY the failure a real tool result of this kind would hit. Fail fast at startup instead.
+      throw new Error(`self-test: result '${c.case}' (${c.label}) could not serialize through the patched fromJson seam (ADD-74): ${(e && e.message) || e} — the sidecar result mapping is out of sync with the SDK; refusing to start`);
     }
   }
-  dbg("selfTestResultSerialization passed", "cases=" + cases.length);
+  dbg("selfTestResultSerialization passed", "checks=" + checks.length);
 }
 
 if (RUN_AS_MAIN) {

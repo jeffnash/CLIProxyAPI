@@ -1038,24 +1038,27 @@ function bodyReq(method, raw) {
 // dropped/failed/misrouted/unknown batch degrades with a typed error / isError, never a clean end_turn.
 
 test("C01: a failed native read/write/delete builds the typed error variant, NOT a fabricated success", () => {
-  // ReadResult/WriteResult/DeleteResult each expose an `error` oneof variant (agent.v1.Error{message}); on
-  // isError the builder must emit it so the model sees the failure instead of a success shape.
+  // ReadResult/WriteResult/DeleteResult each expose an `error` oneof variant of shape { error: <message
+  // string>, path?: <path> } (agent.v1.{Read,Write,Delete}Error in @cursor/sdk 1.0.14 — there is NO `message`
+  // field); on isError the builder must emit it so the model sees the failure instead of a success shape.
   const rd = CC_CASES.readArgs.buildResult("permission denied", { path: "/x" }, true);
-  assert.ok(rd.error && typeof rd.error.message === "string", "failed read -> error variant");
+  assert.ok(rd.error && typeof rd.error.error === "string", "failed read -> error variant");
   assert.ok(!rd.success, "failed read must NOT carry a success shape");
-  assert.match(rd.error.message, /permission denied/);
+  assert.match(rd.error.error, /permission denied/);
+  assert.equal(rd.error.path, "/x", "failed read threads the path into the error variant");
   const wr = CC_CASES.writeArgs.buildResult("disk full", { path: "/x", fileText: "hi" }, true);
   assert.ok(wr.error && !wr.success, "failed write -> error variant, no success");
   const dl = CC_CASES.deleteArgs.buildResult("no such file", { path: "/x" }, true);
   assert.ok(dl.error && !dl.success, "failed delete -> error variant, no success");
   const rr = CC_CASES.redactedReadArgs.buildResult("denied", { path: "/x" }, true);
   assert.ok(rr.error && !rr.success, "failed redacted read -> error variant, no success");
-  // Success path is unchanged (no isError): still the success shape with content/linesCreated/deletedFile.
+  // Success path is unchanged (no isError): still the success shape. deleted_file is a STRING scalar in the
+  // proto (a bool/number is rejected by fromJson), so the builder emits "true", not boolean true.
   assert.ok(CC_CASES.readArgs.buildResult("file body", { path: "/x" }, false).success);
   assert.ok(CC_CASES.writeArgs.buildResult("", { path: "/x", fileText: "ab\ncd" }, false).success.linesCreated === 2);
-  assert.equal(CC_CASES.deleteArgs.buildResult("", { path: "/x" }, false).success.deletedFile, true);
+  assert.equal(CC_CASES.deleteArgs.buildResult("", { path: "/x" }, false).success.deletedFile, "true");
   // The failure message falls back to a default when no content is provided.
-  assert.match(CC_CASES.readArgs.buildResult(null, { path: "/x" }, true).error.message, /read failed/);
+  assert.match(CC_CASES.readArgs.buildResult(null, { path: "/x" }, true).error.error, /read failed/);
 });
 
 test("C01: the failed-tool error variant reaches the model end-to-end via dispatchUnary (isError threaded)", async () => {
@@ -1067,7 +1070,7 @@ test("C01: the failed-tool error variant reaches the model end-to-end via dispat
   assert.equal(s.resolvePending("r1", "boom: cancelled by user", true), true); // client marks it FAILED
   const out = await p;
   assert.ok(out.__ccJson.error, "a failed native read resolves to the typed error variant (not success)");
-  assert.match(out.__ccJson.error.message, /cancelled by user/);
+  assert.match(out.__ccJson.error.error, /cancelled by user/);
 });
 
 test("C04/H06: the concurrent activeRes path uses the strict matcher — an unknown id is an ERROR ack, not clean end_turn", async () => {
@@ -1138,7 +1141,7 @@ test("H08: the dispatch seam blocks a NATIVE read under tool_choice=none with a 
   // heavy, so assert the policy unit: under none, a native read must yield the typed error result.
   const blocked = blockedNativeResult("readArgs", { path: "/etc/passwd" });
   assert.ok(blocked.__ccJson.error, "native read under none -> typed error, never executed on the client");
-  assert.match(blocked.__ccJson.error.message, /disabled/);
+  assert.match(blocked.__ccJson.error.error, /disabled/);
   void s;
 });
 
@@ -1170,8 +1173,8 @@ test("H17: an unsupported case WITH a typed-error result (grep/ls/fetch/backgrou
   for (const cas of ["grepArgs", "lsArgs", "fetchArgs", "backgroundShellSpawnArgs", "readMcpResourceExecArgs"]) {
     assert.ok(TYPED_UNAVAILABLE_U.has(cas), `${cas} is in the typed-unavailable set`);
     const r = typedUnavailableResult(cas);
-    assert.ok(r.__ccJson.error && typeof r.__ccJson.error.message === "string", `${cas} -> typed error variant`);
-    assert.match(r.__ccJson.error.message, /not available/);
+    assert.ok(r.__ccJson.error && typeof r.__ccJson.error.error === "string", `${cas} -> typed error variant`);
+    assert.match(r.__ccJson.error.error, /not available/);
   }
   // Cases with NO safe typed-result shape are NOT in the set (kept fail-closed per the caveat).
   for (const cas of ["subagentArgs", "computerUseArgs", "recordScreenArgs", "smartModeClassifierArgs"]) {
@@ -1775,11 +1778,14 @@ test("ADD-74: selfTestResultSerialization drives every representative result thr
   // A faithful fake of the patched `$` factory: it must accept our success/error/oneof __ccJson shapes for the
   // known result cases, and THROW on an unknown case (mirroring the real fromJson seam). This proves the
   // self-test actually exercises the return-trip serialization, catching a future SDK field-name drift.
-  const KNOWN = new Set(["readResult", "writeResult", "deleteResult", "shellResult", "shellStreamResult", "mcpResult", "requestContextResult"]);
+  // Accept any real ExecClientMessage result case (every `*Result` field + the streaming `shellStream` case) —
+  // a PREDICATE, not a fixed list, so this fake cannot drift as selfTestResultSerialization's coverage grows
+  // (the fixed list was itself a false-confidence trap: it silently failed to mirror new enumerated cases).
+  const isKnown = (caseName) => /Result$/.test(caseName) || caseName === "shellStream";
   const saved = globalThis.__CC_SELFTEST_SERIALIZE;
   // Happy path: a faithful factory -> the self-test passes.
   globalThis.__CC_SELFTEST_SERIALIZE = (caseName) => {
-    if (!KNOWN.has(caseName)) throw new Error("unknown result case " + caseName);
+    if (!isKnown(caseName)) throw new Error("unknown result case " + caseName);
     return (id, value) => {
       if (value && typeof value === "object" && "__ccJson" in value) {
         // emulate fromJson: a minimal shape validation (must be an object with success|error|oneof key).

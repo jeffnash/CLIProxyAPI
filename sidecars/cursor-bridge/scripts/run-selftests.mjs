@@ -18,8 +18,15 @@ async function runAll() {
   await bridge.selfTestNativeUnreachable();
   await bridge.selfTestBundleSeam();
   // ADD-74: prove RESULT SERIALIZATION through the patched `$`/fromJson seam, not just dispatch interception.
+  // Run the EXACT production startup gate first (bridge.selfTestResultSerialization drives every emittable
+  // result shape — success + error/blocked/unavailable variants — through the real builders), so CI fails on
+  // the same drift the bridge would refuse to start on. The local selfTestResultSerialize() below then adds
+  // the negative controls (unknown result case / structurally-invalid shape must be REJECTED by the seam).
+  // Previously CI ran only the local success-only payloads, so an error-variant proto-shape drift (e.g. the
+  // no-such-field agent.v1.ReadError{message}) passed CI yet crashed the bridge at startup.
+  await bridge.selfTestResultSerialization();
   await selfTestResultSerialize();
-  console.log("bridge self-tests passed (native unreachable + bundle seam + result serialize)");
+  console.log("bridge self-tests passed (native unreachable + bundle seam + result serialize [prod gate + negative controls])");
 }
 
 // ADD-74: prove RESULT SERIALIZATION through the patched `$`/fromJson seam, not just dispatch interception.
