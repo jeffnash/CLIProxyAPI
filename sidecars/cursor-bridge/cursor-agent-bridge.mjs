@@ -445,8 +445,13 @@ class Session {
     const want = (s && (s.toolName || s.name)) || "";
     const ccName = this.reconcileToolName(want);
     const input = toPlainJson(s && s.args);
+    // Every tool the MODEL actually calls lands here (raw name + whether it reconciled to an advertised tool).
+    // This is how we tell whether composer ever invokes a harness tool like Task/Agent (subagent spawn) and,
+    // if it does, whether the call survives reconciliation or is rejected as "not available".
+    dbg("dispatchMcp", "session=" + this.id, "want=" + want, "reconciled=" + (ccName || "<UNAVAILABLE>"));
     if (!ccName) {
       const names = (this.advertise || []).map((t) => t.toolName || t.name).join(", ");
+      dbg("dispatchMcp TOOL NOT AVAILABLE", "want=" + want, "advertisedCount=" + (this.advertise || []).length, "advertised=" + names);
       return Promise.resolve({ __ccJson: { success: { isError: true, content: [{ text: { text: `Tool '${want}' is not available. Available tools: ${names || "(none)"}.` } }] } } });
     }
     return new Promise((resolve, reject) => {

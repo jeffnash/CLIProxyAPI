@@ -903,6 +903,22 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 	inp := composerInput(oai)
 	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, extractComposerClientEnv(opts), composerConstraints(oai))
 	composerDebugf("[composer %s] STREAM sessionID=%s inputType=%v toolChoice=%q advertise=%d -> POST /agent/turn", responseID, sessionID, inp["type"], toolChoice, len(advertise))
+	if composerDebugEnabled {
+		// Log the ADVERTISED tool names (+ how many lost their schema). This is the only way to tell whether a
+		// harness tool the model should call (e.g. Task/Agent for subagents) is actually offered to composer,
+		// vs. dropped upstream — counts alone hide it. A tool with a mangled/absent inputSchema is one the model
+		// will typically refuse to call.
+		names := make([]string, 0, len(advertise))
+		noSchema := 0
+		for _, a := range advertise {
+			n, _ := a["name"].(string)
+			names = append(names, n)
+			if s, ok := a["inputSchema"]; !ok || s == nil {
+				noSchema++
+			}
+		}
+		composerDebugf("[composer %s] STREAM advertised %d tools (%d missing schema): %s", responseID, len(names), noSchema, strings.Join(names, ","))
+	}
 
 	httpResp, err := e.postAgentTurn(ctx, auth, apiKey, body)
 	if err != nil {
@@ -959,7 +975,9 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 			case "reasoning":
 				choice = map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": ev.Get("delta").String()}}
 			case "tool_call":
-				name, args := mapComposerToolCall(ev.Get("name").String(), ev.Get("input"), defs, toolAliases)
+				rawName := ev.Get("name").String()
+				name, args := mapComposerToolCall(rawName, ev.Get("input"), defs, toolAliases)
+				composerDebugf("[composer %s] STREAM tool_call emitted by model: raw=%q -> mapped=%q id=%s", responseID, rawName, name, ev.Get("id").String())
 				recordComposerToolCall(tenant, ev.Get("id").String(), sessionID) // route the continuation turn back here
 				choice = map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []map[string]any{{
 					"index": toolIdx, "id": ev.Get("id").String(), "type": "function",
