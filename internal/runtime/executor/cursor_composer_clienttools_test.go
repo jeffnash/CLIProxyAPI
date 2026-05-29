@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -686,6 +687,74 @@ func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 	}
 	if !strings.Contains(outO, "hi") {
 		t.Fatalf("openai content lost (ping handling must not drop real content): %q", outO)
+	}
+}
+
+// Comment 4 (empirical): a pure Anthropic tool_results request with N parallel tool_result blocks must
+// survive TranslateRequest(claude->openai) + composerInput as N results — pins whether of<N desync is
+// translation/extraction loss vs. the bridge's batching. Also covers a mixed tool_result+trailing-text turn.
+func TestComposerToolResultsExtractionCount(t *testing.T) {
+	from := sdktranslator.FromString("claude")
+	to := sdktranslator.FromString("openai")
+	mk := func(n int, trailingText bool) []byte {
+		var tu, tr strings.Builder
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				tu.WriteString(",")
+				tr.WriteString(",")
+			}
+			id := fmt.Sprintf("toolu_%d", i)
+			tu.WriteString(fmt.Sprintf(`{"type":"tool_use","id":"%s","name":"Read","input":{"path":"/f%d"}}`, id, i))
+			tr.WriteString(fmt.Sprintf(`{"type":"tool_result","tool_use_id":"%s","content":"result %d"}`, id, i))
+		}
+		if trailingText {
+			tr.WriteString(`,{"type":"text","text":"also please continue"}`)
+		}
+		return []byte(fmt.Sprintf(`{"model":"composer-2.5","messages":[{"role":"user","content":"go"},{"role":"assistant","content":[%s]},{"role":"user","content":[%s]}]}`, tu.String(), tr.String()))
+	}
+	for _, n := range []int{2, 4} {
+		oai := sdktranslator.TranslateRequest(from, to, "composer-2.5", mk(n, false), false)
+		inp := composerInput(oai)
+		results, _ := inp["results"].([]map[string]any)
+		t.Logf("n=%d trailingText=false -> type=%v results=%d oai=%s", n, inp["type"], len(results), string(oai))
+		if inp["type"] != "tool_results" || len(results) != n {
+			t.Fatalf("n=%d: expected tool_results with %d results, got type=%v count=%d", n, n, inp["type"], len(results))
+		}
+	}
+	// Mixed: tool_results + trailing text must still classify as tool_results (Comment 4), not a fresh user
+	// turn, and the trailing text is carried (not dropped).
+	oai := sdktranslator.TranslateRequest(from, to, "composer-2.5", mk(2, true), false)
+	inp := composerInput(oai)
+	results, _ := inp["results"].([]map[string]any)
+	if inp["type"] != "tool_results" || len(results) != 2 {
+		t.Fatalf("mixed tool_result+text must classify as tool_results with 2 results, got type=%v count=%d", inp["type"], len(results))
+	}
+	if s, _ := inp["trailingText"].(string); !strings.Contains(s, "continue") {
+		t.Fatalf("mixed turn must carry the trailing user text, got %q", s)
+	}
+}
+
+// Comment 5: a tool_results continuation routes by tool_call_id OWNERSHIP ahead of the stable conv id. When
+// stable metadata derives session A but the tool was emitted under session B, the continuation must route to B.
+func TestDeriveComposerSessionID_ContinuationOwnershipWins(t *testing.T) {
+	auth := authWith("authA", "keyA")
+	convA := optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-A"})
+	sessionA, _ := deriveComposerSessionID(auth, toolTurn("x"), convA)
+	sessionB := "sess_ownerB000000000000000000000000"
+	recordComposerToolCall(composerTenant(auth, convA), "tc_owned_by_B", sessionB)
+	// A continuation carrying conv-A metadata (which derives sessionA) but answering a tool emitted by B.
+	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_owned_by_B"}]},{"role":"tool","tool_call_id":"tc_owned_by_B","content":"R"}]}`)
+	got, err := deriveComposerSessionID(auth, cont, convA)
+	if err != nil {
+		t.Fatalf("ownership continuation must route, not error: %v", err)
+	}
+	if got != sessionB {
+		t.Fatalf("continuation must route to the emitting session B (%s), not the stable conv-id session A (%s); got %s", sessionB, sessionA, got)
+	}
+	// recordComposerToolCall refreshes to the latest emitter (Comment 5): re-emit the same id under A.
+	recordComposerToolCall(composerTenant(auth, convA), "tc_owned_by_B", sessionA)
+	if got2, _ := deriveComposerSessionID(auth, cont, convA); got2 != sessionA {
+		t.Fatalf("re-emitted tool_call_id must refresh ownership to the latest session A (%s), got %s", sessionA, got2)
 	}
 }
 

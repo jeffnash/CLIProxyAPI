@@ -366,6 +366,10 @@ class Session {
     this.agent = null; this.agentPromise = null; this.run = null;
     this.activeRes = null; this.pending = new Map();
     this.turnBatch = []; this.flushTimer = null;
+    this.delivered = new Set();   // tool ids the client has SEEN (sent in a turn_end) this logical run — so a
+                                  // tool_results turn matches against what was actually delivered (Comment 2)
+    this.undelivered = [];        // {id,name,input} of tools emitted with no open response (turn closed mid-burst);
+                                  // delivered on the next /agent/turn so the client can answer them (Comment 1)
     this.turnToken = 0;           // increments per turn; flush is bound to a token
     this.settleTurn = null;
     this.streamedText = "";       // cumulative text streamed in the CURRENT run (reset per user turn)
@@ -461,6 +465,14 @@ class Session {
 
   emitToolUse(id, name, input) {
     this.touch();
+    if (!this.activeRes) {
+      // No open client-facing response — the prior turn already closed (e.g. the debounce flushed mid-burst
+      // and the SDK kept emitting). Writing the tool_call to a dead socket would silently create a pending
+      // the client can never answer (the desync). Buffer it and deliver it on the next /agent/turn (Comment 1).
+      dbg("emitToolUse BUFFERED (no activeRes)", "session=" + this.id, "id=" + id, "name=" + name);
+      this.undelivered.push({ id, name, input });
+      return;
+    }
     dbg("emitToolUse", "session=" + this.id, "id=" + id, "name=" + name);
     this.turnBatch.push({ id, name, input });
     this.sse({ type: "tool_call", id, name, input });
@@ -468,8 +480,20 @@ class Session {
     if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = setTimeout(() => { if (token === this.turnToken) this.pauseForTools(); }, 60);
   }
+  // flushUndelivered delivers tools that were emitted while no response was open, on a later turn's OPEN
+  // response, so the client finally sees them and can answer them. Emits one tool_use turn_end + settles.
+  flushUndelivered() {
+    if (!this.undelivered.length || !this.activeRes) return false;
+    const batch = this.undelivered;
+    this.undelivered = [];
+    for (const t of batch) { this.delivered.add(t.id); this.sse({ type: "tool_call", id: t.id, name: t.name, input: t.input }); }
+    this.sse({ type: "turn_end", stop_reason: "tool_use", tool_calls: batch.map((t) => t.id) });
+    this.settle();
+    return true;
+  }
   pauseForTools() {
     this.flushTimer = null;
+    for (const b of this.turnBatch) this.delivered.add(b.id);
     this.sse({ type: "turn_end", stop_reason: "tool_use", tool_calls: this.turnBatch.map((b) => b.id) });
     this.turnBatch = [];
     this.settle();
@@ -486,6 +510,7 @@ class Session {
     if (!this.streamedText) { const full = (res && res.result) || ""; if (full) this.sse({ type: "text", delta: full }); }
     this.sse({ type: "turn_end", stop_reason: res && res.status === "finished" ? "end_turn" : "error", status: res && res.status, error: res && res.error, usage: (res && res.usage) || {} });
     this.rejectAllPending("run completed");
+    this.clearTurnState();
     this.settle();
     this.notifyLogicalDone(); // real completion -> admit the next queued new-user turn
   }
@@ -495,6 +520,7 @@ class Session {
     dbg("onRunError", "session=" + this.id, (err && err.stack) || (err && err.message) || String(err));
     this.sse({ type: "turn_end", stop_reason: "error", error: (err && err.message) || String(err) });
     this.rejectAllPending("run errored");
+    this.clearTurnState();
     this.settle();
     this.notifyLogicalDone(); // run terminated (error) -> admit the next queued new-user turn
   }
@@ -502,11 +528,17 @@ class Session {
     for (const [, p] of this.pending) { try { p.reject(new Error(`[bridge] ${why}`)); } catch {} }
     this.pending.clear();
   }
+  // Clear per-run tool-delivery state when the logical run ends/errors/cancels (Comment 1): stale turnBatch,
+  // undelivered buffer, and the delivered set must not leak into the next logical run on this session.
+  clearTurnState() {
+    if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
+    this.turnBatch = []; this.undelivered = []; this.delivered.clear();
+  }
   async cancel() {
     this.done = true;     // short-circuit any late run.wait() settlement (onRunComplete/onRunError no-op on done)
     this.runEpoch++;      // invalidate the in-flight run's completion callback so it can't mutate a successor turn
     this.rejectAllPending("session cancelled");
-    if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
+    this.clearTurnState();
     try { await (this.run && this.run.cancel && this.run.cancel()); } catch {}
     try { await (this.agent && this.agent.close && this.agent.close()); } catch {}
     this.run = null;
@@ -593,9 +625,19 @@ async function handleTurn(req, res, body, cursorKey) {
       try { res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "end_turn" })}\n\n`); res.write("data: [DONE]\n\n"); res.end(); } catch {}
       return;
     }
-    // activeRes set means another turn is already streaming this session's socket — an anomalous concurrent
-    // continuation; reject narrowly (this is NOT the new-user concurrency case the queue handles).
-    if (session.activeRes) { fail(409, "a turn is already in progress for this session"); return; }
+    // Comment 3: tool_results ingestion is NEVER 409'd. Resolving pending tool calls is just promise
+    // resolution — safe regardless of any open response. Only the model-output STREAM is single-owner: if a
+    // continuation response is already streaming this session's run (concurrent/incremental tool_results),
+    // resolve the provided ids into the live run and return a short successful ack on THIS response, leaving
+    // the model output on the existing activeRes. Otherwise (the normal case) drive the continuation here.
+    if (session.activeRes) {
+      res.writeHead(200, SSE_HEADERS);
+      let matched = 0;
+      for (const tr of input.results || []) { if (session.resolvePending(tr.toolCallId, tr.content)) matched++; }
+      dbg("handleTurn tool_results CONCURRENT ack", sessionId, "matched=" + matched, "of=" + ((input.results || []).length));
+      try { res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "end_turn" })}\n\n`); res.write("data: [DONE]\n\n"); res.end(); } catch {}
+      return;
+    }
     dbg("handleTurn tool_results -> existing session", sessionId, "pending=" + session.pending.size, "runActive=" + !!session.run);
     res.writeHead(200, SSE_HEADERS);
     return runTurn(req, res, session, model, input, constraints);
@@ -687,23 +729,32 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
   try {
     dbg("runTurn START", "session=" + session.id, "inputType=" + input.type, "turnToken=" + session.turnToken);
     if (input.type === "tool_results") {
+      // Comment 2: match each result idempotently against pending; resolve what is provided and leave the
+      // rest pending WITHOUT erroring (the client may answer incrementally / across requests). A re-sent
+      // already-resolved id (or an id we delivered earlier) is a benign ack, never a fatal error. Only an id
+      // we NEVER emitted to the client AND that isn't pending is "unknown".
       let matched = 0;
-      for (const tr of input.results || []) { if (session.resolvePending(tr.toolCallId, tr.content)) matched++; }
-      dbg("runTurn tool_results matched=" + matched, "of=" + ((input.results || []).length), "pendingRemaining=" + session.pending.size, "ids=" + safeJson((input.results || []).map((r) => r.toolCallId)));
-      if (matched === 0) {
-        // No provided result matched a pending: the run is still blocked on its real tool calls and would
-        // hang until the watchdog, stranding any queued waiter. Terminate it like the partial-batch case.
-        session.rejectAllPending("no pending tool calls matched the provided tool_results");
-        session.sse({ type: "turn_end", stop_reason: "error", error: "no pending tool calls matched the provided tool_results" });
-        session.settle();
+      const unknown = [];
+      for (const tr of input.results || []) {
+        if (session.resolvePending(tr.toolCallId, tr.content)) matched++;
+        else if (!session.delivered.has(tr.toolCallId)) unknown.push(tr.toolCallId);
+      }
+      dbg("runTurn tool_results", "session=" + session.id, "matched=" + matched, "of=" + ((input.results || []).length),
+        "pending=" + session.pending.size, "undelivered=" + session.undelivered.length, "unknown=" + safeJson(unknown));
+      if (session.flushUndelivered()) {
+        // Tools the SDK emitted after the prior turn closed (mid-burst) are now delivered as THIS turn's
+        // tool_use batch (Comment 1) so the client can answer them; the run stays paused awaiting them.
       } else if (session.pending.size > 0) {
-        // Partial batch: the run is blocked on tool calls this turn did not answer and cannot proceed, so
-        // it would neither emit new tools nor complete — the HTTP turn would otherwise hang until the
-        // PENDING_TIMEOUT_MS watchdog. Fail cleanly: reject the outstanding pendings so the run terminates
-        // (no zombie paused run) and report the missing ids. A parallel tool batch must be answered together.
-        const missing = [...session.pending.keys()].join(", ");
-        session.rejectAllPending("incomplete tool_results batch");
-        session.sse({ type: "turn_end", stop_reason: "error", error: `incomplete tool_results: missing results for ${missing}` });
+        // Some delivered tools remain unanswered (true incremental answer). The run is still blocked, so it
+        // will neither stream nor complete this turn. Don't error and don't hang: settle a benign empty turn;
+        // the run stays paused (bounded by PENDING_TIMEOUT_MS) and the client may answer the rest next.
+        session.sse({ type: "turn_end", stop_reason: "end_turn" });
+        session.settle();
+      } else if (matched === 0) {
+        // Nothing matched and nothing pending: a stale/duplicate ack (e.g. a client retry of an already-
+        // resolved id). Acknowledge cleanly rather than erroring (Comment 2 idempotency) — this is what
+        // breaks the old retry storm. When matched>0 and pending==0, the run resumes and streams below.
+        session.sse({ type: "turn_end", stop_reason: "end_turn" });
         session.settle();
       }
     } else if (session.run) {
@@ -757,6 +808,15 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
           throw sendErr;
         } finally {
           session.advertise = savedAdvertise;
+        }
+        // If cancel() ran DURING agent.send (client disconnected mid-send) or a newer run superseded this
+        // turn, agent.send still resolved and re-assigned an orphan to session.run. Leaving it there parks
+        // the FIFO forever (whenLogicalDone never resolves) and blocks eviction (run!=null). Discard it.
+        if (ep !== session.runEpoch || session.done) {
+          const orphan = session.run; session.run = null;
+          try { await (orphan && orphan.cancel && orphan.cancel()); } catch {}
+          session.notifyLogicalDone(); // release the FIFO so the queued waiter advances
+          return;
         }
         // Bind completion to THIS run's epoch, not the session: a cancelled/superseded run's late settlement
         // must not tear down a freshly-promoted queued turn that now owns session.run/activeRes/pending.

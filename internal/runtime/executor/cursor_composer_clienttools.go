@@ -159,6 +159,10 @@ func recordComposerToolCall(tenant, toolCallID, sessionID string) {
 	composerToolCallMu.Lock()
 	defer composerToolCallMu.Unlock()
 	if _, ok := composerToolCallSessions[key]; ok {
+		// Comment 5: refresh to the LATEST emitting session (a re-emitted tool_call_id moves to whichever
+		// session emitted it most recently), avoiding a stale first-writer mapping. The key already exists
+		// in the LRU order, so don't re-append.
+		composerToolCallSessions[key] = sessionID
 		return
 	}
 	composerToolCallSessions[key] = sessionID
@@ -173,15 +177,15 @@ func recordComposerToolCall(tenant, toolCallID, sessionID string) {
 // lookupSessionByToolResults returns the session id for a continuation turn whose trailing tool messages
 // carry tool_call_ids previously emitted by a bridge session FOR THIS TENANT, or "" if none match.
 func lookupSessionByToolResults(tenant string, oai []byte) string {
-	messages := gjson.GetBytes(oai, "messages").Array()
+	results, _, ok := composerToolResults(gjson.GetBytes(oai, "messages").Array())
+	if !ok {
+		return ""
+	}
 	composerToolCallMu.Lock()
 	defer composerToolCallMu.Unlock()
-	for i := len(messages) - 1; i >= 0; i-- {
-		m := messages[i]
-		if m.Get("role").String() != "tool" {
-			break
-		}
-		if id := strings.TrimSpace(m.Get("tool_call_id").String()); id != "" {
+	for _, r := range results {
+		id, _ := r["toolCallId"].(string)
+		if id = strings.TrimSpace(id); id != "" {
 			if sid, ok := composerToolCallSessions[tenant+"\x00"+id]; ok {
 				return sid
 			}
@@ -252,22 +256,31 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, oai []byte, opts cliproxye
 		log.Infof("[composer] deriveSessionID BRANCH=ephemeral(utility one-shot) -> sessionID=%s", sid)
 		return sid, nil
 	}
+	// Comment 5: a tool_results continuation routes by tool_call_id OWNERSHIP first — the session that
+	// actually emitted the pending tool calls is authoritative, ahead of the stable conversation id. This
+	// prevents a continuation whose tools were emitted under a different session (isolation/race) from being
+	// silently mis-routed to the conv-id session (which would never match the pending tool calls).
+	if _, _, isCont := composerToolResults(gjson.GetBytes(oai, "messages").Array()); isCont {
+		if sid := lookupSessionByToolResults(tenant, oai); sid != "" {
+			log.Infof("[composer] deriveSessionID BRANCH=continuation(tool_call_id ownership) -> sessionID=%s", sid)
+			return sid, nil
+		}
+		// No recorded emitter (bridge restart / TTL eviction / cross-instance): fall back to the stable conv
+		// id so the bridge can re-seed; else fail clearly rather than silently mis-route an unknown batch.
+		if id := stableConversationID(opts); id != "" {
+			sum := sha256.Sum256([]byte(tenant + "\x00conv:" + id))
+			sid := "sess_" + hex.EncodeToString(sum[:])[:32]
+			log.Infof("[composer] deriveSessionID BRANCH=continuation(stable fallback) convID=%q -> sessionID=%s", id, sid)
+			return sid, nil
+		}
+		log.Errorf("[composer] deriveSessionID BRANCH=continuation MISS: tool_results turn, no recorded tool_call_id and no stable id -> ERROR")
+		return "", fmt.Errorf("cursor composer: tool_results turn with no known pending tool call and no stable conversation id (session expired, or the tool call was not issued by this bridge)")
+	}
 	if id := stableConversationID(opts); id != "" {
 		sum := sha256.Sum256([]byte(tenant + "\x00conv:" + id))
 		sid := "sess_" + hex.EncodeToString(sum[:])[:32]
 		log.Infof("[composer] deriveSessionID BRANCH=stable convID=%q -> sessionID=%s", id, sid)
 		return sid, nil
-	}
-	// No stable conversation id. A continuation (tool_results) turn MUST route to the session that emitted
-	// its pending tool calls; if that mapping is gone we error (we cannot continue an unknown tool batch).
-	messages := gjson.GetBytes(oai, "messages").Array()
-	if n := len(messages); n > 0 && messages[n-1].Get("role").String() == "tool" {
-		if sid := lookupSessionByToolResults(tenant, oai); sid != "" {
-			log.Infof("[composer] deriveSessionID BRANCH=continuation(tool_results) -> sessionID=%s", sid)
-			return sid, nil
-		}
-		log.Errorf("[composer] deriveSessionID BRANCH=continuation MISS: tool_results turn, no stable id, no recorded tool_call_id -> ERROR")
-		return "", fmt.Errorf("cursor composer: tool_results turn with no stable conversation id and no known pending tool call (session expired, or the tool call was not issued by this bridge)")
 	}
 	// New user turn with no stable id (a stateless client — curl/SDK/simple UI). Mint a FRESH RANDOM session
 	// id: it can never collide with another conversation (unlike a content hash), so this is safe for the
@@ -301,8 +314,7 @@ func isComposerUtilityOneShot(oai []byte) bool {
 	if len(composerToolDefs(oai)) > 0 {
 		return false // an agentic turn advertises tools — never isolate it
 	}
-	msgs := gjson.GetBytes(oai, "messages").Array()
-	if n := len(msgs); n > 0 && msgs[n-1].Get("role").String() == "tool" {
+	if _, _, ok := composerToolResults(gjson.GetBytes(oai, "messages").Array()); ok {
 		return false // a tool_results continuation must route to its emitting session, not a fresh one
 	}
 	return true
@@ -570,21 +582,80 @@ func extractComposerClientEnv(opts cliproxyexecutor.Options) map[string]any {
 
 // composerInput classifies the incoming turn: a trailing tool message means the client returned tool
 // results (continuation); otherwise it is a new user turn carrying text + images + system + history.
-func composerInput(oai []byte) map[string]any {
-	messages := gjson.GetBytes(oai, "messages").Array()
+// composerToolResults extracts a tool_results continuation from the (OpenAI-shape) messages: the role:tool
+// results that follow the LAST assistant message bearing tool_calls, provided the model has not yet replied
+// to them (no assistant message after them). ok=false when the turn is not such a continuation. trailing is
+// any user text that accompanies the results in the same turn (a mixed tool_result+text turn). This is the
+// single source of continuation detection (composerInput, lookupSessionByToolResults, deriveComposerSessionID
+// all use it) so a mixed turn is never misclassified as a fresh user turn (Comment 4).
+func composerToolResults(messages []gjson.Result) (results []map[string]any, trailing string, ok bool) {
+	toolRes := func(m gjson.Result) map[string]any {
+		return map[string]any{"toolCallId": m.Get("tool_call_id").String(), "content": cursorMessageText(m)}
+	}
+	// (a) Preferred: the role:tool results that follow the LAST assistant message bearing tool_calls, as long
+	// as the model has not yet replied to them (no later assistant). This is what makes a MIXED turn (tool
+	// results + trailing user text) classify as a continuation instead of a fresh user turn (Comment 4).
+	lastTC := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Get("role").String() == "assistant" && m.Get("tool_calls").Exists() {
+			lastTC = i
+			break
+		}
+	}
+	if lastTC >= 0 {
+		var sb strings.Builder
+		res := make([]map[string]any, 0)
+		replied := false
+		for i := lastTC + 1; i < len(messages); i++ {
+			switch messages[i].Get("role").String() {
+			case "tool":
+				res = append(res, toolRes(messages[i]))
+			case "user":
+				if t := cursorMessageText(messages[i]); t != "" {
+					if sb.Len() > 0 {
+						sb.WriteString("\n")
+					}
+					sb.WriteString(t)
+				}
+			case "assistant":
+				replied = true
+			}
+		}
+		if len(res) > 0 && !replied {
+			return res, sb.String(), true
+		}
+	}
+	// (b) Fallback: a turn that simply ENDS with a contiguous run of role:tool messages (truncated history,
+	// or a lone results turn with no assistant tool_calls in view). Preserves the original detection.
 	if n := len(messages); n > 0 && messages[n-1].Get("role").String() == "tool" {
-		results := make([]map[string]any, 0)
+		res := make([]map[string]any, 0)
 		for i := n - 1; i >= 0; i-- {
-			m := messages[i]
-			if m.Get("role").String() != "tool" {
+			if messages[i].Get("role").String() != "tool" {
 				break
 			}
-			results = append([]map[string]any{{
-				"toolCallId": m.Get("tool_call_id").String(),
-				"content":    cursorMessageText(m),
-			}}, results...)
+			res = append([]map[string]any{toolRes(messages[i])}, res...)
 		}
-		return map[string]any{"type": "tool_results", "results": results}
+		if len(res) > 0 {
+			return res, "", true
+		}
+	}
+	return nil, "", false
+}
+
+func composerInput(oai []byte) map[string]any {
+	messages := gjson.GetBytes(oai, "messages").Array()
+	// Tool_results continuation detection (Comment 4): a continuation is the LAST assistant turn bearing
+	// tool_calls, followed by role:tool results the model has NOT yet replied to (no later assistant). Keying
+	// only on "the last message is role:tool" misclassifies a MIXED turn carrying tool_result blocks AND
+	// trailing user text (which translates to a trailing role:user) as a fresh user turn, stranding the
+	// paused run's tools. Collect the results regardless of trailing user text; carry that text intentionally.
+	if results, trailing, ok := composerToolResults(messages); ok {
+		inp := map[string]any{"type": "tool_results", "results": results}
+		if trailing != "" {
+			inp["trailingText"] = trailing
+		}
+		return inp
 	}
 	lastUserIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -888,7 +959,9 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 				// "canonical -> per-provider" rule), never on client identity. Anthropic requires the typed
 				// ping AFTER message_start, so the first ping lazily opens the envelope (an empty delta ->
 				// message_start) and later pings emit a real ping event; for OpenAI an empty delta is itself a
-				// valid no-op chunk; any other schema falls back to a spec-safe SSE comment.
+				// valid no-op chunk. NOTE: for Gemini-family and OpenAI-Responses inbound, an empty delta
+				// currently translates to zero wire bytes (after the first), so the keepalive is a no-op there
+				// — acceptable for the Claude-Code-centric composer path; revisit if those become hot routes.
 				if fr := from.String(); (fr == "claude" || fr == "anthropic") && started {
 					if !emit([][]byte{[]byte("event: ping\ndata: {\"type\": \"ping\"}\n\n")}) {
 						return

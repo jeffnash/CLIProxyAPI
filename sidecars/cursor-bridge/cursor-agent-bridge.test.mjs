@@ -138,6 +138,44 @@ test("Session pending bookkeeping: resolve a subset leaves the rest pending (bas
   assert.equal(got.b, "__rejected__");
 });
 
+test("emitToolUse buffers a late tool when no response is open; flushUndelivered delivers it next turn (Comment 1)", () => {
+  const s = new Session("b1");
+  const res = { write() {}, writeHead() {}, end() {}, on() {}, off() {} };
+  s.activeRes = res;
+  s.emitToolUse("A", "read", {});
+  s.emitToolUse("B", "read", {});
+  if (s.flushTimer) clearTimeout(s.flushTimer); // avoid the real 60ms timer firing after the test
+  s.pauseForTools(); // close the turn -> turn_end{A,B}; delivered={A,B}
+  assert.ok(s.delivered.has("A") && s.delivered.has("B"), "delivered tools are tracked");
+  // Turn closed (the finally nulls activeRes). A late tool C must be BUFFERED, never silently lost as an
+  // undeliverable pending.
+  s.activeRes = null;
+  s.emitToolUse("C", "read", {});
+  assert.equal(s.undelivered.length, 1, "late tool with no open response must be buffered");
+  assert.equal(s.undelivered[0].id, "C");
+  assert.ok(!s.delivered.has("C"), "buffered tool is not yet delivered to the client");
+  // Next turn opens a response; flushUndelivered delivers C so the client can answer it.
+  s.activeRes = res;
+  const flushed = s.flushUndelivered();
+  assert.equal(flushed, true);
+  assert.ok(s.delivered.has("C") && s.undelivered.length === 0, "buffered tool delivered on the next turn");
+});
+
+test("resolvePending is incremental + idempotent: a subset resolves, a re-sent id is a benign no-op not an error (Comment 2)", () => {
+  const s = new Session("b2");
+  const got = {};
+  const mk = (id) => { const w = (c) => { got[id] = c; }; w.__reject = () => { got[id] = "__rej__"; }; return w; };
+  s.newPending("A", mk("A"));
+  s.newPending("B", mk("B"));
+  assert.equal(s.resolvePending("A", "ra"), true);    // resolve only A
+  assert.equal(s.pending.size, 1, "B stays pending — incremental answer must NOT error");
+  assert.equal(s.resolvePending("A", "again"), false); // re-sent already-resolved id -> benign no-op (the retry case)
+  assert.equal(s.resolvePending("B", "rb"), true);
+  assert.equal(s.pending.size, 0);
+  assert.equal(got.A, "ra");
+  assert.equal(got.B, "rb");
+});
+
 test("Session.whenLogicalDone admits on REAL completion, not on a tool-pause settle (FIFO queue admission)", async () => {
   const s = new Session("q1");
   // No live run -> the next queued turn is admitted immediately.
