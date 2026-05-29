@@ -21,6 +21,43 @@ var (
 	dataTag = []byte("data:")
 )
 
+// thinkingEnabledForClaude reports whether the inbound Anthropic request opted
+// into thinking. ADD-66: the composer/Cursor path emits reasoning deltas even
+// when the client never requested thinking, and this translator would
+// otherwise render unrequested (and unsigned) Anthropic `thinking` blocks. We
+// gate every thinking-emit site on this signal so the negative guarantee holds:
+// never emit a thinking block the client did not ask for.
+//
+// Primary signal: the inbound Claude request carries thinking.type ∈
+// {enabled, adaptive, auto}. Fallback signal: the translated OpenAI request
+// carries a reasoning_effort that is not "none" (the request translator maps
+// thinking.type:"disabled" → reasoning_effort:"none", so a "none" effort must
+// NOT count as enabled).
+//
+// Note on signatures (per C-ADD66-THINKING-GATE §3): even when thinking IS
+// enabled, this translator still emits text-only thinking blocks with no
+// `signature`. Generating valid Anthropic thinking-block signatures is out of
+// scope for the composer path; the hard guarantee delivered here is the
+// negative one (no unrequested thinking), not signed-thinking replay continuity.
+func thinkingEnabledForClaude(originalRequestRawJSON, requestRawJSON []byte) bool {
+	switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(originalRequestRawJSON, "thinking.type").String())) {
+	case "enabled", "adaptive", "auto":
+		return true
+	}
+	// Fallback: a present, non-"none" reasoning_effort on the translated OpenAI
+	// request indicates thinking was requested. "none" maps from
+	// thinking.type:"disabled" and must not be treated as enabled.
+	if effort := gjson.GetBytes(requestRawJSON, "reasoning_effort"); effort.Exists() && effort.Type == gjson.String {
+		switch strings.ToLower(strings.TrimSpace(effort.String())) {
+		case "", "none":
+			return false
+		default:
+			return true
+		}
+	}
+	return false
+}
+
 // ConvertOpenAIResponseToAnthropicParams holds parameters for response conversion
 type ConvertOpenAIResponseToAnthropicParams struct {
 	MessageID   string
@@ -57,6 +94,11 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	ThinkingContentBlockIndex int
 	// Next available content block index
 	NextContentBlockIndex int
+	// ThinkingEnabled records whether the inbound Anthropic request opted into
+	// thinking. ADD-66: when false, all thinking/thinking_delta emit sites are
+	// suppressed so the client never receives an unrequested (unsigned)
+	// thinking block.
+	ThinkingEnabled bool
 }
 
 // ToolCallAccumulator holds the state for accumulating tool call data
@@ -100,6 +142,9 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 			TextContentBlockIndex:       -1,
 			ThinkingContentBlockIndex:   -1,
 			NextContentBlockIndex:       0,
+			// ADD-66: gate thinking emission on the inbound request having
+			// actually enabled thinking.
+			ThinkingEnabled: thinkingEnabledForClaude(originalRequestRawJSON, requestRawJSON),
 		}
 	}
 
@@ -119,7 +164,7 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 
 	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
 	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON)
+		return convertOpenAINonStreamingToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams).ThinkingEnabled)
 	} else {
 		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
@@ -165,8 +210,11 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			// Don't send content_block_start for text here - wait for actual content
 		}
 
-		// Handle reasoning content delta
-		if reasoning := delta.Get("reasoning_content"); reasoning.Exists() {
+		// Handle reasoning content delta.
+		// ADD-66: only emit Anthropic thinking blocks when the inbound request
+		// enabled thinking; otherwise drop the reasoning (never render an
+		// unrequested/unsigned thinking block).
+		if reasoning := delta.Get("reasoning_content"); reasoning.Exists() && param.ThinkingEnabled {
 			for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
 				if reasoningText == "" {
 					continue
@@ -415,8 +463,9 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 	return results
 }
 
-// convertOpenAINonStreamingToAnthropic converts OpenAI non-streaming response to Anthropic format
-func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
+// convertOpenAINonStreamingToAnthropic converts OpenAI non-streaming response to Anthropic format.
+// thinkingEnabled (ADD-66) gates whether reasoning_content is rendered as Anthropic thinking blocks.
+func convertOpenAINonStreamingToAnthropic(rawJSON []byte, thinkingEnabled bool) [][]byte {
 	root := gjson.ParseBytes(rawJSON)
 
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
@@ -427,14 +476,18 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() && len(choices.Array()) > 0 {
 		choice := choices.Array()[0] // Take first choice
 
-		reasoningNode := choice.Get("message.reasoning_content")
-		for _, reasoningText := range collectOpenAIReasoningTexts(reasoningNode) {
-			if reasoningText == "" {
-				continue
+		// ADD-66: only emit Anthropic thinking blocks when the inbound request
+		// enabled thinking; otherwise drop the reasoning.
+		if thinkingEnabled {
+			reasoningNode := choice.Get("message.reasoning_content")
+			for _, reasoningText := range collectOpenAIReasoningTexts(reasoningNode) {
+				if reasoningText == "" {
+					continue
+				}
+				block := []byte(`{"type":"thinking","thinking":""}`)
+				block, _ = sjson.SetBytes(block, "thinking", reasoningText)
+				out, _ = sjson.SetRawBytes(out, "content.-1", block)
 			}
-			block := []byte(`{"type":"thinking","thinking":""}`)
-			block, _ = sjson.SetBytes(block, "thinking", reasoningText)
-			out, _ = sjson.SetRawBytes(out, "content.-1", block)
 		}
 
 		// Handle text content
@@ -611,7 +664,8 @@ func toolCallAccumulatorIndexes(accumulators map[int]*ToolCallAccumulator) []int
 // Returns:
 //   - []byte: An Anthropic-compatible JSON response.
 func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
-	_ = requestRawJSON
+	// ADD-66: gate thinking emission on the inbound request having enabled thinking.
+	thinkingEnabled := thinkingEnabledForClaude(originalRequestRawJSON, requestRawJSON)
 
 	root := gjson.ParseBytes(rawJSON)
 	toolNameMap := util.ToolNameMapFromClaudeRequest(originalRequestRawJSON)
@@ -690,8 +744,13 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 							}
 						case "reasoning":
 							flushText()
-							if thinking := item.Get("text"); thinking.Exists() {
-								thinkingBuilder.WriteString(thinking.String())
+							// ADD-66: only accumulate reasoning into a thinking
+							// block when thinking was enabled by the request;
+							// otherwise drop it (flushThinking stays a no-op).
+							if thinkingEnabled {
+								if thinking := item.Get("text"); thinking.Exists() {
+									thinkingBuilder.WriteString(thinking.String())
+								}
 							}
 						default:
 							flushThinking()
@@ -711,7 +770,9 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 				}
 			}
 
-			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
+			// ADD-66: only emit Anthropic thinking blocks when the inbound
+			// request enabled thinking; otherwise drop the reasoning.
+			if reasoning := message.Get("reasoning_content"); reasoning.Exists() && thinkingEnabled {
 				for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
 					if reasoningText == "" {
 						continue

@@ -164,6 +164,14 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 					msg, _ = sjson.SetRawBytes(msg, "content.-1", contentPart)
 					hasContent = true
 				}
+
+				// ADD-54: handle fileData (URI-referenced media) in the system instruction
+				// too. Mirrors the contents-loop branch: never silently drop the part.
+				var ignoreOnlyText bool
+				if cp, ok := geminiFileDataPart(part, &ignoreOnlyText); ok {
+					msg, _ = sjson.SetRawBytes(msg, "content.-1", cp)
+					hasContent = true
+				}
 				return true
 			})
 		}
@@ -219,6 +227,17 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
 						contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
 						contentWrapper, _ = sjson.SetRawBytes(contentWrapper, "arr.-1", contentPart)
+						contentPartsCount++
+					}
+
+					// ADD-54: handle fileData (a media part referenced by URI instead of
+					// inline base64). Without this branch the part was silently dropped, so
+					// a Gemini turn that attaches an image/file by URI reached Composer with
+					// the attachment missing. Image MIME types become an OpenAI image_url
+					// (the URI is a fetchable reference); any other / missing MIME degrades
+					// to a visible text marker so the attachment is NEVER silently dropped.
+					if cp, ok := geminiFileDataPart(part, &onlyTextContent); ok {
+						contentWrapper, _ = sjson.SetRawBytes(contentWrapper, "arr.-1", cp)
 						contentPartsCount++
 					}
 
@@ -414,6 +433,73 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 
 	return out
+}
+
+// geminiFileDataPart translates a Gemini `fileData` part (media referenced by URI
+// instead of inline base64) into an OpenAI content part (ADD-54). Without this the
+// part is silently dropped and a URI-attached image/file never reaches the model.
+//
+// Behavior:
+//   - Image MIME type with a non-empty URI -> OpenAI {"type":"image_url",...} carrying
+//     the URI verbatim (a fetchable reference the downstream consumer can resolve).
+//   - Any other MIME type, or a present-but-empty URI -> a visible OpenAI text part that
+//     names the attachment and its type. This degrades to a model-visible marker rather
+//     than silently discarding the part. (This translator returns []byte with no error
+//     channel; a visible marker is the "explicit unsupported-media" surface, mirroring the
+//     claude->gemini translator's file_data handling.)
+//
+// Both the camelCase wire form (`fileData.fileUri`/`fileData.mimeType`) and the snake_case
+// form some SDKs emit (`file_data.file_uri`/`file_data.mime_type`) are accepted.
+//
+// onlyText is set to false whenever a part is produced, because the produced part is
+// emitted through the structured content array (not the plain-string fast path), so the
+// caller must not collapse the message to bare text and lose it.
+//
+// Returns the content-part JSON and true when a `fileData` part exists; (nil, false) when
+// the part has neither a fileData nor file_data field (nothing to translate).
+func geminiFileDataPart(part gjson.Result, onlyText *bool) ([]byte, bool) {
+	fileData := part.Get("fileData")
+	if !fileData.Exists() {
+		fileData = part.Get("file_data")
+	}
+	if !fileData.Exists() {
+		return nil, false
+	}
+
+	fileURI := fileData.Get("fileUri").String()
+	if fileURI == "" {
+		fileURI = fileData.Get("file_uri").String()
+	}
+	mimeType := fileData.Get("mimeType").String()
+	if mimeType == "" {
+		mimeType = fileData.Get("mime_type").String()
+	}
+
+	if onlyText != nil {
+		*onlyText = false
+	}
+
+	// Supported case: an image referenced by a usable URI -> OpenAI image_url.
+	if fileURI != "" && strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
+		contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", fileURI)
+		return contentPart, true
+	}
+
+	// Unsupported / non-image / missing-URI: surface a visible marker. Never drop.
+	mimeLabel := mimeType
+	if mimeLabel == "" {
+		mimeLabel = "unknown type"
+	}
+	var marker string
+	if fileURI != "" {
+		marker = fmt.Sprintf("[unsupported file attachment: %s (%s) — this media type cannot be forwarded and was omitted]", fileURI, mimeLabel)
+	} else {
+		marker = fmt.Sprintf("[unsupported file attachment (%s) — missing file URI; the attachment was omitted]", mimeLabel)
+	}
+	contentPart := []byte(`{"type":"text","text":""}`)
+	contentPart, _ = sjson.SetBytes(contentPart, "text", marker)
+	return contentPart, true
 }
 
 // setOpenAIAllowedTools writes a first-class `allowed_tools` object onto the OpenAI body

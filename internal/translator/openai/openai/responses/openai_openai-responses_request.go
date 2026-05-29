@@ -61,6 +61,13 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// so this is additive and must never strip them. previous_response_id is the id the
 	// client echoes from a prior response; conversation_id (or the conversation.id object
 	// form) is stable across a conversation's turns.
+	//
+	// ADD-65 / C-ADD65-RESPID-CONT: previous_response_id MUST survive even on a continuation
+	// turn whose input is [function_call_output, message(user)]. It is one of the two signals
+	// (the other is tool_call_id ownership) the executor's composerToolResults branch (c) uses
+	// to classify that shape as a continuation rather than a fresh user turn. Surfacing it here
+	// unconditionally (independent of whether tools/tool-results are present) keeps that
+	// classification path fed.
 	if prevID := root.Get("previous_response_id"); prevID.Exists() && prevID.Type == gjson.String {
 		if v := strings.TrimSpace(prevID.String()); v != "" {
 			out, _ = sjson.SetBytes(out, "previous_response_id", v)
@@ -176,9 +183,36 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 							contentPart, _ = sjson.SetBytes(contentPart, "text", text)
 							message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
 						case "input_image":
-							imageURL := contentItem.Get("image_url").String()
-							contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
-							contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
+							// ADD-55: a Responses `input_image` is not always a scalar `image_url`
+							// string. Clients (and Chat-Completions-shaped relays) send the canonical
+							// object form `image_url:{url:...}`, and OpenAI also accepts a `file_id`
+							// reference to a previously-uploaded file. The previous code did
+							// `contentItem.Get("image_url").String()`, which returns "" for the object
+							// form (gjson stringifies an object to its raw JSON, not the URL) and for
+							// `file_id`, then emitted an `image_url` part with an EMPTY url. The composer
+							// image extractor (extractComposerImages) silently skips empty/unsupported
+							// urls, so the user's image was lost with no error (false success on an
+							// image-only turn). Resolve every shape and NEVER emit an empty image part:
+							//   - scalar `image_url` string                -> use verbatim
+							//   - object `image_url:{url:...}`              -> use the nested url
+							//   - top-level `url` (some relays)             -> use it as a fallback
+							//   - `file_id` (no resolvable url)             -> this gateway cannot fetch
+							//     uploaded files into the composer path, so emit a model-VISIBLE text
+							//     marker instead of an empty image part (pairs with ADD-56's executor
+							//     placeholder), surfacing the unsupported attachment rather than dropping
+							//     it silently.
+							imageURL := responsesInputImageURL(contentItem)
+							if imageURL != "" {
+								contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
+								contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
+								message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
+								break
+							}
+							// No usable URL. Surface the unsupported attachment as visible text so the
+							// model is not handed an empty turn (never emit an empty image_url part).
+							marker := responsesUnsupportedImageMarker(contentItem)
+							contentPart := []byte(`{"type":"text","text":""}`)
+							contentPart, _ = sjson.SetBytes(contentPart, "text", marker)
 							message, _ = sjson.SetRawBytes(message, "content.-1", contentPart)
 						}
 						return true
@@ -218,7 +252,25 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 			case "function_call_output":
-				// Handle function call output conversion to tool message
+				// Handle function call output conversion to tool message.
+				//
+				// ADD-65 / C-ADD65-RESPID-CONT (request-side contract): a Responses/Codex
+				// client using stateful continuation sends ONLY the current
+				// function_call_output plus new user text, NOT the prior assistant
+				// function_call (the assistant call is chained server-side via
+				// previous_response_id). That input array is
+				//   [{type:function_call_output,...}, {type:message,role:user,...}]
+				// which this translator must (and does) normalize to
+				//   [..., {role:"tool",tool_call_id:<call_id>,...}, {role:"user",...}].
+				// There is intentionally NO synthetic assistant tool_calls message here
+				// (we must not fabricate the prior call). The executor's composerToolResults
+				// branch (c) classifies this [role:tool, role:user] shape as a CONTINUATION
+				// by tool_call_id ownership OR a present previous_response_id (surfaced onto
+				// the translated body above). The request side's only obligation is to
+				// preserve all three signals — the role:tool message with its real call_id,
+				// the trailing user text, and previous_response_id — which it does. Do NOT
+				// drop the trailing user message or stringify previous_response_id away, or
+				// the turn falls back to a fresh user turn and strands the tool output.
 				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
 				callID := ""
 
@@ -367,6 +419,49 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	return out
+}
+
+// responsesInputImageURL resolves the image URL from a Responses `input_image` content
+// part across the shapes real clients send (ADD-55). It returns "" when no usable URL is
+// present (e.g. a bare `file_id` reference, or an object with no `url`), so the caller can
+// degrade to a visible marker instead of emitting an empty `image_url` part.
+//
+// Accepted shapes (in priority order):
+//   - scalar string:  {"type":"input_image","image_url":"data:..."|"https://..."}
+//   - object form:    {"type":"input_image","image_url":{"url":"..."}}
+//   - top-level url:   {"type":"input_image","url":"..."}
+func responsesInputImageURL(contentItem gjson.Result) string {
+	img := contentItem.Get("image_url")
+	if img.Type == gjson.String {
+		if s := strings.TrimSpace(img.String()); s != "" {
+			return s
+		}
+	}
+	if img.IsObject() {
+		if s := strings.TrimSpace(img.Get("url").String()); s != "" {
+			return s
+		}
+	}
+	if s := strings.TrimSpace(contentItem.Get("url").String()); s != "" {
+		return s
+	}
+	return ""
+}
+
+// responsesUnsupportedImageMarker builds a short, model-visible text marker for an
+// `input_image` part that carries no resolvable URL (ADD-55). The composer path cannot fetch
+// an uploaded `file_id` into an image part, so rather than dropping the attachment silently
+// (which would strand an image-only turn as an empty turn — false success) we surface it as
+// text. The marker is bounded and contains no secrets (a file_id is an opaque reference id).
+func responsesUnsupportedImageMarker(contentItem gjson.Result) string {
+	if fid := strings.TrimSpace(contentItem.Get("file_id").String()); fid != "" {
+		// Bound the id length defensively; file ids are short opaque tokens.
+		if len(fid) > 128 {
+			fid = fid[:128]
+		}
+		return "[image attachment unsupported: file_id reference cannot be resolved by this gateway (file_id=" + fid + ")]"
+	}
+	return "[image attachment unsupported: image_url is missing or in an unsupported form]"
 }
 
 // responsesConversationID extracts a conversation-stable identifier from a Responses

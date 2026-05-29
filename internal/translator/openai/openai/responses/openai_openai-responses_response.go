@@ -212,8 +212,12 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 // Contract C-RESPID (H16): `response.id` MUST be surfaced verbatim from the OpenAI chunk `id`
 // (st.ResponseID = root.Get("id").String() below). The composer executor records
 // composerResponseSessions[tenant+"\x00resp:"+id] = sessionID using this exact id, so a follow-up turn
-// carrying previous_response_id can resume the durable agent. Renaming or synthesizing a different id here
-// would break that mapping (a follow-up would mint a fresh session and silently lose context).
+// carrying previous_response_id can resume the durable agent. Renaming or synthesizing a different id for a
+// PRESENT id here would break that mapping (a follow-up would mint a fresh session and silently lose
+// context). ADD-38: the ONLY synthesized case is a genuinely-empty upstream id — we then mint a unique
+// resp_ id instead of emitting an empty response.id, so an id-less buggy upstream cannot collapse every
+// conversation's previous_response_id onto one degenerate map key (a cross-conversation wrong-session
+// continuation). Composer never hits this branch (it always supplies a fixed composerResponseID()).
 func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &oaiToResponsesState{
@@ -297,10 +301,22 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 	var out [][]byte
 
 	if !st.Started {
-		// C-RESPID (H16): surface the OpenAI chunk id verbatim as response.id. The composer executor keys
-		// its outward-response-id -> sessionID map on this exact value, so previous_response_id follow-ups
-		// can resume the durable agent. Do not synthesize/rename here.
+		// C-RESPID (H16/ADD-38): surface the OpenAI chunk id verbatim as response.id. The composer executor
+		// keys its outward-response-id -> sessionID map on this exact value, so previous_response_id
+		// follow-ups can resume the durable agent. Do not synthesize/rename a PRESENT id.
+		//
+		// ADD-38 (false-success guard): only when the upstream chunk omitted id entirely do we synthesize a
+		// resp_ id rather than surfacing an EMPTY response.id. An empty response.id would round-trip as
+		// previous_response_id:"" and collapse the executor's map key to the degenerate tenant+"\x00resp:"
+		// pre-image, silently colliding every id-less conversation onto one bridge session (a wrong-session
+		// continuation, i.e. false success). This mirrors the non-stream synthesize fallback below and never
+		// fires for composer, which always supplies a fixed composerResponseID(); it only protects a buggy
+		// non-composer upstream that emitted no id. A synthesized id is per-response unique so it cannot
+		// alias another conversation; a later follow-up simply misses the map and reseeds cleanly.
 		st.ResponseID = root.Get("id").String()
+		if st.ResponseID == "" {
+			st.ResponseID = fmt.Sprintf("resp_%x_%d", time.Now().UnixNano(), atomic.AddUint64(&responseIDCounter, 1))
+		}
 		st.Created = root.Get("created").Int()
 		// reset aggregation state for a new streaming response
 		st.MsgTextBuf = make(map[int]*strings.Builder)

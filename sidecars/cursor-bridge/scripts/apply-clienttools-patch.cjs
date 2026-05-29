@@ -12,6 +12,9 @@
 //   1. serializeResult/serializeStream factory `$`: when the result carries
 //      `__ccJson`, build the proper protobuf result via `<MsgType>.fromJson(...)`
 //      (handles nested oneofs correctly — plain partial objects silently drop them).
+//      It also publishes the live `$` as `globalThis.__CC_SELFTEST_SERIALIZE` so a
+//      startup self-test (ADD-74) can drive real result payloads through this exact
+//      seam and fail-fast if fromJson cannot construct the SDK shape.
 //   2. unary exec call -> `globalThis.__CC_EXEC_U` (falls back to native if unset).
 //   3. stream exec call -> `globalThis.__CC_EXEC_S` (falls back to native if unset).
 //
@@ -33,9 +36,13 @@ const PINNED_VERSION = "1.0.14";
 const EXPECTED_BUNDLE_SHA256 = "fe49583a88f280b6efa32729dd724d10d5a07a04fcc1cdb16a75733678a8d7db";
 const sdkRoot = path.join(__dirname, "..", "node_modules", "@cursor", "sdk");
 const target = path.join(sdkRoot, "dist", "cjs", "index.js");
-// Bump on any patch-shape change (e.g. adding the self-test harness) so an older-patched bundle is
-// detected as stale: the anchor `from` strings won't match an already-patched bundle, so the patcher
-// fails loud and the deploy must reinstall a pristine bundle (npm ci) before re-patching.
+// An already-patched bundle is detected as stale WITHOUT bumping this marker: the anchor `from` strings
+// (pristine forms) won't match an already-patched bundle, so the anchor-count check fails loud (and the SHA
+// gate also rejects a non-pristine byte-stream), forcing a pristine reinstall (npm ci) before re-patching.
+// CONTRACT: this MARK is a cross-file shared constant — the bridge's assertPatched() greps for this exact
+// substring. Changing it (e.g. to a "-v2") REQUIRES updating assertPatched() in cursor-agent-bridge.mjs in
+// lockstep, or loadSdk() will reject the freshly-patched bundle. So do NOT bump it for a patch-shape change
+// alone (the anchor/SHA gates already catch a stale bundle); only bump it alongside the bridge-side grep.
 const MARK = "/*cursor-composer-clienttools-patched-v1*/";
 
 // Development escape hatches that downgrade the M27 SHA fail-closed gate to a warning. EITHER name is
@@ -60,10 +67,16 @@ function shaOverrideEnabled(env) {
 
 const edits = [
   {
+    // ADD-74: capture the LIVE patched `$` factory onto a global so the bridge can drive representative
+    // result `__ccJson` payloads through the REAL serializer at startup (selfTestResultSerialize), proving
+    // the fromJson seam constructs the SDK protobuf shape — not merely that dispatch is intercepted. `$` and
+    // its closed-over `I.yT` (ExecClientMessage) are module-internal, so the capture MUST sit next to the
+    // definition (the appended tail harness cannot see them). Appended to `to` only; `from` is unchanged so a
+    // pristine bundle still matches, and the `expect:1` count below still guards the single seam.
     name: "serializeResult/serializeStream fromJson",
     expect: 1,
     from: `function $(e){return function(t,n){const r={case:e,value:n};return new I.yT({id:t,message:r})}}`,
-    to: `function $(e){return function(t,n){if(n&&typeof n==="object"&&"__ccJson"in n){var __j=n.__ccJson,__f=I.yT.fields.list().find(function(f){return f.localName===e||f.name===e});if(__f&&__f.T){try{n=__f.T.fromJson(__j)}catch(__err){throw new Error("[clienttools] sidecar sent invalid result shape for "+e+": "+((__err&&__err.message)||__err))}}else{throw new Error("[clienttools] unknown result case "+e+" (no ExecClientMessage field) -- sidecar mapping out of sync with SDK")}}var r={case:e,value:n};return new I.yT({id:t,message:r})}}`,
+    to: `function $(e){return function(t,n){if(n&&typeof n==="object"&&"__ccJson"in n){var __j=n.__ccJson,__f=I.yT.fields.list().find(function(f){return f.localName===e||f.name===e});if(__f&&__f.T){try{n=__f.T.fromJson(__j)}catch(__err){throw new Error("[clienttools] sidecar sent invalid result shape for "+e+": "+((__err&&__err.message)||__err))}}else{throw new Error("[clienttools] unknown result case "+e+" (no ExecClientMessage field) -- sidecar mapping out of sync with SDK")}}var r={case:e,value:n};return new I.yT({id:t,message:r})}}try{globalThis.__CC_SELFTEST_SERIALIZE=$}catch(__e){}`,
   },
   {
     name: "unary tool dispatch -> CC",

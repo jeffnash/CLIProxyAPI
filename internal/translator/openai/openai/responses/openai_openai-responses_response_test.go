@@ -546,3 +546,96 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_Response
 		t.Fatalf("expected synthesized id to be prefixed resp_, got %q", synthID)
 	}
 }
+
+// ADD-38 (stream false-success guard): when the upstream OpenAI chunk omits id entirely, the streaming
+// converter must NOT emit an empty response.id. An empty id would round-trip as previous_response_id:"" and
+// collapse the executor's composerResponseSessions key to the degenerate tenant+"\x00resp:" pre-image,
+// silently routing every id-less conversation to one bridge session (a wrong-session continuation). It must
+// instead synthesize a unique resp_ id (symmetric with the non-stream fallback). Composer never hits this
+// branch because executeComposerStream always supplies a fixed composerResponseID(); this protects a buggy
+// non-composer upstream that emitted no id.
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_StreamMissingUpstreamIDSynthesizesNonEmpty(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"gpt-5.4"}`)
+	in := []string{
+		`data: {"object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+		`data: {"object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`,
+		`data: [DONE]`,
+	}
+
+	var param any
+	seenID := ""
+	for _, line := range in {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			ev, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			switch ev {
+			case "response.created", "response.in_progress", "response.completed":
+				id := data.Get("response.id").String()
+				if id == "" {
+					t.Fatalf("%s emitted an EMPTY response.id (ADD-38 false-success hazard)", ev)
+				}
+				if !strings.HasPrefix(id, "resp_") {
+					t.Fatalf("%s synthesized response.id %q, want resp_ prefix", ev, id)
+				}
+				if seenID == "" {
+					seenID = id
+				} else if id != seenID {
+					// All envelope events for one streamed response must carry the SAME id, otherwise a
+					// follow-up could record/look up under a different key than the client observed.
+					t.Fatalf("%s carried response.id %q, inconsistent with earlier %q", ev, id, seenID)
+				}
+			}
+		}
+	}
+	if seenID == "" {
+		t.Fatalf("expected at least one response.* envelope event carrying a synthesized id")
+	}
+}
+
+// ADD-65 / C-RESPID (continuation echo): a Responses follow-up that carries previous_response_id must have
+// that value echoed back onto response.previous_response_id in BOTH the streaming response.completed event
+// and the non-stream body. Clients chaining state via previous_response_id rely on this echo; dropping it
+// would break the continuation contract that lets the executor resume the durable agent (the response-id ->
+// sessionID lookup is keyed on the id the client passes back here as previous_response_id).
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_PreviousResponseIDEchoedForContinuation(t *testing.T) {
+	t.Parallel()
+
+	const priorID = "resp_composer_prior_turn_0123456789"
+	// The translated OpenAI request preserves previous_response_id at top level (the request translator does
+	// not strip it); buildResponsesCompletedEvent / the non-stream builder read it from requestRawJSON.
+	request := []byte(`{"model":"gpt-5.4","previous_response_id":"` + priorID + `"}`)
+
+	// Streaming path: assert the echo lands on response.completed.
+	in := []string{
+		`data: {"id":"resp_followup_stream","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"continuing"},"finish_reason":null}]}`,
+		`data: {"id":"resp_followup_stream","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`,
+		`data: [DONE]`,
+	}
+	var param any
+	sawCompleted := false
+	for _, line := range in {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			ev, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			if ev == "response.completed" {
+				sawCompleted = true
+				if got := data.Get("response.previous_response_id").String(); got != priorID {
+					t.Fatalf("stream response.completed previous_response_id was %q, want %q", got, priorID)
+				}
+			}
+		}
+	}
+	if !sawCompleted {
+		t.Fatalf("expected a response.completed event in the stream")
+	}
+
+	// Non-stream path: assert the echo lands on the top-level response body.
+	body := []byte(`{"id":"resp_followup_nonstream","object":"chat.completion","created":1773896263,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"continuing"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+	out := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, body, nil)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("non-stream output is not valid JSON: %q", out)
+	}
+	if got := gjson.GetBytes(out, "previous_response_id").String(); got != priorID {
+		t.Fatalf("non-stream previous_response_id was %q, want %q", got, priorID)
+	}
+}

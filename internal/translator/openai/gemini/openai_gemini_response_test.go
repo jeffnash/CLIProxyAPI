@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -224,6 +225,108 @@ func TestNonStreamOmitsFunctionCallIDWhenAbsent(t *testing.T) {
 	}
 	if calls[0].Get("id").Exists() {
 		t.Fatalf("functionCall.id must be omitted when no OpenAI id present, got %q", calls[0].Get("id").String())
+	}
+}
+
+// --- ADD-69: deterministic parallel functionCall part order (stream + non-stream) ---
+//
+// ADD-69's client-visible symptom is that candidates[0].content.parts can present
+// parallel function calls in a nondeterministic order, because the streaming flush
+// used to range over a Go map (ToolCallsAccumulator). Clients that lack
+// functionCall.id pair functionResponse parts BY POSITION, so a flaky part order
+// silently mis-pairs tool results. The committed C02/C-GEMID fix sorts by tool
+// index before flushing; these tests pin that invariant directly on PART ORDER
+// (not just ids) and prove the order is governed by tool index, not by arrival /
+// map iteration. The non-stream path iterates the OpenAI tool_calls JSON array in
+// order, so it is deterministic by construction — the non-stream test guards that
+// no future refactor reorders it.
+
+// partNamesInFrame returns the functionCall names in the order they appear within
+// a single Gemini frame's candidates[0].content.parts (the exact slot ordering a
+// position-pairing client observes).
+func partNamesInFrame(t *testing.T, frame []byte) []string {
+	t.Helper()
+	var names []string
+	gjson.GetBytes(frame, "candidates.0.content.parts").ForEach(func(_, part gjson.Result) bool {
+		if fc := part.Get("functionCall"); fc.Exists() {
+			names = append(names, fc.Get("name").String())
+		}
+		return true
+	})
+	return names
+}
+
+// TestStreamParallelPartOrderDeterministicReverseArrival is the core ADD-69
+// regression: many parallel tool calls are DELIVERED in reverse tool-index order
+// (and ids/names are otherwise indistinguishable from their slot), yet the flushed
+// frame must present them in ascending tool-index order every single run. With 8
+// keys arriving reversed, a buggy Go map-range would almost never reproduce the
+// sorted order, so this catches a regression even without the across-runs loop.
+func TestStreamParallelPartOrderDeterministicReverseArrival(t *testing.T) {
+	const nCalls = 8
+	// Build deltas that deliver the HIGHEST tool index first.
+	var chunks []string
+	for idx := nCalls - 1; idx >= 0; idx-- {
+		chunks = append(chunks, fmt.Sprintf(
+			`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":%d,"id":"id%d","type":"function","function":{"name":"t%d","arguments":"{}"}}]}}]}`,
+			idx, idx, idx))
+	}
+	chunks = append(chunks, `data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+
+	want := make([]string, nCalls)
+	for i := range want {
+		want[i] = fmt.Sprintf("t%d", i)
+	}
+
+	for run := 0; run < 50; run++ {
+		frames := streamConvert(t, chunks)
+		// The flush emits a single terminal frame carrying all parts; assert the
+		// PART ORDER within that frame, which is what a position-pairing client sees.
+		var combined []string
+		for _, f := range frames {
+			combined = append(combined, partNamesInFrame(t, f)...)
+		}
+		if len(combined) != nCalls {
+			t.Fatalf("run %d: expected %d functionCall parts, got %d (frames=%v)", run, nCalls, len(combined), frames)
+		}
+		for i := range want {
+			if combined[i] != want[i] {
+				t.Fatalf("run %d: part %d = %q, want %q (parallel part order must be ascending tool index, not arrival/map order)", run, i, combined[i], want[i])
+			}
+		}
+	}
+}
+
+// TestNonStreamParallelPartOrderFollowsArray verifies the non-stream path emits
+// functionCall parts in the SAME order as the OpenAI tool_calls array, regardless
+// of the ids' lexical order. Here the array is [zeta, alpha] with descending ids
+// (call_9 before call_1): the output must stay [zeta, alpha] — proving array order,
+// not id sorting, governs. This is the non-stream half of "verify both" for ADD-69.
+func TestNonStreamParallelPartOrderFollowsArray(t *testing.T) {
+	resp := `{
+		"choices": [{
+			"index": 0,
+			"message": {
+				"role": "assistant",
+				"tool_calls": [
+					{"id": "call_9", "type": "function", "function": {"name": "zeta", "arguments": "{}"}},
+					{"id": "call_1", "type": "function", "function": {"name": "alpha", "arguments": "{}"}}
+				]
+			},
+			"finish_reason": "tool_calls"
+		}]
+	}`
+	var param any
+	out := ConvertOpenAIResponseToGeminiNonStream(context.Background(), "m", nil, nil, []byte(resp), &param)
+	names := partNamesInFrame(t, out)
+	want := []string{"zeta", "alpha"}
+	if len(names) != len(want) {
+		t.Fatalf("expected %d functionCall parts, got %d (out=%s)", len(want), len(names), out)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("part %d = %q, want %q (non-stream part order must follow the tool_calls array)", i, names[i], want[i])
+		}
 	}
 }
 

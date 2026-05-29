@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -498,5 +499,225 @@ func TestGeminiModeOnlyNoAllowedNamesUnchanged(t *testing.T) {
 		if gjson.GetBytes(out, "allowed_tools").Exists() {
 			t.Fatalf("mode %s: did not expect allowed_tools without allowedFunctionNames: %s", mode, out)
 		}
+	}
+}
+
+// lastUserContentParts returns the content array of the last role:"user" message in the
+// converted OpenAI request. Used by the ADD-54 fileData tests.
+func lastUserContentParts(t *testing.T, out []byte) gjson.Result {
+	t.Helper()
+	var found gjson.Result
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() == "user" {
+			found = msg.Get("content")
+		}
+		return true
+	})
+	return found
+}
+
+// TestGeminiFileDataImageBecomesImageURL (ADD-54) verifies a Gemini fileData image part
+// (media referenced by URI, camelCase wire form) is translated to an OpenAI image_url
+// content part carrying the URI verbatim — not silently dropped.
+func TestGeminiFileDataImageBecomesImageURL(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [
+				{"text": "what is this?"},
+				{"fileData": {"fileUri": "https://files.example/img.png", "mimeType": "image/png"}}
+			]}
+		]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	content := lastUserContentParts(t, out)
+	if !content.IsArray() {
+		t.Fatalf("expected structured content array (image present), got: %s", out)
+	}
+	var gotImageURL string
+	content.ForEach(func(_, p gjson.Result) bool {
+		if p.Get("type").String() == "image_url" {
+			gotImageURL = p.Get("image_url.url").String()
+		}
+		return true
+	})
+	if gotImageURL != "https://files.example/img.png" {
+		t.Fatalf("expected fileData image URI carried into image_url.url, got %q: %s", gotImageURL, out)
+	}
+}
+
+// TestGeminiFileDataSnakeCaseImageBecomesImageURL (ADD-54) verifies the snake_case wire
+// form some SDKs emit (file_data.file_uri / file_data.mime_type) is also translated.
+func TestGeminiFileDataSnakeCaseImageBecomesImageURL(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [
+				{"file_data": {"file_uri": "gs://bucket/photo.jpg", "mime_type": "image/jpeg"}}
+			]}
+		]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	content := lastUserContentParts(t, out)
+	if !content.IsArray() || content.Get("0.type").String() != "image_url" {
+		t.Fatalf("expected snake_case file_data image -> image_url, got: %s", out)
+	}
+	if got := content.Get("0.image_url.url").String(); got != "gs://bucket/photo.jpg" {
+		t.Fatalf("expected file_uri carried into image_url.url, got %q: %s", got, out)
+	}
+}
+
+// TestGeminiFileDataNonImageNotSilentlyDropped (ADD-54) verifies that a non-image fileData
+// part (e.g. a PDF by URI) is NOT silently dropped: it must surface as a visible text
+// marker so the model can see an attachment was referenced. The dominant failure mode is
+// false success — never silently omit media.
+func TestGeminiFileDataNonImageNotSilentlyDropped(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [
+				{"text": "summarize"},
+				{"fileData": {"fileUri": "https://files.example/doc.pdf", "mimeType": "application/pdf"}}
+			]}
+		]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	content := lastUserContentParts(t, out)
+	if !content.IsArray() {
+		t.Fatalf("expected structured content array, got: %s", out)
+	}
+	var markerSeen bool
+	content.ForEach(func(_, p gjson.Result) bool {
+		if p.Get("type").String() == "text" {
+			txt := p.Get("text").String()
+			if strings.Contains(txt, "doc.pdf") && strings.Contains(txt, "application/pdf") {
+				markerSeen = true
+			}
+		}
+		// The non-image attachment must NOT become a bogus image_url.
+		if p.Get("type").String() == "image_url" {
+			t.Fatalf("non-image fileData must not become image_url: %s", out)
+		}
+		return true
+	})
+	if !markerSeen {
+		t.Fatalf("expected a visible unsupported-attachment marker naming the PDF, got: %s", out)
+	}
+}
+
+// TestGeminiFileDataImageOnlyTurnNotEmptied (ADD-54) verifies an image-only turn whose
+// ONLY part is a non-image fileData (no text part) does not collapse to an empty string
+// content. Before the fix the part was dropped and the turn could become an empty user
+// turn; the marker must be preserved via the structured content array.
+func TestGeminiFileDataImageOnlyTurnNotEmptied(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [
+				{"fileData": {"fileUri": "https://files.example/data.bin", "mimeType": "application/octet-stream"}}
+			]}
+		]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	content := lastUserContentParts(t, out)
+	// Must be a non-empty structured array carrying the marker, not "" and not absent.
+	if !content.IsArray() || len(content.Array()) == 0 {
+		t.Fatalf("expected non-empty structured content for a fileData-only turn, got: %s", out)
+	}
+	if txt := content.Get("0.text").String(); !strings.Contains(txt, "data.bin") {
+		t.Fatalf("expected the fileData marker to survive for a fileData-only turn, got: %s", out)
+	}
+}
+
+// TestGeminiFileDataMissingURIMarker (ADD-54) verifies a fileData part with no usable URI
+// still surfaces a visible marker (never a silent drop, never an empty image_url).
+func TestGeminiFileDataMissingURIMarker(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [
+				{"text": "look"},
+				{"fileData": {"mimeType": "image/png"}}
+			]}
+		]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	content := lastUserContentParts(t, out)
+	content.ForEach(func(_, p gjson.Result) bool {
+		if p.Get("type").String() == "image_url" {
+			if p.Get("image_url.url").String() == "" {
+				t.Fatalf("missing-URI fileData must not produce an empty image_url: %s", out)
+			}
+		}
+		return true
+	})
+	var markerSeen bool
+	content.ForEach(func(_, p gjson.Result) bool {
+		if p.Get("type").String() == "text" && strings.Contains(p.Get("text").String(), "missing file URI") {
+			markerSeen = true
+		}
+		return true
+	})
+	if !markerSeen {
+		t.Fatalf("expected a missing-URI marker, got: %s", out)
+	}
+}
+
+// TestGeminiFileDataInSystemInstruction (ADD-54) verifies fileData parts in the
+// systemInstruction are also handled (image -> image_url), not dropped.
+func TestGeminiFileDataInSystemInstruction(t *testing.T) {
+	req := `{
+		"systemInstruction": {"parts": [
+			{"text": "you are a vision model"},
+			{"fileData": {"fileUri": "https://files.example/ref.webp", "mimeType": "image/webp"}}
+		]},
+		"contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	sys := gjson.GetBytes(out, "messages.0")
+	if sys.Get("role").String() != "system" {
+		t.Fatalf("expected first message to be system, got: %s", out)
+	}
+	var gotURL string
+	sys.Get("content").ForEach(func(_, p gjson.Result) bool {
+		if p.Get("type").String() == "image_url" {
+			gotURL = p.Get("image_url.url").String()
+		}
+		return true
+	})
+	if gotURL != "https://files.example/ref.webp" {
+		t.Fatalf("expected systemInstruction fileData image carried to image_url, got %q: %s", gotURL, out)
+	}
+}
+
+// TestGeminiSamplingFieldsStillMapped (ADD-72 dependency) guards the contract the composer
+// executor relies on: this request translator must keep emitting temperature/top_p/n from
+// generationConfig onto the OpenAI body. The ADD-72 fix (detecting present-but-unsupported
+// sampling and recording unsupportedHardGuarantees) lives in the executor's
+// composerConstraints and reads these fields; if this mapping were removed the executor
+// could no longer detect them. This test ensures the mapping is not regressed here.
+func TestGeminiSamplingFieldsStillMapped(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "go"}]}],
+		"generationConfig": {"temperature": 0.3, "topP": 0.9, "candidateCount": 2}
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	if got := gjson.GetBytes(out, "temperature").Float(); got != 0.3 {
+		t.Fatalf("expected temperature=0.3 mapped, got %v: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "top_p").Float(); got != 0.9 {
+		t.Fatalf("expected top_p=0.9 mapped, got %v: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "n").Int(); got != 2 {
+		t.Fatalf("expected candidateCount->n=2 mapped, got %v: %s", got, out)
 	}
 }

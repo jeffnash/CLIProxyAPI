@@ -216,7 +216,9 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 				if len(accumulators) > 0 {
 					// Emit parts in ASCENDING tool-index order so the part order is
 					// deterministic across runs (a Go map range is nondeterministic and
-					// would reorder parallel calls). C-GEMID / C02.
+					// would reorder parallel calls). C-GEMID / C02 / ADD-69: clients without
+					// functionCall.id pair functionResponse parts by position, so a flaky
+					// part order silently mis-pairs parallel tool results.
 					toolIndexes := make([]int, 0, len(accumulators))
 					for toolIndex := range accumulators {
 						toolIndexes = append(toolIndexes, toolIndex)
@@ -597,7 +599,10 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 				partIndex++
 			}
 
-			// Handle tool calls
+			// Handle tool calls. ADD-69: the non-stream path iterates the OpenAI
+			// tool_calls JSON ARRAY in order (gjson ForEach preserves array order),
+			// so parts are already emitted deterministically here — unlike the
+			// streaming path, this side never accumulates into a Go map.
 			if toolCalls := message.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 				toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 					if toolCall.Get("type").String() == "function" {

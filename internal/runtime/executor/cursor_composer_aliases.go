@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/json"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -35,52 +36,114 @@ func normalizeToolName(s string) string {
 // client knows.
 //
 // Match order (mirrors composer-api openai.ts:1139-1147):
-//  1. Exact name match
+//  1. Exact name match (unambiguous by construction — at most one)
 //  2. Normalized name match (case + punctuation stripped)
 //  3. toolNameAliases table — Composer-native names → typical client names
 //     (e.g. "read_file" → "Read"/"read", "run_terminal_cmd" → "bash"/"shell")
 //
-// Returns nil when no spec matches; callers should keep the raw name in
-// that case (the client may still recognize it, or it's a hallucinated tool).
+// ADD-51: the fuzzy (normalized / alias) tiers MUST disambiguate or refuse —
+// they may route to a client tool ONLY when EXACTLY ONE candidate matches.
+// When a normalized name or an alias candidate matches MULTIPLE distinct client
+// tools (e.g. the client registered both "mcp__server-a__run" and
+// "mcp_server_a_run", which normalize identically, or both "bash" and "shell"
+// while the alias table maps "terminal" → {bash, shell}), picking the
+// first-in-inventory tool is nondeterministic and risks routing a benign call
+// to a more privileged tool. In that case resolveToolSpec returns nil so the
+// caller PRESERVES the raw emitted name (which the client can recognize or
+// reject) rather than silently mis-routing. This mirrors the bridge-side
+// reconcileToolName single/ambiguous guard (cursor-agent-bridge.mjs:751-779,
+// H18): `matches.length === 1 ? match : null`.
+//
+// Returns nil when no spec matches OR when a fuzzy tier is ambiguous; callers
+// keep the raw name in that case (the client may still recognize it, or it's a
+// hallucinated/ambiguous tool).
 func resolveToolSpec(name string, tools []cursorToolDefinition, overrides map[string]string) *cursorToolDefinition {
 	if name == "" || len(tools) == 0 {
 		return nil
 	}
 	// 0. Caller-configured override (env CURSOR_TOOL_ALIASES / YAML tool-aliases) wins on conflict: map the
-	//    emitted name (normalized) to a specific client tool. Falls through if the target tool isn't present.
+	//    emitted name (normalized) to a specific client tool. An override is an EXPLICIT operator decision, so
+	//    it intentionally bypasses the ambiguity guard — but it still prefers an exact target-name match before
+	//    a normalized one so a normalized collision in the inventory cannot silently flip the override target.
 	if len(overrides) > 0 {
 		if target := overrides[normalizeToolName(name)]; target != "" {
+			for i := range tools {
+				if tools[i].Name == target {
+					return &tools[i]
+				}
+			}
 			nt := normalizeToolName(target)
 			for i := range tools {
-				if tools[i].Name == target || normalizeToolName(tools[i].Name) == nt {
+				if normalizeToolName(tools[i].Name) == nt {
 					return &tools[i]
 				}
 			}
 		}
 	}
-	// 1. Exact match.
+	// 1. Exact match (at most one — client tool names are unique).
 	for i := range tools {
 		if tools[i].Name == name {
 			return &tools[i]
 		}
 	}
-	// 2. Normalized match.
-	target := normalizeToolName(name)
-	for i := range tools {
-		if normalizeToolName(tools[i].Name) == target {
-			return &tools[i]
-		}
+	// 2. Normalized match — accept ONLY when exactly one client tool normalizes to the emitted name.
+	switch idx := soleToolMatchingNormalized(tools, normalizeToolName(name)); {
+	case idx >= 0:
+		return &tools[idx]
+	case idx == ambiguousToolMatch:
+		// Multiple distinct client tools share this normalized name: refuse rather than
+		// fall through to the (lower-confidence) alias table, which could mis-route.
+		return nil
 	}
-	// 3. Alias table: emitted name → list of normalized client names.
-	candidates := toolNameAliases(target)
+	// 3. Alias table: emitted name → list of normalized client names, in preference order.
+	//    A candidate that matches exactly one tool wins; a candidate that matches MULTIPLE
+	//    distinct tools is ambiguous → refuse (do NOT pick the first, do NOT try a
+	//    lower-preference candidate that could route to an unrelated/more-privileged tool).
+	candidates := toolNameAliases(normalizeToolName(name))
 	for _, cand := range candidates {
-		for i := range tools {
-			if normalizeToolName(tools[i].Name) == cand {
-				return &tools[i]
-			}
+		idx := soleToolMatchingNormalized(tools, cand)
+		if idx >= 0 {
+			return &tools[idx]
+		}
+		if idx == ambiguousToolMatch {
+			return nil
 		}
 	}
 	return nil
+}
+
+// ambiguousToolMatch is the sentinel returned by soleToolMatchingNormalized when MORE THAN ONE
+// distinct client tool matches; -1 (noToolMatch) means none matched.
+const (
+	noToolMatch        = -1
+	ambiguousToolMatch = -2
+)
+
+// soleToolMatchingNormalized returns the index of the UNIQUE client tool whose normalized name
+// equals normTarget, ambiguousToolMatch if two or more distinct tools match, or noToolMatch if
+// none match. Distinctness is keyed on the tool's exact Name so a single tool listed twice (which
+// should not happen) is not treated as ambiguous. This is the Go mirror of the bridge's
+// reconcileToolName `matches.length === 1` discipline (ADD-51).
+func soleToolMatchingNormalized(tools []cursorToolDefinition, normTarget string) int {
+	if normTarget == "" {
+		return noToolMatch
+	}
+	match := noToolMatch
+	matchName := ""
+	for i := range tools {
+		if normalizeToolName(tools[i].Name) != normTarget {
+			continue
+		}
+		if match == noToolMatch {
+			match = i
+			matchName = tools[i].Name
+			continue
+		}
+		if tools[i].Name != matchName {
+			return ambiguousToolMatch
+		}
+	}
+	return match
 }
 
 // toolNameAliases maps a normalized Cursor-native tool name to a list of
@@ -222,6 +285,19 @@ func in(haystack []string, needle string) bool {
 	return false
 }
 
+// sortedKeys returns the keys of m in ascending lexical order. Used to give
+// the argument-normalization passes a STABLE iteration order so colliding-key
+// resolution is deterministic regardless of Go's randomized map iteration
+// (ADD-44).
+func sortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // normalizeToolArguments remaps Composer-emitted argument keys onto the
 // client's actual schema using exact + normalized + alias-table matching.
 // When no mapping is found and the schema doesn't allow additional
@@ -274,7 +350,16 @@ func normalizeToolArguments(args map[string]any, tool *cursorToolDefinition) map
 
 	output := map[string]any{}
 	priorities := map[string]int{}
-	for key, value := range expanded {
+	// ADD-44: iterate emitted keys in a STABLE (sorted) order. Go map iteration
+	// is randomized, so the original `>=` tie-break let whichever colliding key
+	// happened to come last win — meaning a path/command/replacement argument
+	// could nondeterministically flip between two emitted values across runs.
+	// With sorted iteration the tie-break becomes deterministic and we use a
+	// strict `>` so equal-priority collisions are FIRST-WRITER-WINS (first by
+	// sorted key order), never a random overwrite. Strictly-higher priority
+	// (e.g. an exact schema key over a normalized one) still overwrites.
+	for _, key := range sortedKeys(expanded) {
+		value := expanded[key]
 		target, priority := mapArgKey(key, schema.Properties, normalizedProps, toolNorm)
 		if target == "" {
 			if allowAdditional {
@@ -282,10 +367,7 @@ func normalizeToolArguments(args map[string]any, tool *cursorToolDefinition) map
 			}
 			continue
 		}
-		// Priority resolution: composer-api uses `>=` so equal priority
-		// overwrites the previous value (deterministic on iteration order
-		// matching JS object enumeration). We preserve the same semantic.
-		if prev, ok := priorities[target]; !ok || priority >= prev {
+		if prev, ok := priorities[target]; !ok || priority > prev {
 			output[target] = value
 			priorities[target] = priority
 		}
@@ -306,32 +388,59 @@ func normalizeToolArguments(args map[string]any, tool *cursorToolDefinition) map
 // real `input`/`params`/`targeting` field) is preserved verbatim rather than
 // unwrapped — only true single-wrapper envelopes (keys NOT in the schema) are
 // flattened. A nil/empty declared set restores the old unconditional behavior.
+//
+// ADD-44 determinism: keys are processed in a STABLE (sorted) order, and a key
+// supplied DIRECTLY at the top level always wins over the same key produced by
+// unwrapping a nested envelope (e.g. {"path":"safe","arguments":{"path":
+// "danger"}} → path="safe"). Among colliding ENVELOPE-derived keys (or, under
+// the legacy nil-declared fallback, among nested keys generally) the first by
+// sorted order wins. Go map iteration is randomized, so without this the winner
+// of such a collision flipped nondeterministically across runs.
 func expandToolArguments(args map[string]any, declared map[string]bool) map[string]any {
 	out := map[string]any{}
-	for key, value := range args {
-		norm := normalizeToolName(key)
-		// A declared property named like a wrapper key is a real argument, not
-		// an envelope: keep it untouched.
-		if declared[norm] {
-			out[key] = value
+	keys := sortedKeys(args)
+	// Phase 1: unwrap envelopes (lower precedence). First-writer-wins among
+	// envelope-derived keys, in sorted order.
+	for _, key := range keys {
+		if declared[normalizeToolName(key)] {
+			// A declared property named like a wrapper key is a real (direct)
+			// argument, not an envelope — handled in phase 2.
 			continue
 		}
-		nested := recordArgumentValue(value)
-		if nested != nil && in([]string{"arguments", "args", "input", "parameters", "params"}, norm) {
-			for k, v := range expandToolArguments(nested, declared) {
-				out[k] = v
+		if !isEnvelopeKey(key, args[key]) {
+			continue
+		}
+		unwrapped := expandToolArguments(recordArgumentValue(args[key]), declared)
+		for _, nk := range sortedKeys(unwrapped) {
+			if _, exists := out[nk]; !exists {
+				out[nk] = unwrapped[nk]
 			}
-			continue
 		}
-		if nested != nil && norm == "targeting" {
-			for k, v := range expandToolArguments(nested, declared) {
-				out[k] = v
-			}
-			continue
+	}
+	// Phase 2: direct top-level keys (highest precedence — overwrite any
+	// envelope-derived collision). A declared wrapper-named property is direct.
+	// Two distinct direct keys cannot collide (map keys are unique), so the
+	// assignment order does not matter for direct-vs-direct; it intentionally
+	// overrides any envelope-derived value for the same key.
+	for _, key := range keys {
+		if !declared[normalizeToolName(key)] && isEnvelopeKey(key, args[key]) {
+			continue // already unwrapped in phase 1
 		}
-		out[key] = value
+		out[key] = args[key]
 	}
 	return out
+}
+
+// isEnvelopeKey reports whether key/value is a single-wrapper envelope that
+// should be unwrapped: a recognized wrapper name carrying a nested object.
+// Callers must first exclude declared properties (a real `input`/`params`/
+// `targeting` field is NOT an envelope).
+func isEnvelopeKey(key string, value any) bool {
+	if recordArgumentValue(value) == nil {
+		return false
+	}
+	norm := normalizeToolName(key)
+	return in([]string{"arguments", "args", "input", "parameters", "params"}, norm) || norm == "targeting"
 }
 
 // recordArgumentValue treats `value` as a nested object: accepts a real map
@@ -424,18 +533,29 @@ func shellDescription(command any) string {
 	return "Runs " + strings.Join(fields, " ")
 }
 
+// Match priorities. ADD-44: exact-schema-key matches MUST strictly outrank
+// normalized-name matches so a collision like {"filePath":"safe","file_path":
+// "danger"} against a schema declaring `filePath` resolves deterministically to
+// the exact key, regardless of Go map iteration order. Both stay above every
+// alias-table priority (max 98 in the tables below) so the "exact/normalized
+// always beat alias" invariant is preserved.
+const (
+	argPriorityExact      = 120
+	argPriorityNormalized = 110
+)
+
 // mapArgKey resolves a single emitted argument key. Returns the target
 // schema property name and the priority of the match, or "" if unmappable.
 func mapArgKey(key string, properties []string, normalizedProps map[string]string, toolNorm string) (string, int) {
-	// Exact-name match wins.
+	// Exact-name match wins (strictly above normalized — ADD-44 precedence).
 	for _, p := range properties {
 		if p == key {
-			return p, 100
+			return p, argPriorityExact
 		}
 	}
 	// Normalized-name match.
 	if target, ok := normalizedProps[normalizeToolName(key)]; ok {
-		return target, 100
+		return target, argPriorityNormalized
 	}
 	// Alias table (tool-specific first, then common).
 	keyNorm := normalizeToolName(key)

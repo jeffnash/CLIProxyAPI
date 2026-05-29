@@ -165,9 +165,37 @@ test("happy path: a SHA-matching pristine bundle patches without override (verif
   assert.match(res.patchedSrc, /globalThis\.__CC_SELFTEST_DISPATCH_U=/);
   assert.match(res.patchedSrc, /globalThis\.__CC_SELFTEST_DISPATCH_S=/);
 
+  // ADD-74: the patched `$` factory must also publish itself as globalThis.__CC_SELFTEST_SERIALIZE so the
+  // result-serialize self-test can drive real __ccJson payloads through the live fromJson seam.
+  assert.match(res.patchedSrc, /try\{globalThis\.__CC_SELFTEST_SERIALIZE=\$\}catch\(__e\)\{\}/);
+
   // Idempotency: feeding the patched output back in must short-circuit (it now starts with MARK).
   const again = applyPatch({ src: res.patchedSrc, version: PINNED_VERSION, env: {} });
   assert.equal(again.alreadyPatched, true);
+});
+
+test("ADD-74: the __CC_SELFTEST_SERIALIZE capture is part of the single `$` edit and sits next to its definition", () => {
+  // The serialize-capture lives INSIDE the `$` edit's `to` string (not a separately-appended tail), because
+  // `$` and its closed-over I.yT are module-internal and unreachable from the appended dispatch harness. This
+  // pins that placement so a future refactor cannot accidentally move the capture out of scope.
+  const serializeEdit = edits.find((e) => e.name === "serializeResult/serializeStream fromJson");
+  assert.ok(serializeEdit, "the $ serializer edit must exist");
+  assert.equal(serializeEdit.expect, 1, "the $ seam is a single anchor; the capture must ride along with it (one count guards both)");
+  // The capture must immediately follow the `$` function definition in the `to` (so `$` is in scope).
+  assert.match(
+    serializeEdit.to,
+    /new I\.yT\(\{id:t,message:r\}\)\}\}try\{globalThis\.__CC_SELFTEST_SERIALIZE=\$\}catch\(__e\)\{\}$/,
+    "the capture must be appended directly after the `$` function body, capturing the live factory",
+  );
+  // The pristine `from` must NOT mention the capture (so a pristine bundle still matches the anchor).
+  assert.doesNotMatch(serializeEdit.from, /__CC_SELFTEST_SERIALIZE/, "the pristine `from` anchor must not contain the capture");
+});
+
+test("ADD-74: the patcher does NOT bump the cross-file MARK for the capture (assertPatched compatibility)", () => {
+  // The MARK is grepped verbatim by the bridge's assertPatched(); bumping it without updating the bridge would
+  // make loadSdk() reject a freshly-patched bundle. The capture is guarded by the anchor/SHA gates instead, so
+  // the marker must stay -v1 here. (If this ever changes, the bridge-side grep must move in lockstep.)
+  assert.equal(MARK, "/*cursor-composer-clienttools-patched-v1*/");
 });
 
 test("the SHA decision is always observable (verified log XOR unverified warning), never silent", () => {

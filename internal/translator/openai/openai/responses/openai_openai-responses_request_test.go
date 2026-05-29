@@ -360,3 +360,179 @@ func TestConvertOpenAIResponsesRequest_StringFunctionOutputStaysString(t *testin
 		t.Fatalf("string output content = %q, want %q", got, "plain result")
 	}
 }
+
+// ADD-55: a scalar `image_url` string input_image must be carried verbatim into an
+// OpenAI image_url part (the common, already-working case must not regress).
+func TestConvertOpenAIResponsesRequest_InputImageScalarString(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"role":"user","content":[
+			{"type":"input_text","text":"look"},
+			{"type":"input_image","image_url":"https://example.com/a.png"}
+		]}
+	]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	parts := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(parts) != 2 {
+		t.Fatalf("want 2 content parts, got %d: %s", len(parts), prettyJSONForTest(out))
+	}
+	if got := parts[1].Get("type").String(); got != "image_url" {
+		t.Fatalf("image part type = %q, want image_url: %s", got, prettyJSONForTest(out))
+	}
+	if got := parts[1].Get("image_url.url").String(); got != "https://example.com/a.png" {
+		t.Fatalf("image url = %q, want https://example.com/a.png: %s", got, prettyJSONForTest(out))
+	}
+}
+
+// ADD-55: an object-form input_image (`image_url:{url:...}`, the canonical Chat Completions
+// shape) previously produced an EMPTY url (gjson stringified the object) which the composer
+// image extractor then silently dropped. The url must now be resolved from the nested field.
+func TestConvertOpenAIResponsesRequest_InputImageObjectForm(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"role":"user","content":[
+			{"type":"input_image","image_url":{"url":"data:image/png;base64,QQ=="}}
+		]}
+	]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	parts := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(parts) != 1 {
+		t.Fatalf("want 1 content part, got %d: %s", len(parts), prettyJSONForTest(out))
+	}
+	if got := parts[0].Get("type").String(); got != "image_url" {
+		t.Fatalf("image part type = %q, want image_url: %s", got, prettyJSONForTest(out))
+	}
+	if got := parts[0].Get("image_url.url").String(); got != "data:image/png;base64,QQ==" {
+		t.Fatalf("image url = %q, want the nested data url: %s", got, prettyJSONForTest(out))
+	}
+}
+
+// ADD-55: a top-level `url` fallback (some relays emit input_image with a top-level url).
+func TestConvertOpenAIResponsesRequest_InputImageTopLevelURL(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"role":"user","content":[
+			{"type":"input_image","url":"https://example.com/b.jpg"}
+		]}
+	]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	parts := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(parts) != 1 {
+		t.Fatalf("want 1 content part, got %d: %s", len(parts), prettyJSONForTest(out))
+	}
+	if got := parts[0].Get("image_url.url").String(); got != "https://example.com/b.jpg" {
+		t.Fatalf("image url = %q, want top-level url fallback: %s", got, prettyJSONForTest(out))
+	}
+}
+
+// ADD-55 (core guarantee): a `file_id`-only input_image (no resolvable url) must NEVER emit
+// an empty image_url part (which the composer extractor would silently drop, producing false
+// success). Instead it degrades to a model-VISIBLE text marker that names the unsupported
+// attachment and includes the file_id.
+func TestConvertOpenAIResponsesRequest_InputImageFileIDDegradesToVisibleText(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"role":"user","content":[
+			{"type":"input_image","file_id":"file-abc123"}
+		]}
+	]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	parts := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(parts) != 1 {
+		t.Fatalf("want 1 content part, got %d: %s", len(parts), prettyJSONForTest(out))
+	}
+	if got := parts[0].Get("type").String(); got != "text" {
+		t.Fatalf("unsupported image part type = %q, want text: %s", got, prettyJSONForTest(out))
+	}
+	text := parts[0].Get("text").String()
+	if text == "" {
+		t.Fatalf("unsupported image marker text is empty: %s", prettyJSONForTest(out))
+	}
+	if !bytes.Contains([]byte(text), []byte("file-abc123")) {
+		t.Fatalf("marker should name the file_id, got %q", text)
+	}
+	if !bytes.Contains([]byte(text), []byte("unsupported")) {
+		t.Fatalf("marker should flag unsupported, got %q", text)
+	}
+	// Guard against the original bug: there must be NO image_url part with an empty url.
+	for _, p := range parts {
+		if p.Get("type").String() == "image_url" && p.Get("image_url.url").String() == "" {
+			t.Fatalf("emitted an empty image_url part (the ADD-55 bug): %s", prettyJSONForTest(out))
+		}
+	}
+}
+
+// ADD-55: an input_image with neither a usable url nor a file_id still degrades to a visible
+// text marker, never an empty image_url part.
+func TestConvertOpenAIResponsesRequest_InputImageEmptyObjectDegradesToVisibleText(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"role":"user","content":[
+			{"type":"input_image","image_url":{}}
+		]}
+	]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	parts := gjson.GetBytes(out, "messages.0.content").Array()
+	if len(parts) != 1 {
+		t.Fatalf("want 1 content part, got %d: %s", len(parts), prettyJSONForTest(out))
+	}
+	if got := parts[0].Get("type").String(); got != "text" {
+		t.Fatalf("unsupported image part type = %q, want text: %s", got, prettyJSONForTest(out))
+	}
+	if parts[0].Get("text").String() == "" {
+		t.Fatalf("marker text is empty: %s", prettyJSONForTest(out))
+	}
+	for _, p := range parts {
+		if p.Get("type").String() == "image_url" && p.Get("image_url.url").String() == "" {
+			t.Fatalf("emitted an empty image_url part (the ADD-55 bug): %s", prettyJSONForTest(out))
+		}
+	}
+}
+
+// ADD-65 / C-ADD65-RESPID-CONT (request-side contract): a stateful-continuation turn that
+// sends ONLY [function_call_output, message(user)] with a previous_response_id (no prior
+// assistant function_call resent) must normalize to [role:tool, role:user] AND surface
+// previous_response_id onto the translated body, so the executor's composerToolResults
+// branch (c) can classify it as a continuation rather than a fresh user turn. This proves
+// all three signals (role:tool with its real call_id, trailing user text, previous_response_id)
+// survive translation.
+func TestConvertOpenAIResponsesRequest_ToolOutputPlusUserTextWithPrevRespID(t *testing.T) {
+	raw := []byte(`{
+		"previous_response_id":"resp_abc",
+		"input":[
+			{"type":"function_call_output","call_id":"call_A","output":"tool said hi"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Also do X"}]}
+		]
+	}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+
+	// previous_response_id must be surfaced for the executor's continuation classifier.
+	if got := gjson.GetBytes(out, "previous_response_id").String(); got != "resp_abc" {
+		t.Fatalf("previous_response_id = %q, want resp_abc: %s", got, prettyJSONForTest(out))
+	}
+
+	msgs := gjson.GetBytes(out, "messages").Array()
+	if len(msgs) != 2 {
+		t.Fatalf("want exactly 2 messages [tool,user], got %d: %s", len(msgs), prettyJSONForTest(out))
+	}
+	// First message: role:tool carrying the real call_id (NOT preceded by a fabricated
+	// assistant tool_calls message — the prior call is chained server-side).
+	if got := msgs[0].Get("role").String(); got != "tool" {
+		t.Fatalf("messages[0].role = %q, want tool: %s", got, prettyJSONForTest(out))
+	}
+	if got := msgs[0].Get("tool_call_id").String(); got != "call_A" {
+		t.Fatalf("messages[0].tool_call_id = %q, want call_A: %s", got, prettyJSONForTest(out))
+	}
+	if got := msgs[0].Get("content").String(); got != "tool said hi" {
+		t.Fatalf("messages[0].content = %q, want tool said hi: %s", got, prettyJSONForTest(out))
+	}
+	// Second message: the trailing user text must be preserved (not dropped).
+	if got := msgs[1].Get("role").String(); got != "user" {
+		t.Fatalf("messages[1].role = %q, want user: %s", got, prettyJSONForTest(out))
+	}
+	if got := msgs[1].Get("content.0.text").String(); got != "Also do X" {
+		t.Fatalf("messages[1] user text = %q, want Also do X: %s", got, prettyJSONForTest(out))
+	}
+	// Invariant: NO synthetic assistant tool_calls message may be fabricated for the
+	// server-side-chained prior call.
+	for _, m := range msgs {
+		if m.Get("role").String() == "assistant" && m.Get("tool_calls").Exists() {
+			t.Fatalf("must not fabricate an assistant tool_calls message: %s", prettyJSONForTest(out))
+		}
+	}
+}

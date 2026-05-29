@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -909,10 +911,12 @@ func TestDeriveComposerSessionID_ContinuationOwnershipWins(t *testing.T) {
 	if got != sessionB {
 		t.Fatalf("continuation must route to the emitting session B (%s), not the stable conv-id session A (%s); got %s", sessionB, sessionA, got)
 	}
-	// recordComposerToolCall refreshes to the latest emitter (Comment 5): re-emit the same id under A.
+	// ADD-70: re-emitting the SAME id under session A makes it owned by {A,B} — now AMBIGUOUS, not
+	// latest-writer-wins. Because this continuation carries the conv-A stable id, the ambiguity is
+	// disambiguated by routing to the conv-A stable session (which is sessionA), never by guessing.
 	recordComposerToolCall(composerTenant(auth, convA), "tc_owned_by_B", sessionA)
 	if got2, _ := deriveComposerSessionID(auth, cont, convA); got2 != sessionA {
-		t.Fatalf("re-emitted tool_call_id must refresh ownership to the latest session A (%s), got %s", sessionA, got2)
+		t.Fatalf("ambiguous re-emitted id with a stable conv id must route to the conv-A session A (%s), got %s", sessionA, got2)
 	}
 }
 
@@ -1134,7 +1138,9 @@ func TestComposerContinuationTrailingImage(t *testing.T) {
 // the same conv id is stable across content changes.
 func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
 	auth := authWith("authA", "keyA")
-	headerCases := []string{"Session_id", "Conversation_id", "X-Amp-Thread-Id", "X-Client-Request-Id"}
+	// ADD-48: X-Client-Request-Id is no longer in the stable set (it is a per-request tracing id). Only true
+	// conversation/session/thread headers are stable.
+	headerCases := []string{"Session_id", "Conversation_id", "X-Amp-Thread-Id"}
 	for _, h := range headerCases {
 		o1 := optsWithHeaders(map[string]string{h: "cid-" + h})
 		s1, err := deriveComposerSessionID(auth, toolTurn("hello"), o1)
@@ -1145,6 +1151,17 @@ func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
 		if s1 != s2 {
 			t.Fatalf("header %s: same conv id must be stable across content (%s vs %s)", h, s1, s2)
 		}
+	}
+	// ADD-48: a request-id-only turn (X-Client-Request-Id, metadata request_id) must NOT be treated as a stable
+	// conv id — each is per-request, so stableConversationID returns "" and the turn mints a fresh session.
+	if got := stableConversationID(optsWithHeaders(map[string]string{"X-Client-Request-Id": "req-123"})); got != "" {
+		t.Fatalf("ADD-48: X-Client-Request-Id must not be a stable conv id, got %q", got)
+	}
+	if got := stableConversationID(cliproxyexecutor.Options{Metadata: map[string]any{"request_id": "req-abc"}}); got != "" {
+		t.Fatalf("ADD-48: metadata request_id must not be a stable conv id, got %q", got)
+	}
+	if got := stableConversationID(cliproxyexecutor.Options{Metadata: map[string]any{"requestId": "req-xyz"}}); got != "" {
+		t.Fatalf("ADD-48: metadata requestId must not be a stable conv id, got %q", got)
 	}
 	// H16: previous_response_id is INTENTIONALLY NOT in this stable set anymore — it changes every turn, so it
 	// is no longer hashed as a stable conv id; it routes via the response-id->sessionID map instead (covered by
@@ -1265,24 +1282,34 @@ func TestComposerContinuationCarriesSystemAndHistory(t *testing.T) {
 	}
 }
 
-// EX9: assistant reasoning_content is preserved (bounded) in the rendered re-seed history.
-func TestRenderComposerHistoryIncludesReasoning(t *testing.T) {
+// ADD-67 (reverses EX9): assistant reasoning_content is NOT replayed verbatim by default — it becomes a
+// neutral omission marker. The assistant answer text still appears. (Verbatim replay is restorable behind
+// CURSOR_COMPOSER_REPLAY_REASONING=1; covered by TestADD67_ReasoningNotReplayedByDefault.)
+func TestRenderComposerHistoryOmitsReasoningByDefault(t *testing.T) {
 	messages := gjson.GetBytes([]byte(`{"messages":[
 		{"role":"user","content":"q"},
 		{"role":"assistant","content":"answer","reasoning_content":"because of X and Y"},
 		{"role":"user","content":"next"}
 	]}`), "messages").Array()
 	h := renderComposerHistory(messages, 2)
-	if !strings.Contains(h, "[thinking: because of X and Y]") {
-		t.Fatalf("assistant reasoning_content must appear in rendered history: %q", h)
+	if strings.Contains(h, "because of X and Y") {
+		t.Fatalf("ADD-67: raw reasoning must NOT appear in rendered history: %q", h)
+	}
+	if !strings.Contains(h, "[assistant reasoning omitted]") {
+		t.Fatalf("ADD-67: an omission marker must replace replayed reasoning: %q", h)
 	}
 	if !strings.Contains(h, "ASSISTANT: answer") {
 		t.Fatalf("assistant text must still appear: %q", h)
 	}
-	// A bare reasoning-only assistant turn (no text, no tool calls) must still render.
+	// A bare reasoning-only assistant turn (no text, no tool calls) must still render the omission marker (so
+	// positional context survives) — not be silently dropped.
 	only := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"","reasoning_content":"silent thought"},{"role":"user","content":"n"}]}`), "messages").Array()
-	if h2 := renderComposerHistory(only, 2); !strings.Contains(h2, "[thinking: silent thought]") {
-		t.Fatalf("reasoning-only assistant turn must render: %q", h2)
+	h2 := renderComposerHistory(only, 2)
+	if strings.Contains(h2, "silent thought") {
+		t.Fatalf("ADD-67: bare reasoning-only turn must not leak raw reasoning: %q", h2)
+	}
+	if !strings.Contains(h2, "[assistant reasoning omitted]") {
+		t.Fatalf("ADD-67: reasoning-only assistant turn must still render the omission marker: %q", h2)
 	}
 }
 
@@ -1439,22 +1466,22 @@ func TestDeriveComposerSessionID_PreviousResponseIDResumes(t *testing.T) {
 // HEADER conv id STAYS a one-shot (concurrent-collision guard — see isComposerUtilityOneShot doc).
 func TestIsComposerUtilityOneShotExclusions(t *testing.T) {
 	// Pure tool-less probe with a user-only transcript IS a one-shot.
-	if !isComposerUtilityOneShot([]byte(`{"messages":[{"role":"user","content":"title this"}]}`), cliproxyexecutor.Options{}) {
+	if !isComposerUtilityOneShot([]byte(`{"messages":[{"role":"user","content":"title this"}]}`), cliproxyexecutor.Options{}, composerContinuationHint{}) {
 		t.Fatalf("a tool-less user-only probe must classify as a utility one-shot")
 	}
 	// previous_response_id present -> NOT a one-shot (H16).
 	if isComposerUtilityOneShot([]byte(`{"messages":[{"role":"user","content":"thanks"}]}`),
-		cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"r1"}`)}) {
+		cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"r1"}`)}, composerContinuationHint{}) {
 		t.Fatalf("H16: a follow-up with previous_response_id must NOT be a one-shot")
 	}
 	// conversation_id present -> NOT a one-shot (H16/L35).
 	if isComposerUtilityOneShot([]byte(`{"messages":[{"role":"user","content":"thanks"}]}`),
-		cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation_id":"c1"}`)}) {
+		cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation_id":"c1"}`)}, composerContinuationHint{}) {
 		t.Fatalf("H16/L35: a follow-up with conversation_id must NOT be a one-shot")
 	}
 	// Tool-less with assistant history but NO body durable reference STAYS a one-shot (concurrent throwaway
 	// summary shape — routing it to the stable session would reintroduce the 409 collision the isolation guards).
-	if !isComposerUtilityOneShot([]byte(`{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"summarize"}]}`), cliproxyexecutor.Options{}) {
+	if !isComposerUtilityOneShot([]byte(`{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"summarize"}]}`), cliproxyexecutor.Options{}, composerContinuationHint{}) {
 		t.Fatalf("a history-only tool-less turn with no body durable reference must remain a one-shot (concurrency guard)")
 	}
 }
@@ -1727,5 +1754,508 @@ func TestExecuteComposerStreamKeepaliveNotBeforeEnvelope(t *testing.T) {
 	}
 	if strings.HasPrefix(string(first), ": keepalive") {
 		t.Fatalf("M24: a pre-envelope ping must NOT emit the keepalive comment first, got %q", string(first))
+	}
+}
+
+// ===========================================================================
+// Combined addendum (ADD-36..ADD-75) regression tests — executor side.
+// ===========================================================================
+
+// ADD-59: a bridge non-2xx (here 410 for a lost tool-results continuation) must surface to the client as a
+// typed StatusError carrying the bridge status, NOT a generic 500 — and never as a clean success. The 410
+// message must signal a lost/re-seedable continuation (distinct from "retry later").
+func TestADD59_BridgeStatusErrorPreservesCode(t *testing.T) {
+	for _, mode := range []string{"stream", "nonstream"} {
+		t.Run(mode, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(410)
+				_, _ = w.Write([]byte("unknown or expired session: the tool call this result answers was not issued by this bridge"))
+			}))
+			defer srv.Close()
+			e := NewCursorExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{ID: "tA59", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
+			req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}`)}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"a59-" + mode}}}
+			var err error
+			if mode == "stream" {
+				_, err = e.executeComposerStream(context.Background(), auth, "k", req, opts)
+			} else {
+				_, err = e.executeComposer(context.Background(), auth, "k", req, opts)
+			}
+			if err == nil {
+				t.Fatalf("ADD-59: a 410 from the bridge must error, never succeed")
+			}
+			var se cliproxyexecutor.StatusError
+			if !errors.As(err, &se) {
+				t.Fatalf("ADD-59: error must implement StatusError, got %T: %v", err, err)
+			}
+			if se.StatusCode() != 410 {
+				t.Fatalf("ADD-59: status must be preserved as 410, got %d", se.StatusCode())
+			}
+			// The 410 message must NOT echo the raw bridge body (M25) but MUST be specific about the lost
+			// continuation (re-seed/restart, not retry-later).
+			if strings.Contains(err.Error(), "unknown or expired session: the tool") {
+				t.Fatalf("ADD-59/M25: the raw bridge body must not leak into the client error: %v", err)
+			}
+			low := strings.ToLower(err.Error())
+			if !strings.Contains(low, "re-seed") && !strings.Contains(low, "restart") {
+				t.Fatalf("ADD-59: 410 message must signal a re-seedable/restartable continuation, got %v", err)
+			}
+		})
+	}
+}
+
+// ADD-59: a non-410 non-2xx (e.g. 429) must also surface its status, distinct from the 410 lost-continuation
+// wording so the client can tell "retry later" from "the continuation is gone".
+func TestADD59_BridgeStatusErrorNon410(t *testing.T) {
+	se := &composerBridgeStatusError{status: 429, correlation: "abc123"}
+	if se.StatusCode() != 429 {
+		t.Fatalf("status not preserved: %d", se.StatusCode())
+	}
+	if strings.Contains(strings.ToLower(se.Error()), "re-seed") {
+		t.Fatalf("a 429 must not use the 410 lost-continuation wording: %v", se)
+	}
+	if !strings.Contains(se.Error(), "abc123") {
+		t.Fatalf("correlation id must be in the message: %v", se)
+	}
+}
+
+// ADD-41: a non-local bridge URL over plain HTTP must be REJECTED at request-build time (credential leak),
+// while loopback http and any https are allowed. The opt-in env flag relaxes it.
+func TestADD41_RequireHTTPSForRemoteBridge(t *testing.T) {
+	cases := []struct {
+		url      string
+		insecure bool
+		wantErr  bool
+	}{
+		{"http://127.0.0.1:9798", false, false},      // loopback http ok
+		{"http://localhost:9798", false, false},      // loopback http ok
+		{"https://bridge.example.com", false, false}, // remote https ok
+		{"http://bridge.example.com", false, true},   // remote http rejected
+		{"http://bridge.example.com", true, false},   // remote http allowed with flag
+		{"http://169.254.10.1:9798", false, false},   // link-local http ok
+	}
+	for _, c := range cases {
+		auth := &cliproxyauth.Auth{Attributes: map[string]string{"composer_client_tools_bridge_url": c.url}}
+		if c.insecure {
+			auth.Attributes["composer_client_tools_allow_insecure_bridge"] = "1"
+		}
+		_, err := buildComposerTurnURL(auth)
+		if c.wantErr && err == nil {
+			t.Fatalf("ADD-41: %q (insecure=%v) must be rejected", c.url, c.insecure)
+		}
+		if !c.wantErr && err != nil {
+			t.Fatalf("ADD-41: %q (insecure=%v) must be allowed, got %v", c.url, c.insecure, err)
+		}
+	}
+}
+
+// ADD-47: the /agent/turn URL must be joined STRUCTURALLY (preserve a base path, drop a stray query) and a
+// base with userinfo or a query string must be rejected (credentials must not ride in the URL).
+func TestADD47_StructuralURLJoin(t *testing.T) {
+	// Base path preserved, /agent/turn appended.
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"composer_client_tools_bridge_url": "https://bridge.example.com/cursor"}}
+	got, err := buildComposerTurnURL(auth)
+	if err != nil {
+		t.Fatalf("structural join must succeed: %v", err)
+	}
+	if got != "https://bridge.example.com/cursor/agent/turn" {
+		t.Fatalf("ADD-47: base path not preserved on join: %q", got)
+	}
+	// A query string in the base is rejected (would be mis-joined / could carry credentials).
+	authQ := &cliproxyauth.Auth{Attributes: map[string]string{"composer_client_tools_bridge_url": "https://bridge.example.com?token=abc"}}
+	if _, err := buildComposerTurnURL(authQ); err == nil {
+		t.Fatalf("ADD-47: a base URL with a query string must be rejected")
+	}
+	// Userinfo in the base is rejected.
+	authU := &cliproxyauth.Auth{Attributes: map[string]string{"composer_client_tools_bridge_url": "https://user:pass@bridge.example.com"}}
+	if _, err := buildComposerTurnURL(authU); err == nil {
+		t.Fatalf("ADD-47: a base URL with userinfo must be rejected")
+	}
+	// Default (loopback) still works and yields the canonical path.
+	def, err := buildComposerTurnURL(&cliproxyauth.Auth{})
+	if err != nil || !strings.HasSuffix(def, "/agent/turn") {
+		t.Fatalf("ADD-47: default bridge URL must join to /agent/turn, got %q err=%v", def, err)
+	}
+}
+
+// ADD-68: the SSE scanner buffer must be raised to align with the 64 MB body cap so a single large data:
+// line does not tear down the stream. We assert the bound constant and that a >52 MB single line is read.
+func TestADD68_ScannerBufferRaised(t *testing.T) {
+	if composerSSEMaxLineBytes < 64<<20 {
+		t.Fatalf("ADD-68: SSE line cap must be >= 64MB, got %d", composerSSEMaxLineBytes)
+	}
+	// Drive a single text delta larger than the old 52MB bound through the non-stream path; it must be read,
+	// not fail with bufio.ErrTooLong.
+	big := strings.Repeat("x", 53<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		ev, _ := json.Marshal(map[string]any{"type": "text", "delta": big})
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(ev)
+		_, _ = w.Write([]byte("\n\n"))
+		if fl != nil {
+			fl.Flush()
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"turn_end\",\"stop_reason\":\"stop\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "tA68", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
+	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}`)}
+	resp, err := e.executeComposer(context.Background(), auth, "k", req,
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"a68"}}})
+	if err != nil {
+		t.Fatalf("ADD-68: a >52MB single SSE line must not tear down the stream: %v", err)
+	}
+	if !strings.Contains(string(resp.Payload), "xxxx") {
+		t.Fatalf("ADD-68: the large text delta was not delivered")
+	}
+}
+
+// ADD-72: sampling/candidate controls (temperature/top_p/n) have no surface on the composer path, so they
+// must be surfaced as explicit unsupportedHardGuarantees — never silently dropped, never faked.
+func TestADD72_SamplingControlsUnsupported(t *testing.T) {
+	c := composerConstraints([]byte(`{"temperature":0,"top_p":0.5,"n":3,"messages":[]}`))
+	notes, _ := c["unsupportedHardGuarantees"].([]string)
+	joined := strings.Join(notes, " | ")
+	for _, want := range []string{"temperature", "top_p", "n="} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("ADD-72: %q sampling control not surfaced as unsupported: %q", want, joined)
+		}
+	}
+	// n must NOT be carried as a constraint the bridge would silently ignore (no fake enforcement).
+	if _, ok := c["n"]; ok {
+		t.Fatalf("ADD-72: n must not be carried to the bridge (no fake enforcement)")
+	}
+	if _, ok := c["temperature"]; ok {
+		t.Fatalf("ADD-72: temperature must not be carried to the bridge (no fake enforcement)")
+	}
+	// n=1 is the default — not worth a note.
+	c1 := composerConstraints([]byte(`{"n":1,"messages":[]}`))
+	if notes1, _ := c1["unsupportedHardGuarantees"].([]string); strings.Contains(strings.Join(notes1, " "), "n=") {
+		t.Fatalf("ADD-72: n=1 must not be flagged: %v", notes1)
+	}
+}
+
+// ADD-67: prior assistant reasoning must NOT be replayed verbatim as plain prompt text on a re-seed (default);
+// it becomes a neutral omission marker. The EX9 behavior is restorable behind a compat flag.
+func TestADD67_ReasoningNotReplayedByDefault(t *testing.T) {
+	messages := gjson.GetBytes([]byte(`{"messages":[
+		{"role":"user","content":"q"},
+		{"role":"assistant","content":"answer","reasoning_content":"SECRET chain of thought"},
+		{"role":"user","content":"next"}
+	]}`), "messages").Array()
+	h := renderComposerHistory(messages, 2)
+	if strings.Contains(h, "SECRET chain of thought") {
+		t.Fatalf("ADD-67: raw reasoning must not be replayed as prompt text: %q", h)
+	}
+	if !strings.Contains(h, "[assistant reasoning omitted]") {
+		t.Fatalf("ADD-67: an omission marker must replace replayed reasoning: %q", h)
+	}
+	if !strings.Contains(h, "ASSISTANT: answer") {
+		t.Fatalf("ADD-67: the assistant answer text must still be present: %q", h)
+	}
+	// Compat flag restores verbatim replay.
+	t.Setenv("CURSOR_COMPOSER_REPLAY_REASONING", "1")
+	composerReplayReasoningEnabled = true
+	defer func() { composerReplayReasoningEnabled = false }()
+	h2 := renderComposerHistory(messages, 2)
+	if !strings.Contains(h2, "thinking: SECRET chain of thought") {
+		t.Fatalf("ADD-67: compat flag must restore verbatim reasoning replay: %q", h2)
+	}
+}
+
+// ADD-56: an image-only turn whose every image is degenerate must be rejected with a typed 400 (not a silent
+// empty turn). A mixed text+invalid-image turn must keep a model-visible invalid-attachment placeholder.
+func TestADD56_DegenerateImageOnlyTurn(t *testing.T) {
+	// image-only + all-invalid => rejected.
+	imgOnly := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,"}}]}]}`), "messages").Array()
+	if !lastUserTurnImageOnlyInvalid(imgOnly) {
+		t.Fatalf("ADD-56: an image-only turn with only a degenerate image must be flagged invalid")
+	}
+	// mixed text + invalid image => NOT rejected, placeholder added in composerInput.
+	mixed := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:,"}}]}]}`)
+	if lastUserTurnImageOnlyInvalid(gjson.GetBytes(mixed, "messages").Array()) {
+		t.Fatalf("ADD-56: a mixed text+invalid-image turn must NOT be rejected (text is present)")
+	}
+	inp := composerInput(mixed)
+	text, _ := inp["text"].(string)
+	if !strings.Contains(text, "what is this") || !strings.Contains(text, "could not be processed") {
+		t.Fatalf("ADD-56: a mixed turn must keep the text AND a model-visible invalid-image placeholder, got %q", text)
+	}
+	// a valid image-only turn is fine.
+	validOnly := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QQ=="}}]}]}`), "messages").Array()
+	if lastUserTurnImageOnlyInvalid(validOnly) {
+		t.Fatalf("ADD-56: a valid image-only turn must NOT be flagged invalid")
+	}
+	// a plain text-only turn is fine (no image parts).
+	textOnly := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":"hello"}]}`), "messages").Array()
+	if lastUserTurnImageOnlyInvalid(textOnly) {
+		t.Fatalf("ADD-56: a text-only turn must NOT be flagged invalid")
+	}
+}
+
+// ADD-56: the executor must reject an image-only-all-invalid turn with a typed 400, both stream and nonstream.
+func TestADD56_ExecutorRejectsImageOnlyInvalid(t *testing.T) {
+	// The bridge must never be called; fail the test if it is.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("ADD-56: the bridge must not be called for an invalid image-only turn")
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "tA56", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
+	payload := []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,"}}]}]}`)
+	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: payload}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"a56x"}}}
+	_, err := e.executeComposer(context.Background(), auth, "k", req, opts)
+	if err == nil {
+		t.Fatalf("ADD-56: nonstream must reject an image-only-invalid turn")
+	}
+	var se cliproxyexecutor.StatusError
+	if !errors.As(err, &se) || se.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("ADD-56: must be a typed 400, got %T %v", err, err)
+	}
+	if _, err := e.executeComposerStream(context.Background(), auth, "k", req, opts); err == nil {
+		t.Fatalf("ADD-56: stream must reject an image-only-invalid turn")
+	}
+}
+
+// ADD-55: extractComposerimages must accept both the object form image_url:{url} AND the scalar form
+// image_url:"…"; a file_id-only part has no url and is treated as degenerate (not an empty image part).
+func TestADD55_ImageURLScalarAndObjectForms(t *testing.T) {
+	obj := gjson.Parse(`{"content":[{"type":"image_url","image_url":{"url":"https://x/y.png"}}]}`)
+	if imgs := extractComposerImages(obj); len(imgs) != 1 || imgs[0]["url"] != "https://x/y.png" {
+		t.Fatalf("ADD-55: object-form image_url not extracted: %v", imgs)
+	}
+	scalar := gjson.Parse(`{"content":[{"type":"image_url","image_url":"https://x/z.jpg"}]}`)
+	if imgs := extractComposerImages(scalar); len(imgs) != 1 || imgs[0]["url"] != "https://x/z.jpg" {
+		t.Fatalf("ADD-55: scalar-form image_url not extracted: %v", imgs)
+	}
+	// file_id-only part: no fetchable url -> degenerate (skipped), never an empty-url image part.
+	fileID := gjson.Parse(`{"content":[{"type":"input_image","file_id":"file_123"}]}`)
+	if imgs := extractComposerImages(fileID); len(imgs) != 0 {
+		t.Fatalf("ADD-55: a file_id-only image must not yield an (empty) image part: %v", imgs)
+	}
+	if !messageHasImageParts(fileID) {
+		t.Fatalf("ADD-55: a file_id image part must be detected as an image part (so ADD-56 can flag it)")
+	}
+}
+
+// ADD-65: a Responses server-side-chained continuation [..., role:tool, role:user] with previous_response_id
+// (and NO assistant tool_calls adjacency) must classify as a tool_results continuation with userText, never a
+// fresh user turn.
+func TestADD65_ResponsesChainedContinuationIsToolResults(t *testing.T) {
+	// previous_response_id present => branch (c) via the hint.
+	oai := []byte(`{"previous_response_id":"resp_x","messages":[
+		{"role":"user","content":"do the thing"},
+		{"role":"tool","tool_call_id":"call_A","content":"tool said hi"},
+		{"role":"user","content":"Also do X"}
+	]}`)
+	inp := composerInput(oai)
+	if inp["type"] != "tool_results" {
+		t.Fatalf("ADD-65: chained continuation must be tool_results, got %v", inp["type"])
+	}
+	if inp["userText"] != "Also do X" {
+		t.Fatalf("ADD-65: the trailing user text must be carried as userText, got %v", inp["userText"])
+	}
+	results, _ := inp["results"].([]map[string]any)
+	if len(results) != 1 || results[0]["toolCallId"] != "call_A" {
+		t.Fatalf("ADD-65: the tool result must be collected, got %v", results)
+	}
+	// Without previous_response_id AND without tool ownership, the SAME shape must NOT be a continuation (it is
+	// an ordinary conversation that ends [tool, user]) — it falls through to a fresh user turn.
+	plain := []byte(`{"messages":[
+		{"role":"user","content":"do the thing"},
+		{"role":"tool","tool_call_id":"call_unowned","content":"tool said hi"},
+		{"role":"user","content":"Also do X"}
+	]}`)
+	if inp2 := composerInput(plain); inp2["type"] != "user" {
+		t.Fatalf("ADD-65: without a continuation signal the [tool,user] shape must be a fresh user turn, got %v", inp2["type"])
+	}
+}
+
+// ADD-65: ownership alone (no previous_response_id) is a valid continuation signal — when a trailing tool id
+// is owned for the tenant, the chained shape classifies as tool_results and routes to the owning session.
+func TestADD65_OwnershipSignalRoutesContinuation(t *testing.T) {
+	auth := authWith("authA65", "keyA65")
+	owner := "sess_owner65000000000000000000000000"
+	tenant := composerTenant(auth, cliproxyexecutor.Options{})
+	recordComposerToolCall(tenant, "call_owned65", owner)
+	oai := []byte(`{"messages":[
+		{"role":"user","content":"start"},
+		{"role":"tool","tool_call_id":"call_owned65","content":"R"},
+		{"role":"user","content":"and more"}
+	]}`)
+	inp := composerInputHinted(oai, composerContinuationHintFor(tenant, oai))
+	if inp["type"] != "tool_results" {
+		t.Fatalf("ADD-65: an owned trailing tool id must make the chained shape a tool_results continuation, got %v", inp["type"])
+	}
+	got, err := deriveComposerSessionID(auth, oai, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("ADD-65: routing must not error: %v", err)
+	}
+	if got != owner {
+		t.Fatalf("ADD-65: chained continuation must route to the owning session %s, got %s", owner, got)
+	}
+}
+
+// ADD-70: the same visible tool-call id emitted by TWO of a tenant's sessions must be AMBIGUOUS — a
+// continuation echoing it with no stable id must surface a typed error, never silently pick the latest writer.
+func TestADD70_AmbiguousOwnershipRejectedWithoutDisambiguator(t *testing.T) {
+	auth := authWith("authA70", "keyA70")
+	tenant := composerTenant(auth, cliproxyexecutor.Options{})
+	recordComposerToolCall(tenant, "call_dup70", "sess_a70000000000000000000000000000")
+	recordComposerToolCall(tenant, "call_dup70", "sess_b70000000000000000000000000000")
+	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"call_dup70"}]},{"role":"tool","tool_call_id":"call_dup70","content":"R"}]}`)
+	// No stable id and no previous_response_id -> ambiguous -> typed error.
+	_, err := deriveComposerSessionID(auth, cont, cliproxyexecutor.Options{})
+	if !errors.Is(err, errAmbiguousToolOwnership) {
+		t.Fatalf("ADD-70: an ambiguous id with no disambiguator must return errAmbiguousToolOwnership, got %v", err)
+	}
+	// With a stable conv id, it disambiguates by routing to the conv-id session (no error).
+	got, err2 := deriveComposerSessionID(auth, cont, optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-disambig70"}))
+	if err2 != nil {
+		t.Fatalf("ADD-70: a stable conv id must disambiguate an ambiguous ownership, got %v", err2)
+	}
+	if !strings.HasPrefix(got, "sess_") {
+		t.Fatalf("ADD-70: disambiguated route must be a sess_ id, got %q", got)
+	}
+}
+
+// ADD-50: re-emitting an active tool-call id must perform a true LRU touch (keep it), so unrelated churn does
+// not evict it. We use a tiny per-tenant cap via a fresh store to prove the touched key survives.
+func TestADD50_TrueLRURefresh(t *testing.T) {
+	s := newComposerToolCallStore()
+	s.perCap = 3
+	s.entryTTL = 0 // disable TTL for this test
+	tenant := "tnt50"
+	s.record(tenant, "id_keep", "sess_keep")
+	s.record(tenant, "id_1", "sess_x")
+	s.record(tenant, "id_2", "sess_x")
+	// Touch id_keep so it becomes most-recently-used; then push two more to evict the oldest.
+	s.record(tenant, "id_keep", "sess_keep") // touch (same session)
+	s.record(tenant, "id_3", "sess_x")       // evicts the now-oldest (id_1)
+	s.record(tenant, "id_4", "sess_x")       // evicts id_2
+	to := s.tenants[tenant]
+	if to == nil {
+		t.Fatalf("ADD-50: tenant ownership missing")
+	}
+	if _, ok := to.byKey[composerOwnershipKey("sess_keep", "id_keep")]; !ok {
+		t.Fatalf("ADD-50: a touched (re-emitted) id must survive cap eviction; it was evicted")
+	}
+	if _, ok := to.byKey[composerOwnershipKey("sess_x", "id_1")]; ok {
+		t.Fatalf("ADD-50: the genuinely-oldest id_1 should have been evicted")
+	}
+}
+
+// ADD-71: per-tenant cap — one noisy tenant must NOT evict another tenant's ownership entries.
+func TestADD71_PerTenantCapIsolation(t *testing.T) {
+	s := newComposerToolCallStore()
+	s.perCap = 2
+	s.entryTTL = 0
+	// Quiet tenant records one id.
+	s.record("quiet", "q_id", "sess_q")
+	// Noisy tenant blows way past its own cap.
+	for i := 0; i < 50; i++ {
+		s.record("noisy", fmt.Sprintf("n_%d", i), "sess_n")
+	}
+	if to := s.tenants["quiet"]; to == nil || len(to.byTool["q_id"]) == 0 {
+		t.Fatalf("ADD-71: a noisy tenant must not evict the quiet tenant's entry")
+	}
+	if to := s.tenants["noisy"]; to == nil || len(to.byKey) > s.perCap {
+		t.Fatalf("ADD-71: the noisy tenant must be bounded by its own per-tenant cap")
+	}
+}
+
+// ADD-71: ownership entries expire by age (TTL), so the cap is not the only cleanup; and forgetSession drops a
+// finished session's entries.
+func TestADD71_TTLAndSessionForget(t *testing.T) {
+	s := newComposerToolCallStore()
+	now := time.Now()
+	s.nowFn = func() time.Time { return now }
+	s.entryTTL = time.Minute
+	s.record("tnt", "old_id", "sess_old")
+	// Advance past TTL; a lookup-time expiry must drop it.
+	now = now.Add(2 * time.Minute)
+	if s.ownsTool("tnt", "old_id") {
+		t.Fatalf("ADD-71: an entry older than the TTL must be expired")
+	}
+	// forgetSession drops a session's entries explicitly.
+	now = time.Now()
+	s.nowFn = func() time.Time { return now }
+	s.record("tnt2", "a", "sess_keep")
+	s.record("tnt2", "b", "sess_drop")
+	s.forgetSession("tnt2", "sess_drop")
+	if s.ownsTool("tnt2", "b") {
+		t.Fatalf("ADD-71: forgetSession must drop the finished session's id")
+	}
+	if !s.ownsTool("tnt2", "a") {
+		t.Fatalf("ADD-71: forgetSession must keep other sessions' ids")
+	}
+}
+
+// ADD-71: the exported forgetComposerSessionToolCalls wrapper drops a session's entries from the global store.
+func TestADD71_ForgetWrapper(t *testing.T) {
+	tenant := "tnt_forget_wrapper"
+	recordComposerToolCall(tenant, "fw_id", "sess_fw")
+	if !composerOwnership.ownsTool(tenant, "fw_id") {
+		t.Fatalf("ADD-71: setup — id must be owned before forget")
+	}
+	forgetComposerSessionToolCalls(tenant, "sess_fw")
+	if composerOwnership.ownsTool(tenant, "fw_id") {
+		t.Fatalf("ADD-71: forgetComposerSessionToolCalls must drop the session's id from the global store")
+	}
+}
+
+// ADD-62: the external session id must be derived from tenant+conversation ONLY, never the model, so a model
+// change on the same conversation keeps the same session id (the bridge then rotates the durable agent).
+func TestADD62_SessionIDStableAcrossModelChange(t *testing.T) {
+	auth := authWith("authA62", "keyA62")
+	conv := optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-62"})
+	// Two turns on the same conversation with DIFFERENT models must derive the SAME external session id.
+	turnFast := []byte(`{"model":"composer-2.5-fast","tools":[{"type":"function","function":{"name":"Read"}}],"messages":[{"role":"user","content":"hi"}]}`)
+	turnStd := []byte(`{"model":"composer-2.5","tools":[{"type":"function","function":{"name":"Read"}}],"messages":[{"role":"user","content":"hi"}]}`)
+	s1, err1 := deriveComposerSessionID(auth, turnFast, conv)
+	s2, err2 := deriveComposerSessionID(auth, turnStd, conv)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("ADD-62: routing must not error: %v / %v", err1, err2)
+	}
+	if s1 != s2 {
+		t.Fatalf("ADD-62: a model change on the same conversation must keep the same session id: %s vs %s", s1, s2)
+	}
+}
+
+// ADD-36 (executor side): a partial-parallel turn — the model emitted tools A,B,C; the client returns ONLY
+// A's result and the user types new text in the same turn — must classify as a tool_results continuation and
+// carry the trailing user text as first-class userText (so the bridge can drive the interruption / answer it),
+// never as a fresh user turn that strands the result. The unresolved B/C are the bridge's concern.
+func TestADD36_PartialParallelToolResultsCarriesUserText(t *testing.T) {
+	mixed := composerInput([]byte(`{"messages":[
+		{"role":"user","content":"do A B C"},
+		{"role":"assistant","content":"","tool_calls":[
+			{"id":"tc_A","function":{"name":"Read"}},
+			{"id":"tc_B","function":{"name":"Read"}},
+			{"id":"tc_C","function":{"name":"Read"}}
+		]},
+		{"role":"tool","tool_call_id":"tc_A","content":"A done"},
+		{"role":"user","content":"actually, stop and summarize"}
+	]}`))
+	if mixed["type"] != "tool_results" {
+		t.Fatalf("ADD-36: a partial-parallel mixed turn must be tool_results, got %v", mixed["type"])
+	}
+	if mixed["userText"] != "actually, stop and summarize" {
+		t.Fatalf("ADD-36: the trailing user message must be carried as first-class userText, got %v", mixed["userText"])
+	}
+	results, _ := mixed["results"].([]map[string]any)
+	if len(results) != 1 || results[0]["toolCallId"] != "tc_A" {
+		t.Fatalf("ADD-36: only the returned tool result (A) is present; the bridge owns B/C, got %v", results)
+	}
+	// The trailing text is also folded into A's content so a resuming run reads it inline.
+	if c, _ := results[0]["content"].(string); !strings.Contains(c, "A done") || !strings.Contains(c, "stop and summarize") {
+		t.Fatalf("ADD-36: trailing user text must also be folded into the last result content, got %q", c)
 	}
 }
