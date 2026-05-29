@@ -18,7 +18,7 @@ import path from "node:path";
 
 const require = createRequire(import.meta.url);
 const patcher = require("./apply-clienttools-patch.cjs");
-const { applyPatch, PatchError, PINNED_VERSION, EXPECTED_BUNDLE_SHA256, MARK, SHA_OVERRIDE_ENV, edits } = patcher;
+const { applyPatch, PatchError, PINNED_VERSION, EXPECTED_BUNDLE_SHA256, MARK, REQUIRED_SEAM_TOKENS, SHA_OVERRIDE_ENV, edits } = patcher;
 
 // Build a synthetic "pristine" bundle that contains EXACTLY the four anchor `from` strings the patcher
 // expects (each once), padded with filler so the anchors are embedded the way they would be in the real
@@ -35,6 +35,25 @@ function makeAnchoredBundle({ dropAnchor = null } = {}) {
     parts.push(`;${ed.from};\n`);
   }
   return parts.join("");
+}
+
+// Build a MARK-prefixed "already-patched-looking" bundle that contains ONLY the given seam tokens (as literal
+// substrings). Used to exercise ADD-102 / Comment 7 / RBT-042: a marked bundle missing a required seam must
+// fail CLOSED ('stale-bundle'); a marked bundle carrying ALL required seams must short-circuit
+// (alreadyPatched:true). Defaults to ALL required tokens (the fully-capable case). Pass a subset to omit
+// seams. Body filler intentionally does NOT contain the pristine `from` anchors (a real patched bundle has
+// them replaced), so this fixture only varies the capability surface the check inspects.
+function makeMarkedBundle({ tokens = REQUIRED_SEAM_TOKENS } = {}) {
+  const body = tokens.map((t) => `/* seam sentinel: ${t} */\n`).join("");
+  return MARK + "/* synthetic already-patched @cursor/sdk bundle for tests */\n" + body;
+}
+
+// The genuine fully-patched output (drift + dev override -> real seam injection). This is the most faithful
+// "already-patched, current" fixture because it carries the EXACT seam tokens the live patcher emits, so the
+// idempotent short-circuit is exercised against real bytes rather than a hand-stubbed marker.
+function makePatchedBundle() {
+  const res = applyPatch({ src: makeAnchoredBundle(), version: PINNED_VERSION, env: { [SHA_OVERRIDE_ENV[0]]: "1" } });
+  return res.patchedSrc;
 }
 
 // Sanity: our synthetic bundle never collides with the recorded pristine hash (otherwise the "drifted"
@@ -136,13 +155,117 @@ test("version pin fails closed regardless of SHA / override", () => {
 });
 
 test("already-patched bundle short-circuits idempotently (no SHA check, no re-patch)", () => {
-  // A bundle that already starts with MARK must early-return without throwing, even though its bytes will
-  // not match the pristine SHA (it is post-patch). This is the npm-ci re-run / double-postinstall case.
-  const patchedish = MARK + driftedSrc;
+  // A fully-patched bundle (MARK + every required seam) must early-return without throwing, even though its
+  // bytes will not match the pristine SHA (it is post-patch). This is the npm-ci re-run / double-postinstall
+  // case. NOTE: post ADD-102 the short-circuit is a marker + CAPABILITY check, so the fixture must carry the
+  // real seam tokens (a bare MARK + pristine anchors is now correctly rejected as stale — see RBT-042 below).
+  const patchedish = makePatchedBundle();
   const res = applyPatch({ src: patchedish, version: PINNED_VERSION, env: {} });
   assert.equal(res.alreadyPatched, true);
   assert.equal(res.patchedSrc, patchedish, "already-patched bundle is returned unchanged");
   assert.ok(res.messages.some((m) => /already patched/.test(m.text)));
+});
+
+// RBT-042 / ADD-102 / Comment 7: a marker-only or partially-patched bundle (marker present, but a required
+// seam missing) must fail CLOSED with the typed 'stale-bundle' error and an actionable remediation — NOT be
+// accepted as already-patched. Otherwise the bridge would start with a broken seam (no tools advertised, or
+// malformed result deserialization) as a silent behavior bug. The complementary fully-capable case must still
+// short-circuit. (The bridge-side assertPatched()/runtime self-tests are the dynamic counterpart.)
+test("RBT-042: marker present but __CC_SELFTEST_SERIALIZE seam missing fails closed (stale-bundle, not alreadyPatched)", () => {
+  // Dispatch + advertise seams present, serialize seam absent — the exact 'half-patched' shape ADD-102 calls
+  // out (result deserialization broken while dispatch looks fine).
+  const src = makeMarkedBundle({
+    tokens: ["__CC_SELFTEST_DISPATCH_U", "__CC_SELFTEST_DISPATCH_S", "__CC_GET_ADVERTISE__"],
+  });
+  let thrown;
+  try {
+    applyPatch({ src, version: PINNED_VERSION, env: {} });
+  } catch (e) {
+    thrown = e;
+  }
+  assert.ok(thrown instanceof PatchError, "must throw a typed PatchError, not return alreadyPatched");
+  assert.equal(thrown.code, "stale-bundle", "a marked-but-incomplete bundle must fail closed as stale-bundle");
+  assert.match(thrown.message, /__CC_SELFTEST_SERIALIZE/, "the error must name the missing seam");
+  assert.match(thrown.message, /npm ci|reinstall the SDK/, "the error must give an actionable remediation");
+});
+
+test("RBT-042: marker present with only dispatch seams (advertise seam missing) fails closed (stale-bundle)", () => {
+  // Advertise injection broken while dispatch patched -> the model would see no client tools. Must not pass.
+  const src = makeMarkedBundle({ tokens: ["__CC_SELFTEST_SERIALIZE", "__CC_SELFTEST_DISPATCH_U", "__CC_SELFTEST_DISPATCH_S"] });
+  let thrown;
+  try {
+    applyPatch({ src, version: PINNED_VERSION, env: {} });
+  } catch (e) {
+    thrown = e;
+  }
+  assert.ok(thrown instanceof PatchError);
+  assert.equal(thrown.code, "stale-bundle");
+  assert.match(thrown.message, /__CC_GET_ADVERTISE__/, "the error must name the missing advertise seam");
+});
+
+test("RBT-042: marker only, no seams at all fails closed (stale-bundle), never exit 0", () => {
+  // Variant 1 from RBT-042's repro list: bare marker, zero seams. The marker-only short-circuit is gone.
+  const src = makeMarkedBundle({ tokens: [] });
+  let thrown;
+  try {
+    applyPatch({ src, version: PINNED_VERSION, env: {} });
+  } catch (e) {
+    thrown = e;
+  }
+  assert.ok(thrown instanceof PatchError && thrown.code === "stale-bundle", "marker-only must be rejected as stale");
+});
+
+test("RBT-042: EACH required seam, when individually missing, fails closed (no seam can be silently skipped)", () => {
+  // Sweep: drop exactly one token at a time; every one must trip the capability check. This pins the contract
+  // that ALL of REQUIRED_SEAM_TOKENS are load-bearing — a future edit that forgets to require one would fail.
+  for (const missing of REQUIRED_SEAM_TOKENS) {
+    const tokens = REQUIRED_SEAM_TOKENS.filter((t) => t !== missing);
+    let thrown;
+    try {
+      applyPatch({ src: makeMarkedBundle({ tokens }), version: PINNED_VERSION, env: {} });
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown instanceof PatchError && thrown.code === "stale-bundle", `missing ${missing} must fail closed`);
+    assert.match(thrown.message, new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `error must name the missing seam ${missing}`);
+  }
+});
+
+test("RBT-042: marker + ALL required seams short-circuits as alreadyPatched (capability check satisfied)", () => {
+  // The complement of the failure cases: when every seam is present the idempotent short-circuit must fire
+  // (no throw, no re-patch). Built from the literal token list, independent of makePatchedBundle, to prove the
+  // capability check keys off the tokens themselves.
+  const src = makeMarkedBundle(); // defaults to ALL required tokens
+  const res = applyPatch({ src, version: PINNED_VERSION, env: {} });
+  assert.equal(res.alreadyPatched, true, "marker + all seams must be treated as already-patched");
+  assert.equal(res.patchedSrc, src, "a complete already-patched bundle is returned unchanged");
+  assert.ok(res.messages.some((m) => /already patched/.test(m.text)));
+});
+
+test("RBT-042: the capability short-circuit fires BEFORE the SHA gate (a complete marked bundle never hits sha-mismatch)", () => {
+  // A genuinely-patched bundle's bytes will not equal the pristine SHA. The marker+capability check must run
+  // first so a complete patched bundle returns alreadyPatched (not sha-mismatch). Pairs with the M27 ordering:
+  // version pin -> marker+capability -> SHA gate. (A marked-but-incomplete bundle still fails, as stale-bundle,
+  // BEFORE reaching the SHA gate — proven by the missing-seam tests above never reporting sha-mismatch.)
+  const res = applyPatch({ src: makeMarkedBundle(), version: PINNED_VERSION, env: {} });
+  assert.equal(res.alreadyPatched, true);
+  assert.equal(res.observedSha, null, "the short-circuit returns before computing/comparing the SHA");
+});
+
+test("RBT-042: REQUIRED_SEAM_TOKENS covers the four cross-file seams the bridge depends on (contract pin)", () => {
+  // These exact tokens are installed by the patcher and consumed by the bridge (assertPatched/loadSdk + the
+  // runtime self-tests). Pinning the set guards against silently narrowing the capability check.
+  assert.deepEqual(
+    [...REQUIRED_SEAM_TOKENS].sort(),
+    ["__CC_GET_ADVERTISE__", "__CC_SELFTEST_DISPATCH_S", "__CC_SELFTEST_DISPATCH_U", "__CC_SELFTEST_SERIALIZE"],
+    "the capability check must require exactly the serialize + unary/stream dispatch + advertise seam tokens",
+  );
+  // And the genuine patched output must actually contain every one (else the patcher and its own check would
+  // disagree — the static capability check would reject the patcher's own output).
+  const patched = makePatchedBundle();
+  for (const token of REQUIRED_SEAM_TOKENS) {
+    assert.ok(patched.includes(token), `the patcher's own output must contain the required seam token ${token}`);
+  }
 });
 
 test("happy path: a SHA-matching pristine bundle patches without override (verified branch)", () => {

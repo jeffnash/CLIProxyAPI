@@ -47,6 +47,14 @@ import {
   keyFingerprint,
   PlatformKeyCollisionError,
   selfTestResultSerialization,
+  wrapToolInput,
+  truncateLiveToolResult,
+  validateBindHost,
+  resolveBridgeHost,
+  bindHostIsLoopback,
+  COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES,
+  COMPOSER_SCHEMA_INLINE_MAX_BYTES,
+  COMPOSER_OUT_QUEUE_MAX_BYTES,
 } from "./cursor-agent-bridge.mjs";
 
 test("reconcileToolName: exact / case-insensitive / single (GUARDED H18) / token-boundary / ambiguous", () => {
@@ -814,8 +822,11 @@ test("MCP buildMcpServers (default natural): mcp__server__tool -> its server key
   // A chrome-style server token (single underscores, no "__") is preserved as one key (non-greedy split).
   const s2 = { id: "s2", advertise: [{ name: "mcp__plugin_chrome-devtools-mcp_chrome-devtools__click" }] };
   assert.deepEqual(Object.keys(buildMcpServers(s2)), ["plugin_chrome-devtools-mcp_chrome-devtools"]);
-  // No advertised tools -> no servers (nothing to register).
-  assert.deepEqual(buildMcpServers({ id: "empty", advertise: [] }), {});
+  // Comment 6: NO advertised tools this turn STILL registers one empty session-scoped "cc" server (so the SDK
+  // dials /mcp and tools/list can surface a tool advertised on a LATER turn without rotating the durable agent).
+  const empty = buildMcpServers({ id: "empty", advertise: [] });
+  assert.deepEqual(Object.keys(empty), ["cc"], "a tool-less turn still registers one session-scoped server (Comment 6)");
+  assert.match(empty.cc.url, /\/mcp\/empty$/, "the empty server's URL has no serverKey segment (the cc shape)");
 });
 
 test("MCP grouping=one: a single 'cc' server whose URL has no serverKey segment + serves ALL tools", () => {
@@ -1805,4 +1816,467 @@ test("ADD-74: selfTestResultSerialization drives every representative result thr
   try {
     await assert.rejects(() => selfTestResultSerialization(), /could not serialize|factory threw|out of sync|unknown result case/);
   } finally { globalThis.__CC_SELFTEST_SERIALIZE = saved2; }
+});
+
+// ══════════════════════ ADDENDUM 4/5/6 + Comments (bridge half) regression tests ══════════════════════
+// One+ test per work-order item. Dominant invariant: NEVER fake success, NEVER mark a tool seen the client did
+// not receive, NEVER lose the latest user intent, NO new data-path timeouts.
+
+// ── ADD-76 [RBT-008]: the pending watchdog starts only AFTER a tool is delivered, not at creation ──────────
+test("ADD-76: a tool buffered in undelivered (no activeRes) does NOT arm its watchdog until flushUndelivered delivers it", () => {
+  const s = new Session("add76");
+  const w = () => {}; w.__reject = () => {};
+  // newPending alone must NOT arm a timer (the tool has not been shown to any client yet).
+  s.newPending("buf-1", w);
+  assert.equal(s.pending.get("buf-1").timer, null, "newPending creates the pending WITHOUT a watchdog timer (ADD-76)");
+  // Buffer it (no activeRes) — emitToolUse pushes to undelivered; still no timer.
+  s.emitToolUse("buf-1", "read", { path: "/f" });
+  assert.equal(s.undelivered.length, 1, "no activeRes -> the tool is buffered");
+  assert.equal(s.pending.get("buf-1").timer, null, "a buffered tool's watchdog is STILL not armed (never seen by the client)");
+  // Open a response; flushUndelivered delivers it -> NOW the watchdog is armed.
+  s.activeRes = { write() { return true; }, on() {}, off() {} };
+  assert.equal(s.flushUndelivered(), true);
+  assert.ok(s.pending.get("buf-1").timer, "flushUndelivered arms the watchdog at delivery (ADD-76)");
+  clearTimeout(s.pending.get("buf-1").timer); // avoid the real PENDING_TIMEOUT_MS timer in the test runner
+  s.rejectAllPending("test cleanup");
+});
+test("ADD-76: pauseForTools arms the watchdog for each batched id at the tool_use delivery", () => {
+  const s = new Session("add76b");
+  s.activeRes = { write() { return true; }, on() {}, off() {} };
+  const w = () => {}; w.__reject = () => {};
+  s.newPending("A", w);
+  s.emitToolUse("A", "read", {});
+  if (s.flushTimer) clearTimeout(s.flushTimer);
+  // Before pauseForTools, the timer was armed at successful emit? No — pauseForTools arms it. The debounce path
+  // marks delivered at emit but the watchdog is armed when the tool_use turn_end is emitted.
+  s.pauseForTools();
+  assert.ok(s.pending.get("A") && s.pending.get("A").timer, "pauseForTools arms the abandonment watchdog (ADD-76)");
+  clearTimeout(s.pending.get("A").timer);
+  s.rejectAllPending("test cleanup");
+});
+
+// ── ADD-100 [RBT-009/010]: sse() honors backpressure/failure; delivery bookkeeping gates on the write ──────
+test("ADD-100 [RBT-009]: a tool_use write that THROWS -> id NOT delivered, run not paused, re-buffered", () => {
+  const s = new Session("add100-throw");
+  // A res whose write throws on the tool_call frame (a destroyed socket). on/off present for drain attach.
+  s.activeRes = { write() { throw new Error("EPIPE: socket destroyed"); }, on() {}, off() {} };
+  const w = () => {}; w.__reject = () => {};
+  s.newPending("T", w);
+  s.emitToolUse("T", "read", { path: "/f" });
+  assert.equal(s.delivered.has("T"), false, "a tool whose write threw must NOT be marked delivered (RBT-009)");
+  assert.equal(s.writeFailed, true, "the write path is marked dead");
+  // The run is not paused as if the client saw the tool: turnBatch must not still contain T, no flush armed.
+  assert.ok(!s.turnBatch.some((b) => b.id === "T"), "the failed tool is removed from turnBatch (not pending as delivered)");
+  assert.equal(s.flushTimer, null, "no pause/flush is armed for a tool the client never received");
+});
+test("ADD-100 [RBT-010]: sustained backpressure (write returns false) caps the output queue + cancels the turn", () => {
+  const s = new Session("add100-bp");
+  let canceled = false;
+  s.cancel = async () => { canceled = true; };
+  // A res whose write ALWAYS returns false (backpressure) and whose 'drain' never fires.
+  s.activeRes = { write() { return false; }, on() {}, off() {} };
+  // Seed the queue close to the cap so one more frame overflows it deterministically (no huge allocation).
+  s.outQueueBytes = COMPOSER_OUT_QUEUE_MAX_BYTES - 4;
+  s.outQueue = ["seed"];
+  // This frame's bytes push the queue over the cap -> failWrite -> cancel + bounded memory.
+  const ok = s.sse({ type: "text", delta: "this frame overflows the bounded queue" });
+  assert.equal(ok, false, "an overflowing write returns false (RBT-010)");
+  assert.equal(s.writeFailed, true, "the write path is marked dead on overflow");
+  assert.equal(s.outQueue.length, 0, "the queue is dropped (memory bounded), not grown unboundedly");
+  assert.equal(s.outQueueBytes, 0);
+  assert.equal(canceled, true, "the turn is cancelled with a transport failure (never a fake success)");
+  assert.match(s.lastRunError || "", /transport failure/);
+});
+test("ADD-100: backpressure (write false, then drain) queues then flushes in order — bounded, no loss", () => {
+  const s = new Session("add100-drain");
+  let drainCb = null;
+  const written = [];
+  // write returns false for the FIRST two frames (queue them), then true; 'drain' is captured so we can fire it.
+  let allowWrite = false;
+  s.activeRes = {
+    write(p) { if (!allowWrite) return false; written.push(p); return true; },
+    on(ev, fn) { if (ev === "drain") drainCb = fn; },
+    off() {},
+  };
+  assert.equal(s.sse({ type: "text", delta: "one" }), true, "a backpressured frame is queued (returns true, not lost)");
+  assert.equal(s.sse({ type: "text", delta: "two" }), true);
+  assert.equal(s.outQueue.length, 2, "both frames are queued behind backpressure");
+  assert.ok(drainCb, "a 'drain' listener was attached");
+  // Socket drains: the queued frames flush in order.
+  allowWrite = true;
+  drainCb();
+  assert.equal(s.outQueue.length, 0, "the queue drains on 'drain'");
+  assert.equal(written.length, 2);
+  assert.match(written[0], /one/); assert.match(written[1], /two/);
+});
+
+// ── ADD-98 + ADD-101 [RBT-032]: runTurn never strands activeRes/settleTurn on an initial-write/send throw ──
+test("ADD-98/ADD-101 [RBT-032]: a throw in agent.send clears activeRes + settleTurn, releases the waiter once", async () => {
+  const id = "rbt032";
+  const cursorKey = "k-rbt032";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  // agent.send throws (SDK rejection). ensureAgent succeeds (H11 keeps the session), but the turn errors.
+  installFakePlatform(cursorKey, { onSend: () => { throw new Error("agent.send blew up"); } });
+  let logicalDoneCount = 0;
+  const realNotify = s.notifyLogicalDone.bind(s);
+  s.notifyLogicalDone = () => { logicalDoneCount++; return realNotify(); };
+  const res = makeRes();
+  await drainTurn(makeReq(), res, { sessionId: id, input: { type: "user", text: "hi" } }, cursorKey);
+  assert.match(res.sse, /"stop_reason":"error"/, "the throw surfaces as an error turn (no false success)");
+  assert.equal(s.activeRes, null, "activeRes is cleared by the finally even though the body threw (ADD-98)");
+  assert.equal(s.settleTurn, null, "settleTurn is cleared so a later cancel never fires a stale latch (ADD-101)");
+  assert.ok(res.ended, "the response is terminated");
+  assert.equal(logicalDoneCount, 1, "the queued waiter is released EXACTLY once (RBT-032: no run installed -> catch-path safety net fires once)");
+  sessions.delete(id);
+});
+test("ADD-98 [RBT-032]: a throw on the INITIAL res.write does not strand activeRes", async () => {
+  const id = "rbt032-initwrite";
+  const cursorKey = "k-rbt032b";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  installFakePlatform(cursorKey, null);
+  // A res that throws on the FIRST write (the {type:"session"} frame) — a socket destroyed at promotion.
+  let firstWrite = true;
+  const res = {
+    status: 0, sse: "", ended: false,
+    writeHead(c) { this.status = c; return this; },
+    write(s2) { if (firstWrite) { firstWrite = false; throw new Error("destroyed before first write"); } this.sse += s2; return true; },
+    end() { this.ended = true; },
+    on() {}, off() {},
+  };
+  await handleTurn(makeReq(), res, { sessionId: id, input: { type: "tool_results", results: [{ toolCallId: "x", content: "y" }] } }, cursorKey);
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  assert.equal(s.activeRes, null, "a throw on the initial write must not leave activeRes set (ADD-98)");
+  assert.equal(s.settleTurn, null, "settleTurn is cleared (ADD-101)");
+  sessions.delete(id);
+});
+
+// ── ADD-90 [RBT-031]: cancelStaleRun({notify:false}) does not promote a queued waiter before the replacement ─
+test("ADD-90 [RBT-031]: cancel({notify:false}) does NOT release queued waiters; default cancel() does", async () => {
+  const s = new Session("add90-cancel");
+  s.run = { id: "r", cancel: async () => {} };
+  let notified = 0;
+  s._logicalDone = [() => { notified++; }];
+  await s.cancel({ notify: false });
+  assert.equal(notified, 0, "cancel({notify:false}) must NOT release queued waiters (ADD-90)");
+  // A default cancel() DOES notify (external callers rely on it).
+  const s2 = new Session("add90-cancel2");
+  s2.run = { id: "r", cancel: async () => {} };
+  let notified2 = 0;
+  s2._logicalDone = [() => { notified2++; }];
+  await s2.cancel();
+  assert.equal(notified2, 1, "default cancel() releases queued waiters (external callers)");
+});
+test("ADD-90 [RBT-031]: a C1 redirect that supersedes a live run does not promote the queued waiter before the replacement send installs session.run", async () => {
+  const id = "add90";
+  const cursorKey = "k-add90";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  const order = [];
+  let sendInstalledRun = false;
+  installFakePlatform(cursorKey, {
+    onSend: () => { order.push("replacement-send"); sendInstalledRun = true; return Promise.resolve({ id: "r2", status: "finished", wait: () => Promise.resolve({ status: "finished" }), cancel: async () => {} }); },
+  });
+  // A live (paused) run + an outstanding pending the continuation does NOT answer -> matched===0 + run live +
+  // trailing user text = the C1 REDIRECT path (cancel the stale run, fresh-send the user's instruction).
+  s.run = { id: "live", wait: () => new Promise(() => {}), cancel: async () => {} };
+  const w = () => {}; w.__reject = () => {};
+  s.newPending("still-pending", w); s.everEmitted.add("still-pending"); s.delivered.add("still-pending");
+  // The result answers a DIFFERENT, already-reaped (ever-emitted) id -> benign, matched===0 (no resume).
+  s.everEmitted.add("reaped-id");
+  // Hook notifyLogicalDone to record WHEN a queued-waiter release would happen relative to the replacement send.
+  const realNotify = s.notifyLogicalDone.bind(s);
+  s.notifyLogicalDone = () => { order.push(sendInstalledRun ? "notify-after-send" : "notify-before-send"); return realNotify(); };
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "reaped-id", content: "stale" }], userText: "actually do X instead" },
+  }, cursorKey);
+  // The replacement send must run, and any logical-done notification must NOT happen BEFORE the replacement send
+  // installed the run (cancelStaleRun used notify:false so the queued waiter cannot race the replacement send).
+  assert.ok(order.includes("replacement-send"), "the C1 replacement send runs");
+  assert.ok(!order.includes("notify-before-send"), "no queued-waiter release BEFORE the replacement send (ADD-90)");
+  sessions.delete(id);
+});
+
+// ── ADD-89 [RBT-006]: a failed tool result + trailing user text forces a fresh send (no silent resume) ─────
+test("ADD-89 [RBT-006]: is_error tool_result + trailing user text drives a FRESH user send; the failure is not folded as success", async () => {
+  const id = "add89";
+  const cursorKey = "k-add89";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  const { sends } = installFakePlatform(cursorKey, null);
+  // A live paused run with one pending tool the client now answers AS A FAILURE, plus trailing user text.
+  let resolvedErr = null;
+  const runDone = makeDeferred();
+  s.run = { id: "live", wait: () => runDone.promise, cancel: async () => {} };
+  const w = (c, e) => { resolvedErr = { c, e }; runDone.resolve({ status: "finished" }); }; w.__reject = () => {};
+  s.newPending("bash-1", w); s.everEmitted.add("bash-1"); s.delivered.add("bash-1");
+  s.run.wait().then((r) => s.onRunComplete(r)).catch((e) => s.onRunError(e));
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "bash-1", isError: true, content: "Bash was cancelled" }], userText: "that failed; try a simpler command" },
+  }, cursorKey);
+  // The failed result reaches the model AS failure (isError threaded to the pending), never folded as success.
+  assert.ok(resolvedErr, "the failed tool result was resolved into the run");
+  assert.equal(resolvedErr.e, true, "the result reached the model AS a failure (isError), not a fake success");
+  // ADD-89: a fresh user send carries the trailing instruction (the reply is NOT a silent resume of the failure).
+  assert.equal(sends.length, 1, "a fresh user send is driven for the trailing instruction (ADD-89)");
+  const text = typeof sends[0].msg === "string" ? sends[0].msg : sends[0].msg.text;
+  assert.match(text, /try a simpler command/, "the user's trailing instruction is sent as a real user turn");
+  sessions.delete(id);
+});
+test("ADD-89: a SUCCESSFUL tool result + trailing user text still RESUMES (regression guard — only failures force fresh)", async () => {
+  const id = "add89-ok";
+  const cursorKey = "k-add89-ok";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  const { sends } = installFakePlatform(cursorKey, null);
+  const runDone = makeDeferred();
+  s.run = { id: "live", wait: () => runDone.promise, cancel: async () => {} };
+  const got = {};
+  const w = (c) => { got.c = c; runDone.resolve({ status: "finished" }); }; w.__reject = () => {};
+  s.newPending("ok-1", w); s.everEmitted.add("ok-1"); s.delivered.add("ok-1");
+  s.run.wait().then((r) => s.onRunComplete(r)).catch((e) => s.onRunError(e));
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "ok-1", content: "RESULT" }], userText: "and note this" },
+  }, cursorKey);
+  assert.equal(got.c, "RESULT", "the successful result resolves and the run resumes");
+  assert.equal(sends.length, 0, "no separate fresh send when a SUCCESSFUL result resumes (userText rode along)");
+  sessions.delete(id);
+});
+
+// ── ADD-77 + ADD-83 (bridge half): a changed system / per-turn constraints reach a RESUMING run ────────────
+test("ADD-77: a changed system on a tool_results RESUME injects the updated-system marker into the last result + updates seededSystem", async () => {
+  const id = "add77";
+  const cursorKey = "k-add77";
+  const s = seedSession(id, cursorKey, { seeded: true, seededSystem: "OLD SYSTEM" });
+  installFakePlatform(cursorKey, null);
+  const runDone = makeDeferred();
+  s.run = { id: "live", wait: () => runDone.promise, cancel: async () => {} };
+  let resolvedContent = null;
+  const w = (c) => { resolvedContent = c; runDone.resolve({ status: "finished" }); }; w.__reject = () => {};
+  s.newPending("t-1", w); s.everEmitted.add("t-1"); s.delivered.add("t-1");
+  s.run.wait().then((r) => s.onRunComplete(r)).catch((e) => s.onRunError(e));
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "t-1", content: "TOOL OUTPUT" }], system: "NEW PLAN-MODE SYSTEM" },
+  }, cursorKey);
+  assert.ok(resolvedContent, "the last pending was resolved (the run resumes)");
+  assert.match(resolvedContent, /\[Updated system instructions:\]\nNEW PLAN-MODE SYSTEM/, "the updated-system marker is injected into the resumed result content (ADD-77)");
+  assert.match(resolvedContent, /TOOL OUTPUT/, "the original tool output is preserved after the marker");
+  assert.equal(s.seededSystem, "NEW PLAN-MODE SYSTEM", "seededSystem is updated on the resume so a later send does not re-inject");
+  sessions.delete(id);
+});
+test("ADD-83: a response_format constraint on a tool_results RESUME injects the JSON-format instruction into the last result", async () => {
+  const id = "add83";
+  const cursorKey = "k-add83";
+  const s = seedSession(id, cursorKey, { seeded: true, seededSystem: "" });
+  installFakePlatform(cursorKey, null);
+  const runDone = makeDeferred();
+  s.run = { id: "live", wait: () => runDone.promise, cancel: async () => {} };
+  let resolvedContent = null;
+  const w = (c) => { resolvedContent = c; runDone.resolve({ status: "finished" }); }; w.__reject = () => {};
+  s.newPending("t-1", w); s.everEmitted.add("t-1"); s.delivered.add("t-1");
+  s.run.wait().then((r) => s.onRunComplete(r)).catch((e) => s.onRunError(e));
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    responseFormat: { type: "json_object" },
+    input: { type: "tool_results", results: [{ toolCallId: "t-1", content: "TOOL OUTPUT" }] },
+  }, cursorKey);
+  assert.ok(resolvedContent, "the run resumes");
+  assert.match(resolvedContent, /\[Constraints for your reply:\]/, "a per-turn constraint preamble is injected on the resume (ADD-83)");
+  assert.match(resolvedContent, /single valid JSON object only/, "the response_format instruction reaches the resuming run");
+  sessions.delete(id);
+});
+test("ADD-77/ADD-83: an UNCHANGED system + no constraints injects NOTHING on a resume (no spurious preamble)", async () => {
+  const id = "add77-noop";
+  const cursorKey = "k-add77-noop";
+  const s = seedSession(id, cursorKey, { seeded: true, seededSystem: "SAME" });
+  installFakePlatform(cursorKey, null);
+  const runDone = makeDeferred();
+  s.run = { id: "live", wait: () => runDone.promise, cancel: async () => {} };
+  let resolvedContent = null;
+  const w = (c) => { resolvedContent = c; runDone.resolve({ status: "finished" }); }; w.__reject = () => {};
+  s.newPending("t-1", w); s.everEmitted.add("t-1"); s.delivered.add("t-1");
+  s.run.wait().then((r) => s.onRunComplete(r)).catch((e) => s.onRunError(e));
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "t-1", content: "TOOL OUTPUT" }], system: "SAME" },
+  }, cursorKey);
+  assert.equal(resolvedContent, "TOOL OUTPUT", "an unchanged system + no constraints leaves the result content untouched");
+  sessions.delete(id);
+});
+
+// ── ADD-79 (bridge half): a changed Cursor key on REUSE rotates the durable agent ─────────────────────────
+test("ADD-79: composeAgentId appends _k<keyEpoch>; rotateForKeyChange rotates + re-seeds + swaps the key", async () => {
+  const s = new Session("add79", "KEY_OLD");
+  assert.equal(s.composeAgentId(), "add79");
+  await s.rotateForKeyChange("KEY_NEW");
+  assert.equal(s.agentId, "add79_k1", "a key change suffixes _k1 (separate budget from _r/_m)");
+  assert.equal(s.cursorKey, "KEY_NEW", "the session key is swapped to the new key");
+  assert.equal(s.seeded, false, "seeded is reset so the next turn re-seeds into the fresh agent");
+  assert.equal(s.historyFingerprint, null, "the stale fingerprint is dropped");
+  // All three epochs compose into one unique id.
+  const s2 = new Session("x"); s2.recoveryEpoch = 1; s2.modelEpoch = 1; s2.keyEpoch = 1;
+  assert.equal(s2.composeAgentId(), "x_r2_m1_k1");
+});
+test("ADD-79: a second turn with a DIFFERENT cursorKey rotates -> ensureAgent never resumes the old durable id", async () => {
+  const id = "add79-reuse";
+  const keyA = "cursor-key-AAAA";
+  const keyB = "cursor-key-BBBB";
+  const s = seedSession(id, keyA, { seeded: true });
+  s.agentId = id; // established under key A
+  // Platform for key A (turn 1 would run here); platform for key B captures which agentId is resumed/created.
+  installFakePlatform(keyA, null);
+  const resumedB = [], createdB = [];
+  platforms.set(keyHash(keyB), {
+    promise: Promise.resolve({
+      resumeAgent: async (aid) => { resumedB.push(aid); return { send: () => Promise.resolve({ id: "r", status: "finished", wait: () => Promise.resolve({ status: "finished" }), cancel: async () => {} }), close() {} }; },
+      createAgent: async (o) => { createdB.push(o.agentId); return { send: () => Promise.resolve({ id: "r", status: "finished", wait: () => Promise.resolve({ status: "finished" }), cancel: async () => {} }), close() {} }; },
+      getAgentMessages: async () => [],
+    }),
+    stateRoot: "/tmp/fake", lastUsed: Date.now(), fp: keyFingerprint(keyB),
+  });
+  // Second turn: same session id, the NEW key B (a key rotation under the same conversation).
+  const res = makeRes();
+  await drainTurn(makeReq(), res, { sessionId: id, input: { type: "user", text: "continue", history: "U: earlier" } }, keyB);
+  assert.equal(s.cursorKey, keyB, "the session is now bound to the new key");
+  assert.match(s.agentId, /_k1$/, "the durable agentId rotated for the key change");
+  assert.ok(!resumedB.includes(id), "ensureAgent must NOT resumeAgent the OLD durable id under the new key (ADD-79)");
+  assert.ok(resumedB.includes(s.agentId) || createdB.includes(s.agentId), "ensureAgent resumes/creates against the ROTATED key-epoch id");
+  sessions.delete(id);
+});
+test("ADD-79: the SAME key on reuse does NOT rotate", async () => {
+  const id = "add79-same";
+  const cursorKey = "k-add79-same";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  const origAgentId = s.agentId;
+  installFakePlatform(cursorKey, null);
+  await drainTurn(makeReq(), makeRes(), { sessionId: id, input: { type: "user", text: "again" } }, cursorKey);
+  assert.equal(s.agentId, origAgentId, "no rotation when the key is unchanged");
+  assert.equal(s.keyEpoch, 0, "keyEpoch stays 0 for an unchanged key");
+  sessions.delete(id);
+});
+
+// ── ADD-95 (bridge backstop): live tool-result content is capped with the 'truncated by proxy' marker ─────
+test("ADD-95: truncateLiveToolResult caps an oversized string with the pinned 'truncated by proxy' marker", () => {
+  const big = "x".repeat(COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES + 1000);
+  const out = truncateLiveToolResult(big);
+  assert.ok(out.length < big.length, "oversized content is shortened");
+  assert.match(out, /truncated by proxy/, "the pinned marker substring is present (both halves agree)");
+  assert.match(out, /kept \d+\/\d+ bytes/, "the marker reports kept/total bytes");
+  // Under the cap -> untouched. A structured OBJECT is never truncated (would corrupt the channel).
+  assert.equal(truncateLiveToolResult("small"), "small");
+  const obj = { stdout: "ok", exitCode: 0 };
+  assert.equal(truncateLiveToolResult(obj), obj, "object content passes through untouched");
+});
+test("ADD-95: an oversized live tool result reaching resolvePending is capped before it resolves into the run", () => {
+  const s = new Session("add95");
+  let resolved = null;
+  const w = (c) => { resolved = c; }; w.__reject = () => {};
+  s.newPending("big-1", w);
+  const big = "y".repeat(COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES + 5000);
+  assert.equal(s.resolvePending("big-1", big), true);
+  assert.ok(resolved.length < big.length, "the resolved content is capped (backstop to the executor cap)");
+  assert.match(resolved, /truncated by proxy/);
+});
+
+// ── ADD-103 [RBT-040]: a huge response_format/schema is NOT inlined verbatim into the prompt ───────────────
+test("ADD-103 [RBT-040]: a huge json_schema is bounded to a short note, not inlined verbatim", () => {
+  // Build a schema whose serialization exceeds the inline cap.
+  const props = {};
+  for (let i = 0; i < 2000; i++) props["field_" + i] = { type: "string", description: "x".repeat(20) };
+  const schema = { type: "object", properties: props };
+  const serialized = JSON.stringify(schema);
+  assert.ok(serialized.length > COMPOSER_SCHEMA_INLINE_MAX_BYTES, "the schema is genuinely over the cap");
+  const out = constraintInstructions({ responseFormat: { type: "json_schema", json_schema: { name: "Big", schema } } });
+  assert.ok(!out.includes(serialized), "the full schema is NOT inlined (ADD-103)");
+  assert.match(out, /too large to inline/, "a short best-effort note replaces the oversized schema");
+  assert.match(out, /single valid JSON value only/, "the model is still told to emit JSON");
+  // A SMALL schema is still inlined verbatim (no regression).
+  const small = { type: "object", properties: { a: { type: "string" } } };
+  const outSmall = constraintInstructions({ responseFormat: { type: "json_schema", json_schema: { schema: small } } });
+  assert.ok(outSmall.includes(JSON.stringify(small)), "a small schema is still inlined");
+});
+
+// ── ADD-104 (bridge half): a non-object tool input is wrapped as {input:<raw>} before SSE ──────────────────
+test("ADD-104: wrapToolInput wraps non-object inputs and passes objects through", () => {
+  assert.deepEqual(wrapToolInput("raw string"), { input: "raw string" });
+  assert.deepEqual(wrapToolInput(123), { input: 123 });
+  assert.deepEqual(wrapToolInput([1, 2]), { input: [1, 2] });
+  assert.deepEqual(wrapToolInput(true), { input: true });
+  // A plain object passes through unchanged; null/undefined pass through (render as {} downstream).
+  assert.deepEqual(wrapToolInput({ a: 1 }), { a: 1 });
+  assert.equal(wrapToolInput(null), null);
+  assert.equal(wrapToolInput(undefined), undefined);
+});
+test("ADD-104: a tool_call whose input is a raw string is emitted to SSE as {input:'raw string'}", () => {
+  const s = new Session("add104");
+  const lines = [];
+  s.activeRes = { write(l) { lines.push(l); return true; }, on() {}, off() {} };
+  s.emitToolUse("tc-1", "mcp__x__y", "raw string");
+  if (s.flushTimer) clearTimeout(s.flushTimer);
+  const toolCall = lines.map((l) => l.replace(/^data: /, "")).map((j) => { try { return JSON.parse(j); } catch { return null; } }).find((o) => o && o.type === "tool_call");
+  assert.ok(toolCall, "a tool_call frame is written");
+  assert.deepEqual(toolCall.input, { input: "raw string" }, "the non-object input is wrapped (ADD-104)");
+  // The buffered (no activeRes) path also wraps before queuing.
+  const s2 = new Session("add104b");
+  s2.emitToolUse("tc-2", "mcp__x__y", 42);
+  assert.deepEqual(s2.undelivered[0].input, { input: 42 }, "a buffered tool's input is wrapped too");
+});
+
+// ── ADD-105 (bridge half): bind-host validation is secure by default ──────────────────────────────────────
+test("ADD-105: resolveBridgeHost defaults to 127.0.0.1; bindHostIsLoopback classifies loopback hosts", () => {
+  assert.equal(resolveBridgeHost(""), "127.0.0.1");
+  assert.equal(resolveBridgeHost("0.0.0.0"), "0.0.0.0");
+  assert.equal(bindHostIsLoopback("127.0.0.1"), true);
+  assert.equal(bindHostIsLoopback("::1"), true);
+  assert.equal(bindHostIsLoopback("localhost"), true);
+  assert.equal(bindHostIsLoopback("0.0.0.0"), false);
+  assert.equal(bindHostIsLoopback(""), false, "empty host binds all interfaces -> NOT loopback");
+});
+test("ADD-105: validateBindHost — loopback ok; non-loopback requires a token; insecure opt-in warns", () => {
+  // Loopback is always fine, token or not.
+  assert.deepEqual(validateBindHost("127.0.0.1", false), { ok: true });
+  // Non-loopback WITHOUT a token -> refuse to start (fail-closed).
+  const bad = validateBindHost("0.0.0.0", false);
+  assert.equal(bad.ok, false, "a non-loopback bind without a token must be refused");
+  assert.match(bad.error, /non-loopback/);
+  assert.match(bad.error, /CURSOR_AGENT_BRIDGE_TOKEN/);
+  // Non-loopback WITH a token -> allowed, but warns about plaintext exposure.
+  const withTok = validateBindHost("0.0.0.0", true);
+  assert.equal(withTok.ok, true);
+  assert.match(withTok.warn, /plaintext|TLS/);
+  // Non-loopback with the explicit insecure opt-in (no token) -> allowed but warns.
+  const insecure = validateBindHost("0.0.0.0", false, true);
+  assert.equal(insecure.ok, true);
+  assert.match(insecure.warn, /plaintext|TLS/);
+});
+
+// ── Comment 6: MCP shim registration stable across the session lifetime ───────────────────────────────────
+test("Comment 6: a tool-less first turn STILL registers one MCP server; tools advertised later surface via tools/list", async () => {
+  const id = "comment6";
+  const cursorKey = "k-comment6";
+  const s = seedSession(id, cursorKey, { seeded: false, advertise: [] }); // first turn: NO tools
+  // Capture the mcpServers ensureAgent registers on the durable agent.
+  let registeredServers = null;
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      resumeAgent: async (aid, opts) => { registeredServers = opts && opts.mcpServers; throw new Error("not found"); },
+      createAgent: async (opts) => { registeredServers = opts && opts.mcpServers; return { send: () => Promise.resolve({ id: "r", status: "finished", wait: () => Promise.resolve({ status: "finished" }), cancel: async () => {} }), close() {} }; },
+      getAgentMessages: async () => [],
+    }),
+    stateRoot: "/tmp/fake", lastUsed: Date.now(), fp: keyFingerprint(cursorKey),
+  });
+  await ensureAgent(s, "composer-2.5");
+  assert.ok(registeredServers && Object.keys(registeredServers).length >= 1, "Comment 6: a tool-less turn still registers an MCP server so the SDK dials /mcp");
+  assert.ok(registeredServers.cc, "the empty session registers the 'cc' loopback server");
+  // A tool advertised on a LATER turn surfaces via tools/list WITHOUT a durable-agent rotation (dynamic read).
+  s.advertise = [{ name: "mcp__nanobanana__generate_image", toolName: "mcp__nanobanana__generate_image" }];
+  const list = await mcpDispatch({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, id, "");
+  assert.deepEqual(list.result.tools.map((t) => t.name), ["mcp__nanobanana__generate_image"], "the later-advertised tool surfaces via tools/list (Comment 6)");
+  sessions.delete(id);
 });

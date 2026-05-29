@@ -43,7 +43,32 @@ const target = path.join(sdkRoot, "dist", "cjs", "index.js");
 // substring. Changing it (e.g. to a "-v2") REQUIRES updating assertPatched() in cursor-agent-bridge.mjs in
 // lockstep, or loadSdk() will reject the freshly-patched bundle. So do NOT bump it for a patch-shape change
 // alone (the anchor/SHA gates already catch a stale bundle); only bump it alongside the bridge-side grep.
+//
+// STALENESS GUARD (ADD-102 / Comment 7): the MARK alone does NOT prove a bundle is current. A partial/stale
+// patch (marker written but a seam missing — e.g. a half-applied patch, a hand-edited vendor bundle, or a
+// cached artifact copied with the marker but minus the advertise/serialize seam) would otherwise be accepted
+// by a marker-only short-circuit and start the bridge with a broken seam (no tools advertised, or malformed
+// result deserialization) as a silent behavior bug rather than a startup error. We keep MARK at -v1 and use
+// the CAPABILITY check below (REQUIRED_SEAM_TOKENS) as the structural staleness guard instead of bumping the
+// marker: adding a new patch seam therefore does NOT require a marker bump (which would force a lockstep
+// bridge assertPatched() change), but it DOES require adding that seam's sentinel token to
+// REQUIRED_SEAM_TOKENS so the capability check keeps rejecting bundles that pre-date the seam.
 const MARK = "/*cursor-composer-clienttools-patched-v1*/";
+
+// CAPABILITY tokens (ADD-102 / Comment 7): the sentinel substrings every CURRENT patched bundle MUST contain.
+// A bundle that starts with MARK is only treated as already-patched (idempotent re-run) when ALL of these are
+// present; if MARK is present but any token is missing the bundle is partially/stalely patched and we fail
+// CLOSED with a 'stale-bundle' PatchError (never exit 0). These mirror the globals the bridge installs and
+// relies on (assertPatched()/loadSdk()/the self-tests): the serializer-capture seam (__CC_SELFTEST_SERIALIZE,
+// edit 1), the unary+stream dispatch self-test harness (__CC_SELFTEST_DISPATCH_U/S, appended), and the
+// advertise/mcp_tools seam (__CC_GET_ADVERTISE__, edit 4). Keep this in sync with the `edits`/harness above:
+// any new seam => add its sentinel token here (no marker bump needed — see the MARK comment).
+const REQUIRED_SEAM_TOKENS = [
+  "__CC_SELFTEST_SERIALIZE",
+  "__CC_SELFTEST_DISPATCH_U",
+  "__CC_SELFTEST_DISPATCH_S",
+  "__CC_GET_ADVERTISE__",
+];
 
 // Development escape hatches that downgrade the M27 SHA fail-closed gate to a warning. EITHER name is
 // honored (the audit/spec canonical name plus an alternate); these MUST stay opt-in so production never
@@ -120,11 +145,14 @@ function assertAscii(label, str) {
 // condition. Kept pure (no fs/process) so the self-tests can drive the SHA gate and anchor checks against
 // synthetic bundles without installing the real @cursor/sdk.
 //
-// Order is load-bearing (M27): version pin -> already-patched short-circuit -> SHA gate (fail-closed
-// unless overridden) -> ASCII assertions -> anchor-count checks -> apply -> append self-test harness.
-// The SHA gate MUST precede the anchor checks: a drifted bundle whose anchors happen to still match must
-// NOT be patched silently, because the surrounding semantics may have changed (worst case: an unpatched
-// seam reintroduces native sidecar execution).
+// Order is load-bearing (M27): version pin -> marker + CAPABILITY check (already-patched short-circuit ONLY
+// when MARK present AND every required seam present; MARK present + a seam missing -> fail-closed 'stale-bundle')
+// -> SHA gate (fail-closed unless overridden) -> ASCII assertions -> anchor-count checks -> apply -> append
+// self-test harness. The SHA gate MUST precede the anchor checks: a drifted bundle whose anchors happen to
+// still match must NOT be patched silently, because the surrounding semantics may have changed (worst case:
+// an unpatched seam reintroduces native sidecar execution). The marker+capability check stays BEFORE the SHA
+// gate because an already-patched bundle's bytes will not match the pristine SHA (it is post-patch) — but a
+// MARKED bundle that is missing a seam must still fail loud rather than be hashed against the pristine value.
 function applyPatch({ src, version, env = {} }) {
   const messages = [];
 
@@ -140,7 +168,21 @@ function applyPatch({ src, version, env = {} }) {
     );
   }
 
+  // ADD-102 / Comment 7: marker + CAPABILITY check (replaces the old marker-only short-circuit). A bundle that
+  // starts with MARK is only idempotently already-patched when it ALSO carries every required seam token; if
+  // any is missing the bundle is partially/stalely patched (marker written but a seam dropped) and we fail
+  // CLOSED with 'stale-bundle' — never exit 0 on a half-patched bundle (which would start the bridge with a
+  // broken seam as a silent behavior bug). This is the static counterpart to the bridge's runtime self-tests.
   if (src.startsWith(MARK)) {
+    for (const token of REQUIRED_SEAM_TOKENS) {
+      if (!src.includes(token)) {
+        throw new PatchError(
+          "stale-bundle",
+          `marker present but seam ${token} missing — the @cursor/sdk bundle is partially/stalely patched; ` +
+            "run `npm ci` or reinstall the SDK, then re-run the patcher",
+        );
+      }
+    }
     return { alreadyPatched: true, patchedSrc: src, observedSha: null, messages: [{ level: "log", text: "already patched" }] };
   }
 
@@ -271,6 +313,7 @@ module.exports = {
   PINNED_VERSION,
   EXPECTED_BUNDLE_SHA256,
   MARK,
+  REQUIRED_SEAM_TOKENS,
   SHA_OVERRIDE_ENV,
   edits,
 };

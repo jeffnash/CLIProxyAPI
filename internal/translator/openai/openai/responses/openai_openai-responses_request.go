@@ -352,6 +352,19 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				function, _ = sjson.SetRawBytes(function, "parameters", []byte(parameters.Raw))
 			}
 
+			// ADD-99: preserve a function's `strict` Structured-Outputs hint. OpenAI clients
+			// register strict tool-argument schemas via either a top-level `strict` (Responses
+			// function-tool shape) or `function.strict` (nested Chat-Completions shape). Dropping
+			// it here would strip the strictness contract before the executor's
+			// composerAdvertise/composerConstraints can preserve or flag it, letting Cursor emit
+			// loose/extra/missing arguments while the proxy silently masks the violation. Copy it
+			// onto the rebuilt function object so the downstream consumer sees it.
+			if strict := tool.Get("strict"); strict.Exists() {
+				function, _ = sjson.SetBytes(function, "strict", strict.Bool())
+			} else if strict := tool.Get("function.strict"); strict.Exists() {
+				function, _ = sjson.SetBytes(function, "strict", strict.Bool())
+			}
+
 			chatTool, _ = sjson.SetRawBytes(chatTool, "function", function)
 			chatCompletionsTools = append(chatCompletionsTools, gjson.ParseBytes(chatTool).Value())
 
@@ -368,6 +381,44 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		if effort != "" {
 			out, _ = sjson.SetBytes(out, "reasoning_effort", effort)
 		}
+	}
+
+	// ADD-92 / Comment 3: translate a Responses structured-output request (`text.format`)
+	// into the Chat-Completions `response_format` shape the executor's
+	// extractComposerResponseFormat consumes. The OpenAI Responses API expresses Structured
+	// Outputs via text.format (NOT response_format), so without this the schema/json request
+	// was silently dropped while the Responses response translator still echoed `text` back —
+	// making the proxy appear to honor a contract it never forwarded.
+	//
+	// extractComposerResponseFormat requires an OBJECT and, for json_schema, reads
+	// `response_format.type == "json_schema"` plus `response_format.json_schema`. We therefore
+	// build exactly that shape:
+	//   - {type:"json_object"}                       -> {type:"json_object"}
+	//   - {type:"json_schema", name, schema, strict} -> {type:"json_schema",
+	//       json_schema:{name?, schema, strict?}}     (Responses nests the schema directly
+	//       under text.format with name+schema+strict)
+	//   - {type:"json_schema", json_schema:{...}}    -> carried through (already the nested
+	//       Chat-Completions form some relays emit)
+	// The schema body is copied with SetRawBytes so a large/strict JSON Schema is preserved
+	// verbatim (no lossy re-encode). Per the standing decision this is surfaced as a
+	// best-effort constraint downstream (composerConstraints flags strict json_schema in
+	// unsupportedHardGuarantees); the translator's only job is to forward it, never to claim
+	// hard enforcement.
+	if rf := responsesResponseFormatFromTextFormat(root.Get("text.format")); rf != nil {
+		out, _ = sjson.SetRawBytes(out, "response_format", rf)
+	}
+
+	// ADD-94 / Comment 4: preserve `store` so the executor can act on it. A Responses client
+	// uses store:false to demand a one-shot, non-durable turn. The composer path persists/
+	// resumes durable Cursor agent state by a stable session id, so silently dropping store
+	// here (and echoing store:false back from the response translator) is a privacy/compliance
+	// foot-gun. Surface it as a synthetic field: per the standing decision the executor rejects
+	// store:false with a typed 4xx ("Cursor Composer requires durable state") rather than
+	// faking an ephemeral mode — the translator's sole responsibility is not to drop it. We
+	// only emit the field when it is explicitly false (store:true is the default and needs no
+	// signal).
+	if store := root.Get("store"); store.Exists() && store.Type == gjson.False {
+		out, _ = sjson.SetBytes(out, "store", false)
 	}
 
 	// Convert tool_choice if present.
@@ -462,6 +513,62 @@ func responsesUnsupportedImageMarker(contentItem gjson.Result) string {
 		return "[image attachment unsupported: file_id reference cannot be resolved by this gateway (file_id=" + fid + ")]"
 	}
 	return "[image attachment unsupported: image_url is missing or in an unsupported form]"
+}
+
+// responsesResponseFormatFromTextFormat normalizes a Responses `text.format` value into the
+// Chat-Completions `response_format` raw JSON the executor's extractComposerResponseFormat
+// reads (ADD-92 / Comment 3). It returns nil when there is no usable structured-output request
+// so the caller leaves `response_format` unset.
+//
+// Accepted shapes:
+//   - {"type":"json_object"}                                   -> {"type":"json_object"}
+//   - {"type":"json_schema","name":N,"schema":S,"strict":B}    -> {"type":"json_schema",
+//     "json_schema":{"name":N,"schema":S,"strict":B}}        (Responses-native: schema nested
+//     directly under text.format)
+//   - {"type":"json_schema","json_schema":{...}}               -> {"type":"json_schema",
+//     "json_schema":{...}}                                   (already the nested form)
+//
+// The schema body is copied with SetRawBytes so the JSON Schema is preserved verbatim; name and
+// strict are carried only when present.
+func responsesResponseFormatFromTextFormat(format gjson.Result) []byte {
+	if !format.Exists() || !format.IsObject() {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(format.Get("type").String())) {
+	case "json_object":
+		return []byte(`{"type":"json_object"}`)
+	case "json_schema":
+		// Resolve the schema source: prefer the Responses-native nested fields under
+		// text.format directly, then fall back to an embedded json_schema object.
+		nested := format.Get("json_schema")
+		schema := format.Get("schema")
+		if !schema.Exists() && nested.IsObject() {
+			schema = nested.Get("schema")
+		}
+		name := format.Get("name")
+		if !name.Exists() && nested.IsObject() {
+			name = nested.Get("name")
+		}
+		strict := format.Get("strict")
+		if !strict.Exists() && nested.IsObject() {
+			strict = nested.Get("strict")
+		}
+		jsonSchema := []byte(`{}`)
+		if name.Exists() {
+			jsonSchema, _ = sjson.SetBytes(jsonSchema, "name", name.String())
+		}
+		if schema.Exists() {
+			jsonSchema, _ = sjson.SetRawBytes(jsonSchema, "schema", []byte(schema.Raw))
+		}
+		if strict.Exists() {
+			jsonSchema, _ = sjson.SetBytes(jsonSchema, "strict", strict.Bool())
+		}
+		rf := []byte(`{"type":"json_schema"}`)
+		rf, _ = sjson.SetRawBytes(rf, "json_schema", jsonSchema)
+		return rf
+	default:
+		return nil
+	}
 }
 
 // responsesConversationID extracts a conversation-stable identifier from a Responses

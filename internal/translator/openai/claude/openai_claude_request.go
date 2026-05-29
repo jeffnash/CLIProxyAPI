@@ -181,22 +181,37 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						}
 
 					case "tool_result":
-						// Collect tool_result to emit after the main message (ensures tool results follow tool_calls)
-						toolResultJSON := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
-						toolResultJSON, _ = sjson.SetBytes(toolResultJSON, "tool_call_id", part.Get("tool_use_id").String())
-						toolResultContent, toolResultContentRaw := convertClaudeToolResultContent(part.Get("content"))
-						if toolResultContentRaw {
-							toolResultJSON, _ = sjson.SetRawBytes(toolResultJSON, "content", []byte(toolResultContent))
-						} else {
-							toolResultJSON, _ = sjson.SetBytes(toolResultJSON, "content", toolResultContent)
+						// ADD-81: role-gate tool_result to user messages, mirroring the tool_use guard above
+						// (which only converts assistant-authored tool_use -> tool_calls). A tool_result is, by
+						// the Anthropic protocol, only valid inside a user message. Converting one authored by a
+						// non-user role (assistant/system/developer) into a trusted OpenAI role:"tool" message
+						// would let non-user-authored content resolve a pending client tool with output the real
+						// tool never produced, and would violate OpenAI tool-call adjacency.
+						//
+						// We DROP non-user tool_result blocks with this diagnostic comment rather than convert
+						// them, deliberately matching the existing tool_use behavior (which silently drops for
+						// non-assistant roles) to keep symmetry. A stricter centralized 400 validation error
+						// could be added later; doing it here only would diverge from the tool_use path.
+						if role == "user" {
+							// Collect tool_result to emit after the main message (ensures tool results follow tool_calls)
+							toolResultJSON := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
+							toolResultJSON, _ = sjson.SetBytes(toolResultJSON, "tool_call_id", part.Get("tool_use_id").String())
+							toolResultContent, toolResultContentRaw := convertClaudeToolResultContent(part.Get("content"))
+							if toolResultContentRaw {
+								toolResultJSON, _ = sjson.SetRawBytes(toolResultJSON, "content", []byte(toolResultContent))
+							} else {
+								toolResultJSON, _ = sjson.SetBytes(toolResultJSON, "content", toolResultContent)
+							}
+							// C5: a failed client tool must not reach the model as success. Carry is_error
+							// (snake_case, OpenAI convention) on the role:tool message so it survives to the
+							// composer executor + bridge. Only set when true to keep payloads minimal.
+							if isErr := part.Get("is_error"); isErr.Exists() && isErr.Bool() {
+								toolResultJSON, _ = sjson.SetBytes(toolResultJSON, "is_error", true)
+							}
+							toolResults = append(toolResults, toolResultJSON)
 						}
-						// C5: a failed client tool must not reach the model as success. Carry is_error
-						// (snake_case, OpenAI convention) on the role:tool message so it survives to the
-						// composer executor + bridge. Only set when true to keep payloads minimal.
-						if isErr := part.Get("is_error"); isErr.Exists() && isErr.Bool() {
-							toolResultJSON, _ = sjson.SetBytes(toolResultJSON, "is_error", true)
-						}
-						toolResults = append(toolResults, toolResultJSON)
+						// For role != "user": drop the block (do not append to toolResults) and do NOT convert
+						// it to a role:"tool" message. See diagnostic above.
 					}
 					return true
 				})

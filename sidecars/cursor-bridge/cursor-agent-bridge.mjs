@@ -63,6 +63,14 @@ function envInt(name, def, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
 }
 
 const PORT = envInt("CURSOR_AGENT_BRIDGE_PORT", 9798, { min: 1, max: 65535 });
+// ADD-105: the interface the bridge binds. Defaults to loopback (127.0.0.1) — the safe single-host topology
+// (CLIProxy dials it over loopback). The Go proxy DOES support a remote CURSOR_AGENT_BRIDGE_URL, so an operator
+// running the bridge as a separate container can set CURSOR_AGENT_BRIDGE_HOST=0.0.0.0; binding a non-loopback
+// interface exposes /agent/turn (which carries the per-user Cursor bearer) on the network, so it is gated:
+// validateBindHost REQUIRES multi-tenant auth (BRIDGE_TOKEN) on a non-loopback bind, refusing to start
+// (fail-closed) otherwise unless an explicit insecure opt-in is set, and a startup warning is emitted either way.
+const BRIDGE_HOST = (process.env.CURSOR_AGENT_BRIDGE_HOST || "127.0.0.1").trim() || "127.0.0.1";
+const ALLOW_INSECURE_BIND = process.env.CURSOR_AGENT_ALLOW_INSECURE_BIND === "1" || process.env.CURSOR_AGENT_ALLOW_INSECURE_BIND === "true";
 const API_KEY = process.env.CURSOR_API_KEY || "";
 const STATE_ROOT = process.env.CURSOR_AGENT_STATE_ROOT || path.join(process.cwd(), ".cursor-agent-store");
 const EMPTY_CWD = path.join(STATE_ROOT, ".empty");
@@ -117,6 +125,23 @@ const MAX_QUEUE_DEPTH = envInt("CURSOR_AGENT_MAX_QUEUE_DEPTH", 32, { min: 1 });
 // ADD-64: generalized to the shared envInt guard (was a bespoke Number.isFinite check); min:1 so a 0/blank
 // can never disable the OOM bound (it falls back to the 64 MB default).
 const MAX_AGENT_TURN_BYTES = envInt("MAX_AGENT_TURN_BYTES", 64 * 1024 * 1024, { min: 1 });
+// ADD-100: per-session SSE output-queue cap. When a client/proxy applies sustained backpressure (res.write
+// returns false and 'drain' never fires) the bridge queues unsent SSE payloads in Session.outQueue; this
+// bounds that queue so a slow/stuck client cannot OOM the sidecar via unbounded Node write buffering. Past the
+// cap the turn is cancelled with a typed transport error (never a fake success). This is a MEMORY bound, NOT a
+// data-path wall-clock timeout (allowed by AGENTS.md); default 8 MB is generous for a quiet/slow client.
+const COMPOSER_OUT_QUEUE_MAX_BYTES = envInt("CURSOR_AGENT_OUT_QUEUE_MAX_BYTES", 8 * 1024 * 1024, { min: 1 });
+// ADD-95 (bridge backstop): cap live tool-result content the bridge resolves into a pending, distinct from the
+// executor's history bound. The EXECUTOR's truncateCursorToolResultLive is authoritative and normally wins;
+// this is a slightly HIGHER cap so it only fires for content that bypassed the executor cap (a defense-in-depth
+// backstop). Both sides stamp the SAME marker substring 'truncated by proxy' so callers and tests agree.
+const COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES = envInt("CURSOR_AGENT_LIVE_TOOL_RESULT_MAX_BYTES", 320 * 1024, { min: 1 });
+// ADD-103: cap the serialized response_format / json_schema inlined into the prompt as a best-effort
+// instruction. A large generated schema (nested $defs, many enums) would otherwise bloat the prompt, leak more
+// than necessary, and risk ERROR_CONVERSATION_TOO_LONG — all for a constraint the composer path can only honor
+// best-effort anyway (the unsupportedHardGuarantees advisory still tells the model it is non-enforced). Past
+// the cap we inline a short note instead of the full schema. A SIZE bound on prompt text, not a timeout.
+const COMPOSER_SCHEMA_INLINE_MAX_BYTES = envInt("CURSOR_AGENT_SCHEMA_INLINE_MAX_BYTES", 8 * 1024, { min: 1 });
 // Shared SSE response headers (unbuffered, so keepalives reach the wire end-to-end).
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "X-Accel-Buffering": "no" };
 // Multi-tenant (opt-in): when CURSOR_AGENT_BRIDGE_TOKEN is set, X-Bridge-Auth gates access and the
@@ -138,6 +163,14 @@ const RUN_AS_MAIN = process.argv[1] === fileURLToPath(import.meta.url);
 // Loading is lazy (loadSdk) so this module can be imported for unit tests without pulling the SDK's
 // heavy/native deps; the real server calls loadSdk() at startup (fail-closed) BEFORE it accepts traffic.
 const require = createRequire(import.meta.url);
+// assertPatched greps the bundle's first 64 bytes for the PATCH-MARKER 'cursor-composer-clienttools-patched-v1'.
+// Comment 7 / ADD-102 / PATCH-MARKER-CAPABILITY contract: the patcher (scripts/apply-clienttools-patch.cjs)
+// keeps this marker at -v1 and instead does a CAPABILITY check (the marker alone does not prove a bundle is
+// current — a partial/stale patch with the marker but a missing seam fails closed in the patcher with a
+// 'stale-bundle' error). So this grep STAYS at -v1 and is intentionally NOT bumped. If the team ever bumps the
+// patcher's MARK to -v2, this grep string MUST be bumped in LOCKSTEP (same commit) or an old patched bundle
+// would be wrongly accepted here. The full per-seam capability verification lives on the patcher side; the
+// runtime self-tests (selfTestBundleSeam / selfTestResultSerialization) additionally prove the live seams work.
 function assertPatched(p) {
   if (!p.endsWith(path.join("dist", "cjs", "index.js"))) {
     throw new Error(`[bridge] @cursor/sdk resolved to ${p}, expected dist/cjs/index.js — refusing to start (tools would run natively on the sidecar FS).`);
@@ -250,6 +283,24 @@ function collectToolResultImages(input) {
   return out;
 }
 
+// truncateLiveToolResult is the BRIDGE BACKSTOP for ADD-95: it caps a live tool-result STRING the bridge is
+// about to resolve into a pending (and thus into the resuming Cursor run). The EXECUTOR's
+// truncateCursorToolResultLive is authoritative and uses a SMALLER cap, so it normally wins and this never
+// fires for executor-routed content; this only trims content that bypassed the executor cap. The marker
+// substring 'truncated by proxy' is PINNED so both halves and the tests agree. Only STRING content is capped —
+// a structured OBJECT (the Go side's shell envelope etc.) is passed through untouched (truncating it would
+// corrupt the structured channel). Byte-accurate (not char-length) so multibyte content is bounded correctly.
+function truncateLiveToolResult(content, cap = COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES) {
+  if (typeof content !== "string") return content;
+  const total = Buffer.byteLength(content);
+  if (total <= cap) return content;
+  // Keep a byte-bounded prefix (slice by chars then verify bytes; a final byte-safe trim avoids splitting a
+  // multibyte codepoint mid-sequence).
+  let kept = content.slice(0, cap);
+  while (Buffer.byteLength(kept) > cap && kept.length) kept = kept.slice(0, -1);
+  return kept + `\n[tool result truncated by proxy: kept ${Buffer.byteLength(kept)}/${total} bytes]`;
+}
+
 // constraintInstructions turns the OpenAI-style enforced constraints the SDK has no first-class params
 // for (response_format / stop / token limit / tool_choice required|specific|none) into a model instruction
 // block appended to the user turn, so the Cursor agent honors what the request asked for.
@@ -283,7 +334,16 @@ function constraintInstructions({ toolChoice, responseFormat, stop, maxTokens, f
       lines.push("Respond with a single valid JSON object only — no prose, no markdown code fences.");
     } else if (responseFormat.type === "json_schema") {
       const schema = (responseFormat.json_schema && (responseFormat.json_schema.schema || responseFormat.json_schema)) || {};
-      lines.push("Respond with a single valid JSON value that conforms EXACTLY to this JSON Schema (no prose, no markdown code fences):\n" + JSON.stringify(schema));
+      // ADD-103: bound the inlined schema. JSON.stringify can throw on a cyclic value; if so, fall back to the
+      // size-note branch too (we cannot safely inline it).
+      let serialized = null;
+      try { serialized = JSON.stringify(schema); } catch { serialized = null; }
+      if (serialized != null && Buffer.byteLength(serialized) <= COMPOSER_SCHEMA_INLINE_MAX_BYTES) {
+        lines.push("Respond with a single valid JSON value that conforms EXACTLY to this JSON Schema (no prose, no markdown code fences):\n" + serialized);
+      } else {
+        const n = serialized != null ? Buffer.byteLength(serialized) : "?";
+        lines.push(`Respond with a single valid JSON value only — no prose, no markdown code fences. (A response_format/schema too large to inline (${n} bytes) was requested; it is best-effort only and cannot be hard-enforced on this path.)`);
+      }
     }
   }
   if (Array.isArray(stop) && stop.length) {
@@ -359,6 +419,18 @@ globalThis.__CC_GET_ADVERTISE__ = () => {
   dbg("__CC_GET_ADVERTISE__ called by SDK", "session=" + st.session.id, "returning=" + adv.length + " tools");
   return adv;
 };
+
+// wrapToolInput (ADD-104) gives a tool-call input a STABLE wire shape for the client. The SDK/model may emit
+// MCP args as a raw string/number/array/boolean (or a client-registered tool whose JSON schema is a primitive),
+// but the Go executor only maps OBJECT-shaped `input` into the client tool's arguments and collapses a
+// non-object to {} — silently invoking the local tool with empty args. We wrap any non-plain-object value as
+// {input:<raw>} BEFORE emitting the SSE tool_call, so a client that introspects always sees an object and the
+// raw value survives under the pinned key 'input'. A plain object (or null/undefined) passes through unchanged
+// (null/undefined render as {} downstream, which is the historical no-args shape).
+function wrapToolInput(v) {
+  if (v == null) return v;
+  return (typeof v === "object" && !Array.isArray(v)) ? v : { input: v };
+}
 
 // Convert a proto Value/Struct/JSON-string into plain JSON (mcpArgs.args arrives as a proto map<string,Value>).
 function toPlainJson(v) {
@@ -751,6 +823,11 @@ class Session {
     this.recoveryEpoch = 0;       // C05: increments each too-long rotation; suffixes the rotated agentId
     this.modelEpoch = 0;          // ADD-62: increments each MODEL-CHANGE rotation; a SEPARATE budget from
                                   // recoveryEpoch so toggling models never burns the crash-recovery rotations
+    this.keyEpoch = 0;            // ADD-79: increments each CURSOR-KEY-CHANGE rotation; a SEPARATE budget so a
+                                  // key rotation never burns the crash-recovery / model-change rotations. A turn
+                                  // whose upstream Cursor key fingerprint differs from this session's tombstones
+                                  // the durable agent (bound to the old account) + seeds a fresh agent under the
+                                  // new key, instead of silently continuing on the old (possibly revoked) account.
     this.model = null;            // ADD-62: the model the durable agent was created/resumed under. A turn that
                                   // requests a DIFFERENT model rotates the durable agent (the old agent is bound
                                   // to the old model) + forces a re-seed, instead of silently answering from it.
@@ -801,6 +878,17 @@ class Session {
     this.done = false;
     this.tail = Promise.resolve();   // per-session FIFO chain: each new-user turn runs after the prior one's run completes
     this.waiters = 0;                // new-user turns queued but not yet running (single source of truth for depth-cap + eviction safety)
+    // ADD-100: SSE backpressure/failure state. `sse()` returns a boolean (true=accepted/queued, false=dropped
+    // because the turn was already torn down by overflow). When res.write() signals backpressure (returns false)
+    // we buffer the payload in `outQueue` (BOUNDED) and drain it on the socket's 'drain' event; a thrown write
+    // marks the write path failed. If the queue exceeds OUT_QUEUE_MAX_BYTES (a slow/stuck client that never
+    // drains) we cancel the turn with a typed transport error rather than letting Node buffer unboundedly. The
+    // 'drain' listener is attached lazily (once) per activeRes and detached on clearTurnState/cancel.
+    this.outQueue = [];              // queued SSE payload strings awaiting 'drain'
+    this.outQueueBytes = 0;          // running byte size of outQueue (cap enforcement)
+    this.writeFailed = false;        // a write threw OR the queue overflowed -> the stream is dead for this turn
+    this._drainBound = null;         // the bound 'drain' handler attached to the current activeRes (for detach)
+    this._drainRes = null;           // the res the 'drain' handler is attached to (so we detach from the right one)
     this._logicalDone = [];          // resolvers fired when the live run TRULY completes (onRunComplete/onRunError/cancel), NOT at a tool-pause
     this.runEpoch = 0;               // bumped per run + on cancel; a run.wait() callback ignores its result if the epoch advanced (the run was superseded/cancelled and a new turn may already own the session)
   }
@@ -813,7 +901,87 @@ class Session {
   // turn on settle() would collide with the still-live run. Admission must wait for real completion.
   whenLogicalDone() { if (!this.run) return Promise.resolve(); return new Promise((r) => this._logicalDone.push(r)); }
   notifyLogicalDone() { const ws = this._logicalDone; this._logicalDone = []; for (const w of ws) { try { w(); } catch {} } }
-  sse(obj) { if (this.activeRes) { try { this.activeRes.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* ignore */ } } }
+  // sse writes an SSE frame and returns whether the WRITE PATH is healthy (ADD-100). Returns true when the
+  // frame was accepted by the socket OR safely queued behind backpressure; returns false when the write threw
+  // or the per-session output queue overflowed (the turn is then cancelled). Callers that gate delivery on the
+  // write succeeding (emitToolUse / flushUndelivered / pauseForTools) MUST check this and re-buffer / not pause
+  // on false, so a tool is never marked `delivered` to a client that did not actually receive it.
+  sse(obj) {
+    if (!this.activeRes) return false;
+    if (this.writeFailed) return false;
+    const payload = `data: ${JSON.stringify(obj)}\n\n`;
+    return this.writePayload(payload);
+  }
+  // writePayload performs the low-level write with backpressure handling. true = accepted or queued; false =
+  // failed (threw) or overflowed. On a `false` return from res.write() (backpressure) we queue the payload and
+  // attach a one-shot 'drain' listener (idempotent per res) to flush the queue when the socket clears.
+  writePayload(payload) {
+    if (this.writeFailed || !this.activeRes) return false;
+    const res = this.activeRes;
+    // If we are already buffering behind backpressure, keep order: queue rather than writing ahead of the queue.
+    if (this.outQueue.length) return this.enqueueOut(payload);
+    let ok;
+    try { ok = res.write(payload); }
+    catch (e) { dbg("sse write THREW -> mark stream dead + cancel turn (ADD-100)", "session=" + this.id, (e && e.message) || String(e)); this.failWrite("sse write error: " + ((e && e.message) || String(e))); return false; }
+    if (ok === false) return this.enqueueOut(payload);
+    return true;
+  }
+  // enqueueOut buffers a payload that backpressure rejected and ensures the 'drain' flusher is attached. Returns
+  // false (and cancels the turn) when the bounded queue would overflow; true when safely queued.
+  enqueueOut(payload) {
+    const bytes = Buffer.byteLength(payload);
+    if (this.outQueueBytes + bytes > COMPOSER_OUT_QUEUE_MAX_BYTES) {
+      dbg("sse outQueue overflow -> cancel turn (ADD-100)", "session=" + this.id, "queuedBytes=" + this.outQueueBytes, "cap=" + COMPOSER_OUT_QUEUE_MAX_BYTES);
+      this.failWrite(`SSE output queue exceeded ${COMPOSER_OUT_QUEUE_MAX_BYTES} bytes (client backpressure)`);
+      return false;
+    }
+    this.outQueue.push(payload);
+    this.outQueueBytes += bytes;
+    this.attachDrain();
+    return true;
+  }
+  // attachDrain wires a single 'drain' listener on the current activeRes that flushes outQueue in order.
+  attachDrain() {
+    const res = this.activeRes;
+    if (!res || (this._drainBound && this._drainRes === res) || typeof res.on !== "function") return;
+    this.detachDrain();
+    this._drainRes = res;
+    this._drainBound = () => this.drainOut();
+    res.on("drain", this._drainBound);
+  }
+  detachDrain() {
+    if (this._drainBound && this._drainRes && typeof this._drainRes.off === "function") {
+      try { this._drainRes.off("drain", this._drainBound); } catch { /* ignore */ }
+    }
+    this._drainBound = null; this._drainRes = null;
+  }
+  // drainOut flushes the queued payloads on a 'drain' event, stopping if the socket signals backpressure again.
+  drainOut() {
+    const res = this.activeRes;
+    if (!res || this.writeFailed) return;
+    while (this.outQueue.length) {
+      const payload = this.outQueue[0];
+      let ok;
+      try { ok = res.write(payload); }
+      catch (e) { this.failWrite("sse drain write error: " + ((e && e.message) || String(e))); return; }
+      this.outQueue.shift();
+      this.outQueueBytes -= Buffer.byteLength(payload);
+      if (ok === false) return; // still backpressured; the next 'drain' resumes
+    }
+    this.detachDrain();
+  }
+  // failWrite marks the write path dead and cancels the turn with a typed transport error so the run is torn
+  // down (rejecting pendings, advancing the FIFO) instead of waiting on a client that will never receive output.
+  failWrite(reason) {
+    if (this.writeFailed) return;
+    this.writeFailed = true;
+    this.outQueue = []; this.outQueueBytes = 0;
+    this.detachDrain();
+    this.lastRunError = "[bridge] SSE transport failure: " + reason;
+    // Cancel asynchronously; cancel() rejects pendings + notifies logical-done so the queue advances. We do NOT
+    // try to write an error frame (the stream is dead). settle() (inside cancel) clears this turn's latch.
+    void this.cancel();
+  }
 
   // wireToolId derives the per-session WIRE tool-call id from the SDK tool spec, resolving sanitization
   // collisions (H23). ccToolId sanitizes the raw id to the Claude charset; two distinct raw ids (e.g. "call:a"
@@ -846,12 +1014,24 @@ class Session {
     return wire;
   }
 
+  // ADD-76: create the pending entry WITHOUT arming the abandonment watchdog. The timer must NOT start until
+  // the tool is actually DELIVERED to the client (a tool buffered in `undelivered` with no open response has
+  // never been seen, so reaping it after PENDING_TIMEOUT_MS would reject a tool the client never had a chance
+  // to answer). startPendingTimer arms the watchdog at delivery (pauseForTools / flushUndelivered). A pending
+  // whose timer never started simply has timer:null; clearTimeout(null) and clearTimeout(undefined) are no-ops.
   newPending(id, resolveWrap) {
-    const timer = setTimeout(() => {
-      const p = this.pending.get(id);
-      if (p) { this.pending.delete(id); p.reject(new Error(`[bridge] tool ${id} abandoned after ${PENDING_TIMEOUT_MS}ms`)); }
+    this.pending.set(id, { resolve: resolveWrap, reject: (err) => { const p = this.pending.get(id); if (p && p.timer) clearTimeout(p.timer); resolveWrap.__reject(err); }, timer: null });
+  }
+  // startPendingTimer arms the PENDING_TIMEOUT_MS abandonment watchdog for an ALREADY-DELIVERED tool (ADD-76).
+  // Idempotent: re-arming an already-armed (or already-resolved) pending is a no-op, so calling it from both
+  // pauseForTools and flushUndelivered for the same id never double-arms.
+  startPendingTimer(id) {
+    const p = this.pending.get(id);
+    if (!p || p.timer) return;
+    p.timer = setTimeout(() => {
+      const cur = this.pending.get(id);
+      if (cur) { this.pending.delete(id); cur.reject(new Error(`[bridge] tool ${id} abandoned after ${PENDING_TIMEOUT_MS}ms`)); }
     }, PENDING_TIMEOUT_MS);
-    this.pending.set(id, { resolve: resolveWrap, reject: (err) => { clearTimeout(timer); resolveWrap.__reject(err); }, timer });
   }
   // resolvePending answers a pending client tool call. isError (C5/BR4) flags a FAILED/cancelled client tool
   // so the result reaches the model AS a failure (the resolve wrappers in dispatchUnary/Stream/Mcp route it
@@ -859,7 +1039,11 @@ class Session {
   resolvePending(id, content, isError = false) {
     const p = this.pending.get(id);
     if (!p) return false;
-    clearTimeout(p.timer); this.pending.delete(id); p.resolve(content, isError === true);
+    // ADD-95 (bridge backstop): cap an oversized live tool-result string before it resolves into the resuming
+    // run (the executor cap normally wins; this only trims content that bypassed it). Same 'truncated by proxy'
+    // marker on both halves. Structured object content is passed through untouched.
+    const capped = truncateLiveToolResult(content);
+    if (p.timer) clearTimeout(p.timer); this.pending.delete(id); p.resolve(capped, isError === true);
     // ADD-60: a streaming client can answer a tool BEFORE the TOOL_BATCH_MS debounce flushes (the concurrent
     // activeRes path resolves it into the live run). If that id is still sitting in turnBatch, the pending
     // flush would later emit a STALE `turn_end{tool_use, tool_calls:[id]}` for an already-answered call (the
@@ -1000,22 +1184,39 @@ class Session {
 
   emitToolUse(id, name, input) {
     this.touch();
-    this.everEmitted.add(id); // BR1: record EVERY issued id (lifetime), so a late result is benign not "unknown"
-    if (!this.activeRes) {
-      // No open client-facing response — the prior turn already closed (e.g. the debounce flushed mid-burst
-      // and the SDK kept emitting). Writing the tool_call to a dead socket would silently create a pending
-      // the client can never answer (the desync). Buffer it and deliver it on the next /agent/turn (Comment 1).
-      dbg("emitToolUse BUFFERED (no activeRes)", "session=" + this.id, "id=" + id, "name=" + name);
+    // ADD-104: normalize a non-object tool input to {input:<raw>} ONCE, here, before it is buffered (turnBatch /
+    // undelivered) or written to SSE — so the direct emit AND any later flushUndelivered re-emit carry the same
+    // stable object shape, and the executor never collapses a string/number/array arg to {}.
+    input = wrapToolInput(input);
+    if (!this.activeRes || this.writeFailed) {
+      // No open client-facing response (the prior turn already closed mid-burst), or the write path is dead.
+      // Writing the tool_call to a dead/absent socket would silently create a pending the client can never
+      // answer (the desync). Buffer it and deliver it on the next /agent/turn (Comment 1). everEmitted records
+      // the issued id (lifetime) so a late result for it is benign, not an "unknown" foreign id.
+      dbg("emitToolUse BUFFERED (no activeRes / write dead)", "session=" + this.id, "id=" + id, "name=" + name);
+      this.everEmitted.add(id);
       this.undelivered.push({ id, name, input });
       return;
     }
     dbg("emitToolUse", "session=" + this.id, "id=" + id, "name=" + name);
     this.turnBatch.push({ id, name, input });
-    this.sse({ type: "tool_call", id, name, input });
+    // ADD-100: gate delivery bookkeeping on the WRITE actually succeeding. If res.write threw or overflowed the
+    // bounded output queue, the client did NOT receive this tool_call — so do NOT mark it delivered/everEmitted
+    // and do NOT arm the debounce/pause. Re-buffer it into `undelivered` so it is re-attempted on a later turn,
+    // and bail. A client must never have its run paused on a tool it never saw (RBT-009).
+    const ok = this.sse({ type: "tool_call", id, name, input });
+    if (!ok) {
+      dbg("emitToolUse write FAILED -> re-buffer, do not mark delivered/pause (ADD-100)", "session=" + this.id, "id=" + id);
+      this.turnBatch = this.turnBatch.filter((b) => b.id !== id);
+      this.everEmitted.add(id);
+      this.undelivered.push({ id, name, input });
+      return;
+    }
     // ADD-60: mark the id delivered the moment its tool_call frame is WRITTEN to the client (not only later at
     // pauseForTools). A streaming client may post a continuation answering this id BEFORE the debounce fires;
     // resolvePending then removes it from turnBatch, but the client has genuinely SEEN the id, so an early
     // result for it must be treated as a real match (delivered), never as an unknown/foreign id.
+    this.everEmitted.add(id); // BR1: record EVERY issued id (lifetime), so a late result is benign not "unknown"
     this.delivered.add(id);
     const token = this.turnToken;
     if (this.flushTimer) clearTimeout(this.flushTimer);
@@ -1024,18 +1225,38 @@ class Session {
   // flushUndelivered delivers tools that were emitted while no response was open, on a later turn's OPEN
   // response, so the client finally sees them and can answer them. Emits one tool_use turn_end + settles.
   flushUndelivered() {
-    if (!this.undelivered.length || !this.activeRes) return false;
+    if (!this.undelivered.length || !this.activeRes || this.writeFailed) return false;
     const batch = this.undelivered;
     this.undelivered = [];
     dbg("flushUndelivered", "session=" + this.id, "count=" + batch.length, "ids=" + safeJson(batch.map((t) => t.id)));
-    for (const t of batch) { this.delivered.add(t.id); this.everEmitted.add(t.id); this.sse({ type: "tool_call", id: t.id, name: t.name, input: t.input }); }
-    this.sse({ type: "turn_end", stop_reason: "tool_use", tool_calls: batch.map((t) => t.id) });
+    const delivered = [];
+    for (const t of batch) {
+      // ADD-100: only mark a tool delivered after its frame WRITES successfully. On a write failure, re-buffer
+      // the remainder (this one + the rest) so nothing is marked seen that the client never received.
+      const ok = this.sse({ type: "tool_call", id: t.id, name: t.name, input: t.input });
+      if (!ok) {
+        dbg("flushUndelivered write FAILED -> re-buffer remainder (ADD-100)", "session=" + this.id, "id=" + t.id);
+        this.undelivered.unshift(t, ...batch.slice(batch.indexOf(t) + 1));
+        break;
+      }
+      this.delivered.add(t.id); this.everEmitted.add(t.id);
+      // ADD-76: the watchdog clock for a buffered tool starts ONLY now, at delivery (it was created without a
+      // timer in newPending), so the client gets a fair PENDING_TIMEOUT_MS window from when it first saw the tool.
+      this.startPendingTimer(t.id);
+      delivered.push(t.id);
+    }
+    if (!delivered.length) return false; // first write failed before anything was delivered (turn cancelled)
+    this.sse({ type: "turn_end", stop_reason: "tool_use", tool_calls: delivered });
     this.settle();
     return true;
   }
   pauseForTools() {
     this.flushTimer = null;
-    for (const b of this.turnBatch) this.delivered.add(b.id);
+    // ADD-76: arm the abandonment watchdog for each batched id NOW, at the moment it is delivered in the
+    // tool_use turn_end (the pending was created without a timer in newPending). ADD-100: the ids are already in
+    // `delivered` (set at successful emit time); the turn_end write is best-effort here (the run pauses either
+    // way and the ids are tracked), so a failed terminal write does not strand bookkeeping.
+    for (const b of this.turnBatch) { this.delivered.add(b.id); this.startPendingTimer(b.id); }
     this.sse({ type: "turn_end", stop_reason: "tool_use", tool_calls: this.turnBatch.map((b) => b.id) });
     this.turnBatch = [];
     this.settle();
@@ -1087,6 +1308,7 @@ class Session {
     let aid = this.id;
     if (this.recoveryEpoch > 0) aid += `_r${this.recoveryEpoch + 1}`; // first too-long rotation -> _r2
     if (this.modelEpoch > 0) aid += `_m${this.modelEpoch}`;           // first model change   -> _m1
+    if (this.keyEpoch > 0) aid += `_k${this.keyEpoch}`;               // ADD-79: first key change -> _k1
     return aid;
   }
   // rotateDurableAgent tombstones the poisoned durable agent and allocates a fresh agentId (C05). The session
@@ -1144,6 +1366,34 @@ class Session {
     await this.cancel();          // tear down the old-model live agent/run (nulls agent/run, rejects pendings)
     this.done = false;            // cancel() set done=true; the next turn must drive a fresh send
   }
+  // rotateForKeyChange (ADD-79) rotates the durable agent when the upstream Cursor key changes for the SAME
+  // external session (a tenant rotates their key, an admin rebinds it, or multi-tenant forwards a different
+  // per-user key under the same conversation id). The old durable agent lives under the OLD key's account +
+  // stateRoot; resumeAgent would silently keep answering from it (stale/revoked creds, wrong billing, wrong
+  // isolation). So we tombstone it, point session.cursorKey at the NEW key, allocate a fresh agentId under a
+  // SEPARATE keyEpoch budget (so a key rotation never burns the C05 crash-recovery or ADD-62 model rotations),
+  // and force a re-seed of the client's history into the fresh agent on the NEW key's platform. The external
+  // session id is KEPT so continuations keep routing here. Bounded so pathological key-flapping cannot churn
+  // agentIds without limit; past the cap we keep the last rotated agent (the next turn re-seeds into it). Per the
+  // CURSOR-KEY-FINGERPRINT contract: NEVER mutate session.cursorKey on a live run without rotating the durable
+  // agent — this method does both atomically (set the key, rotate the id, then cancel the old-key run).
+  async rotateForKeyChange(newKey) {
+    const COMPOSER_MAX_KEY_ROTATIONS = 8;
+    const oldAgentId = this.agentId;
+    if (this.keyEpoch < COMPOSER_MAX_KEY_ROTATIONS) {
+      this.keyEpoch++;
+      this.agentId = this.composeAgentId(); // first key change -> <id>_k1 (+ _rN/_mN if those also happened)
+    } else {
+      dbg("rotateForKeyChange cap reached -> keep last agentId, force re-seed", "session=" + this.id, "agentId=" + this.agentId, "epoch=" + this.keyEpoch);
+    }
+    this.cursorKey = newKey || API_KEY; // run subsequent turns on the NEW key's platform/account
+    this.seeded = false;          // force re-seed the client's history into the fresh agent under the new key
+    this.seededSystem = "";
+    this.historyFingerprint = null;
+    dbg("rotateForKeyChange -> rotate durable agentId for new key (no resumeAgent(old key's agent))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId);
+    await this.cancel();          // tear down the old-key live agent/run (nulls agent/run, rejects pendings)
+    this.done = false;            // cancel() set done=true; the next turn must drive a fresh send
+  }
   rejectAllPending(why) {
     for (const [, p] of this.pending) { try { p.reject(new Error(`[bridge] ${why}`)); } catch {} }
     this.pending.clear();
@@ -1154,8 +1404,15 @@ class Session {
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
     this.turnBatch = []; this.undelivered = []; this.delivered.clear();
     this.activeAdvertise = null; // ADD-40: the turn-scoped effective tool policy ends with the run
+    // ADD-100: drop any queued backpressured output + detach the 'drain' listener; the run is over.
+    this.outQueue = []; this.outQueueBytes = 0; this.detachDrain();
   }
-  async cancel() {
+  // cancel tears down the live run/agent + rejects pendings. ADD-90: `notify` controls whether queued waiters
+  // are released (notifyLogicalDone). External callers (onClose, handleTurn interrupt, rotate*, shutdown, evict,
+  // failWrite) use the default notify:true so the FIFO advances. Internal SUPERSESSION (cancelStaleRun) passes
+  // notify:false so a queued new-user turn is NOT promoted before driveUserSend installs the replacement
+  // session.run — otherwise the queued turn and the replacement send would race on the same durable agent.
+  async cancel({ notify = true } = {}) {
     this.done = true;     // short-circuit any late run.wait() settlement (onRunComplete/onRunError no-op on done)
     this.runEpoch++;      // invalidate the in-flight run's completion callback so it can't mutate a successor turn
     this.rejectAllPending("session cancelled");
@@ -1167,7 +1424,7 @@ class Session {
     // re-resumes/recreates a live agent via ensureAgent instead of reusing this dead one.
     this.agent = null; this.agentPromise = null;
     this.settle();
-    this.notifyLogicalDone(); // run torn down -> release any queued waiter so the chain advances
+    if (notify) this.notifyLogicalDone(); // run torn down -> release any queued waiter so the chain advances
   }
 }
 
@@ -1348,13 +1605,18 @@ function buildMcpServers(session) {
   try {
     if (!MCP_SHIM_ENABLED) return {};
     const adv = (session && session.advertise) || [];
-    if (!adv.length) return {};
     const sid = session.id;
     const mkServer = (serverKey) => ({
       type: "http",
       url: `http://127.0.0.1:${PORT}/mcp/${sid}` + (serverKey && serverKey !== "cc" ? `/${serverKey}` : ""),
       headers: { "X-CC-Session": sid },
     });
+    // Comment 6: register at least ONE session-scoped loopback server even when the CURRENT turn advertises NO
+    // tools. The durable agent's mcpServers map is fixed when the agent is first created/resumed; if we returned
+    // {} on a tool-less first turn, the SDK would never dial /mcp and a tool advertised on a LATER turn could not
+    // surface (tools/list reads session.advertise DYNAMICALLY, so the empty server still picks up later tools
+    // without rotating the durable agent). Always-register is the simpler path (no advertise-transition rotation).
+    if (!adv.length) { dbg("buildMcpServers: no tools this turn -> register one empty session server (Comment 6)", "session=" + sid); return { cc: mkServer("cc") }; }
     if (MCP_GROUPING === "one") return { cc: mkServer("cc") };
     const servers = {};
     // R5 collision guard (natural only): detect two distinct server tokens collapsing to one URL-safe key.
@@ -1538,6 +1800,28 @@ function isLoopbackRemote(req) {
   const a = (req && req.socket && req.socket.remoteAddress) || "";
   return a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1" || a === "" /* unix socket / test */;
 }
+// ADD-105: classify a BIND-HOST string (the interface server.listen binds), mirroring the loopback addresses
+// isLoopbackRemote treats as local. "localhost" resolves to loopback; an empty/absent host binds all
+// interfaces (treated as NON-loopback, the conservative choice). Used by validateBindHost.
+function bindHostIsLoopback(host) {
+  const h = String(host || "").trim().toLowerCase();
+  if (h === "") return false; // empty host = bind all interfaces (NOT loopback)
+  return h === "127.0.0.1" || h === "::1" || h === "::ffff:127.0.0.1" || h === "localhost";
+}
+// resolveBridgeHost returns the configured bind host (defaulting to 127.0.0.1). Pure (testable).
+function resolveBridgeHost(host = BRIDGE_HOST) { return String(host || "").trim() || "127.0.0.1"; }
+// validateBindHost (ADD-105) enforces the secure-by-default bind policy. A loopback bind is always allowed. A
+// NON-loopback bind exposes /agent/turn (which carries the per-user Cursor bearer) on the network, so it
+// REQUIRES multi-tenant auth (a BRIDGE_TOKEN) — otherwise it refuses to start (fail-closed) UNLESS the operator
+// sets the explicit insecure opt-in. Returns { ok, warn?, error? }: `error` (when present) means refuse to
+// start; `warn` is an always-surfaced plaintext-exposure caution on any non-loopback bind. Pure (testable).
+function validateBindHost(host, hasToken, allowInsecure = false) {
+  if (bindHostIsLoopback(host)) return { ok: true };
+  if (!hasToken && !allowInsecure) {
+    return { ok: false, error: `CURSOR_AGENT_BRIDGE_HOST=${host} binds a non-loopback interface but no CURSOR_AGENT_BRIDGE_TOKEN (multi-tenant auth) is set — refusing to start (the bearer would be exposed in plaintext). Set CURSOR_AGENT_BRIDGE_TOKEN, terminate TLS in front, or set CURSOR_AGENT_ALLOW_INSECURE_BIND=1 to override.` };
+  }
+  return { ok: true, warn: `CURSOR_AGENT_BRIDGE_HOST=${host} binds a non-loopback interface — /agent/turn is reachable over the network. Ensure TLS is terminated in front; the per-user Cursor bearer is sent in plaintext otherwise.` };
+}
 // healthBody returns the FULL diagnostic health payload (patched flag + live session count) to a loopback or
 // bridge-token-authenticated caller, and a bare liveness {ok:true} to any remote/forwarded caller (ADD-58).
 function healthBody(req) {
@@ -1577,8 +1861,11 @@ async function handleTurn(req, res, body, cursorKey) {
   if (!sessionId) { fail(400, "sessionId is required"); return; }
 
   // Enforced response constraints + tool_choice carried from the Go executor (Comment 3). Applied as
-  // model instructions and tool-advertisement gating on the user turn.
-  const constraints = { toolChoice: body.toolChoice || "", responseFormat: body.responseFormat, stop: body.stop, maxTokens: body.maxTokens };
+  // model instructions and tool-advertisement gating on the user turn. unsupportedHardGuarantees (H20/H21/
+  // ADD-72/ADD-84) is the executor's advisory list of constraints the composer path cannot hard-enforce; it is
+  // threaded through here so BOTH the send path (driveUserSend) AND the ADD-77/ADD-83 resume-injection surface
+  // it to the model identically (never a claim of hard enforcement).
+  const constraints = { toolChoice: body.toolChoice || "", responseFormat: body.responseFormat, stop: body.stop, maxTokens: body.maxTokens, unsupportedHardGuarantees: body.unsupportedHardGuarantees };
 
   if (input.type === "tool_results") {
     // A continuation COMPLETES the active (paused) run; it must reach resolvePending promptly and must
@@ -1668,7 +1955,21 @@ async function handleTurn(req, res, body, cursorKey) {
     if (MULTI_TENANT && !platformCapHasRoomForNew(cursorKey)) { fail(429, `platform capacity reached (${MAX_PLATFORMS}); all tenant platforms are in use — retry later`); return; }
     session = new Session(sessionId, cursorKey); sessions.set(sessionId, session); dbg("handleTurn NEW session", sessionId);
   }
-  else dbg("handleTurn REUSE session", sessionId, "runActive=" + !!session.run, "activeRes=" + !!session.activeRes, "waiters=" + session.waiters);
+  else {
+    dbg("handleTurn REUSE session", sessionId, "runActive=" + !!session.run, "activeRes=" + !!session.activeRes, "waiters=" + session.waiters);
+    // ADD-79 (bridge half): the upstream Cursor key may have changed for the SAME external session (tenant key
+    // rotation, admin rebind, or multi-tenant forwarding a different per-user key under the same conversation
+    // id). Compare a NON-REVERSIBLE fingerprint of the request key to the session's stored key fingerprint; if
+    // they differ, rotate the durable agent onto the NEW key (tombstone the old-key agent, fresh agentId under a
+    // new keyEpoch, re-seed) — NEVER keep answering on the old (possibly revoked / wrong-billed) account.
+    // rotateForKeyChange sets session.cursorKey + rotates the durable agent atomically (never a live mutation of
+    // the key without rotation). Defense-in-depth: the executor half folds the key fingerprint into the sess_id
+    // so a key change normally arrives as a NEW session id; this catches the same-id case (either half is safe).
+    if (keyFingerprint(cursorKey) !== keyFingerprint(session.cursorKey)) {
+      dbg("handleTurn REUSE with CHANGED cursor key -> rotateForKeyChange (ADD-79)", sessionId, "oldKeyHash=" + keyHash(session.cursorKey), "newKeyHash=" + keyHash(cursorKey));
+      await session.rotateForKeyChange(cursorKey);
+    }
+  }
   if (Array.isArray(body.tools)) {
     session.advertise = dedupeByName(body.tools.map((t) => ({ name: t.name, toolName: t.name, providerIdentifier: "cc", description: t.description || "", inputSchema: t.inputSchema || t.parameters || undefined })));
   }
@@ -1748,23 +2049,14 @@ function dedupeByName(tools) {
 }
 
 async function runTurn(req, res, session, model, input, constraints = {}) {
-  session.activeRes = res; session.touch(); session.turnToken++;
-  // H08: keep the dispatch seam's native-tool gating current for THIS turn even on a continuation that does
-  // not call driveUserSend (the model may emit new native tool calls while resuming). driveUserSend sets it
-  // again on a send; this top-level set covers the resume-only path too.
-  session.toolChoice = (constraints && constraints.toolChoice) || "";
-  res.write(`data: ${JSON.stringify({ type: "session", sessionId: session.id })}\n\n`);
-
-  // Typed keepalive (NOT a ": keepalive" comment — the Go executor forwards only "data: " lines, so a
-  // comment never reaches the client). The executor renders {"type":"ping"} into the inbound schema's
-  // keepalive frame, resetting the client's idle watchdog during long/quiet turns.
-  const keepalive = setInterval(() => { try { res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`); } catch {} }, SSE_KEEPALIVE_MS);
-  if (keepalive.unref) keepalive.unref();
+  // ADD-98/ADD-101: declare the turn-latch + close handler BEFORE the first res.write and before assigning
+  // session.activeRes, then register res.on('close') first and wrap the whole body (from the activeRes
+  // assignment onward) in try/finally. A throw on the INITIAL write (a socket already destroyed before/at the
+  // first write) must not strand session.activeRes set or leak the keepalive — the finally always clears them.
   let settled = false;
   let resolveTurn;
   const turnSettled = new Promise((resolve) => { resolveTurn = resolve; });
   const settleOnce = () => { if (!settled) { settled = true; resolveTurn(); } };
-  session.settleTurn = settleOnce;
   // If the client/proxy disconnects MID-turn, settle this turn (so the finally runs and keepalive clears)
   // and cancel the live run. cancel() fires notifyLogicalDone(), advancing the FIFO to the next waiter. A
   // close that arrives AFTER the turn already settled is a normal end-of-turn socket close and must NOT
@@ -1776,7 +2068,25 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
     void session.cancel();
     if (!session.hasQueuedWaiters()) sessions.delete(session.id);
   };
-  res.on("close", onClose);
+  let keepalive = null;
+  try {
+    session.activeRes = res; session.touch(); session.turnToken++;
+    session.writeFailed = false; // ADD-100: a fresh turn starts with a healthy write path
+    // H08: keep the dispatch seam's native-tool gating current for THIS turn even on a continuation that does
+    // not call driveUserSend (the model may emit new native tool calls while resuming). driveUserSend sets it
+    // again on a send; this top-level set covers the resume-only path too.
+    session.toolChoice = (constraints && constraints.toolChoice) || "";
+    session.settleTurn = settleOnce;
+    // ADD-98: register the disconnect handler BEFORE the first write so a close during/just-before the initial
+    // write is observed and the finally still clears activeRes.
+    res.on("close", onClose);
+    res.write(`data: ${JSON.stringify({ type: "session", sessionId: session.id })}\n\n`);
+
+    // Typed keepalive (NOT a ": keepalive" comment — the Go executor forwards only "data: " lines, so a
+    // comment never reaches the client). The executor renders {"type":"ping"} into the inbound schema's
+    // keepalive frame, resetting the client's idle watchdog during long/quiet turns.
+    keepalive = setInterval(() => { try { res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`); } catch {} }, SSE_KEEPALIVE_MS);
+    if (keepalive.unref) keepalive.unref();
 
   // driveUserSend performs a model-visible user send on the EXISTING no-timeout agent: it seeds (prepends
   // system + prior history on the FIRST send for the session), applies the enforced constraint instructions,
@@ -1878,14 +2188,18 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
   // cancelStaleRun cancels a superseded run WITHOUT settling THIS turn. cancel() calls settle(), which fires
   // session.settleTurn; that handle points to this turn's settleOnce, so a naive cancel here would settle the
   // very turn we are mid-driving (driveUserSend would early-return on `settled`). Detach + restore the handle.
+  // ADD-90: pass {notify:false} so cancel() does NOT release a queued new-user waiter here — that waiter must
+  // not be promoted until driveUserSend has installed the replacement session.run (whose wait()->onRunComplete/
+  // onRunError fires notifyLogicalDone on real completion). Otherwise the queued turn could start a SECOND
+  // concurrent send on the same durable agent in the window between cancel and the replacement send. If the
+  // replacement send fails, the runTurn catch path fires notifyLogicalDone as a safety net so the FIFO advances.
   const cancelStaleRun = async () => {
     session.settleTurn = null;
-    await session.cancel();
+    await session.cancel({ notify: false });
     session.settleTurn = settleOnce;
     session.done = false; // cancel() set done=true; clear it so a subsequent driveUserSend wires completion
   };
 
-  try {
     dbg("runTurn START", "session=" + session.id, "inputType=" + input.type, "turnToken=" + session.turnToken);
     // ADD-62: a model change on an ESTABLISHED session. The durable agent was created/resumed under the OLD
     // model; ensureAgent below would resumeAgent it and silently answer from the wrong model. Rotate the
@@ -1956,13 +2270,6 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
         session.reseeding = false;
       }
     } else if (input.type === "tool_results") {
-      // C-TOOLRESULT-MATCH: match the batch with the ONE shared strict matcher (resolve-by-id -> benign-ack if
-      // ever-emitted -> else unknown). C03: the old inline `pending.size===1` fallback is GONE (it lived here);
-      // matchToolResults keeps only an explicit `tr.idless`-marked lone-pending escape. Comment 2 idempotency
-      // (re-sent already-resolved ids are benign, not fatal) is preserved by the everEmitted/delivered checks.
-      const { matched, unknown } = session.matchToolResults(input.results);
-      dbg("runTurn tool_results", "session=" + session.id, "matched=" + matched, "of=" + ((input.results || []).length),
-        "pending=" + session.pending.size, "undelivered=" + session.undelivered.length, "unknown=" + safeJson(unknown));
       // C1/BR5: a real trailing user message in this mixed turn (set by the executor only for a genuine user
       // message, never a pure system-reminder). If present AND nothing is left to resume (no pending after
       // resolve, or nothing matched at all), drive a fresh user send so the user's message is answered —
@@ -1972,20 +2279,69 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
       const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || collectToolResultImages(input).length > 0;
       const hasUserPayload = hasUserText || hasUserImages;
+      // ADD-89 (bridge half): pre-scan — BEFORE matchToolResults mutates `pending` — whether any result that
+      // WILL resolve a pending carries isError. A reply built on a FAILED tool must not silently resume the
+      // live run (the user's trailing text would be answered as if the tool succeeded). When there is trailing
+      // user payload AND an answered result failed, we FORCE the C1 fresh-send path even if the run would
+      // otherwise resume, so the failure reaches the model AS failure and the user text is a real user turn.
+      const answeredError = (input.results || []).some((tr) =>
+        tr && tr.isError === true && (session.pending.has(tr.toolCallId) || (tr.idless === true && session.pending.size === 1)));
+      const forceFreshOnError = hasUserPayload && answeredError; // ADD-89
+      // The run will resume and stream the model's answer ONLY when this continuation answers the LAST pending
+      // tool(s) and a run is still live. Pre-compute that here (still BEFORE matching) so ADD-77/ADD-83 can
+      // inject a changed-system / per-turn-constraint preamble into the LAST tool result content BEFORE it is
+      // resolved into the resuming run. `willResolveAllPending` = every currently-pending id is answered by this
+      // batch. Matched/idless results that hit a pending count toward clearing it.
+      let answeredPendingCount = 0;
+      for (const tr of input.results || []) {
+        if (tr && session.pending.has(tr.toolCallId)) answeredPendingCount++;
+        else if (tr && tr.idless === true && session.pending.size === 1) answeredPendingCount++;
+      }
+      const willResolveAllPending = session.pending.size > 0 && answeredPendingCount >= session.pending.size;
+      const willResume = willResolveAllPending && session.run !== null && !forceFreshOnError;
+      // ADD-77 + ADD-83 (bridge half): when this continuation will RESUME the live run, the resumed run answers
+      // under the system + constraints the run was STARTED with — but the client may have changed its system
+      // prompt (e.g. ExitPlanMode) or per-turn constraints (response_format/stop/max_tokens/tool_choice) on THIS
+      // request. The SDK cannot mutate a paused run's instructions, so inject a synthetic, model-visible preamble
+      // into the LAST tool result content (the last thing the model reads before replying) and update
+      // seededSystem so a later send does not re-apply it. Stable marker strings (tested). We do NOT inject on
+      // the forced-fresh-on-error path (driveUserSend applies system+constraints there) to avoid double-applying.
+      if (willResume && Array.isArray(input.results) && input.results.length) {
+        const preamble = [];
+        if (input.system && input.system !== session.seededSystem) {
+          preamble.push("[Updated system instructions:]\n" + input.system);
+          session.seededSystem = input.system; // remember so a later send does not re-apply the same swap
+        }
+        const ci = constraintInstructions({ ...constraints });
+        if (ci) preamble.push("[Constraints for your reply:]\n" + ci);
+        if (preamble.length) {
+          const last = input.results[input.results.length - 1];
+          const prev = typeof last.content === "string" ? last.content : (last.content == null ? "" : safeJson(last.content));
+          last.content = preamble.join("\n\n") + (prev ? "\n\n" + prev : "");
+          dbg("runTurn tool_results resume -> inject system/constraints preamble (ADD-77/ADD-83)", "session=" + session.id, "systemSwap=" + (input.system && input.system !== undefined), "constraints=" + (ci ? 1 : 0));
+        }
+      }
+      // C-TOOLRESULT-MATCH: match the batch with the ONE shared strict matcher (resolve-by-id -> benign-ack if
+      // ever-emitted -> else unknown). C03: the old inline `pending.size===1` fallback is GONE (it lived here);
+      // matchToolResults keeps only an explicit `tr.idless`-marked lone-pending escape. Comment 2 idempotency
+      // (re-sent already-resolved ids are benign, not fatal) is preserved by the everEmitted/delivered checks.
+      const { matched, unknown } = session.matchToolResults(input.results);
+      dbg("runTurn tool_results", "session=" + session.id, "matched=" + matched, "of=" + ((input.results || []).length),
+        "pending=" + session.pending.size, "undelivered=" + session.undelivered.length, "unknown=" + safeJson(unknown), "forceFreshOnError=" + forceFreshOnError);
       // The run will resume and stream the model's answer ONLY when this continuation answered tool(s) and
-      // nothing is left pending and the run is still live. In THAT case the trailing user message rode along
-      // folded into the last tool result (executor C1 belt-and-suspenders), so a separate fresh send would be
-      // redundant AND would cancel the resuming run — so we must NOT drive C1 there.
-      const runWillResume = matched > 0 && session.pending.size === 0 && session.run !== null;
+      // nothing is left pending and the run is still live AND we are not forcing a fresh send on a failed tool.
+      // In THAT case the trailing user message rode along folded into the last tool result (executor C1
+      // belt-and-suspenders), so a separate fresh send would be redundant AND would cancel the resuming run.
+      const runWillResume = matched > 0 && session.pending.size === 0 && session.run !== null && !forceFreshOnError;
       const noneToResume = matched === 0 || session.pending.size === 0;
       // DECISION ORDER (C-TOOLRESULT-MATCH; H06 puts unknown BEFORE the partial-pending clean ack):
-      //   1. C1 fresh-send (user payload + nothing will resume)
+      //   1. C1 fresh-send (user payload + nothing will resume, OR ADD-89 forced fresh on a failed tool)
       //   2. unknown.length>0 -> ERROR turn (a foreign id must never hide behind a partial clean ack)
       //   3. flushUndelivered (late tools delivered this turn)
       //   4. pending.size>0 -> benign empty end_turn (true incremental answer; run stays paused)
       //   5. matched===0 && a paused run DIED upstream -> ERROR turn (BR2; never fake success)
       //   6. else -> benign end_turn (idempotent stale/duplicate ack)
-      if (hasUserPayload && noneToResume && !runWillResume) {
+      if (hasUserPayload && (noneToResume || forceFreshOnError) && !runWillResume) {
         // The user's trailing message/image would otherwise produce an empty end_turn (no output is coming).
         // Answer it with a fresh send. If a run is still live (e.g. matched===0 but unrelated tools are
         // pending), the user is redirecting — cancel the stale run first so we don't spawn a concurrent /
@@ -2047,6 +2403,15 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
   } catch (e) {
     dbg("runTurn CATCH exception", "session=" + session.id, (e && e.stack) || (e && e.message) || String(e));
     if (!settled) session.sse({ type: "turn_end", stop_reason: "error", error: (e && e.message) || String(e) });
+    // ADD-101: ALWAYS settle the turn on an error so the per-turn latch (turnSettled) resolves — otherwise a
+    // throw before any settle() call leaves the latch unresolved (queue/lifecycle stalls). settle() is idempotent.
+    session.settle();
+    // ADD-90 safety net (guarded): if this throw aborted a C1/reseed replacement send AFTER cancelStaleRun
+    // (which used notify:false) and NO run was installed, nothing will fire onRunComplete to release a queued
+    // waiter -> release it here so the FIFO does not hang. But ONLY when no run is live: if a run WAS installed,
+    // its wait()->onRunComplete/onRunError will notify on REAL completion, and releasing a waiter early here
+    // would re-introduce the very ADD-90 race (the queued turn starting concurrently with the live run).
+    if (session.run === null) session.notifyLogicalDone();
     // ADD-61: an EMPTY newly-created session whose first turn failed before any AGENT was even established
     // (getPlatform/ensureAgent threw — a transient platform-init failure, or the ADD-53 key-collision reject)
     // must NOT linger in the sessions map. While present it pins its platform (platformHasSession) and blocks
@@ -2060,9 +2425,14 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       void session.cancel();
     }
   } finally {
-    clearInterval(keepalive);
+    if (keepalive) clearInterval(keepalive);
     res.off("close", onClose);
     if (session.activeRes === res) session.activeRes = null;
+    // ADD-100: stop buffering output + detach the 'drain' listener for THIS response (the turn is over).
+    session.detachDrain(); session.outQueue = []; session.outQueueBytes = 0;
+    // ADD-101: clear the per-turn latch handle when it still points at THIS turn's settleOnce, so a LATER
+    // cancellation (e.g. from a queued turn) never fires a stale settleTurn belonging to an already-finished turn.
+    if (session.settleTurn === settleOnce) session.settleTurn = null;
     try { res.write("data: [DONE]\n\n"); res.end(); } catch {}
   }
 }
@@ -2312,6 +2682,11 @@ if (RUN_AS_MAIN) {
   // Single-tenant needs CURSOR_API_KEY; multi-tenant needs CURSOR_AGENT_BRIDGE_TOKEN (per-user keys arrive
   // on each request). Require at least one so the bridge always has a way to obtain a Cursor credential.
   if (!API_KEY && !BRIDGE_TOKEN) { console.error("[bridge] set CURSOR_API_KEY (single-tenant) or CURSOR_AGENT_BRIDGE_TOKEN (multi-tenant) — refusing to start"); process.exit(1); }
+  // ADD-105: validate the bind host BEFORE doing any work. A non-loopback bind without multi-tenant auth is
+  // refused (fail-closed) unless explicitly overridden; a non-loopback bind always warns about plaintext exposure.
+  const bindCheck = validateBindHost(BRIDGE_HOST, MULTI_TENANT, ALLOW_INSECURE_BIND);
+  if (!bindCheck.ok) { console.error("[bridge]", bindCheck.error); process.exit(1); }
+  if (bindCheck.warn) console.warn("[bridge]", bindCheck.warn);
   // mkdir the store + empty cwd so the SDK's executor-init / git-root probe doesn't ENOENT, and
   // refuse to start if STATE_ROOT is not writable (the SDK persists session/checkpoint state there).
   try { mkdirSync(EMPTY_CWD, { recursive: true }); accessSync(STATE_ROOT, constants.W_OK); }
@@ -2331,9 +2706,9 @@ if (RUN_AS_MAIN) {
   selfTestNativeUnreachable()
     .then(() => selfTestBundleSeam())
     .then(() => selfTestResultSerialization()) // ADD-74: prove the RETURN trip (result __ccJson -> protobuf via fromJson)
-    .then(() => server.listen(PORT, "127.0.0.1", () => console.log(`[cursor-agent-bridge] listening on http://127.0.0.1:${PORT} (patched CJS, fail-closed, native-unreachable + bundle-seam + result-serialization self-tests passed, durable stateRoot=${STATE_ROOT})`)))
+    .then(() => server.listen(PORT, BRIDGE_HOST, () => console.log(`[cursor-agent-bridge] listening on http://${BRIDGE_HOST}:${PORT} (patched CJS, fail-closed, native-unreachable + bundle-seam + result-serialization self-tests passed, durable stateRoot=${STATE_ROOT})`)))
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, headlessRequestContext, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, blockedNativeResult, typedUnavailableResult, TYPED_UNAVAILABLE_U, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS };
+export { CC_CASES, headlessRequestContext, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, blockedNativeResult, typedUnavailableResult, TYPED_UNAVAILABLE_U, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

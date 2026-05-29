@@ -47,24 +47,24 @@ func TestDeriveComposerSessionID(t *testing.T) {
 		return optsWithHeaders(map[string]string{"X-Conversation-Id": conv})
 	}
 	// A stable conversation id routes an agentic turn deterministically and is independent of message text.
-	a, err := deriveComposerSessionID(authWith("authA", "keyA"), toolTurn("hello"), convoOpts("conv-1"))
+	a, err := deriveComposerSessionID(authWith("authA", "keyA"), "cursorkey", toolTurn("hello"), convoOpts("conv-1"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !strings.HasPrefix(a, "sess_") {
 		t.Fatalf("session id should be prefixed sess_, got %s", a)
 	}
-	a2, _ := deriveComposerSessionID(authWith("authA", "keyA"), toolTurn("different text"), convoOpts("conv-1"))
+	a2, _ := deriveComposerSessionID(authWith("authA", "keyA"), "cursorkey", toolTurn("different text"), convoOpts("conv-1"))
 	if a != a2 {
 		t.Fatalf("same conversation id must be stable regardless of content: %s vs %s", a, a2)
 	}
 	// Different tenant, same conversation id => different id (no cross-tenant collision).
-	b, _ := deriveComposerSessionID(authWith("authB", "keyB"), toolTurn("hello"), convoOpts("conv-1"))
+	b, _ := deriveComposerSessionID(authWith("authB", "keyB"), "cursorkey", toolTurn("hello"), convoOpts("conv-1"))
 	if a == b {
 		t.Fatalf("different tenants must not share a session id")
 	}
 	// Different conversation id => different id.
-	c, _ := deriveComposerSessionID(authWith("authA", "keyA"), toolTurn("hello"), convoOpts("conv-2"))
+	c, _ := deriveComposerSessionID(authWith("authA", "keyA"), "cursorkey", toolTurn("hello"), convoOpts("conv-2"))
 	if a == c {
 		t.Fatalf("different conversation ids must differ")
 	}
@@ -87,9 +87,9 @@ func TestDeriveComposerSessionID_UtilityOneShotIsolated(t *testing.T) {
 
 	// Utility one-shots on the SAME conversation id must NOT share a session (no per-session 409 race),
 	// whether or not they carry history.
-	o1, _ := deriveComposerSessionID(auth, title, conv)
-	o2, _ := deriveComposerSessionID(auth, title, conv)
-	o3, _ := deriveComposerSessionID(auth, summary, conv)
+	o1, _ := deriveComposerSessionID(auth, "cursorkey", title, conv)
+	o2, _ := deriveComposerSessionID(auth, "cursorkey", title, conv)
+	o3, _ := deriveComposerSessionID(auth, "cursorkey", summary, conv)
 	if o1 == "" || o2 == "" || o3 == "" {
 		t.Fatalf("utility one-shot must still route to a session (o1=%q o2=%q o3=%q)", o1, o2, o3)
 	}
@@ -99,8 +99,8 @@ func TestDeriveComposerSessionID_UtilityOneShotIsolated(t *testing.T) {
 
 	// The real agentic turn (advertises tools) on that SAME conversation id keeps the stable session, and
 	// it must not collide with the isolated one-shots.
-	r1, _ := deriveComposerSessionID(auth, toolTurn("describe this repo"), conv)
-	r2, _ := deriveComposerSessionID(auth, toolTurn("describe this repo"), conv)
+	r1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("describe this repo"), conv)
+	r2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("describe this repo"), conv)
 	if r1 != r2 {
 		t.Fatalf("agentic turns on the same conv must share the stable session: %s vs %s", r1, r2)
 	}
@@ -111,7 +111,7 @@ func TestDeriveComposerSessionID_UtilityOneShotIsolated(t *testing.T) {
 	// A continuation (last message is a tool result) is NOT a one-shot even with no tools advertised:
 	// it must still route to the conversation's stable session (here via the stable conversation id).
 	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_1"}]},{"role":"tool","tool_call_id":"tc_1","content":"R"}]}`)
-	c1, err := deriveComposerSessionID(auth, cont, conv)
+	c1, err := deriveComposerSessionID(auth, "cursorkey", cont, conv)
 	if err != nil {
 		t.Fatalf("continuation must route, not error: %v", err)
 	}
@@ -126,26 +126,26 @@ func TestDeriveComposerSessionID_UtilityOneShotIsolated(t *testing.T) {
 // routes deterministically and is content-independent.
 func TestDeriveComposerSessionID_StatelessMint(t *testing.T) {
 	auth := authWith("authA", "keyA")
-	a, err := deriveComposerSessionID(auth, []byte(`{"messages":[{"role":"user","content":"hello"}]}`), cliproxyexecutor.Options{})
+	a, err := deriveComposerSessionID(auth, "cursorkey", []byte(`{"messages":[{"role":"user","content":"hello"}]}`), cliproxyexecutor.Options{})
 	if err != nil || !strings.HasPrefix(a, "sess_") {
 		t.Fatalf("stateless new turn must mint a session, not error (id=%q err=%v)", a, err)
 	}
 	// Two distinct stateless conversations must NOT collide (fresh random per new turn).
-	b, _ := deriveComposerSessionID(auth, []byte(`{"messages":[{"role":"user","content":"hello"}]}`), cliproxyexecutor.Options{})
+	b, _ := deriveComposerSessionID(auth, "cursorkey", []byte(`{"messages":[{"role":"user","content":"hello"}]}`), cliproxyexecutor.Options{})
 	if a == b {
 		t.Fatalf("distinct stateless new turns must get distinct minted ids")
 	}
 	// metadata.user_id (Claude session) routes an agentic turn deterministically and is content-independent.
 	o := cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_x_account__session_uuid-1"}}`)}
-	s1, err := deriveComposerSessionID(auth, toolTurn("hi"), o)
+	s1, err := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), o)
 	if err != nil || s1 == "" {
 		t.Fatalf("metadata.user_id should route: %v", err)
 	}
-	s1b, _ := deriveComposerSessionID(auth, toolTurn("different"), o)
+	s1b, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("different"), o)
 	if s1 != s1b {
 		t.Fatalf("same Claude session uuid must be stable regardless of content")
 	}
-	s2, _ := deriveComposerSessionID(auth, toolTurn("hi"), cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_x_account__session_uuid-2"}}`)})
+	s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_x_account__session_uuid-2"}}`)})
 	if s1 == s2 {
 		t.Fatalf("different Claude session uuids must differ")
 	}
@@ -156,13 +156,13 @@ func TestDeriveComposerSessionID_StatelessMint(t *testing.T) {
 // minting a fresh session (the continuation carries history+system, so the bridge re-seeds).
 func TestDeriveComposerSessionID_ToolCallContinuation(t *testing.T) {
 	auth := authWith("authA", "keyA")
-	sid, err := deriveComposerSessionID(auth, toolTurn("start"), optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-x"}))
+	sid, err := deriveComposerSessionID(auth, "cursorkey", toolTurn("start"), optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-x"}))
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
 	recordComposerToolCall(composerTenant(auth, cliproxyexecutor.Options{}), "tc_42", sid)
 	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_42"}]},{"role":"tool","tool_call_id":"tc_42","content":"R"}]}`)
-	got, err := deriveComposerSessionID(auth, cont, cliproxyexecutor.Options{})
+	got, err := deriveComposerSessionID(auth, "cursorkey", cont, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("continuation should route by tool_call_id: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestDeriveComposerSessionID_ToolCallContinuation(t *testing.T) {
 	}
 	// EX6: an unknown tool_call_id with no stable id MINTS a fresh session (degrade-gracefully, never 500).
 	unknown := []byte(`{"messages":[{"role":"tool","tool_call_id":"tc_unknown","content":"R"}]}`)
-	gotU, errU := deriveComposerSessionID(auth, unknown, cliproxyexecutor.Options{})
+	gotU, errU := deriveComposerSessionID(auth, "cursorkey", unknown, cliproxyexecutor.Options{})
 	if errU != nil {
 		t.Fatalf("unknown tool_call_id with no stable id must NOT error (EX6 degrade-gracefully): %v", errU)
 	}
@@ -180,7 +180,7 @@ func TestDeriveComposerSessionID_ToolCallContinuation(t *testing.T) {
 	}
 	// L1: the SAME tool_call_id under a DIFFERENT tenant must NOT resolve to the first tenant's session. With
 	// EX6 it no longer errors; it mints a fresh session DISTINCT from the first tenant's emitting session.
-	gotB, errB := deriveComposerSessionID(authWith("authB", "keyB"), cont, cliproxyexecutor.Options{})
+	gotB, errB := deriveComposerSessionID(authWith("authB", "keyB"), "cursorkey", cont, cliproxyexecutor.Options{})
 	if errB != nil {
 		t.Fatalf("cross-tenant continuation must not error (EX6): %v", errB)
 	}
@@ -193,8 +193,8 @@ func TestDeriveComposerSessionID_ToolCallContinuation(t *testing.T) {
 // who share one upstream Cursor key).
 func TestDeriveComposerSessionID_CallerIsolation(t *testing.T) {
 	auth := authWith("authA", "keyA")
-	u1, _ := deriveComposerSessionID(auth, toolTurn("x"), optsWithHeaders(map[string]string{"X-Conversation-Id": "shared", "Authorization": "Bearer userone"}))
-	u2, _ := deriveComposerSessionID(auth, toolTurn("x"), optsWithHeaders(map[string]string{"X-Conversation-Id": "shared", "Authorization": "Bearer usertwo"}))
+	u1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), optsWithHeaders(map[string]string{"X-Conversation-Id": "shared", "Authorization": "Bearer userone"}))
+	u2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), optsWithHeaders(map[string]string{"X-Conversation-Id": "shared", "Authorization": "Bearer usertwo"}))
 	if u1 == u2 {
 		t.Fatalf("distinct callers must get distinct sessions: %s == %s", u1, u2)
 	}
@@ -713,7 +713,11 @@ func TestExecuteComposerNonStream(t *testing.T) {
 		}
 		if gjson.GetBytes(body, "input.text").String() == "BADUSAGE" {
 			write(`{"type":"text","delta":"partial output"}`)
-			write(`{"type":"turn_end","stop_reason":"stop","usage":{"prompt_tokens":11`) // truncated usage VALUE
+			// M1: a VALID-JSON terminal frame whose usage VALUE is malformed (a string, not a token object).
+			// The frame is valid JSON (so the ADD-96 protocol gate accepts it as a real terminal), but
+			// ParseOpenAIStreamUsage rejects the usage node — so usage is dropped while the text survives.
+			// (A truncated/invalid-JSON FRAME is now a protocol violation by ADD-96/RBT-013, covered separately.)
+			write(`{"type":"turn_end","stop_reason":"stop","usage":"oops-not-an-object"}`)
 			write("[DONE]")
 			return
 		}
@@ -899,12 +903,12 @@ func TestComposerToolResultsExtractionCount(t *testing.T) {
 func TestDeriveComposerSessionID_ContinuationOwnershipWins(t *testing.T) {
 	auth := authWith("authA", "keyA")
 	convA := optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-A"})
-	sessionA, _ := deriveComposerSessionID(auth, toolTurn("x"), convA)
+	sessionA, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), convA)
 	sessionB := "sess_ownerB000000000000000000000000"
 	recordComposerToolCall(composerTenant(auth, convA), "tc_owned_by_B", sessionB)
 	// A continuation carrying conv-A metadata (which derives sessionA) but answering a tool emitted by B.
 	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_owned_by_B"}]},{"role":"tool","tool_call_id":"tc_owned_by_B","content":"R"}]}`)
-	got, err := deriveComposerSessionID(auth, cont, convA)
+	got, err := deriveComposerSessionID(auth, "cursorkey", cont, convA)
 	if err != nil {
 		t.Fatalf("ownership continuation must route, not error: %v", err)
 	}
@@ -915,7 +919,7 @@ func TestDeriveComposerSessionID_ContinuationOwnershipWins(t *testing.T) {
 	// latest-writer-wins. Because this continuation carries the conv-A stable id, the ambiguity is
 	// disambiguated by routing to the conv-A stable session (which is sessionA), never by guessing.
 	recordComposerToolCall(composerTenant(auth, convA), "tc_owned_by_B", sessionA)
-	if got2, _ := deriveComposerSessionID(auth, cont, convA); got2 != sessionA {
+	if got2, _ := deriveComposerSessionID(auth, "cursorkey", cont, convA); got2 != sessionA {
 		t.Fatalf("ambiguous re-emitted id with a stable conv id must route to the conv-A session A (%s), got %s", sessionA, got2)
 	}
 }
@@ -934,8 +938,8 @@ func TestCallerCredentialForms(t *testing.T) {
 	}
 	// Distinct X-Goog-Api-Key callers sharing one Cursor key + conversation id get distinct sessions.
 	auth := authWith("authA", "keyA")
-	g1, _ := deriveComposerSessionID(auth, toolTurn("x"), optsWithHeaders(map[string]string{"X-Conversation-Id": "shared", "X-Goog-Api-Key": "user-one"}))
-	g2, _ := deriveComposerSessionID(auth, toolTurn("x"), optsWithHeaders(map[string]string{"X-Conversation-Id": "shared", "X-Goog-Api-Key": "user-two"}))
+	g1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), optsWithHeaders(map[string]string{"X-Conversation-Id": "shared", "X-Goog-Api-Key": "user-one"}))
+	g2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), optsWithHeaders(map[string]string{"X-Conversation-Id": "shared", "X-Goog-Api-Key": "user-two"}))
 	if g1 == g2 {
 		t.Fatalf("distinct X-Goog-Api-Key callers must get distinct sessions: %s == %s", g1, g2)
 	}
@@ -1143,11 +1147,11 @@ func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
 	headerCases := []string{"Session_id", "Conversation_id", "X-Amp-Thread-Id"}
 	for _, h := range headerCases {
 		o1 := optsWithHeaders(map[string]string{h: "cid-" + h})
-		s1, err := deriveComposerSessionID(auth, toolTurn("hello"), o1)
+		s1, err := deriveComposerSessionID(auth, "cursorkey", toolTurn("hello"), o1)
 		if err != nil || !strings.HasPrefix(s1, "sess_") {
 			t.Fatalf("header %s should route (id=%q err=%v)", h, s1, err)
 		}
-		s2, _ := deriveComposerSessionID(auth, toolTurn("different content"), o1)
+		s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("different content"), o1)
 		if s1 != s2 {
 			t.Fatalf("header %s: same conv id must be stable across content (%s vs %s)", h, s1, s2)
 		}
@@ -1163,19 +1167,20 @@ func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
 	if got := stableConversationID(cliproxyexecutor.Options{Metadata: map[string]any{"requestId": "req-xyz"}}); got != "" {
 		t.Fatalf("ADD-48: metadata requestId must not be a stable conv id, got %q", got)
 	}
-	// H16: previous_response_id is INTENTIONALLY NOT in this stable set anymore — it changes every turn, so it
-	// is no longer hashed as a stable conv id; it routes via the response-id->sessionID map instead (covered by
-	// TestDeriveComposerSessionID_PreviousResponseIDResumes). conversation_id / prompt_cache_key stay stable.
-	bodyCases := []string{"conversation_id", "prompt_cache_key"}
+	// H16: previous_response_id is INTENTIONALLY NOT in this stable set — it changes every turn, so it is no
+	// longer hashed as a stable conv id; it routes via the response-id->sessionID map instead (covered by
+	// TestDeriveComposerSessionID_PreviousResponseIDResumes). ADD-78: prompt_cache_key is ALSO no longer in the
+	// stable set (it is a cache-locality hint, not a conversation identity). Only conversation_id stays stable.
+	bodyCases := []string{"conversation_id"}
 	for _, k := range bodyCases {
 		payload := []byte(`{"` + k + `":"body-` + k + `"}`)
 		o := cliproxyexecutor.Options{OriginalRequest: payload}
-		s1, err := deriveComposerSessionID(auth, toolTurn("hi"), o)
+		s1, err := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), o)
 		if err != nil || !strings.HasPrefix(s1, "sess_") {
 			t.Fatalf("body %s should route (id=%q err=%v)", k, s1, err)
 		}
 		// Same body id, different inbound message content => stable session.
-		s2, _ := deriveComposerSessionID(auth, toolTurn("totally other"), o)
+		s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("totally other"), o)
 		if s1 != s2 {
 			t.Fatalf("body %s: same conv id must be stable across content (%s vs %s)", k, s1, s2)
 		}
@@ -1183,14 +1188,14 @@ func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
 	// H16: a bare previous_response_id with NO recorded mapping must NOT be a stable conv-id hash — it mints a
 	// fresh session (graceful fallback). Two such calls therefore differ (proving it left stableConversationID).
 	prevOpts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"unmapped-prev"}`)}
-	p1, _ := deriveComposerSessionID(auth, toolTurn("hi"), prevOpts)
-	p2, _ := deriveComposerSessionID(auth, toolTurn("hi"), prevOpts)
+	p1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), prevOpts)
+	p2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), prevOpts)
 	if p1 == p2 {
 		t.Fatalf("H16: an unmapped previous_response_id must NOT be hashed as a stable conv id (must mint fresh): %s == %s", p1, p2)
 	}
 	// Distinct conv ids (here via Session_id) must differ.
-	a, _ := deriveComposerSessionID(auth, toolTurn("x"), optsWithHeaders(map[string]string{"Session_id": "A"}))
-	b, _ := deriveComposerSessionID(auth, toolTurn("x"), optsWithHeaders(map[string]string{"Session_id": "B"}))
+	a, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), optsWithHeaders(map[string]string{"Session_id": "A"}))
+	b, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), optsWithHeaders(map[string]string{"Session_id": "B"}))
 	if a == b {
 		t.Fatalf("distinct Session_id values must differ: %s == %s", a, b)
 	}
@@ -1207,7 +1212,7 @@ func TestDeriveComposerSessionID_ContinuationMintsOnMiss(t *testing.T) {
 		{"role":"assistant","tool_calls":[{"id":"tc_orphan"}]},
 		{"role":"tool","tool_call_id":"tc_orphan","content":"R"}
 	]}`)
-	got, err := deriveComposerSessionID(auth, cont, cliproxyexecutor.Options{})
+	got, err := deriveComposerSessionID(auth, "cursorkey", cont, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("orphan continuation must mint, not error (EX6): %v", err)
 	}
@@ -1446,7 +1451,7 @@ func TestDeriveComposerSessionID_PreviousResponseIDResumes(t *testing.T) {
 	recordComposerResponseSession(tenant, "chatcmpl-composer-resp1", prior)
 	// A text-only follow-up (no tools) carrying previous_response_id must resume `prior`.
 	followup := cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"chatcmpl-composer-resp1","input":"thanks"}`)}
-	got, err := deriveComposerSessionID(auth, []byte(`{"messages":[{"role":"user","content":"thanks"}]}`), followup)
+	got, err := deriveComposerSessionID(auth, "cursorkey", []byte(`{"messages":[{"role":"user","content":"thanks"}]}`), followup)
 	if err != nil {
 		t.Fatalf("H16: follow-up must not error: %v", err)
 	}
@@ -1455,7 +1460,7 @@ func TestDeriveComposerSessionID_PreviousResponseIDResumes(t *testing.T) {
 	}
 	// Unknown previous_response_id (bridge restart / eviction) must degrade gracefully (mint), not error.
 	miss := cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"chatcmpl-composer-UNKNOWN","input":"hi"}`)}
-	gotMiss, errMiss := deriveComposerSessionID(auth, []byte(`{"messages":[{"role":"user","content":"hi"}]}`), miss)
+	gotMiss, errMiss := deriveComposerSessionID(auth, "cursorkey", []byte(`{"messages":[{"role":"user","content":"hi"}]}`), miss)
 	if errMiss != nil || !strings.HasPrefix(gotMiss, "sess_") {
 		t.Fatalf("H16: unknown previous_response_id must mint gracefully (id=%q err=%v)", gotMiss, errMiss)
 	}
@@ -1492,9 +1497,9 @@ func TestDeriveComposerSessionID_ToollessBodyConvFollowup(t *testing.T) {
 	auth := authWith("authA", "keyA")
 	agentic := []byte(`{"conversation_id":"conv-l35-body","tools":[{"type":"function","function":{"name":"Read"}}],"messages":[{"role":"user","content":"describe the repo"}]}`)
 	bodyOpts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation_id":"conv-l35-body"}`)}
-	stable, _ := deriveComposerSessionID(auth, agentic, bodyOpts)
+	stable, _ := deriveComposerSessionID(auth, "cursorkey", agentic, bodyOpts)
 	toolless := []byte(`{"conversation_id":"conv-l35-body","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"summarize"}]}`)
-	got, err := deriveComposerSessionID(auth, toolless, bodyOpts)
+	got, err := deriveComposerSessionID(auth, "cursorkey", toolless, bodyOpts)
 	if err != nil {
 		t.Fatalf("L35 follow-up must not error: %v", err)
 	}
@@ -1515,7 +1520,7 @@ func TestDeriveComposerSessionID_MixedSessionBatchErrors(t *testing.T) {
 		{"role":"tool","tool_call_id":"tc_sessA","content":"RA"},
 		{"role":"tool","tool_call_id":"tc_sessB","content":"RB"}
 	]}`)
-	_, err := deriveComposerSessionID(auth, mixed, cliproxyexecutor.Options{})
+	_, err := deriveComposerSessionID(auth, "cursorkey", mixed, cliproxyexecutor.Options{})
 	if err == nil {
 		t.Fatalf("M32: a mixed-session batch must error, not route partially")
 	}
@@ -1530,7 +1535,7 @@ func TestDeriveComposerSessionID_MixedSessionBatchErrors(t *testing.T) {
 		{"role":"tool","tool_call_id":"tc_same1","content":"R1"},
 		{"role":"tool","tool_call_id":"tc_same2","content":"R2"}
 	]}`)
-	got, errSame := deriveComposerSessionID(auth, same, cliproxyexecutor.Options{})
+	got, errSame := deriveComposerSessionID(auth, "cursorkey", same, cliproxyexecutor.Options{})
 	if errSame != nil {
 		t.Fatalf("M32: a same-session batch must route, not error: %v", errSame)
 	}
@@ -1973,12 +1978,12 @@ func TestADD67_ReasoningNotReplayedByDefault(t *testing.T) {
 func TestADD56_DegenerateImageOnlyTurn(t *testing.T) {
 	// image-only + all-invalid => rejected.
 	imgOnly := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,"}}]}]}`), "messages").Array()
-	if !lastUserTurnImageOnlyInvalid(imgOnly) {
+	if !lastUserTurnImageOnlyInvalid(imgOnly, composerContinuationHint{}) {
 		t.Fatalf("ADD-56: an image-only turn with only a degenerate image must be flagged invalid")
 	}
 	// mixed text + invalid image => NOT rejected, placeholder added in composerInput.
 	mixed := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:,"}}]}]}`)
-	if lastUserTurnImageOnlyInvalid(gjson.GetBytes(mixed, "messages").Array()) {
+	if lastUserTurnImageOnlyInvalid(gjson.GetBytes(mixed, "messages").Array(), composerContinuationHint{}) {
 		t.Fatalf("ADD-56: a mixed text+invalid-image turn must NOT be rejected (text is present)")
 	}
 	inp := composerInput(mixed)
@@ -1988,12 +1993,12 @@ func TestADD56_DegenerateImageOnlyTurn(t *testing.T) {
 	}
 	// a valid image-only turn is fine.
 	validOnly := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QQ=="}}]}]}`), "messages").Array()
-	if lastUserTurnImageOnlyInvalid(validOnly) {
+	if lastUserTurnImageOnlyInvalid(validOnly, composerContinuationHint{}) {
 		t.Fatalf("ADD-56: a valid image-only turn must NOT be flagged invalid")
 	}
 	// a plain text-only turn is fine (no image parts).
 	textOnly := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":"hello"}]}`), "messages").Array()
-	if lastUserTurnImageOnlyInvalid(textOnly) {
+	if lastUserTurnImageOnlyInvalid(textOnly, composerContinuationHint{}) {
 		t.Fatalf("ADD-56: a text-only turn must NOT be flagged invalid")
 	}
 }
@@ -2094,7 +2099,7 @@ func TestADD65_OwnershipSignalRoutesContinuation(t *testing.T) {
 	if inp["type"] != "tool_results" {
 		t.Fatalf("ADD-65: an owned trailing tool id must make the chained shape a tool_results continuation, got %v", inp["type"])
 	}
-	got, err := deriveComposerSessionID(auth, oai, cliproxyexecutor.Options{})
+	got, err := deriveComposerSessionID(auth, "cursorkey", oai, cliproxyexecutor.Options{})
 	if err != nil {
 		t.Fatalf("ADD-65: routing must not error: %v", err)
 	}
@@ -2112,12 +2117,12 @@ func TestADD70_AmbiguousOwnershipRejectedWithoutDisambiguator(t *testing.T) {
 	recordComposerToolCall(tenant, "call_dup70", "sess_b70000000000000000000000000000")
 	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"call_dup70"}]},{"role":"tool","tool_call_id":"call_dup70","content":"R"}]}`)
 	// No stable id and no previous_response_id -> ambiguous -> typed error.
-	_, err := deriveComposerSessionID(auth, cont, cliproxyexecutor.Options{})
+	_, err := deriveComposerSessionID(auth, "cursorkey", cont, cliproxyexecutor.Options{})
 	if !errors.Is(err, errAmbiguousToolOwnership) {
 		t.Fatalf("ADD-70: an ambiguous id with no disambiguator must return errAmbiguousToolOwnership, got %v", err)
 	}
 	// With a stable conv id, it disambiguates by routing to the conv-id session (no error).
-	got, err2 := deriveComposerSessionID(auth, cont, optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-disambig70"}))
+	got, err2 := deriveComposerSessionID(auth, "cursorkey", cont, optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-disambig70"}))
 	if err2 != nil {
 		t.Fatalf("ADD-70: a stable conv id must disambiguate an ambiguous ownership, got %v", err2)
 	}
@@ -2219,8 +2224,8 @@ func TestADD62_SessionIDStableAcrossModelChange(t *testing.T) {
 	// Two turns on the same conversation with DIFFERENT models must derive the SAME external session id.
 	turnFast := []byte(`{"model":"composer-2.5-fast","tools":[{"type":"function","function":{"name":"Read"}}],"messages":[{"role":"user","content":"hi"}]}`)
 	turnStd := []byte(`{"model":"composer-2.5","tools":[{"type":"function","function":{"name":"Read"}}],"messages":[{"role":"user","content":"hi"}]}`)
-	s1, err1 := deriveComposerSessionID(auth, turnFast, conv)
-	s2, err2 := deriveComposerSessionID(auth, turnStd, conv)
+	s1, err1 := deriveComposerSessionID(auth, "cursorkey", turnFast, conv)
+	s2, err2 := deriveComposerSessionID(auth, "cursorkey", turnStd, conv)
 	if err1 != nil || err2 != nil {
 		t.Fatalf("ADD-62: routing must not error: %v / %v", err1, err2)
 	}
@@ -2257,5 +2262,298 @@ func TestADD36_PartialParallelToolResultsCarriesUserText(t *testing.T) {
 	// The trailing text is also folded into A's content so a resuming run reads it inline.
 	if c, _ := results[0]["content"].(string); !strings.Contains(c, "A done") || !strings.Contains(c, "stop and summarize") {
 		t.Fatalf("ADD-36: trailing user text must also be folded into the last result content, got %q", c)
+	}
+}
+
+// ADD-78: a request whose ONLY identity signal is prompt_cache_key must MINT a fresh session (cache key is a
+// locality hint, not a conversation identity), not hash to a stable sess_ id — otherwise independent tasks
+// sharing a coarse cache key merge onto one durable Cursor agent.
+func TestADD78_PromptCacheKeyNotStable(t *testing.T) {
+	auth := authWith("authA", "keyA")
+	o := cliproxyexecutor.Options{OriginalRequest: []byte(`{"prompt_cache_key":"repoX-cache"}`)}
+	// stableConversationID must NOT return the prompt_cache_key.
+	if id := stableConversationID(o); id != "" {
+		t.Fatalf("ADD-78: prompt_cache_key must not be a stable conversation id, got %q", id)
+	}
+	// Two turns with the SAME prompt_cache_key but no other id must get DISTINCT minted sessions (proves it is
+	// not hashed to a stable id). BRANCH=mint.
+	s1, err := deriveComposerSessionID(auth, "cursorkey", toolTurn("task one"), o)
+	if err != nil || !strings.HasPrefix(s1, "sess_") {
+		t.Fatalf("ADD-78: a prompt_cache_key-only turn must route (mint), got id=%q err=%v", s1, err)
+	}
+	s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("task two"), o)
+	if s1 == s2 {
+		t.Fatalf("ADD-78: prompt_cache_key must NOT mint a stable session (distinct tasks must not merge): %s == %s", s1, s2)
+	}
+	// A real conversation_id is still stable (regression guard for the surviving signal).
+	convOpts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation_id":"conv-real"}`)}
+	c1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("a"), convOpts)
+	c2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("b"), convOpts)
+	if c1 != c2 {
+		t.Fatalf("ADD-78: conversation_id must remain stable, got %s vs %s", c1, c2)
+	}
+}
+
+// ADD-79 (exec half): the same conversation id under a DIFFERENT upstream Cursor key must derive a DIFFERENT
+// sess_ id (a key rotation re-routes to a fresh durable agent), while the same key is stable.
+func TestADD79_KeyFingerprintFoldedIntoSession(t *testing.T) {
+	auth := authWith("authA", "keyA")
+	conv := optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-key-rot"})
+	a, err := deriveComposerSessionID(auth, "cursor-key-one", toolTurn("hi"), conv)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	// Same conv + same key => stable.
+	aAgain, _ := deriveComposerSessionID(auth, "cursor-key-one", toolTurn("different text"), conv)
+	if a != aAgain {
+		t.Fatalf("ADD-79: same conv + same key must be stable, got %s vs %s", a, aAgain)
+	}
+	// Same conv + DIFFERENT key => different session (the rotated key re-routes).
+	b, _ := deriveComposerSessionID(auth, "cursor-key-two", toolTurn("hi"), conv)
+	if a == b {
+		t.Fatalf("ADD-79: a rotated Cursor key must yield a different sess_ id for the same conversation (a=%s b=%s)", a, b)
+	}
+	// The fingerprint helper is non-reversible and stable, and empty for an empty key.
+	if composerKeyFingerprint("") != "" {
+		t.Fatalf("ADD-79: empty key must yield an empty fingerprint")
+	}
+	if fp := composerKeyFingerprint("cursor-key-one"); len(fp) != 16 || strings.Contains(fp, "cursor-key-one") {
+		t.Fatalf("ADD-79: fingerprint must be a 16-hex non-reversible digest, got %q", fp)
+	}
+}
+
+// ADD-83/87 (exec half): reasoning_effort is carried to the bridge body as reasoningEffort AND flagged as an
+// unsupported hard guarantee (the SDK has no reasoning-effort knob).
+func TestADD83_ReasoningEffortCarriedAndFlagged(t *testing.T) {
+	c := composerConstraints([]byte(`{"reasoning_effort":"high"}`))
+	if c["reasoningEffort"] != "high" {
+		t.Fatalf("ADD-87: reasoning_effort must be carried as reasoningEffort, got %#v", c["reasoningEffort"])
+	}
+	notes, _ := c["unsupportedHardGuarantees"].([]string)
+	if !strings.Contains(strings.Join(notes, " | "), "reasoning_effort=high") {
+		t.Fatalf("ADD-87: reasoning_effort must be flagged unsupported, got %#v", notes)
+	}
+	// Absent reasoning_effort => no reasoningEffort key, no note.
+	if _, ok := composerConstraints([]byte(`{}`))["reasoningEffort"]; ok {
+		t.Fatalf("ADD-87: no reasoning_effort must not add the key")
+	}
+}
+
+// ADD-83 (exec half): a tool_results CONTINUATION turn must carry responseFormat/stop/maxTokens/system/
+// reasoningEffort to the bridge body (composerInputHinted attaches system; composerTurnBody spreads
+// constraints) so the bridge can apply them on the resume.
+func TestADD83_ContinuationBodyCarriesConstraintsAndSystem(t *testing.T) {
+	oai := []byte(`{
+		"response_format":{"type":"json_object"},
+		"stop":["STOP"],
+		"max_tokens":256,
+		"reasoning_effort":"medium",
+		"messages":[
+			{"role":"system","content":"NEW SYSTEM"},
+			{"role":"assistant","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
+			{"role":"tool","tool_call_id":"tc_1","content":"RESULT"}
+		]}`)
+	inp := composerInput(oai)
+	if inp["type"] != "tool_results" {
+		t.Fatalf("ADD-83: expected a tool_results continuation, got %v", inp["type"])
+	}
+	if inp["system"] != "NEW SYSTEM" {
+		t.Fatalf("ADD-83: continuation input must carry the (possibly swapped) system, got %v", inp["system"])
+	}
+	body := composerTurnBody("s1", "composer-2.5", inp, nil, "", nil, composerConstraints(oai))
+	if gjson.GetBytes(body, "input.system").String() != "NEW SYSTEM" {
+		t.Fatalf("ADD-83: bridge body must carry input.system on a continuation, got %s", body)
+	}
+	if gjson.GetBytes(body, "responseFormat.type").String() != "json_object" {
+		t.Fatalf("ADD-83: continuation body must carry responseFormat, got %s", body)
+	}
+	if gjson.GetBytes(body, "stop.0").String() != "STOP" || gjson.GetBytes(body, "maxTokens").Int() != 256 {
+		t.Fatalf("ADD-83: continuation body must carry stop/maxTokens, got %s", body)
+	}
+	if gjson.GetBytes(body, "reasoningEffort").String() != "medium" {
+		t.Fatalf("ADD-83: continuation body must carry reasoningEffort, got %s", body)
+	}
+}
+
+// ADD-89 (exec half): a tool_results turn whose ONLY result is isError:true + trailing user text must NOT
+// fold the instruction into the failed result's content; the user text must remain first-class userText.
+func TestADD89_TrailingTextNotFoldedIntoErrorResult(t *testing.T) {
+	mixed := composerInput([]byte(`{"messages":[
+		{"role":"assistant","tool_calls":[{"id":"tc_1","function":{"name":"Bash"}}]},
+		{"role":"tool","tool_call_id":"tc_1","is_error":true,"content":"Bash was cancelled"},
+		{"role":"user","content":"Ignore that failed command and just explain what to do next."}
+	]}`))
+	if mixed["type"] != "tool_results" {
+		t.Fatalf("ADD-89: expected tool_results, got %v", mixed["type"])
+	}
+	results, _ := mixed["results"].([]map[string]any)
+	if len(results) != 1 {
+		t.Fatalf("ADD-89: expected 1 result, got %d", len(results))
+	}
+	content, _ := results[0]["content"].(string)
+	// The failed result's content must NOT be mutated to embed the instruction.
+	if content != "Bash was cancelled" {
+		t.Fatalf("ADD-89: the user instruction must NOT be folded into a failed (isError) result, got %q", content)
+	}
+	if isErr, _ := results[0]["isError"].(bool); !isErr {
+		t.Fatalf("ADD-89: the error flag must be preserved")
+	}
+	// The trailing text must still be carried first-class so the bridge can answer it.
+	if mixed["userText"] != "Ignore that failed command and just explain what to do next." {
+		t.Fatalf("ADD-89: trailing user text must remain first-class userText, got %v", mixed["userText"])
+	}
+
+	// Control: when a NON-error result is also present, the text folds into the LAST NON-ERROR result, not the error one.
+	mixed2 := composerInput([]byte(`{"messages":[
+		{"role":"assistant","tool_calls":[{"id":"tc_ok","function":{"name":"Read"}},{"id":"tc_err","function":{"name":"Bash"}}]},
+		{"role":"tool","tool_call_id":"tc_ok","content":"OK OUTPUT"},
+		{"role":"tool","tool_call_id":"tc_err","is_error":true,"content":"failed"},
+		{"role":"user","content":"now summarize"}
+	]}`))
+	res2, _ := mixed2["results"].([]map[string]any)
+	if len(res2) != 2 {
+		t.Fatalf("ADD-89: expected 2 results, got %d", len(res2))
+	}
+	if c, _ := res2[0]["content"].(string); !strings.Contains(c, "OK OUTPUT") || !strings.Contains(c, "now summarize") {
+		t.Fatalf("ADD-89: trailing text must fold into the last NON-error result, got %q", c)
+	}
+	if c, _ := res2[1]["content"].(string); c != "failed" {
+		t.Fatalf("ADD-89: the error result must remain unmodified, got %q", c)
+	}
+}
+
+// ADD-95 (exec half): an oversized LIVE tool-result is capped and carries the 'truncated by proxy' marker;
+// a small result is unchanged.
+func TestADD95_LiveToolResultTruncated(t *testing.T) {
+	small := "short result"
+	if got := truncateCursorToolResultLive(small); got != small {
+		t.Fatalf("ADD-95: a small result must be unchanged, got %q", got)
+	}
+	big := strings.Repeat("x", composerLiveToolResultMaxBytes+5000)
+	got := truncateCursorToolResultLive(big)
+	if len(got) >= len(big) {
+		t.Fatalf("ADD-95: an oversized result must be truncated (len %d >= original %d)", len(got), len(big))
+	}
+	if !strings.Contains(got, "truncated by proxy") {
+		t.Fatalf("ADD-95: a truncated result must carry the 'truncated by proxy' marker")
+	}
+	// End-to-end: the cap is applied to the live tool result content in composerToolResultsHinted.
+	bigJSON := strings.Repeat("y", composerLiveToolResultMaxBytes+1000)
+	cont := composerInput([]byte(`{"messages":[
+		{"role":"assistant","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
+		{"role":"tool","tool_call_id":"tc_1","content":"` + bigJSON + `"}
+	]}`))
+	results, _ := cont["results"].([]map[string]any)
+	if len(results) != 1 {
+		t.Fatalf("ADD-95: expected 1 result, got %d", len(results))
+	}
+	c, _ := results[0]["content"].(string)
+	if len(c) > composerLiveToolResultMaxBytes+200 || !strings.Contains(c, "truncated by proxy") {
+		t.Fatalf("ADD-95: live tool-result content must be capped + marked (len=%d)", len(c))
+	}
+}
+
+// ADD-99 (exec half): a tool with strict:true must carry strict on the advertise entry AND be flagged in
+// composerConstraints as not-hard-validated; a non-strict tool carries neither.
+func TestADD99_StrictHintPreservedAndFlagged(t *testing.T) {
+	oai := []byte(`{"tools":[{"type":"function","function":{"name":"edit_file","strict":true,"parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}]}`)
+	adv := composerAdvertise(oai)
+	if len(adv) != 1 {
+		t.Fatalf("ADD-99: expected 1 advertised tool, got %d", len(adv))
+	}
+	if strict, ok := adv[0]["strict"].(bool); !ok || !strict {
+		t.Fatalf("ADD-99: advertise entry must carry strict:true, got %#v", adv[0]["strict"])
+	}
+	notes, _ := composerConstraints(oai)["unsupportedHardGuarantees"].([]string)
+	joined := strings.Join(notes, " | ")
+	if !strings.Contains(joined, "edit_file") || !strings.Contains(joined, "strict") {
+		t.Fatalf("ADD-99: strict:true must be flagged as not-hard-validated, got %q", joined)
+	}
+	// A non-strict tool carries neither the strict key nor a strict note.
+	plain := []byte(`{"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)
+	if _, ok := composerAdvertise(plain)[0]["strict"]; ok {
+		t.Fatalf("ADD-99: a non-strict tool must NOT carry a strict key")
+	}
+	if n, _ := composerConstraints(plain)["unsupportedHardGuarantees"].([]string); strings.Contains(strings.Join(n, " | "), "strict") {
+		t.Fatalf("ADD-99: a non-strict tool must NOT be flagged for strict args")
+	}
+}
+
+// ADD-104 (exec half): a tool_call whose input is NOT an object (a JSON string or number) must preserve the
+// raw value under {"input":<raw>} in the emitted arguments, never collapse to {}.
+func TestADD104_NonObjectToolInputPreserved(t *testing.T) {
+	defs := []cursorToolDefinition{{Name: "Read"}}
+	// String input.
+	_, argsStr := mapComposerToolCall("Read", gjson.Parse(`"hi there"`), defs, nil)
+	if gjson.Get(argsStr, "input").String() != "hi there" {
+		t.Fatalf("ADD-104: a string input must be preserved under {\"input\":...}, got %s", argsStr)
+	}
+	// Number input.
+	_, argsNum := mapComposerToolCall("Read", gjson.Parse(`5`), defs, nil)
+	if gjson.Get(argsNum, "input").Int() != 5 {
+		t.Fatalf("ADD-104: a number input must be preserved under {\"input\":...}, got %s", argsNum)
+	}
+	// Array input.
+	_, argsArr := mapComposerToolCall("Read", gjson.Parse(`[1,2,3]`), defs, nil)
+	if !gjson.Get(argsArr, "input").IsArray() {
+		t.Fatalf("ADD-104: an array input must be preserved under {\"input\":...}, got %s", argsArr)
+	}
+	// An unknown tool name with a string input still preserves the value (and passes the name through).
+	name, argsUnknown := mapComposerToolCall("totally_unknown", gjson.Parse(`"raw"`), defs, nil)
+	if name != "totally_unknown" || gjson.Get(argsUnknown, "input").String() != "raw" {
+		t.Fatalf("ADD-104: unknown tool with string input must pass name + preserve value, got name=%q args=%s", name, argsUnknown)
+	}
+	// An OBJECT input is unchanged (no spurious wrapper).
+	_, argsObj := mapComposerToolCall("Read", gjson.Parse(`{"path":"/x"}`), defs, nil)
+	if gjson.Get(argsObj, "path").String() != "/x" || gjson.Get(argsObj, "input").Exists() {
+		t.Fatalf("ADD-104: an object input must NOT be wrapped, got %s", argsObj)
+	}
+}
+
+// Comment 5: a Responses previous_response_id continuation (and a tool-ownership-hinted continuation) whose
+// trailing user image is malformed must NOT be rejected by lastUserTurnImageOnlyInvalid before tool results
+// are handled — it is a continuation, not an image-only new-user turn.
+func TestComment5_HintedContinuationNotRejectedAsImageOnly(t *testing.T) {
+	// A Responses server-side-chained shape: [..., role:tool, role:user(malformed image only)] with NO
+	// assistant tool_calls anchor — recognized as a continuation ONLY via the previous_response_id hint.
+	msgs := gjson.GetBytes([]byte(`{"messages":[
+		{"role":"tool","tool_call_id":"tc_resp","content":"file contents"},
+		{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,"}}]}
+	]}`), "messages").Array()
+
+	// WITHOUT the hint, branch (c) does not fire, so it would look like an image-only new-user turn and be
+	// rejected — this is the bug Comment 5 fixes.
+	if !lastUserTurnImageOnlyInvalid(msgs, composerContinuationHint{}) {
+		t.Fatalf("Comment 5 (precondition): without a hint, the [tool,user-bad-image] shape looks image-only")
+	}
+	// WITH the previous_response_id hint, it is correctly recognized as a continuation and NOT rejected.
+	prevHint := composerContinuationHint{hasPreviousResponseID: true}
+	if lastUserTurnImageOnlyInvalid(msgs, prevHint) {
+		t.Fatalf("Comment 5: a previous_response_id continuation with a malformed trailing image must NOT be rejected as image-only")
+	}
+	// WITH a tool-ownership hint (the trailing tool id is owned), it is likewise recognized as a continuation.
+	ownHint := composerContinuationHint{ownsToolCallID: func(id string) bool { return id == "tc_resp" }}
+	if lastUserTurnImageOnlyInvalid(msgs, ownHint) {
+		t.Fatalf("Comment 5: a tool-ownership-hinted continuation with a malformed trailing image must NOT be rejected as image-only")
+	}
+}
+
+func TestADD94_StoreFalseRejectedAsTyped400(t *testing.T) {
+	// store:false must be rejected with a typed 4xx BEFORE any durable Cursor state is created — never silently
+	// persisted (ADD-94 / Comment 4). The Responses translator surfaces store:false onto the normalized body.
+	err := composerRejectStoreFalse([]byte(`{"model":"composer-2.5","messages":[],"store":false}`))
+	if err == nil {
+		t.Fatal("ADD-94: store:false must be rejected, not silently persisted")
+	}
+	sc, ok := err.(interface{ StatusCode() int })
+	if !ok || sc.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("ADD-94: store:false must reject as a typed %d, got %v", http.StatusBadRequest, err)
+	}
+	// store:true and absent are the durable default — accepted (no reject).
+	if errTrue := composerRejectStoreFalse([]byte(`{"store":true}`)); errTrue != nil {
+		t.Fatalf("ADD-94: store:true must be accepted, got %v", errTrue)
+	}
+	if errAbsent := composerRejectStoreFalse([]byte(`{"model":"composer-2.5"}`)); errAbsent != nil {
+		t.Fatalf("ADD-94: absent store must be accepted, got %v", errAbsent)
 	}
 }

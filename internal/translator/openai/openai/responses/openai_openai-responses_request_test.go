@@ -536,3 +536,214 @@ func TestConvertOpenAIResponsesRequest_ToolOutputPlusUserTextWithPrevRespID(t *t
 		}
 	}
 }
+
+// ADD-92 / Comment 3: a Responses structured-output request expressed via the native
+// `text.format` with a json_schema (schema nested directly under text.format, with name +
+// strict) must be translated into the Chat-Completions `response_format` shape the executor's
+// extractComposerResponseFormat reads: {type:"json_schema", json_schema:{name,schema,strict}}.
+// The schema body, name, and strict flag must all survive.
+func TestConvertOpenAIResponsesRequest_TextFormatJSONSchema(t *testing.T) {
+	raw := []byte(`{
+		"input":"Return a JSON test summary only.",
+		"text":{
+			"format":{
+				"type":"json_schema",
+				"name":"TestReport",
+				"strict":true,
+				"schema":{"type":"object","properties":{"passed":{"type":"boolean"}},"required":["passed"]}
+			}
+		}
+	}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("composer-2.5", raw, false)
+
+	rf := gjson.GetBytes(out, "response_format")
+	if !rf.IsObject() {
+		t.Fatalf("response_format not carried as object: %s", prettyJSONForTest(out))
+	}
+	if got := rf.Get("type").String(); got != "json_schema" {
+		t.Fatalf("response_format.type = %q, want json_schema (out=%s)", got, prettyJSONForTest(out))
+	}
+	js := rf.Get("json_schema")
+	if !js.IsObject() {
+		t.Fatalf("response_format.json_schema missing: %s", prettyJSONForTest(out))
+	}
+	if got := js.Get("name").String(); got != "TestReport" {
+		t.Fatalf("json_schema.name = %q, want TestReport", got)
+	}
+	if !js.Get("strict").Bool() {
+		t.Fatalf("json_schema.strict lost: %s", prettyJSONForTest(out))
+	}
+	// The schema body must be preserved verbatim (a required field deep inside survives).
+	if got := js.Get("schema.properties.passed.type").String(); got != "boolean" {
+		t.Fatalf("json_schema.schema not preserved: %s", prettyJSONForTest(out))
+	}
+	if got := js.Get("schema.required.0").String(); got != "passed" {
+		t.Fatalf("json_schema.schema.required not preserved: %s", prettyJSONForTest(out))
+	}
+}
+
+// ADD-92 / Comment 3: the already-nested Responses form
+// text.format:{type:"json_schema", json_schema:{name,schema,strict}} (some relays emit it
+// pre-nested) must also normalize to the same response_format shape.
+func TestConvertOpenAIResponsesRequest_TextFormatJSONSchemaNestedForm(t *testing.T) {
+	raw := []byte(`{
+		"input":"x",
+		"text":{
+			"format":{
+				"type":"json_schema",
+				"json_schema":{
+					"name":"R",
+					"strict":true,
+					"schema":{"type":"object","properties":{"ok":{"type":"boolean"}}}
+				}
+			}
+		}
+	}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("composer-2.5", raw, false)
+	js := gjson.GetBytes(out, "response_format.json_schema")
+	if got := gjson.GetBytes(out, "response_format.type").String(); got != "json_schema" {
+		t.Fatalf("response_format.type = %q, want json_schema (out=%s)", got, prettyJSONForTest(out))
+	}
+	if got := js.Get("name").String(); got != "R" {
+		t.Fatalf("nested json_schema.name = %q, want R: %s", got, prettyJSONForTest(out))
+	}
+	if !js.Get("strict").Bool() {
+		t.Fatalf("nested json_schema.strict lost: %s", prettyJSONForTest(out))
+	}
+	if got := js.Get("schema.properties.ok.type").String(); got != "boolean" {
+		t.Fatalf("nested json_schema.schema not preserved: %s", prettyJSONForTest(out))
+	}
+}
+
+// ADD-92 / Comment 3: the text.format json_object form must map to
+// response_format:{type:"json_object"} (the shape extractComposerResponseFormat reads).
+func TestConvertOpenAIResponsesRequest_TextFormatJSONObject(t *testing.T) {
+	raw := []byte(`{"input":"give me json","text":{"format":{"type":"json_object"}}}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("composer-2.5", raw, false)
+	rf := gjson.GetBytes(out, "response_format")
+	if !rf.IsObject() {
+		t.Fatalf("response_format not carried as object: %s", prettyJSONForTest(out))
+	}
+	if got := rf.Get("type").String(); got != "json_object" {
+		t.Fatalf("response_format.type = %q, want json_object (out=%s)", got, prettyJSONForTest(out))
+	}
+	// json_object must NOT spuriously carry a json_schema block.
+	if rf.Get("json_schema").Exists() {
+		t.Fatalf("json_object form must not emit json_schema: %s", prettyJSONForTest(out))
+	}
+}
+
+// ADD-92: when no text.format is present, response_format must stay unset (no spurious field).
+func TestConvertOpenAIResponsesRequest_NoTextFormatLeavesResponseFormatUnset(t *testing.T) {
+	raw := []byte(`{"input":[{"role":"user","content":"hi"}]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	if gjson.GetBytes(out, "response_format").Exists() {
+		t.Fatalf("response_format must not be set when text.format absent: %s", prettyJSONForTest(out))
+	}
+}
+
+// ADD-94 / Comment 4: store:false must be surfaced onto the normalized body (a synthetic field
+// the executor reads to reject with a typed 4xx — Cursor Composer requires durable state). It
+// must never be silently dropped. Proven for both streaming and non-streaming requests.
+func TestConvertOpenAIResponsesRequest_StoreFalsePreserved(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		raw := []byte(`{"model":"composer-2.5","input":"Sensitive one-shot prompt","store":false}`)
+		out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("composer-2.5", raw, stream)
+		v := gjson.GetBytes(out, "store")
+		if !v.Exists() {
+			t.Fatalf("store:false dropped (stream=%v): %s", stream, prettyJSONForTest(out))
+		}
+		if v.Type != gjson.False {
+			t.Fatalf("store = %v, want false (stream=%v): %s", v.Value(), stream, prettyJSONForTest(out))
+		}
+	}
+}
+
+// ADD-94: store:true (the default) needs no synthetic signal — it must be left unset so the
+// executor's durable path is used without any store key to interpret.
+func TestConvertOpenAIResponsesRequest_StoreTrueOmitted(t *testing.T) {
+	raw := []byte(`{"model":"composer-2.5","input":"hi","store":true}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("composer-2.5", raw, false)
+	if gjson.GetBytes(out, "store").Exists() {
+		t.Fatalf("store:true must not be surfaced (only store:false is load-bearing): %s", prettyJSONForTest(out))
+	}
+}
+
+// ADD-99: a Responses function tool's `strict` Structured-Outputs hint (top-level form) must be
+// copied onto the rebuilt tools[].function so the executor's composerAdvertise/composerConstraints
+// can preserve or flag it. Without this the strictness contract is stripped before advertisement.
+func TestConvertOpenAIResponsesRequest_FunctionStrictTopLevelPreserved(t *testing.T) {
+	raw := []byte(`{"tools":[{"type":"function","name":"edit_file","strict":true,"parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}],"input":[{"role":"user","content":"edit"}]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	fn := gjson.GetBytes(out, "tools.0.function")
+	if got := fn.Get("name").String(); got != "edit_file" {
+		t.Fatalf("tools.0.function.name = %q, want edit_file (out=%s)", got, prettyJSONForTest(out))
+	}
+	strict := fn.Get("strict")
+	if !strict.Exists() {
+		t.Fatalf("function.strict dropped: %s", prettyJSONForTest(out))
+	}
+	if !strict.Bool() {
+		t.Fatalf("function.strict = %v, want true", strict.Bool())
+	}
+	// The parameters schema must still be preserved alongside strict.
+	if got := fn.Get("parameters.additionalProperties").Bool(); got != false {
+		t.Fatalf("parameters.additionalProperties lost: %s", prettyJSONForTest(out))
+	}
+}
+
+// ADD-99: the nested Chat-Completions function.strict form must also be preserved onto the
+// rebuilt function object.
+func TestConvertOpenAIResponsesRequest_FunctionStrictNestedPreserved(t *testing.T) {
+	raw := []byte(`{"tools":[{"type":"function","function":{"name":"run","strict":true,"parameters":{"type":"object"}}}],"input":[{"role":"user","content":"go"}]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	if !gjson.GetBytes(out, "tools.0.function.strict").Bool() {
+		t.Fatalf("nested function.strict lost: %s", prettyJSONForTest(out))
+	}
+}
+
+// ADD-99: a function tool WITHOUT strict must not gain a spurious strict field (the contract is
+// opt-in; defaulting it would over-constrain Cursor's argument emission).
+func TestConvertOpenAIResponsesRequest_FunctionWithoutStrictUnset(t *testing.T) {
+	raw := []byte(`{"tools":[{"type":"function","name":"plain","parameters":{"type":"object"}}],"input":[{"role":"user","content":"x"}]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	if gjson.GetBytes(out, "tools.0.function.strict").Exists() {
+		t.Fatalf("strict must not be set when absent on the request: %s", prettyJSONForTest(out))
+	}
+}
+
+// ADD-87 (responses half): a Responses reasoning.effort must be mapped to reasoning_effort
+// (lowercased/trimmed) so the executor's composerConstraints can carry/flag the requested
+// thinking effort. This verifies the already-present mapping stays wired.
+func TestConvertOpenAIResponsesRequest_ReasoningEffortMapped(t *testing.T) {
+	raw := []byte(`{"reasoning":{"effort":"  HIGH "},"input":[{"role":"user","content":"think hard"}]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("reasoning_effort = %q, want high (out=%s)", got, prettyJSONForTest(out))
+	}
+}
+
+// ADD-82 (responses half): a built-in tool (web_search) must survive into the normalized
+// tools[] VERBATIM — not just be present, but carry its original shape — so the tool inventory
+// stays consistent with a forced/allowed tool_choice and the executor can surface an explicit
+// "unsupported built-in tool" signal rather than silently dropping a declared tool.
+func TestConvertOpenAIResponsesRequest_BuiltinWebSearchSurvivesVerbatim(t *testing.T) {
+	raw := []byte(`{"tools":[{"type":"web_search","search_context_size":"high"}],"input":[{"role":"user","content":"search the web"}]}`)
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("m", raw, false)
+	tools := gjson.GetBytes(out, "tools")
+	if !tools.IsArray() || len(tools.Array()) != 1 {
+		t.Fatalf("want exactly 1 tool carried, got: %s", prettyJSONForTest(out))
+	}
+	tool := tools.Array()[0]
+	if got := tool.Get("type").String(); got != "web_search" {
+		t.Fatalf("built-in tool type = %q, want web_search: %s", got, prettyJSONForTest(out))
+	}
+	// Verbatim: the built-in must NOT have been rewrapped into a {type:function,function:{...}}
+	// shape, and its extra fields must survive.
+	if tool.Get("function").Exists() {
+		t.Fatalf("built-in tool must not be rewrapped under function: %s", prettyJSONForTest(out))
+	}
+	if got := tool.Get("search_context_size").String(); got != "high" {
+		t.Fatalf("built-in tool field not carried verbatim: %s", prettyJSONForTest(out))
+	}
+}

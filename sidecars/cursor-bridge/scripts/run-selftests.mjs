@@ -14,6 +14,11 @@ import { fileURLToPath } from "node:url";
 // bridge import + live SDK load (which require the patched bundle to be present).
 async function runAll() {
   const bridge = await import("../cursor-agent-bridge.mjs");
+  // loadSdk() requires + asserts the patched bundle and installs the seam globals (__CC_SELFTEST_DISPATCH_U/S
+  // + __CC_SELFTEST_SERIALIZE + __CC_GET_ADVERTISE__). These RUNTIME self-tests are the dynamic counterpart to
+  // the patcher's STATIC capability check (scripts/apply-clienttools-patch.cjs REQUIRED_SEAM_TOKENS, ADD-102 /
+  // Comment 7): the patcher refuses to leave a marked-but-incomplete bundle on disk, and this suite refuses to
+  // pass if any installed seam is missing/broken at runtime — together they fail closed on a stale/partial patch.
   bridge.loadSdk(); // require + assert the patched bundle; installs __CC_SELFTEST_DISPATCH_U/S + __CC_SELFTEST_SERIALIZE
   await bridge.selfTestNativeUnreachable();
   await bridge.selfTestBundleSeam();

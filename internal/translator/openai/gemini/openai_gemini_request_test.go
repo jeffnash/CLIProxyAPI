@@ -721,3 +721,312 @@ func TestGeminiSamplingFieldsStillMapped(t *testing.T) {
 		t.Fatalf("expected candidateCount->n=2 mapped, got %v: %s", got, out)
 	}
 }
+
+// lastToolContent returns the raw `content` field (as a gjson.Result against the
+// converted body) of the final role:"tool" message. Used by the ADD-85 tests so they
+// can distinguish a string content ("hello") from an embedded JSON value.
+func lastToolContent(t *testing.T, out []byte) gjson.Result {
+	t.Helper()
+	var found gjson.Result
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() == "tool" {
+			found = msg.Get("content")
+		}
+		return true
+	})
+	return found
+}
+
+// TestGeminiFunctionResponseContentTypes is the ADD-85 table test. A Gemini
+// functionResponse.response.content can be a string, object, array, number, or bool. The
+// OpenAI role:"tool" `content` field is always a STRING (that is the OpenAI shape). The
+// fix's correctness property is about HOW that string is built:
+//   - a STRING input must yield the bare unquoted text "hello" (NOT the double-encoded
+//     JSON string "\"hello\"" the old code produced) — content.Raw == `"hello"`.
+//   - object/array/number/bool inputs keep their raw JSON verbatim AS the content string
+//     (the content string's value equals the raw JSON text, e.g. `{"k":"v"}`), never a
+//     re-encoding of a quoted JSON-string-of-a-JSON-string.
+func TestGeminiFunctionResponseContentTypes(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentJSON string
+		// isString marks the string case (its content.Raw must be exactly `"hello"`).
+		isString bool
+		// wantContentValue is the decoded string value the content field must carry.
+		wantContentValue string
+	}{
+		{name: "string", contentJSON: `"hello"`, isString: true, wantContentValue: "hello"},
+		{name: "object", contentJSON: `{"k":"v"}`, wantContentValue: `{"k":"v"}`},
+		{name: "array", contentJSON: `[1,2,3]`, wantContentValue: `[1,2,3]`},
+		{name: "number", contentJSON: `42`, wantContentValue: `42`},
+		{name: "bool", contentJSON: `true`, wantContentValue: `true`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := `{
+				"contents": [
+					{"role": "user", "parts": [
+						{"functionResponse": {"id": "call_x", "name": "fn", "response": {"content": ` + tc.contentJSON + `}}}
+					]}
+				]
+			}`
+			out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+			content := lastToolContent(t, out)
+			// The OpenAI tool content field is always a JSON string.
+			if content.Type != gjson.String {
+				t.Fatalf("content type = %v, want String (OpenAI tool content is a string): raw=%s: %s", content.Type, content.Raw, out)
+			}
+			if content.String() != tc.wantContentValue {
+				t.Fatalf("content value = %q, want %q: %s", content.String(), tc.wantContentValue, out)
+			}
+			if tc.isString {
+				// Guard the specific regression: a string input must NOT be double-encoded.
+				// The serialized field is `"hello"`, never `"\"hello\""`.
+				if content.Raw != `"hello"` {
+					t.Fatalf("string content raw = %s, want \"hello\" (no double-encoding): %s", content.Raw, out)
+				}
+			}
+		})
+	}
+}
+
+// TestGeminiFunctionResponseStringResponseNoContentField (ADD-85, else branch) verifies
+// that when response has no `content` field and the whole `response` is itself a STRING,
+// the tool content is emitted unquoted too (not double-encoded). Note: Gemini's
+// functionResponse.response is normally an object, but a defensive string is handled.
+func TestGeminiFunctionResponseStringResponseNoContentField(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [
+				{"functionResponse": {"id": "call_y", "name": "fn", "response": "plain"}}
+			]}
+		]
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	content := lastToolContent(t, out)
+	if content.Type != gjson.String || content.String() != "plain" {
+		t.Fatalf("expected unquoted string response content \"plain\", got type=%v value=%q: %s", content.Type, content.String(), out)
+	}
+}
+
+// TestGeminiFunctionResponseObjectResponseNoContentField (ADD-85, else branch) verifies
+// an object `response` with no `content` field keeps its raw JSON verbatim as the tool
+// content string (the OpenAI content field is a string carrying the raw JSON text).
+func TestGeminiFunctionResponseObjectResponseNoContentField(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [
+				{"functionResponse": {"id": "call_z", "name": "fn", "response": {"ok": true, "n": 5}}}
+			]}
+		]
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	content := lastToolContent(t, out)
+	if content.Type != gjson.String {
+		t.Fatalf("expected tool content to be a string, got type=%v raw=%s: %s", content.Type, content.Raw, out)
+	}
+	// The string value is the raw JSON object; re-parse it and confirm the fields survive.
+	inner := gjson.Parse(content.String())
+	if inner.Get("ok").Bool() != true || inner.Get("n").Int() != 5 {
+		t.Fatalf("expected object fields preserved in raw-JSON content string, got %q: %s", content.String(), out)
+	}
+}
+
+// TestGeminiMultipleTextPartsJoinedWithNewline is the ADD-86 (gemini half) regression:
+// two flattened text parts [{text:"a"},{text:"b"}] must become the string content "a\nb"
+// — preserving the semantic boundary — not the delimiter-less "ab".
+func TestGeminiMultipleTextPartsJoinedWithNewline(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [{"text": "a"}, {"text": "b"}]}
+		]
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	last := lastMessage(t, out)
+	if got := last.Get("content").String(); got != "a\nb" {
+		t.Fatalf("expected flattened text content %q, got %q: %s", "a\nb", got, out)
+	}
+}
+
+// TestGeminiSingleTextPartUnchanged (ADD-86 guard) verifies the delimiter is only
+// inserted BETWEEN parts: a single text part must not gain a leading "\n".
+func TestGeminiSingleTextPartUnchanged(t *testing.T) {
+	req := `{"contents": [{"role": "user", "parts": [{"text": "solo"}]}]}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	last := lastMessage(t, out)
+	if got := last.Get("content").String(); got != "solo" {
+		t.Fatalf("expected single text part %q unchanged, got %q: %s", "solo", got, out)
+	}
+}
+
+// TestGeminiThinkingBudgetMapsToReasoningEffort is the ADD-87 (gemini half) test: a
+// generationConfig.thinkingConfig.thinkingBudget must map to reasoning_effort (the
+// executor's ADD-87 fix then carries reasoning_effort to the bridge). A budget of 8192
+// falls in the "medium" band (1025..8192) per thinking.ConvertBudgetToLevel.
+func TestGeminiThinkingBudgetMapsToReasoningEffort(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "go"}]}],
+		"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "medium" {
+		t.Fatalf("expected thinkingBudget=8192 -> reasoning_effort=medium, got %q: %s", got, out)
+	}
+}
+
+// TestGeminiThinkingBudgetSnakeCaseMapsToReasoningEffort (ADD-87 guard) verifies the
+// snake_case thinking_budget alias (Google's official Python SDK shape) is also mapped.
+func TestGeminiThinkingBudgetSnakeCaseMapsToReasoningEffort(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "go"}]}],
+		"generationConfig": {"thinkingConfig": {"thinking_budget": 0}}
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	// budget 0 -> "none" per ConvertBudgetToLevel.
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "none" {
+		t.Fatalf("expected thinking_budget=0 -> reasoning_effort=none, got %q: %s", got, out)
+	}
+}
+
+// TestGeminiOmittedRoleDefaultsToUser is the ADD-91 [RBT-028] regression: a content
+// with no role at all (a valid Gemini shape) must produce an OpenAI message with
+// role:"user" carrying the real text, so Composer finds the user turn and does NOT send
+// an empty prompt.
+func TestGeminiOmittedRoleDefaultsToUser(t *testing.T) {
+	req := `{"contents": [{"parts": [{"text": "hi"}]}]}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	last := lastMessage(t, out)
+	if last.Get("role").String() != "user" {
+		t.Fatalf("expected omitted role to default to user, got %q: %s", last.Get("role").String(), out)
+	}
+	if got := last.Get("content").String(); got != "hi" {
+		t.Fatalf("expected user content 'hi' (not empty), got %q: %s", got, out)
+	}
+}
+
+// TestGeminiEmptyRoleStringDefaultsToUser (ADD-91 guard) verifies an explicit empty/
+// whitespace role string is also defaulted to user.
+func TestGeminiEmptyRoleStringDefaultsToUser(t *testing.T) {
+	req := `{"contents": [{"role": "  ", "parts": [{"text": "hey"}]}]}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	last := lastMessage(t, out)
+	if last.Get("role").String() != "user" {
+		t.Fatalf("expected whitespace role to default to user, got %q: %s", last.Get("role").String(), out)
+	}
+}
+
+// TestGeminiOmittedRoleWithFunctionCallDefaultsToAssistant (ADD-91 edge) verifies a
+// role-less content whose parts are a model-side functionCall is emitted as an assistant
+// tool_calls message — OpenAI requires role:"assistant" to carry tool_calls, so the
+// empty-role default must be "assistant" (not "user") in that case.
+func TestGeminiOmittedRoleWithFunctionCallDefaultsToAssistant(t *testing.T) {
+	req := `{
+		"contents": [
+			{"parts": [{"functionCall": {"id": "c1", "name": "search", "args": {"q": "x"}}}]},
+			{"role": "user", "parts": [
+				{"functionResponse": {"id": "c1", "name": "search", "response": {"content": "ok"}}}
+			]}
+		]
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	// The assistant tool_call message must carry role:"assistant" and the tool_call.
+	var assistantWithToolCall bool
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() == "assistant" && msg.Get("tool_calls.0.id").String() == "c1" {
+			assistantWithToolCall = true
+		}
+		return true
+	})
+	if !assistantWithToolCall {
+		t.Fatalf("expected role-less functionCall content to become an assistant tool_call message: %s", out)
+	}
+	// And it must NOT have been emitted as a user message.
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() == "user" && msg.Get("tool_calls").Exists() {
+			t.Fatalf("functionCall content must not be a user tool_call message: %s", out)
+		}
+		return true
+	})
+}
+
+// TestGeminiResponseMimeTypeOnlyMapsToJSONObject is the ADD-93 [Comment 3] test: a
+// generationConfig.responseMimeType of application/json with NO schema maps to
+// response_format {type:"json_object"} so the executor's composerConstraints sees it.
+func TestGeminiResponseMimeTypeOnlyMapsToJSONObject(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "json please"}]}],
+		"generationConfig": {"responseMimeType": "application/json"}
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	rf := gjson.GetBytes(out, "response_format")
+	if !rf.Exists() {
+		t.Fatalf("expected response_format to be emitted: %s", out)
+	}
+	if rf.Get("type").String() != "json_object" {
+		t.Fatalf("expected response_format.type=json_object, got %q: %s", rf.Get("type").String(), out)
+	}
+	if rf.Get("json_schema").Exists() {
+		t.Fatalf("json_object must not carry a json_schema: %s", out)
+	}
+}
+
+// TestGeminiResponseMimeTypeWithSchemaMapsToJSONSchema (ADD-93) verifies that a
+// responseMimeType + responseSchema maps to response_format {type:"json_schema",
+// json_schema:{schema:<schema>}} with the schema embedded verbatim.
+func TestGeminiResponseMimeTypeWithSchemaMapsToJSONSchema(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "recipes"}]}],
+		"generationConfig": {
+			"responseMimeType": "application/json",
+			"responseSchema": {"type": "array", "items": {"type": "object", "properties": {"recipeName": {"type": "string"}}, "required": ["recipeName"]}}
+		}
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	rf := gjson.GetBytes(out, "response_format")
+	if rf.Get("type").String() != "json_schema" {
+		t.Fatalf("expected response_format.type=json_schema, got %q: %s", rf.Get("type").String(), out)
+	}
+	schema := rf.Get("json_schema.schema")
+	if !schema.Exists() {
+		t.Fatalf("expected the schema embedded under json_schema.schema: %s", out)
+	}
+	if schema.Get("type").String() != "array" {
+		t.Fatalf("expected embedded schema.type=array, got %q: %s", schema.Get("type").String(), out)
+	}
+	if schema.Get("items.properties.recipeName.type").String() != "string" {
+		t.Fatalf("expected embedded schema preserved verbatim, got %s: %s", schema.Raw, out)
+	}
+}
+
+// TestGeminiResponseMimeTypeSnakeCaseAliases (ADD-93) verifies the snake_case SDK
+// aliases response_mime_type / response_schema are honored.
+func TestGeminiResponseMimeTypeSnakeCaseAliases(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "json"}]}],
+		"generationConfig": {
+			"response_mime_type": "application/json",
+			"response_schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+		}
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	rf := gjson.GetBytes(out, "response_format")
+	if rf.Get("type").String() != "json_schema" {
+		t.Fatalf("expected snake_case aliases -> json_schema, got %q: %s", rf.Get("type").String(), out)
+	}
+	if rf.Get("json_schema.schema.properties.ok.type").String() != "boolean" {
+		t.Fatalf("expected snake_case response_schema embedded, got %s: %s", rf.Raw, out)
+	}
+}
+
+// TestGeminiNonJSONResponseMimeTypeNoResponseFormat (ADD-93 guard) verifies a non-JSON
+// responseMimeType (e.g. text/plain) does NOT emit a response_format.
+func TestGeminiNonJSONResponseMimeTypeNoResponseFormat(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "go"}]}],
+		"generationConfig": {"responseMimeType": "text/plain"}
+	}`
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+	if gjson.GetBytes(out, "response_format").Exists() {
+		t.Fatalf("text/plain responseMimeType must not emit response_format: %s", out)
+	}
+}

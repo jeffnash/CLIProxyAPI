@@ -115,6 +115,36 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				}
 			}
 		}
+
+		// ADD-93 [Comment 3]: map Gemini structured-output config to OpenAI
+		// response_format so the composer executor's composerConstraints() can see it
+		// (and carry it to the bridge as a best-effort instruction / unsupported-hard-
+		// guarantee advisory). Gemini constrains output with responseSchema only when
+		// responseMimeType is "application/json". Without a schema it is a bare JSON-mode
+		// request -> {type:"json_object"}; with a schema -> {type:"json_schema", json_schema:
+		// {schema:<schema>}} carrying the schema verbatim. Snake_case SDK aliases
+		// (response_mime_type / response_schema) are also accepted, plus the
+		// _responseJsonSchema form some SDKs emit.
+		responseMimeType := genConfig.Get("responseMimeType")
+		if !responseMimeType.Exists() {
+			responseMimeType = genConfig.Get("response_mime_type")
+		}
+		if responseMimeType.Exists() && strings.EqualFold(strings.TrimSpace(responseMimeType.String()), "application/json") {
+			responseSchema := genConfig.Get("responseSchema")
+			if !responseSchema.Exists() {
+				responseSchema = genConfig.Get("response_schema")
+			}
+			if !responseSchema.Exists() {
+				responseSchema = genConfig.Get("_responseJsonSchema")
+			}
+			if responseSchema.Exists() {
+				rf := []byte(`{"type":"json_schema","json_schema":{}}`)
+				rf, _ = sjson.SetRawBytes(rf, "json_schema.schema", []byte(responseSchema.Raw))
+				out, _ = sjson.SetRawBytes(out, "response_format", rf)
+			} else {
+				out, _ = sjson.SetRawBytes(out, "response_format", []byte(`{"type":"json_object"}`))
+			}
+		}
 	}
 
 	// Stream parameter
@@ -183,8 +213,25 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 	if contents := root.Get("contents"); contents.Exists() && contents.IsArray() {
 		contents.ForEach(func(_, content gjson.Result) bool {
-			role := content.Get("role").String()
+			role := strings.TrimSpace(content.Get("role").String())
 			parts := content.Get("parts")
+
+			// ADD-91 [RBT-028]: Gemini documents Content.role as optional (may be
+			// blank/unset for non-multi-turn content). An empty role left as "" made
+			// Composer fail to find the last user turn and send an empty prompt — the
+			// real prompt was silently dropped. Default an empty role to "user" so the
+			// turn is seen. Edge case: a content whose parts are clearly model-side
+			// (a functionCall, with no explicit role) is the assistant's tool-call turn;
+			// those parts are emitted as assistant tool_calls below, and OpenAI requires
+			// role:"assistant" to carry tool_calls — so default such a turn to "assistant"
+			// instead. An explicit role is always honored (only "" is defaulted).
+			if role == "" {
+				if parts.Exists() && parts.IsArray() && parts.Get("#(functionCall)").Exists() {
+					role = "assistant"
+				} else {
+					role = "user"
+				}
+			}
 
 			// Convert role: model -> assistant
 			if role == "model" {
@@ -206,6 +253,15 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 					// Handle text parts
 					if text := part.Get("text"); text.Exists() {
 						formattedText := text.String()
+						// ADD-86: preserve the boundary between successive text parts in the
+						// flattened-string fast path. Without a delimiter [{text:"a"},{text:"b"}]
+						// became "ab", erasing the semantic boundary (commands/paths/code lines
+						// could fuse). Insert a "\n" between two flattened text parts. The
+						// structured content array path (contentWrapper) is untouched — each text
+						// part stays a distinct array element there.
+						if textBuilder.Len() > 0 {
+							textBuilder.WriteString("\n")
+						}
 						textBuilder.WriteString(formattedText)
 						contentPart := []byte(`{"type":"text","text":""}`)
 						contentPart, _ = sjson.SetBytes(contentPart, "text", formattedText)
@@ -281,10 +337,23 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						// Create tool message for function response
 						toolMsg := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
 
-						// Convert response.content to JSON string
+						// Convert response.content to the tool message content (ADD-85).
+						// Branch on the gjson type: a STRING value must be set with its
+						// decoded value (contentField.String()) so the tool content is the
+						// bare text "hello" — not the double-encoded JSON-string "\"hello\"".
+						// Object/array/number/bool keep .Raw so structured JSON survives
+						// verbatim. The `else` branch (no content field, fall back to the
+						// whole response) gets the same care so a string response is also
+						// emitted unquoted.
 						if response := functionResponse.Get("response"); response.Exists() {
 							if contentField := response.Get("content"); contentField.Exists() {
-								toolMsg, _ = sjson.SetBytes(toolMsg, "content", contentField.Raw)
+								if contentField.Type == gjson.String {
+									toolMsg, _ = sjson.SetBytes(toolMsg, "content", contentField.String())
+								} else {
+									toolMsg, _ = sjson.SetBytes(toolMsg, "content", contentField.Raw)
+								}
+							} else if response.Type == gjson.String {
+								toolMsg, _ = sjson.SetBytes(toolMsg, "content", response.String())
 							} else {
 								toolMsg, _ = sjson.SetBytes(toolMsg, "content", response.Raw)
 							}
@@ -352,7 +421,15 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 		})
 	}
 
-	// Tools mapping: Gemini tools -> OpenAI tools
+	// Tools mapping: Gemini tools -> OpenAI tools.
+	//
+	// ADD-99 (gemini half): unlike OpenAI's function tools, a Gemini functionDeclaration
+	// has NO per-tool strict-schema flag in the standard schema — there is no
+	// `function.strict` equivalent to preserve, so nothing is dropped here on the Gemini
+	// side (the strict-flag concern is OpenAI-only). We still pass the schema through
+	// verbatim: `parameters` is the standard field, `parametersJsonSchema` is the
+	// JSON-Schema variant some SDKs send. If a future Gemini revision adds a
+	// strict-equivalent hint, forward it here; until then this is a no-op by design.
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			if functionDeclarations := tool.Get("functionDeclarations"); functionDeclarations.Exists() && functionDeclarations.IsArray() {
