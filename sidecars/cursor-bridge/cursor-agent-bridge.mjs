@@ -202,7 +202,12 @@ const als = new AsyncLocalStorage(); // store = { session }
 globalThis.__CC_GET_ADVERTISE__ = () => {
   const st = als.getStore();
   if (!st || !st.session) { console.warn("[bridge] __CC_GET_ADVERTISE__: no ALS session context; advertising no tools"); return []; }
-  return st.session.advertise || [];
+  const adv = st.session.advertise || [];
+  // Proves the SDK's tool-advertising path (the non-prewarmed else branch) actually runs per model turn and
+  // how many tools it hands the model. If this fires with a full count yet the model still calls only native
+  // read/shell, the gap is the MODEL not engaging mcpTools — not a missing advertisement.
+  dbg("__CC_GET_ADVERTISE__ called by SDK", "session=" + st.session.id, "returning=" + adv.length + " tools");
+  return adv;
 };
 
 // Convert a proto Value/Struct/JSON-string into plain JSON (mcpArgs.args arrives as a proto map<string,Value>).
