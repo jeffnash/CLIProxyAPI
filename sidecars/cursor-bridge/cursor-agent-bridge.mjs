@@ -25,7 +25,11 @@
 // Env: CURSOR_API_KEY (required), CURSOR_AGENT_BRIDGE_PORT (default 9798),
 //      CURSOR_AGENT_STATE_ROOT (default ./.cursor-agent-store — a writable volume on Railway),
 //      CURSOR_AGENT_PENDING_TIMEOUT_MS (default 600000 in-process abandonment watchdog; NOT an upstream deadline),
-//      CURSOR_AGENT_SESSION_TTL_MS (default 1800000 idle session eviction).
+//      CURSOR_AGENT_SESSION_TTL_MS (default 1800000 idle session eviction),
+//      CURSOR_COMPOSER_MCP_SHIM (default ON; "0"/"false" disables registering the client's tools via the SDK's
+//        official mcpServers path — the in-bridge /mcp streamable-http server),
+//      CURSOR_COMPOSER_MCP_GROUPING (one|natural|per-tool, default natural — how advertised tools are
+//        partitioned across the hosted MCP servers).
 
 import { createServer } from "node:http";
 import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
@@ -53,6 +57,28 @@ const TOOL_BATCH_MS = parseInt(process.env.CURSOR_AGENT_TOOL_BATCH_MS || "60", 1
 // Verbose per-turn diagnostic logging ([cct] lines) is OFF by default and gated behind this flag, so
 // production logs stay clean and never echo request content. Set CURSOR_COMPOSER_DEBUG=1 to enable.
 const COMPOSER_DEBUG = process.env.CURSOR_COMPOSER_DEBUG === "1" || process.env.CURSOR_COMPOSER_DEBUG === "true";
+// MCP shim: register the client's advertised tools through the @cursor/sdk's OFFICIAL mcpServers path by
+// hosting a tiny session-aware streamable-http MCP server inside this bridge (route /mcp/<sessionId>). This
+// makes composer-2.5 actually CALL advertised tools (subagents/Agent, MCP tools, WebSearch, …) instead of
+// only native read/shell. DEFAULT ON; disabled ONLY when the value is exactly "0" or "false" (any case).
+// Fully fail-safe: when off (or on any build error) buildMcpServers returns {} and behavior is byte-for-byte
+// today's native-only path. The /mcp route is dialed by the in-process SDK runtime over loopback only.
+const MCP_SHIM_RAW = String(process.env.CURSOR_COMPOSER_MCP_SHIM ?? "").trim().toLowerCase();
+const MCP_SHIM_ENABLED = !(MCP_SHIM_RAW === "0" || MCP_SHIM_RAW === "false");
+// Grouping: how advertised tools are partitioned across MCP servers — one|natural|per-tool (default natural).
+//   one      -> a single server "cc" advertising ALL tools (one MCP connection).
+//   natural  -> reconstruct the user's real MCP topology from mcp__<server>__<tool> names; non-mcp tools
+//               (Bash/Read/Task/WebSearch/…) lump into a synthetic "claude-code" server (cosmetic; bounds
+//               each tools/list payload and mirrors the model's expected grouping).
+//   per-tool -> one server per advertised tool (worst-case compat/diagnostic mode).
+// Parsed once at startup; an unknown value falls back to "natural" with a console.warn.
+const MCP_GROUPING = (() => {
+  const g = String(process.env.CURSOR_COMPOSER_MCP_GROUPING ?? "").trim().toLowerCase();
+  if (g === "" || g === "natural") return "natural";
+  if (g === "one" || g === "per-tool") return g;
+  console.warn(`[bridge] CURSOR_COMPOSER_MCP_GROUPING="${g}" is not one of one|natural|per-tool — falling back to "natural"`);
+  return "natural";
+})();
 // Per-session FIFO queue depth: concurrent NEW-USER turns on one session are serialized (not rejected);
 // this bounds how many may wait behind the active turn before a last-resort 429 (Layer A diverts tool-less
 // one-shots, so reaching this requires many genuine concurrent agentic turns on one conversation).
@@ -640,7 +666,18 @@ async function ensureAgent(session, model) {
   session.agentPromise = (async () => {
     const platform = await getPlatform(session.cursorKey);
     const opts = { model: { id: model }, apiKey: session.cursorKey, local: { cwd: EMPTY_CWD } };
-    dbg("ensureAgent resumeAgent", "session=" + session.id, "model=" + model);
+    // MCP shim registration (additive, never substitutive): attach the session's MCP server map so the SDK's
+    // local runtime dials our in-bridge /mcp/<id> endpoint and surfaces the advertised tools to the model.
+    // Wrapped so any throw degrades to today's native-only behavior — the working read/shell path MUST survive
+    // any shim failure. Built per ensureAgent so a session whose tools change across runs re-registers correctly,
+    // and applied to BOTH the resume and create branches below (they spread the same opts).
+    try {
+      const servers = buildMcpServers(session);
+      if (servers && Object.keys(servers).length) opts.mcpServers = servers;
+    } catch (e) {
+      dbg("ensureAgent buildMcpServers failed (continuing native-only)", "session=" + session.id, (e && e.message) || String(e));
+    }
+    dbg("ensureAgent resumeAgent", "session=" + session.id, "model=" + model, "mcpServers=" + (opts.mcpServers ? Object.keys(opts.mcpServers).length : 0));
     try {
       session.agent = await platform.resumeAgent(session.id, opts);       // cold / restart: resume by our stable id
       // BR-DS: a successful resume of a DURABLE agent that already has prior turns (e.g. after a bridge
@@ -671,6 +708,208 @@ async function ensureAgent(session, model) {
     return session.agent;
   })();
   try { return await session.agentPromise; } finally { session.agentPromise = null; }
+}
+
+// ──────────────────────────── MCP shim (in-bridge streamable-http MCP server) ────────────────────────────
+// The SDK's local runtime is a real MCP client: given an http McpServerConfig it connects out, calls
+// tools/list, surfaces those tools to composer-2.5, and drives tools/call when the model picks one. We host
+// that server here over loopback (route /mcp/<sessionId>[/<serverKey>]) so a tools/call converges on the
+// SAME pending/emit machinery as a native dispatchMcp — the model's call becomes an SSE tool_call the client
+// answers on a later /agent/turn (resolvePending fulfills the awaiting promise).
+
+// mcpServerKeyForTool maps an advertised tool NAME to its server key under the active grouping. Pure helper.
+//   one      -> always "cc".
+//   natural  -> mcp__<server>__<tool> -> sanitize(<server>); everything else -> "claude-code".
+//   per-tool -> sanitize(<toolName>) (one server per tool).
+// sanitize restricts a key to a URL-safe segment [A-Za-z0-9_.-] (other chars -> "-").
+function mcpSanitizeKey(s) { return String(s || "").replace(/[^A-Za-z0-9_.-]/g, "-"); }
+function mcpServerKeyForTool(name, grouping = MCP_GROUPING) {
+  const n = String(name || "");
+  if (grouping === "one") return "cc";
+  if (grouping === "per-tool") return mcpSanitizeKey(n);
+  // natural: reconstruct the originating MCP server from the mcp__<server>__<tool> convention. Non-greedy
+  // first group so the FIRST "__" after the prefix delimits server vs tool (a server token may itself carry
+  // single underscores, e.g. plugin_chrome-devtools-mcp_chrome-devtools, but never "__").
+  const m = n.match(/^mcp__(.+?)__(.+)$/);
+  return m ? mcpSanitizeKey(m[1]) : "claude-code";
+}
+
+// mcpToolsForServer returns the slice of the session's advertised tools that belongs to serverKey under the
+// active grouping. For grouping "one" (serverKey "cc" / empty) it returns ALL advertised tools. Recomputed
+// per request (never cached) because session.advertise can change per turn. Each entry is shaped for
+// tools/list: {name, description, inputSchema} with a valid object inputSchema default.
+function mcpToolsForServer(session, serverKey, grouping = MCP_GROUPING) {
+  const adv = (session && session.advertise) || [];
+  const all = grouping === "one" || !serverKey || serverKey === "cc";
+  const out = [];
+  for (const t of adv) {
+    const name = t.toolName || t.name;
+    if (!name) continue;
+    if (!all && mcpServerKeyForTool(name, grouping) !== serverKey) continue;
+    const schema = t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : { type: "object" };
+    out.push({ name, description: t.description || "", inputSchema: schema });
+  }
+  return out;
+}
+
+// buildMcpServers returns the Record<serverKey, McpServerConfig> registered via AgentOptions.mcpServers for a
+// session, or {} when the shim is off (DEFAULT ON; off only when CURSOR_COMPOSER_MCP_SHIM is "0"/"false").
+// Every server is the same loopback http shape; only the SET of keys + the per-key tool slice differ by
+// grouping. The url carries the sessionId (authoritative) and, when grouping != "one", the serverKey segment;
+// a belt-and-suspenders X-CC-Session header is sent too (our handler ignores it — the path is authoritative).
+// MUST be fail-safe: any throw returns {} so a shim bug can never break the working native path. R5: under
+// "natural", if two distinct server tokens sanitize to the SAME key, degrade this session to "one" (correct
+// full tool names are unchanged regardless) and log a dbg line.
+function buildMcpServers(session) {
+  try {
+    if (!MCP_SHIM_ENABLED) return {};
+    const adv = (session && session.advertise) || [];
+    if (!adv.length) return {};
+    const sid = session.id;
+    const mkServer = (serverKey) => ({
+      type: "http",
+      url: `http://127.0.0.1:${PORT}/mcp/${sid}` + (serverKey && serverKey !== "cc" ? `/${serverKey}` : ""),
+      headers: { "X-CC-Session": sid },
+    });
+    if (MCP_GROUPING === "one") return { cc: mkServer("cc") };
+    const servers = {};
+    // R5 collision guard (natural only): detect two distinct server tokens collapsing to one URL-safe key.
+    const seenRaw = new Map(); // sanitizedKey -> rawServerToken (for the collision check)
+    for (const t of adv) {
+      const name = t.toolName || t.name;
+      if (!name) continue;
+      const key = mcpServerKeyForTool(name, MCP_GROUPING);
+      if (MCP_GROUPING === "natural") {
+        const m = name.match(/^mcp__(.+?)__(.+)$/);
+        const raw = m ? m[1] : "claude-code";
+        const prev = seenRaw.get(key);
+        if (prev !== undefined && prev !== raw) {
+          dbg("buildMcpServers natural key collision -> degrade to one", "session=" + sid, "key=" + key, "a=" + prev, "b=" + raw);
+          return { cc: mkServer("cc") };
+        }
+        seenRaw.set(key, raw);
+      }
+      if (!servers[key]) servers[key] = mkServer(key);
+    }
+    return servers;
+  } catch (e) {
+    dbg("buildMcpServers threw (returning {})", "session=" + (session && session.id), (e && e.message) || String(e));
+    return {};
+  }
+}
+
+// mcpError builds a JSON-RPC 2.0 error response object (never thrown to the socket).
+function mcpError(id, code, message) { return { jsonrpc: "2.0", id: id ?? null, error: { code, message } }; }
+// mcpResult builds a JSON-RPC 2.0 success response object.
+function mcpResult(id, result) { return { jsonrpc: "2.0", id: id ?? null, result }; }
+
+// mcpDispatch handles ONE JSON-RPC message for the in-bridge MCP server and returns either a JSON-RPC
+// response object, or null for a notification (no id) that needs only a 202. NEVER throws — every path is
+// wrapped so the socket always receives a valid JSON-RPC object (fail-soft). sessionId + serverKey come from
+// the URL path; the session is looked up in the existing `sessions` Map (no new session concept).
+async function mcpDispatch(msg, sessionId, serverKey) {
+  try {
+    if (!msg || typeof msg !== "object" || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
+      return mcpError(msg && msg.id, -32600, "Invalid Request");
+    }
+    const { id, method, params } = msg;
+    const hasId = id !== undefined && id !== null;
+    switch (method) {
+      case "initialize": {
+        const ver = (params && typeof params.protocolVersion === "string" && params.protocolVersion) || "2025-06-18";
+        dbg("mcp initialize", "session=" + sessionId, "serverKey=" + (serverKey || "cc"), "protocol=" + ver);
+        return mcpResult(id, { protocolVersion: ver, capabilities: { tools: {} }, serverInfo: { name: "cursor-composer-clienttools", version: "1" } });
+      }
+      case "notifications/initialized":
+        // A notification (no id): no state to track beyond the existing Session. The caller replies 202.
+        return null;
+      case "ping":
+        return mcpResult(id, {});
+      case "tools/list": {
+        const session = sessions.get(sessionId);
+        const tools = session ? mcpToolsForServer(session, serverKey) : [];
+        dbg("mcp tools/list", "session=" + sessionId, "serverKey=" + (serverKey || "cc"), "count=" + tools.length);
+        // Return everything; omit nextCursor (a few hundred tools is fine, no real pagination needed).
+        return mcpResult(id, { tools });
+      }
+      case "tools/call": {
+        const want = (params && params.name) || "";
+        const input = (params && params.arguments) || {};
+        const session = sessions.get(sessionId);
+        dbg("mcp tools/call", "session=" + sessionId, "serverKey=" + (serverKey || "cc"), "name=" + want);
+        if (!session) {
+          // Degrade, never fake success: an unknown/expired session yields a typed isError tool result.
+          return mcpResult(id, { content: [{ type: "text", text: `session ${sessionId} not found (bridge restart or idle eviction); the tool call cannot be routed` }], isError: true });
+        }
+        const ccName = session.reconcileToolName(want);
+        dbg("mcp tools/call reconciled", "session=" + sessionId, "want=" + want, "reconciled=" + (ccName || "<UNAVAILABLE>"));
+        if (!ccName) {
+          const names = (session.advertise || []).map((t) => t.toolName || t.name).join(", ");
+          return mcpResult(id, { content: [{ type: "text", text: `Tool '${want}' is not available. Available tools: ${names || "(none)"}.` }], isError: true });
+        }
+        // Correlate + await exactly like Session.dispatchMcp: ccToolId(undefined) mints a sanitized tc_<uuid>
+        // that is BOTH the SSE tool_call id and the pending-map key. The only bound on the wait is the existing
+        // PENDING_TIMEOUT_MS watchdog (no new data-path timeout). resolvePending (on the later tool_results
+        // turn) fulfills `wrap`; rejectAllPending (run completed/errored/cancelled/abandoned) -> __reject.
+        const callId = ccToolId(undefined);
+        try {
+          const content = await new Promise((resolve, reject) => {
+            const wrap = (c) => resolve(c);
+            wrap.__reject = reject;
+            session.newPending(callId, wrap);
+            session.emitToolUse(callId, ccName, input);
+          });
+          return mcpResult(id, { content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content ?? "") }], isError: false });
+        } catch (rejErr) {
+          // Run completed/errored/cancelled/abandoned before the client answered: a typed failure (per MCP,
+          // tool-execution failures are RESULTS with isError, not protocol errors), so the runtime never hangs.
+          return mcpResult(id, { content: [{ type: "text", text: (rejErr && rejErr.message) || String(rejErr) }], isError: true });
+        }
+      }
+      default:
+        // Unknown method: a JSON-RPC error for a request; silently drop an unknown notification (no id).
+        return hasId ? mcpError(id, -32601, "Method not found") : null;
+    }
+  } catch (e) {
+    // Last-resort fail-soft: never throw to the socket. A request gets a JSON-RPC error; a notification gets 202.
+    dbg("mcpDispatch internal error", "session=" + sessionId, (e && e.message) || String(e));
+    return msg && (msg.id !== undefined && msg.id !== null) ? mcpError(msg.id, -32603, "Internal error") : null;
+  }
+}
+
+// handleMcp serves the /mcp/<sessionId>[/<serverKey>] streamable-http endpoint. POST carries a single
+// JSON-RPC 2.0 message or a batch array; we always reply application/json with the JSON-RPC response (or 202
+// for a pure-notification request). A GET (the optional server->client SSE channel we don't need) -> 405. The
+// body is read the same way /agent/turn reads its body. NEVER throws to the socket.
+async function handleMcp(req, res, sessionId, serverKey) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  if (req.method !== "POST") {
+    // streamable-http permits omitting the optional GET SSE stream (no server-initiated notifications here).
+    res.writeHead(405, { Allow: "POST", "Content-Type": "application/json" });
+    res.end(JSON.stringify(mcpError(null, -32600, "Method Not Allowed (POST only)")));
+    return;
+  }
+  let raw = ""; for await (const c of req) raw += c;
+  let body;
+  try { body = JSON.parse(raw); } catch (e) {
+    dbg("handleMcp -> -32700 parse error", "session=" + sessionId, (e && e.message) || String(e));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(mcpError(null, -32700, "Parse error")));
+    return;
+  }
+  // Always issue an Mcp-Session-Id (R4: liberal in, conservative out — the StreamableHTTP transport stores it
+  // on initialize). We accept any/none on later requests; the URL path is the authority.
+  res.setHeader("Mcp-Session-Id", sessionId);
+  if (Array.isArray(body)) {
+    const out = [];
+    for (const m of body) { const r = await mcpDispatch(m, sessionId, serverKey); if (r) out.push(r); }
+    // A batch of pure notifications yields no responses -> 202; otherwise return the response array.
+    if (!out.length) { res.writeHead(202, { "Content-Type": "application/json" }); res.end(); return; }
+    res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(out)); return;
+  }
+  const result = await mcpDispatch(body, sessionId, serverKey);
+  if (result === null) { res.writeHead(202, { "Content-Type": "application/json" }); res.end(); return; }
+  res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(result));
 }
 
 function streamCallbacks(session) {
@@ -1075,6 +1314,16 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
 const server = createServer(async (req, res) => {
   if (req.method === "OPTIONS") { res.setHeader("Access-Control-Allow-Origin", "*"); res.writeHead(204); res.end(); return; }
   if (req.method === "GET" && req.url === "/health") { res.setHeader("Access-Control-Allow-Origin", "*"); res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: true, patched: true, sessions: sessions.size })); return; }
+  // MCP shim endpoint: /mcp/<sessionId>[/<serverKey>]. Dialed by the in-process SDK runtime over loopback
+  // (NOT by an external client), so it is authorized by the in-path sessionId + the session lookup, not the
+  // inbound X-Bridge-Auth gate /agent/turn uses. Strip the query string, then split the path segments.
+  if (req.url && (req.url === "/mcp" || req.url.startsWith("/mcp/"))) {
+    const segs = req.url.split("?")[0].split("/").filter(Boolean); // ["mcp", sessionId?, serverKey?]
+    const sessionId = segs[1] ? decodeURIComponent(segs[1]) : "";
+    const serverKey = segs[2] ? decodeURIComponent(segs[2]) : "";
+    if (!sessionId) { res.setHeader("Access-Control-Allow-Origin", "*"); res.writeHead(404, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "missing sessionId in /mcp path" })); return; }
+    await handleMcp(req, res, sessionId, serverKey); return;
+  }
   if (req.method === "POST" && req.url === "/agent/turn") {
     const cursorKey = authorizeRequest(req);
     if (!cursorKey) {
@@ -1233,5 +1482,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, headlessRequestContext, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent };
+export { CC_CASES, headlessRequestContext, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

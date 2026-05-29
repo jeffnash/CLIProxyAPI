@@ -22,6 +22,12 @@ import {
   isConversationTooLong,
   ensureAgent,
   CC_CASES,
+  buildMcpServers,
+  mcpServerKeyForTool,
+  mcpToolsForServer,
+  mcpDispatch,
+  handleMcp,
+  MCP_GROUPING,
 } from "./cursor-agent-bridge.mjs";
 
 test("reconcileToolName: exact / case-insensitive / single / token-boundary / ambiguous", () => {
@@ -656,3 +662,256 @@ test("BR3: a disconnected QUEUED waiter self-reaps synchronously (frees the slot
   assert.equal(s.waiters, 0, "no double-decrement after the tail releases");
   sessions.delete(id);
 });
+
+// ───────────────────────────────── MCP shim (in-bridge streamable-http) ─────────────────────────────────
+//
+// buildMcpServers / MCP_GROUPING / MCP_SHIM_ENABLED are parsed ONCE at startup from the env, so this test
+// process sees the defaults (grouping="natural", shim ON). The grouping-specific KEY/SLICE logic is exercised
+// directly through the PURE helpers mcpServerKeyForTool(name, grouping) and mcpToolsForServer(session,
+// serverKey, grouping), which take grouping as an argument. buildMcpServers' default (natural) + the
+// one/per-tool/flag-off variants (which read the module-level const) are exercised via short spawned child
+// processes with the env set before import. The /mcp handler + tools/call degrade paths use mcpDispatch
+// directly with the exported `sessions` map.
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+const BRIDGE_PATH = _fileURLToPath(new URL("./cursor-agent-bridge.mjs", import.meta.url));
+// runInChild evaluates `expr` (a JS expression) inside a fresh node process that imports the bridge with the
+// given env, prints the JSON result on a marker line, and returns the parsed value — so grouping/flag consts
+// resolved at import time can be varied (they are read once at startup and cannot be re-read in-process).
+function runInChild(env, expr) {
+  const code = `import(${JSON.stringify(BRIDGE_PATH)}).then((m)=>{const v=(${expr});process.stdout.write("__R__"+JSON.stringify(v)+"__R__");});`;
+  const out = execFileSync(process.execPath, ["-e", code], { env: { ...process.env, ...env }, encoding: "utf8" });
+  const mm = out.match(/__R__([\s\S]*)__R__/);
+  assert.ok(mm, `child produced no marked result; raw output: ${out}`);
+  return JSON.parse(mm[1]);
+}
+
+test("MCP buildMcpServers (default natural): mcp__server__tool -> its server key; non-mcp -> claude-code", () => {
+  // This process's default grouping is "natural" (shim ON), so buildMcpServers is tested directly here.
+  const s = { id: "sid-nat", advertise: [{ name: "mcp__nanobanana__generate_image" }, { name: "Bash" }] };
+  const servers = buildMcpServers(s);
+  assert.deepEqual(Object.keys(servers).sort(), ["claude-code", "nanobanana"]);
+  assert.equal(servers.nanobanana.type, "http");
+  // The mcp__server__tool tool rides under a serverKey path segment; the URL carries the sessionId.
+  assert.match(servers.nanobanana.url, /\/mcp\/sid-nat\/nanobanana$/);
+  assert.match(servers["claude-code"].url, /\/mcp\/sid-nat\/claude-code$/);
+  assert.equal(servers.nanobanana.headers["X-CC-Session"], "sid-nat");
+  // A chrome-style server token (single underscores, no "__") is preserved as one key (non-greedy split).
+  const s2 = { id: "s2", advertise: [{ name: "mcp__plugin_chrome-devtools-mcp_chrome-devtools__click" }] };
+  assert.deepEqual(Object.keys(buildMcpServers(s2)), ["plugin_chrome-devtools-mcp_chrome-devtools"]);
+  // No advertised tools -> no servers (nothing to register).
+  assert.deepEqual(buildMcpServers({ id: "empty", advertise: [] }), {});
+});
+
+test("MCP grouping=one: a single 'cc' server whose URL has no serverKey segment + serves ALL tools", () => {
+  // grouping=one is a startup const, so exercise buildMcpServers through a child process with the env set.
+  const servers = runInChild(
+    { CURSOR_COMPOSER_MCP_GROUPING: "one", CURSOR_AGENT_BRIDGE_PORT: "9798" },
+    `m.buildMcpServers({id:"sone",advertise:[{name:"mcp__nanobanana__generate_image"},{name:"Bash"}]})`,
+  );
+  assert.deepEqual(Object.keys(servers), ["cc"]);
+  assert.equal(servers.cc.type, "http");
+  // "one" -> url is /mcp/<id> with NO serverKey segment.
+  assert.match(servers.cc.url, /\/mcp\/sone$/);
+  assert.doesNotMatch(servers.cc.url, /\/mcp\/sone\//);
+  // The pure slice helper returns ALL advertised tools for "one".
+  const session = { advertise: [{ name: "mcp__nanobanana__generate_image" }, { name: "Bash" }] };
+  assert.deepEqual(mcpToolsForServer(session, "cc", "one").map((t) => t.name).sort(), ["Bash", "mcp__nanobanana__generate_image"]);
+});
+
+test("MCP grouping=per-tool: one server per advertised tool, keyed by the sanitized tool name", () => {
+  const servers = runInChild(
+    { CURSOR_COMPOSER_MCP_GROUPING: "per-tool", CURSOR_AGENT_BRIDGE_PORT: "9798" },
+    `m.buildMcpServers({id:"sper",advertise:[{name:"mcp__nanobanana__generate_image"},{name:"Bash"}]})`,
+  );
+  // Server keys are sanitized tool names ("mcp__..." keeps its underscores; they are URL-safe).
+  assert.deepEqual(Object.keys(servers).sort(), ["Bash", "mcp__nanobanana__generate_image"]);
+  assert.match(servers.Bash.url, /\/mcp\/sper\/Bash$/);
+  // Each per-tool server's slice is exactly its one tool.
+  const session = { advertise: [{ name: "mcp__nanobanana__generate_image" }, { name: "Bash" }] };
+  assert.deepEqual(mcpToolsForServer(session, "Bash", "per-tool").map((t) => t.name), ["Bash"]);
+  assert.deepEqual(mcpToolsForServer(session, "mcp__nanobanana__generate_image", "per-tool").map((t) => t.name), ["mcp__nanobanana__generate_image"]);
+});
+
+test("MCP shim OFF (CURSOR_COMPOSER_MCP_SHIM=false) -> buildMcpServers returns {} (native-only path)", () => {
+  for (const v of ["false", "0", "FALSE", "False"]) {
+    const servers = runInChild(
+      { CURSOR_COMPOSER_MCP_SHIM: v, CURSOR_AGENT_BRIDGE_PORT: "9798" },
+      `m.buildMcpServers({id:"soff",advertise:[{name:"Bash"}]})`,
+    );
+    assert.deepEqual(servers, {}, `value "${v}" must disable the shim`);
+  }
+  // Any other value keeps it ON (default-on), so a tool set still yields servers.
+  const on = runInChild({ CURSOR_COMPOSER_MCP_SHIM: "yes", CURSOR_AGENT_BRIDGE_PORT: "9798" }, `Object.keys(m.buildMcpServers({id:"son",advertise:[{name:"Bash"}]}))`);
+  assert.ok(on.length > 0, "a non-0/false value must leave the shim ON");
+});
+
+test("MCP mcpServerKeyForTool maps names per grouping (pure)", () => {
+  assert.equal(mcpServerKeyForTool("mcp__nanobanana__generate_image", "natural"), "nanobanana");
+  assert.equal(mcpServerKeyForTool("Bash", "natural"), "claude-code");
+  assert.equal(mcpServerKeyForTool("mcp__nanobanana__generate_image", "one"), "cc");
+  assert.equal(mcpServerKeyForTool("Bash", "one"), "cc");
+  assert.equal(mcpServerKeyForTool("mcp__nanobanana__generate_image", "per-tool"), "mcp__nanobanana__generate_image");
+  // Sanitization replaces non-[A-Za-z0-9_.-] with "-" (e.g. a slash in a per-tool key).
+  assert.equal(mcpServerKeyForTool("weird/tool name", "per-tool"), "weird-tool-name");
+});
+
+test("MCP tools/list returns the session's advertised tools with an object inputSchema default", async () => {
+  const id = "mcp-list";
+  const s = seedSession(id, "k-mcp-list", {
+    seeded: true,
+    advertise: [
+      { name: "mcp__nanobanana__generate_image", toolName: "mcp__nanobanana__generate_image", description: "make an image", inputSchema: { type: "object", properties: { prompt: { type: "string" } } } },
+      { name: "Bash", toolName: "Bash" }, // no inputSchema -> default {type:"object"}
+    ],
+  });
+  // grouping="natural" in this process: the "claude-code" serverKey serves only Bash.
+  const ccList = await mcpDispatch({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, id, "claude-code");
+  assert.deepEqual(ccList.result.tools.map((t) => t.name), ["Bash"]);
+  assert.deepEqual(ccList.result.tools[0].inputSchema, { type: "object" }, "a tool with no schema gets {type:'object'}");
+  // The "nanobanana" serverKey serves only the image tool, preserving its provided schema.
+  const nb = await mcpDispatch({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, id, "nanobanana");
+  assert.deepEqual(nb.result.tools.map((t) => t.name), ["mcp__nanobanana__generate_image"]);
+  assert.equal(nb.result.tools[0].description, "make an image");
+  assert.deepEqual(nb.result.tools[0].inputSchema.properties.prompt, { type: "string" });
+  // Empty serverKey ("cc"/grouping-one shape) returns ALL tools regardless of grouping.
+  const all = await mcpDispatch({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} }, id, "");
+  assert.deepEqual(all.result.tools.map((t) => t.name).sort(), ["Bash", "mcp__nanobanana__generate_image"]);
+  sessions.delete(id);
+});
+
+test("MCP initialize returns protocolVersion + capabilities.tools + serverInfo (echoes client version)", async () => {
+  const r = await mcpDispatch({ jsonrpc: "2.0", id: 7, method: "initialize", params: { protocolVersion: "2025-03-26" } }, "any", "cc");
+  assert.equal(r.jsonrpc, "2.0");
+  assert.equal(r.id, 7);
+  assert.equal(r.result.protocolVersion, "2025-03-26", "echoes the client's requested protocolVersion");
+  assert.deepEqual(r.result.capabilities, { tools: {} });
+  assert.equal(r.result.serverInfo.name, "cursor-composer-clienttools");
+  assert.equal(r.result.serverInfo.version, "1");
+  // No client version -> a sane default is returned.
+  const d = await mcpDispatch({ jsonrpc: "2.0", id: 8, method: "initialize", params: {} }, "any", "cc");
+  assert.equal(d.result.protocolVersion, "2025-06-18");
+});
+
+test("MCP notifications/initialized -> null (202, no body); ping -> empty result", async () => {
+  const init = await mcpDispatch({ jsonrpc: "2.0", method: "notifications/initialized" }, "any", "cc");
+  assert.equal(init, null, "a notification yields no JSON-RPC response object (the handler sends 202)");
+  const ping = await mcpDispatch({ jsonrpc: "2.0", id: 5, method: "ping" }, "any", "cc");
+  assert.deepEqual(ping.result, {});
+});
+
+test("MCP unknown method -> -32601; malformed -> -32600; never throws", async () => {
+  const unk = await mcpDispatch({ jsonrpc: "2.0", id: 9, method: "tools/doesnotexist" }, "any", "cc");
+  assert.equal(unk.error.code, -32601, "unknown method -> Method not found");
+  // Malformed (missing method / wrong jsonrpc) -> Invalid Request.
+  const bad = await mcpDispatch({ jsonrpc: "1.0", id: 10 }, "any", "cc");
+  assert.equal(bad.error.code, -32600);
+  // An unknown NOTIFICATION (no id) is silently dropped (null), never an error object.
+  const unkNotif = await mcpDispatch({ jsonrpc: "2.0", method: "notifications/cancelled" }, "any", "cc");
+  assert.equal(unkNotif, null);
+});
+
+test("MCP tools/call with no matching session returns an isError result (degrade, NOT fake success)", async () => {
+  const id = "mcp-no-session";
+  sessions.delete(id); // guarantee the lookup misses
+  const r = await mcpDispatch({ jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "Bash", arguments: {} } }, id, "cc");
+  assert.equal(r.jsonrpc, "2.0");
+  // Per MCP, a tool-execution failure is a RESULT with isError:true (not a JSON-RPC protocol error), so the
+  // runtime gets a typed failure and continues — and crucially it is NOT a clean/empty success.
+  assert.ok(r.result, "tool failures are results, not protocol errors");
+  assert.equal(r.result.isError, true, "an unknown session must degrade to isError, never fake success");
+  assert.match(r.result.content[0].text, /not found/);
+});
+
+test("MCP tools/call with an unresolvable tool name returns an isError result with the available-tools hint", async () => {
+  const id = "mcp-bad-tool";
+  // Two distinct tools so reconcileToolName genuinely fails (its single-tool rule would otherwise route the
+  // lone tool); neither shares a token with the unknown name, so it stays unresolved -> typed isError.
+  seedSession(id, "k-mcp-bad", { seeded: true, advertise: [{ name: "Bash", toolName: "Bash" }, { name: "Read", toolName: "Read" }] });
+  const r = await mcpDispatch({ jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "totally_unknown_tool", arguments: {} } }, id, "cc");
+  assert.equal(r.result.isError, true);
+  assert.match(r.result.content[0].text, /not available/);
+  assert.match(r.result.content[0].text, /Bash/, "the available-tools hint lists the advertised set");
+  sessions.delete(id);
+});
+
+test("MCP tools/call happy path: emits an SSE tool_call and a later resolvePending yields an MCP text result", async () => {
+  const id = "mcp-call-ok";
+  const s = seedSession(id, "k-mcp-ok", { seeded: true, advertise: [{ name: "mcp__nanobanana__generate_image", toolName: "mcp__nanobanana__generate_image" }] });
+  // Capture the SSE tool_call emitted to the active response.
+  const emitted = [];
+  s.activeRes = { write(line) { emitted.push(line); return true; } };
+  // Fire the call; it parks on a pending until the client answers on a later turn.
+  const p = mcpDispatch({ jsonrpc: "2.0", id: 13, method: "tools/call", params: { name: "mcp__nanobanana__generate_image", arguments: { prompt: "a cat" } } }, id, "nanobanana");
+  await Promise.resolve();
+  // The full client tool name round-trips verbatim (the §4 contract), and the args are passed through.
+  const toolCall = emitted.map((l) => l.replace(/^data: /, "")).map((j) => { try { return JSON.parse(j); } catch { return null; } }).find((o) => o && o.type === "tool_call");
+  assert.ok(toolCall, "an SSE tool_call must be written to the active response");
+  assert.equal(toolCall.name, "mcp__nanobanana__generate_image", "the reconciled (full) tool name is emitted");
+  assert.deepEqual(toolCall.input, { prompt: "a cat" }, "the arguments pass through to the client");
+  // The client answers on a later /agent/turn -> resolvePending fulfills the awaiting MCP promise.
+  const callId = [...s.everEmitted][0];
+  assert.ok(callId, "the tools/call must register a pending keyed by the minted id");
+  if (s.flushTimer) clearTimeout(s.flushTimer); // avoid the real batch timer firing post-test
+  assert.equal(s.resolvePending(callId, "IMAGE_BYTES"), true);
+  const r = await p;
+  assert.equal(r.result.isError, false);
+  assert.deepEqual(r.result.content, [{ type: "text", text: "IMAGE_BYTES" }], "the resolved content is shaped as MCP text content");
+  sessions.delete(id);
+});
+
+test("MCP tools/call reject (run torn down) -> a typed isError result, never a hang", async () => {
+  const id = "mcp-call-reject";
+  const s = seedSession(id, "k-mcp-rej", { seeded: true, advertise: [{ name: "Bash", toolName: "Bash" }] });
+  s.activeRes = { write() { return true; } };
+  const p = mcpDispatch({ jsonrpc: "2.0", id: 14, method: "tools/call", params: { name: "Bash", arguments: {} } }, id, "cc");
+  await Promise.resolve();
+  // The run completes/errors/cancels before the client answers -> rejectAllPending -> the RPC resolves isError.
+  if (s.flushTimer) clearTimeout(s.flushTimer);
+  s.rejectAllPending("run completed");
+  const r = await p;
+  assert.equal(r.result.isError, true, "a torn-down run must yield a typed failure, not a protocol throw or hang");
+  assert.match(r.result.content[0].text, /run completed/);
+  sessions.delete(id);
+});
+
+test("MCP handleMcp HTTP: POST initialize -> 200 + Mcp-Session-Id header; GET -> 405; bad JSON -> -32700", async () => {
+  // initialize over the HTTP shell: a single JSON-RPC message in, a JSON-RPC response out + the session header.
+  const reqInit = bodyReq("POST", JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+  const resInit = makeMcpRes();
+  await handleMcp(reqInit, resInit, "sid-http", "cc");
+  assert.equal(resInit.status, 200);
+  assert.equal(resInit.headers["Mcp-Session-Id"], "sid-http", "initialize must set Mcp-Session-Id to the path session id");
+  assert.equal(JSON.parse(resInit.body).result.serverInfo.name, "cursor-composer-clienttools");
+  // A notification yields 202 with no body.
+  const reqNotif = bodyReq("POST", JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
+  const resNotif = makeMcpRes();
+  await handleMcp(reqNotif, resNotif, "sid-http", "cc");
+  assert.equal(resNotif.status, 202);
+  assert.equal(resNotif.body, "");
+  // GET (the optional server->client SSE channel we don't serve) -> 405.
+  const resGet = makeMcpRes();
+  await handleMcp({ method: "GET", async *[Symbol.asyncIterator]() {} }, resGet, "sid-http", "cc");
+  assert.equal(resGet.status, 405);
+  // Malformed JSON body -> a JSON-RPC -32700 (HTTP 200; fail-soft, never a thrown socket).
+  const resBad = makeMcpRes();
+  await handleMcp(bodyReq("POST", "{not json"), resBad, "sid-http", "cc");
+  assert.equal(resBad.status, 200);
+  assert.equal(JSON.parse(resBad.body).error.code, -32700);
+});
+
+// makeMcpRes builds a mock node res that captures status, headers (via setHeader + writeHead), and the body.
+function makeMcpRes() {
+  return {
+    status: 0, headers: {}, body: "", ended: false,
+    setHeader(k, v) { this.headers[k] = v; },
+    writeHead(code, h) { this.status = code; if (h) Object.assign(this.headers, h); return this; },
+    write(s) { this.body += s; return true; },
+    end(s) { if (s != null) this.body += s; this.ended = true; },
+  };
+}
+// bodyReq builds a mock node request that streams `raw` via async iteration (mirrors how /agent/turn + /mcp
+// read the body) with the given HTTP method.
+function bodyReq(method, raw) {
+  return { method, async *[Symbol.asyncIterator]() { yield raw; } };
+}
