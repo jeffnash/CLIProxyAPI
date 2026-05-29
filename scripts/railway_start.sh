@@ -608,6 +608,7 @@ if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR
         CURSOR_AGENT_BRIDGE_TOKEN="${CURSOR_AGENT_BRIDGE_TOKEN:-}" \
         CURSOR_AGENT_BRIDGE_PORT="${CURSOR_AGENT_BRIDGE_PORT}" \
         CURSOR_AGENT_STATE_ROOT="${CURSOR_AGENT_STATE_ROOT}" \
+        CURSOR_COMPOSER_DEBUG="${CURSOR_COMPOSER_DEBUG:-}" \
         node cursor-agent-bridge.mjs &
     )
     sidecar_ready=0

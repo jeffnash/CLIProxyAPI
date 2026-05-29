@@ -43,6 +43,16 @@ const PENDING_TIMEOUT_MS = parseInt(process.env.CURSOR_AGENT_PENDING_TIMEOUT_MS 
 const SESSION_TTL_MS = parseInt(process.env.CURSOR_AGENT_SESSION_TTL_MS || "1800000", 10);
 const MAX_SESSIONS = parseInt(process.env.CURSOR_AGENT_MAX_SESSIONS || "1000", 10);
 const SSE_KEEPALIVE_MS = 15000;
+// Tool-batch coalescing window. The @cursor/sdk never pauses for tools — it streams tool calls in waves —
+// so this debounce merges a wave (emits <window apart) into ONE turn_end. It is a pure latency<->round-trip
+// knob, NOT a correctness control: tools emitted after a turn closes are buffered + re-delivered next turn
+// regardless (see emitToolUse/flushUndelivered), so any value is safe. Raise it (e.g. 150-200) to coalesce
+// slower waves into fewer client round-trips at the cost of a little per-turn latency; lower it for snappier
+// turns and more round-trips. Default 60 preserves the original behavior.
+const TOOL_BATCH_MS = parseInt(process.env.CURSOR_AGENT_TOOL_BATCH_MS || "60", 10);
+// Verbose per-turn diagnostic logging ([cct] lines) is OFF by default and gated behind this flag, so
+// production logs stay clean and never echo request content. Set CURSOR_COMPOSER_DEBUG=1 to enable.
+const COMPOSER_DEBUG = process.env.CURSOR_COMPOSER_DEBUG === "1" || process.env.CURSOR_COMPOSER_DEBUG === "true";
 // Per-session FIFO queue depth: concurrent NEW-USER turns on one session are serialized (not rejected);
 // this bounds how many may wait behind the active turn before a last-resort 429 (Layer A diverts tool-less
 // one-shots, so reaching this requires many genuine concurrent agentic turns on one conversation).
@@ -478,7 +488,7 @@ class Session {
     this.sse({ type: "tool_call", id, name, input });
     const token = this.turnToken;
     if (this.flushTimer) clearTimeout(this.flushTimer);
-    this.flushTimer = setTimeout(() => { if (token === this.turnToken) this.pauseForTools(); }, 60);
+    this.flushTimer = setTimeout(() => { if (token === this.turnToken) this.pauseForTools(); }, TOOL_BATCH_MS);
   }
   // flushUndelivered delivers tools that were emitted while no response was open, on a later turn's OPEN
   // response, so the client finally sees them and can answer them. Emits one tool_use turn_end + settles.
@@ -486,6 +496,7 @@ class Session {
     if (!this.undelivered.length || !this.activeRes) return false;
     const batch = this.undelivered;
     this.undelivered = [];
+    dbg("flushUndelivered", "session=" + this.id, "count=" + batch.length, "ids=" + safeJson(batch.map((t) => t.id)));
     for (const t of batch) { this.delivered.add(t.id); this.sse({ type: "tool_call", id: t.id, name: t.name, input: t.input }); }
     this.sse({ type: "turn_end", stop_reason: "tool_use", tool_calls: batch.map((t) => t.id) });
     this.settle();
@@ -594,7 +605,7 @@ function streamCallbacks(session) {
 // even though Node block-buffers pipe stdout. Lines are content-free (session ids, statuses, lengths,
 // error messages) — turn routing decisions and failures only, never request/response bodies.
 function safeJson(a) { try { return typeof a === "string" ? a : JSON.stringify(a); } catch { return String(a); } }
-function dbg(...args) { try { writeSync(1, "[cct] " + args.map(safeJson).join(" ") + "\n"); } catch { /* never throw from logging */ } }
+function dbg(...args) { if (!COMPOSER_DEBUG) return; try { writeSync(1, "[cct] " + args.map(safeJson).join(" ") + "\n"); } catch { /* never throw from logging */ } }
 
 async function handleTurn(req, res, body, cursorKey) {
   const input = body.input || (body.text != null ? { type: "user", text: body.text } : { type: "user", text: "" });

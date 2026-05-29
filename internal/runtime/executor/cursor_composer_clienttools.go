@@ -88,6 +88,20 @@ var (
 
 const composerToolCallMapCap = 20000
 
+// composerDebugEnabled gates the verbose per-turn [composer] diagnostic logs (session routing, dispatch).
+// OFF by default so production logs stay clean; set CURSOR_COMPOSER_DEBUG=1 to enable. Error-level logs
+// (bridge non-2xx, transport/scanner errors) are NOT gated — they always report.
+var composerDebugEnabled = func() bool {
+	v := os.Getenv("CURSOR_COMPOSER_DEBUG")
+	return v == "1" || v == "true"
+}()
+
+func composerDebugf(format string, args ...any) {
+	if composerDebugEnabled {
+		log.Infof(format, args...)
+	}
+}
+
 // stableConversationID returns a stable caller/session identifier from the request headers, the inbound
 // request's session metadata, or CLIProxy execution metadata — or "" when the caller provides none. It
 // is NEVER derived from message text.
@@ -253,7 +267,7 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, oai []byte, opts cliproxye
 	// context to preserve), and the idle session is later evicted.
 	if isComposerUtilityOneShot(oai) {
 		sid := mintComposerSessionID()
-		log.Infof("[composer] deriveSessionID BRANCH=ephemeral(utility one-shot) -> sessionID=%s", sid)
+		composerDebugf("[composer] deriveSessionID BRANCH=ephemeral(utility one-shot) -> sessionID=%s", sid)
 		return sid, nil
 	}
 	// Comment 5: a tool_results continuation routes by tool_call_id OWNERSHIP first — the session that
@@ -262,7 +276,7 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, oai []byte, opts cliproxye
 	// silently mis-routed to the conv-id session (which would never match the pending tool calls).
 	if _, _, isCont := composerToolResults(gjson.GetBytes(oai, "messages").Array()); isCont {
 		if sid := lookupSessionByToolResults(tenant, oai); sid != "" {
-			log.Infof("[composer] deriveSessionID BRANCH=continuation(tool_call_id ownership) -> sessionID=%s", sid)
+			composerDebugf("[composer] deriveSessionID BRANCH=continuation(tool_call_id ownership) -> sessionID=%s", sid)
 			return sid, nil
 		}
 		// No recorded emitter (bridge restart / TTL eviction / cross-instance): fall back to the stable conv
@@ -270,7 +284,7 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, oai []byte, opts cliproxye
 		if id := stableConversationID(opts); id != "" {
 			sum := sha256.Sum256([]byte(tenant + "\x00conv:" + id))
 			sid := "sess_" + hex.EncodeToString(sum[:])[:32]
-			log.Infof("[composer] deriveSessionID BRANCH=continuation(stable fallback) convID=%q -> sessionID=%s", id, sid)
+			composerDebugf("[composer] deriveSessionID BRANCH=continuation(stable fallback) convID=%q -> sessionID=%s", id, sid)
 			return sid, nil
 		}
 		log.Errorf("[composer] deriveSessionID BRANCH=continuation MISS: tool_results turn, no recorded tool_call_id and no stable id -> ERROR")
@@ -279,7 +293,7 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, oai []byte, opts cliproxye
 	if id := stableConversationID(opts); id != "" {
 		sum := sha256.Sum256([]byte(tenant + "\x00conv:" + id))
 		sid := "sess_" + hex.EncodeToString(sum[:])[:32]
-		log.Infof("[composer] deriveSessionID BRANCH=stable convID=%q -> sessionID=%s", id, sid)
+		composerDebugf("[composer] deriveSessionID BRANCH=stable convID=%q -> sessionID=%s", id, sid)
 		return sid, nil
 	}
 	// New user turn with no stable id (a stateless client — curl/SDK/simple UI). Mint a FRESH RANDOM session
@@ -287,7 +301,7 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, oai []byte, opts cliproxye
 	// default Cursor Composer Client-Tools path; a stateless multi-turn client keeps context via history re-seeding (not durable
 	// resume). Continuations still resolve because we record each emitted tool_call_id -> session.
 	sid := mintComposerSessionID()
-	log.Infof("[composer] deriveSessionID BRANCH=mint(stateless new user turn) -> sessionID=%s", sid)
+	composerDebugf("[composer] deriveSessionID BRANCH=mint(stateless new user turn) -> sessionID=%s", sid)
 	return sid, nil
 }
 
@@ -861,7 +875,7 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 	}
 	inp := composerInput(oai)
 	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, extractComposerClientEnv(opts), composerConstraints(oai))
-	log.Infof("[composer %s] STREAM sessionID=%s inputType=%v toolChoice=%q advertise=%d -> POST /agent/turn", responseID, sessionID, inp["type"], toolChoice, len(advertise))
+	composerDebugf("[composer %s] STREAM sessionID=%s inputType=%v toolChoice=%q advertise=%d -> POST /agent/turn", responseID, sessionID, inp["type"], toolChoice, len(advertise))
 
 	httpResp, err := e.postAgentTurn(ctx, auth, apiKey, body)
 	if err != nil {
