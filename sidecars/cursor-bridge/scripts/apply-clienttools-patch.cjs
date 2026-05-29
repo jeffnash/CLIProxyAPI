@@ -18,10 +18,13 @@
 // If the globals are not installed (e.g. SDK used standalone), behavior is native.
 //
 // On any anchor mismatch or version drift the patcher fails LOUD (non-zero exit)
-// so a new SDK release is re-verified before shipping.
+// so a new SDK release is re-verified before shipping. The SHA-256 of the pristine
+// bundle is gated FAIL-CLOSED (M27): a drifted byte-stream aborts the patch unless an
+// explicit development escape hatch is set, BEFORE any anchor replacement runs.
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const PINNED_VERSION = "1.0.14";
 // SHA-256 of the pristine dist/cjs/index.js the anchors were verified against. On any SDK bump this
@@ -35,28 +38,24 @@ const target = path.join(sdkRoot, "dist", "cjs", "index.js");
 // fails loud and the deploy must reinstall a pristine bundle (npm ci) before re-patching.
 const MARK = "/*cursor-composer-clienttools-patched-v1*/";
 
-function fail(msg) { console.error(`[clienttools] ${msg}`); process.exit(1); }
+// Development escape hatches that downgrade the M27 SHA fail-closed gate to a warning. EITHER name is
+// honored (the audit/spec canonical name plus an alternate); these MUST stay opt-in so production never
+// patches a drifted byte-stream by default. They do NOT relax the version pin or the anchor-count checks.
+const SHA_OVERRIDE_ENV = ["CURSOR_CLIENTTOOLS_ALLOW_UNVERIFIED_SDK", "CURSOR_SDK_PATCH_ALLOW_SHA_MISMATCH"];
 
-let version;
-try { version = require(path.join(sdkRoot, "package.json")).version; }
-catch (e) { fail(`cannot read @cursor/sdk package.json: ${e.message}`); }
-if (version !== PINNED_VERSION) {
-  fail(`@cursor/sdk is ${version} but patch is pinned to ${PINNED_VERSION}. ` +
-       `Re-verify the anchors against the new bundle, then bump PINNED_VERSION.`);
+// A typed failure the CLI wrapper maps to a non-zero exit and callers/tests can assert on by `code`.
+// Carrying a code (instead of a bare string) lets the self-tests prove the SHA gate fails CLOSED rather
+// than relying on stdout text matching.
+class PatchError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "PatchError";
+    this.code = code;
+  }
 }
 
-let src;
-try { src = fs.readFileSync(target, "latin1"); }
-catch (e) { fail(`cannot read bundle ${target}: ${e.message}`); }
-
-if (src.startsWith(MARK)) { console.log("[clienttools] already patched"); process.exit(0); }
-
-const observedSha = require("crypto").createHash("sha256").update(src, "latin1").digest("hex");
-if (observedSha !== EXPECTED_BUNDLE_SHA256) {
-  console.warn(`[clienttools] WARNING: pristine bundle sha256=${observedSha} != recorded ${EXPECTED_BUNDLE_SHA256}. ` +
-    `@cursor/sdk may have changed — re-verify anchors. Proceeding; the per-anchor count checks below still guard.`);
-} else {
-  console.log(`[clienttools] pristine bundle sha256 verified (${observedSha.slice(0, 16)}…)`);
+function shaOverrideEnabled(env) {
+  return SHA_OVERRIDE_ENV.some((k) => env[k] === "1");
 }
 
 const edits = [
@@ -95,33 +94,170 @@ const edits = [
 function assertAscii(label, str) {
   for (let i = 0; i < str.length; i++) {
     if (str.charCodeAt(i) > 0x7f) {
-      fail(`injected string "${label}" has a non-ASCII char U+${str.charCodeAt(i).toString(16)} at index ${i}; the latin1 write would corrupt it -- use ASCII.`);
+      throw new PatchError(
+        "non-ascii-injection",
+        `injected string "${label}" has a non-ASCII char U+${str.charCodeAt(i).toString(16)} at index ${i}; the latin1 write would corrupt it -- use ASCII.`,
+      );
     }
   }
 }
-for (const ed of edits) assertAscii(ed.name + ".to", ed.to);
 
-for (const ed of edits) {
-  const count = src.split(ed.from).length - 1;
-  if (count !== ed.expect) {
-    fail(`anchor "${ed.name}": found ${count}, expected ${ed.expect}. SDK bundle changed — re-verify.`);
+// Core, side-effect-free patch logic. Takes the pristine bundle text + SDK version + an env map and returns
+// the patched text plus the messages the CLI should print, OR throws a PatchError on any fail-closed
+// condition. Kept pure (no fs/process) so the self-tests can drive the SHA gate and anchor checks against
+// synthetic bundles without installing the real @cursor/sdk.
+//
+// Order is load-bearing (M27): version pin -> already-patched short-circuit -> SHA gate (fail-closed
+// unless overridden) -> ASCII assertions -> anchor-count checks -> apply -> append self-test harness.
+// The SHA gate MUST precede the anchor checks: a drifted bundle whose anchors happen to still match must
+// NOT be patched silently, because the surrounding semantics may have changed (worst case: an unpatched
+// seam reintroduces native sidecar execution).
+function applyPatch({ src, version, env = {} }) {
+  const messages = [];
+
+  if (typeof src !== "string") {
+    throw new PatchError("bad-input", "applyPatch requires the bundle source as a latin1 string");
+  }
+
+  if (version !== PINNED_VERSION) {
+    throw new PatchError(
+      "version-mismatch",
+      `@cursor/sdk is ${version} but patch is pinned to ${PINNED_VERSION}. ` +
+        `Re-verify the anchors against the new bundle, then bump PINNED_VERSION.`,
+    );
+  }
+
+  if (src.startsWith(MARK)) {
+    return { alreadyPatched: true, patchedSrc: src, observedSha: null, messages: [{ level: "log", text: "already patched" }] };
+  }
+
+  // --- M27: fail-closed SHA gate, BEFORE the anchor-count checks below. ---
+  const observedSha = crypto.createHash("sha256").update(src, "latin1").digest("hex");
+  if (observedSha !== EXPECTED_BUNDLE_SHA256) {
+    if (!shaOverrideEnabled(env)) {
+      // Hard-fail: the byte-stream the anchors were verified against has changed. Do NOT proceed to the
+      // anchor replacements — a coincidental anchor match on a semantically-different bundle could ship a
+      // partially-patched (or native-exec-leaking) SDK.
+      throw new PatchError(
+        "sha-mismatch",
+        `pristine bundle sha256=${observedSha} != recorded ${EXPECTED_BUNDLE_SHA256}. @cursor/sdk has changed ` +
+          `(or was already modified) — re-verify the anchors, then update PINNED_VERSION + EXPECTED_BUNDLE_SHA256. ` +
+          `Refusing to patch a drifted bundle. To override for local development only, set ` +
+          `${SHA_OVERRIDE_ENV[0]}=1 (or ${SHA_OVERRIDE_ENV[1]}=1).`,
+      );
+    }
+    // Override set: development-only escape hatch. The anchor-count checks below still guard structurally,
+    // but the operator has explicitly accepted an unverified byte-stream.
+    messages.push({
+      level: "warn",
+      text:
+        `WARNING: pristine bundle sha256=${observedSha} != recorded ${EXPECTED_BUNDLE_SHA256}, but ` +
+        `${SHA_OVERRIDE_ENV.find((k) => env[k] === "1")}=1 is set — proceeding with an UNVERIFIED @cursor/sdk ` +
+        `(development override). Re-verify anchors and update the recorded hash before shipping.`,
+    });
+  } else {
+    messages.push({ level: "log", text: `pristine bundle sha256 verified (${observedSha.slice(0, 16)}…)` });
+  }
+
+  for (const ed of edits) assertAscii(ed.name + ".to", ed.to);
+
+  // --- anchor-count checks (structural guard); only reached AFTER the SHA gate. ---
+  for (const ed of edits) {
+    const count = src.split(ed.from).length - 1;
+    if (count !== ed.expect) {
+      throw new PatchError(
+        "anchor-mismatch",
+        `anchor "${ed.name}": found ${count}, expected ${ed.expect}. SDK bundle changed — re-verify.`,
+      );
+    }
+  }
+
+  let out = src;
+  for (const ed of edits) out = out.split(ed.from).join(ed.to);
+
+  // Bundle-level self-test harness: expose the EXACT unary/stream seam expressions (the same strings just
+  // applied at the real dispatch sites) as globals, so the bridge can drive the real patched dispatch logic
+  // at startup and prove native exec.execute() is unreachable. Derived from the same `to` strings, so the
+  // harness can never drift from the live seam; the anchor-count checks above guarantee the live seam exists.
+  const unaryExpr = edits.find((e) => e.name === "unary tool dispatch -> CC").to.replace(/^o=await/, "");
+  const streamExpr = edits.find((e) => e.name === "stream tool dispatch -> CC").to.replace(/^o=/, "").replace(/;for await$/, "");
+  const harness =
+    `\n;globalThis.__CC_SELFTEST_DISPATCH_U=function(n,e,s,t){return Promise.resolve(${unaryExpr})};` +
+    `globalThis.__CC_SELFTEST_DISPATCH_S=function(n,e,s,t){return ${streamExpr}};\n`;
+  assertAscii("self-test harness", harness);
+  out += harness;
+
+  out = MARK + out;
+
+  messages.push({
+    level: "log",
+    text: `patched @cursor/sdk@${version}: CC tool routing (unary+stream) + fromJson result construction`,
+  });
+
+  return { alreadyPatched: false, patchedSrc: out, observedSha, messages };
+}
+
+function emit(messages) {
+  for (const m of messages) {
+    if (m.level === "warn") console.warn(`[clienttools] ${m.text}`);
+    else if (m.level === "error") console.error(`[clienttools] ${m.text}`);
+    else console.log(`[clienttools] ${m.text}`);
   }
 }
-for (const ed of edits) src = src.split(ed.from).join(ed.to);
 
-// Bundle-level self-test harness: expose the EXACT unary/stream seam expressions (the same strings just
-// applied at the real dispatch sites) as globals, so the bridge can drive the real patched dispatch logic
-// at startup and prove native exec.execute() is unreachable. Derived from the same `to` strings, so the
-// harness can never drift from the live seam; the anchor-count checks above guarantee the live seam exists.
-const unaryExpr = edits.find((e) => e.name === "unary tool dispatch -> CC").to.replace(/^o=await/, "");
-const streamExpr = edits.find((e) => e.name === "stream tool dispatch -> CC").to.replace(/^o=/, "").replace(/;for await$/, "");
-const harness = `\n;globalThis.__CC_SELFTEST_DISPATCH_U=function(n,e,s,t){return Promise.resolve(${unaryExpr})};` +
-  `globalThis.__CC_SELFTEST_DISPATCH_S=function(n,e,s,t){return ${streamExpr}};\n`;
-assertAscii("self-test harness", harness);
-src += harness;
+// CLI entrypoint: read the real bundle, run the pure core, write the result. Preserves the original
+// stdout/stderr/exit contract exactly (postinstall depends on it). A PatchError is mapped to a single
+// `[clienttools] <msg>` on stderr + non-zero exit (fail-loud / fail-closed).
+function main() {
+  function fail(msg) {
+    console.error(`[clienttools] ${msg}`);
+    process.exit(1);
+  }
 
-src = MARK + src;
+  let version;
+  try {
+    version = require(path.join(sdkRoot, "package.json")).version;
+  } catch (e) {
+    return fail(`cannot read @cursor/sdk package.json: ${e.message}`);
+  }
 
-try { fs.writeFileSync(target, src, "latin1"); }
-catch (e) { fail(`cannot write bundle: ${e.message}`); }
-console.log(`[clienttools] patched @cursor/sdk@${version}: CC tool routing (unary+stream) + fromJson result construction`);
+  let src;
+  try {
+    src = fs.readFileSync(target, "latin1");
+  } catch (e) {
+    return fail(`cannot read bundle ${target}: ${e.message}`);
+  }
+
+  let result;
+  try {
+    result = applyPatch({ src, version, env: process.env });
+  } catch (e) {
+    if (e instanceof PatchError) return fail(e.message);
+    return fail(`unexpected patch failure: ${e && e.message ? e.message : e}`);
+  }
+
+  emit(result.messages);
+  if (result.alreadyPatched) {
+    process.exit(0);
+  }
+
+  try {
+    fs.writeFileSync(target, result.patchedSrc, "latin1");
+  } catch (e) {
+    return fail(`cannot write bundle: ${e.message}`);
+  }
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  applyPatch,
+  PatchError,
+  PINNED_VERSION,
+  EXPECTED_BUNDLE_SHA256,
+  MARK,
+  SHA_OVERRIDE_ENV,
+  edits,
+};

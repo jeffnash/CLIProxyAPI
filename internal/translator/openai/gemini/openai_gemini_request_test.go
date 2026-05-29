@@ -230,3 +230,273 @@ func TestGeminiSanitizesNonAlnumNameInMintedID(t *testing.T) {
 		t.Fatalf("sanitized call/response ids must agree; call=%q resp=%q", callIDs[0], respIDs[0])
 	}
 }
+
+// lastMessage returns the final entry of the converted OpenAI `messages` array.
+func lastMessage(t *testing.T, out []byte) gjson.Result {
+	t.Helper()
+	msgs := gjson.GetBytes(out, "messages").Array()
+	if len(msgs) == 0 {
+		t.Fatalf("expected at least one message, got none: %s", out)
+	}
+	return msgs[len(msgs)-1]
+}
+
+// countRole returns how many messages in the converted OpenAI body carry the role.
+func countRole(out []byte, role string) int {
+	n := 0
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() == role {
+			n++
+		}
+		return true
+	})
+	return n
+}
+
+// TestGeminiFunctionResponseOnlyContinuationDoesNotAppendEmptyUser is the H14
+// regression: a continuation turn that contains ONLY functionResponse parts (no
+// user text, no image, no functionCall) must NOT produce a trailing empty
+// role:"user" message. The executor classifies a continuation by the LAST message
+// being role:"tool"; an empty trailing user turn would instead look like a fresh
+// (empty) user turn and the paused run would never receive the tool output.
+func TestGeminiFunctionResponseOnlyContinuationDoesNotAppendEmptyUser(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [{"text": "read both files"}]},
+			{"role": "model", "parts": [
+				{"functionCall": {"id": "call_a", "name": "read_file", "args": {"path": "a"}}},
+				{"functionCall": {"id": "call_b", "name": "read_file", "args": {"path": "b"}}}
+			]},
+			{"role": "user", "parts": [
+				{"functionResponse": {"id": "call_a", "name": "read_file", "response": {"content": "A"}}},
+				{"functionResponse": {"id": "call_b", "name": "read_file", "response": {"content": "B"}}}
+			]}
+		]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	// The translated history must END on a role:"tool" message so the executor's
+	// continuation detector classifies it as a tool_results continuation.
+	if last := lastMessage(t, out); last.Get("role").String() != "tool" {
+		t.Fatalf("expected last message role=tool (tool_results continuation), got %q: %s", last.Get("role").String(), out)
+	}
+
+	// No empty trailing user turn may exist: the only user message is the first one
+	// (which has real text). There must be exactly one user message here.
+	if got := countRole(out, "user"); got != 1 {
+		t.Fatalf("expected exactly one (non-empty) user message, got %d: %s", got, out)
+	}
+
+	// Both tool responses must be present and carry their round-tripped ids.
+	_, respIDs := collectToolCallIDs(t, out)
+	if len(respIDs) != 2 || respIDs[0] != "call_a" || respIDs[1] != "call_b" {
+		t.Fatalf("expected two tool responses [call_a call_b], got %v: %s", respIDs, out)
+	}
+}
+
+// TestGeminiMixedToolResultPlusTextStillEmitsUserMessage guards the opposite of
+// H14: a trailing turn that carries functionResponse parts AND user text is a mixed
+// turn, not function-response-only. The user text must still be emitted (as a
+// role:"user" message), so the H14 suppression does NOT swallow real trailing text.
+func TestGeminiMixedToolResultPlusTextStillEmitsUserMessage(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "model", "parts": [
+				{"functionCall": {"id": "toolu_x", "name": "get_weather", "args": {}}}
+			]},
+			{"role": "user", "parts": [
+				{"functionResponse": {"id": "toolu_x", "name": "get_weather", "response": {"content": "rainy"}}},
+				{"text": "thanks, now compare with yesterday"}
+			]}
+		]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	// The trailing user text must survive as a user message.
+	if got := countRole(out, "user"); got != 1 {
+		t.Fatalf("expected the trailing user text to be emitted as one user message, got %d: %s", got, out)
+	}
+	var userText string
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() == "user" {
+			userText = msg.Get("content").String()
+		}
+		return true
+	})
+	if userText != "thanks, now compare with yesterday" {
+		t.Fatalf("expected trailing user text preserved, got %q: %s", userText, out)
+	}
+	// And the id still round-trips.
+	_, respIDs := collectToolCallIDs(t, out)
+	if len(respIDs) != 1 || respIDs[0] != "toolu_x" {
+		t.Fatalf("expected tool response id toolu_x, got %v", respIDs)
+	}
+}
+
+// TestGeminiEmptyUserTurnIsDropped verifies a content entry with no parts at all
+// (a bare empty user turn) does not produce a phantom empty user message — same H14
+// suppression path, generalized.
+func TestGeminiEmptyUserTurnIsDropped(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "user", "parts": [{"text": "hello"}]},
+			{"role": "user", "parts": []}
+		]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	if got := countRole(out, "user"); got != 1 {
+		t.Fatalf("expected exactly one non-empty user message (empty turn dropped), got %d: %s", got, out)
+	}
+	if last := lastMessage(t, out); last.Get("content").String() != "hello" {
+		t.Fatalf("expected last user message to be the non-empty 'hello' turn, got %q", last.Get("content").String())
+	}
+}
+
+// TestGeminiTwoParallelFunctionResponsesRoundTripExactIDs is the C02 read-back
+// contract (C-GEMID, reader side): two parallel functionResponse parts carrying the
+// exact ids the model emitted must map to two role:"tool" messages with those exact
+// ids — no minting, no 1-pending collapse. This is the half this file owns; the
+// response translator owns emitting functionCall.id on the wire.
+func TestGeminiTwoParallelFunctionResponsesRoundTripExactIDs(t *testing.T) {
+	req := `{
+		"contents": [
+			{"role": "model", "parts": [
+				{"functionCall": {"id": "fc_1", "name": "search", "args": {"q": "a"}}},
+				{"functionCall": {"id": "fc_2", "name": "search", "args": {"q": "b"}}}
+			]},
+			{"role": "user", "parts": [
+				{"functionResponse": {"id": "fc_1", "name": "search", "response": {"content": "A"}}},
+				{"functionResponse": {"id": "fc_2", "name": "search", "response": {"content": "B"}}}
+			]}
+		]
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	callIDs, respIDs := collectToolCallIDs(t, out)
+	if len(callIDs) != 2 || callIDs[0] != "fc_1" || callIDs[1] != "fc_2" {
+		t.Fatalf("expected call ids [fc_1 fc_2] verbatim, got %v", callIDs)
+	}
+	if len(respIDs) != 2 || respIDs[0] != "fc_1" || respIDs[1] != "fc_2" {
+		t.Fatalf("expected parallel response ids [fc_1 fc_2] echoed verbatim (no mint/collapse), got %v", respIDs)
+	}
+}
+
+// TestGeminiAllowedFunctionNamesAnySingleMapsToSpecific is the H15 regression: mode
+// ANY with exactly one allowedFunctionNames entry is the strongest constraint — force
+// THAT tool. The executor consumes the `specific:<name>` token.
+func TestGeminiAllowedFunctionNamesAnySingleMapsToSpecific(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "temp?"}]}],
+		"toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["get_current_temperature"]}}
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	if tc := gjson.GetBytes(out, "tool_choice").String(); tc != "specific:get_current_temperature" {
+		t.Fatalf("expected tool_choice=specific:get_current_temperature, got %q: %s", tc, out)
+	}
+	// A single forced tool does not also need an allowed_tools list.
+	if gjson.GetBytes(out, "allowed_tools").Exists() {
+		t.Fatalf("did not expect allowed_tools for a single forced tool: %s", out)
+	}
+}
+
+// TestGeminiAllowedFunctionNamesAnyMultipleMapsToRequiredPlusAllowed verifies mode ANY
+// with multiple allowed names keeps "required" (must call SOME tool) and carries the
+// restricted set as allowed_tools (the C-TOOLCHOICE field the executor intersects with
+// advertised tools). The allowed_tools shape mirrors the Responses allowed_tools form so
+// the single shared executor consumer matches.
+func TestGeminiAllowedFunctionNamesAnyMultipleMapsToRequiredPlusAllowed(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "go"}]}],
+		"toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["Read", "Grep"]}}
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	if tc := gjson.GetBytes(out, "tool_choice").String(); tc != "required" {
+		t.Fatalf("expected tool_choice=required for ANY with multiple allowed names, got %q: %s", tc, out)
+	}
+	at := gjson.GetBytes(out, "allowed_tools")
+	if !at.Exists() {
+		t.Fatalf("expected allowed_tools object for multiple allowed names: %s", out)
+	}
+	if at.Get("type").String() != "allowed_tools" {
+		t.Fatalf("allowed_tools.type = %q, want allowed_tools: %s", at.Get("type").String(), out)
+	}
+	names := []string{}
+	at.Get("tools").ForEach(func(_, tr gjson.Result) bool {
+		if tr.Get("type").String() != "function" {
+			t.Fatalf("allowed_tools tool ref must be type=function, got %q", tr.Get("type").String())
+		}
+		names = append(names, tr.Get("name").String())
+		return true
+	})
+	if len(names) != 2 || names[0] != "Read" || names[1] != "Grep" {
+		t.Fatalf("expected allowed_tools tools [Read Grep], got %v: %s", names, out)
+	}
+}
+
+// TestGeminiAllowedFunctionNamesAutoSingleIsAllowNotForce verifies that a single allowed
+// name under AUTO is an allow-restriction (the model may still answer in text), NOT a
+// forced specific:<name>. So tool_choice stays "auto" and the single name is carried via
+// allowed_tools.
+func TestGeminiAllowedFunctionNamesAutoSingleIsAllowNotForce(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "go"}]}],
+		"toolConfig": {"functionCallingConfig": {"mode": "AUTO", "allowedFunctionNames": ["Read"]}}
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	if tc := gjson.GetBytes(out, "tool_choice").String(); tc != "auto" {
+		t.Fatalf("expected tool_choice=auto (AUTO does not force), got %q: %s", tc, out)
+	}
+	at := gjson.GetBytes(out, "allowed_tools")
+	if !at.Exists() || at.Get("tools.0.name").String() != "Read" {
+		t.Fatalf("expected allowed_tools restricting to [Read] under AUTO, got: %s", out)
+	}
+}
+
+// TestGeminiNoneModeIgnoresAllowedNames verifies mode NONE maps to tool_choice=none and
+// never carries allowed_tools (the model cannot call any tool regardless of the list).
+func TestGeminiNoneModeIgnoresAllowedNames(t *testing.T) {
+	req := `{
+		"contents": [{"role": "user", "parts": [{"text": "go"}]}],
+		"toolConfig": {"functionCallingConfig": {"mode": "NONE", "allowedFunctionNames": ["Read"]}}
+	}`
+
+	out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+
+	if tc := gjson.GetBytes(out, "tool_choice").String(); tc != "none" {
+		t.Fatalf("expected tool_choice=none, got %q: %s", tc, out)
+	}
+	if gjson.GetBytes(out, "allowed_tools").Exists() {
+		t.Fatalf("NONE must not carry allowed_tools: %s", out)
+	}
+}
+
+// TestGeminiModeOnlyNoAllowedNamesUnchanged verifies the pre-H15 behavior is preserved
+// when no allowedFunctionNames is present: AUTO->auto, ANY->required, NONE->none, and no
+// allowed_tools is added.
+func TestGeminiModeOnlyNoAllowedNamesUnchanged(t *testing.T) {
+	cases := map[string]string{"AUTO": "auto", "ANY": "required", "NONE": "none"}
+	for mode, want := range cases {
+		req := `{
+			"contents": [{"role": "user", "parts": [{"text": "go"}]}],
+			"toolConfig": {"functionCallingConfig": {"mode": "` + mode + `"}}
+		}`
+		out := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
+		if tc := gjson.GetBytes(out, "tool_choice").String(); tc != want {
+			t.Fatalf("mode %s: expected tool_choice=%q, got %q", mode, want, tc)
+		}
+		if gjson.GetBytes(out, "allowed_tools").Exists() {
+			t.Fatalf("mode %s: did not expect allowed_tools without allowedFunctionNames: %s", mode, out)
+		}
+	}
+}

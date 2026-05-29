@@ -36,7 +36,7 @@ import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { readFileSync, mkdirSync, accessSync, constants, writeSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, accessSync, constants, writeSync } from "node:fs";
 import path from "node:path";
 
 const PORT = parseInt(process.env.CURSOR_AGENT_BRIDGE_PORT || "9798", 10);
@@ -83,6 +83,15 @@ const MCP_GROUPING = (() => {
 // this bounds how many may wait behind the active turn before a last-resort 429 (Layer A diverts tool-less
 // one-shots, so reaching this requires many genuine concurrent agentic turns on one conversation).
 const MAX_QUEUE_DEPTH = parseInt(process.env.CURSOR_AGENT_MAX_QUEUE_DEPTH || "8", 10);
+// M26: cap how many bytes a single /agent/turn (and /mcp) request body may read into memory, so a buggy or
+// hostile authenticated CLIProxy cannot OOM the sidecar (which would kill every session on this bridge). The
+// cap is GENEROUS — large histories + base64 images are legitimate — defaulting to 64 MB and env-overridable
+// via MAX_AGENT_TURN_BYTES; a real conversation must never hit it. Past the cap we stop concatenating and
+// return 413 (a READ bound, not an upstream wall-clock timeout, so it is allowed by AGENTS.md).
+const MAX_AGENT_TURN_BYTES = (() => {
+  const n = parseInt(process.env.MAX_AGENT_TURN_BYTES || "", 10);
+  return Number.isFinite(n) && n > 0 ? n : 64 * 1024 * 1024;
+})();
 // Shared SSE response headers (unbuffered, so keepalives reach the wire end-to-end).
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "X-Accel-Buffering": "no" };
 // Multi-tenant (opt-in): when CURSOR_AGENT_BRIDGE_TOKEN is set, X-Bridge-Auth gates access and the
@@ -206,16 +215,32 @@ function collectToolResultImages(input) {
 }
 
 // constraintInstructions turns the OpenAI-style enforced constraints the SDK has no first-class params
-// for (response_format / stop / token limit / tool_choice required|specific) into a model instruction
+// for (response_format / stop / token limit / tool_choice required|specific|none) into a model instruction
 // block appended to the user turn, so the Cursor agent honors what the request asked for.
-function constraintInstructions({ toolChoice, responseFormat, stop, maxTokens } = {}) {
+// IMPORTANT LIMIT (H08/H20/H21): these are MODEL INSTRUCTIONS, not hard protocol enforcement. The composer
+// path cannot truly enforce stop sequences / token caps / response_format / parallel-call limits server-side
+// (Cursor generates the tokens; the bridge only relays), and Cursor's NATIVE tools (read/shell/write/...) are
+// SDK built-ins that cannot be structurally un-advertised — so tool_choice:none/specific gating of native
+// tools is BEST-EFFORT (this instruction) PLUS a hard reject of native exec cases in the dispatch seam
+// (see __CC_EXEC_U/S + nativeToolBlockedByChoice). `forcedUnavailable` (H09) is set when a forced
+// specific:<name> tool is not in the advertised set: we tell the model it is unavailable rather than offering
+// other tools or pretending the constraint held.
+function constraintInstructions({ toolChoice, responseFormat, stop, maxTokens, forcedUnavailable } = {}) {
   const lines = [];
   const tc = toolChoice || "";
-  if (tc === "required") {
+  if (forcedUnavailable && tc.startsWith("specific:")) {
+    // H09: never widen to other tools; tell the model the forced tool cannot be used this turn.
+    const nm = tc.slice("specific:".length);
+    lines.push(`The tool "${nm}" was required for this request but is NOT available. Do not call any other tool as a substitute; explain that the requested tool is unavailable.`);
+  } else if (tc === "required") {
     lines.push("You MUST call one of the available tools to fulfill this request; do not produce a final answer until you have called at least one tool.");
   } else if (tc.startsWith("specific:")) {
     const nm = tc.slice("specific:".length);
     lines.push(`You MUST call the tool named "${nm}" to fulfill this request, and you may call only that tool.`);
+  } else if (tc === "none") {
+    // H08 (best-effort): instruct the model to use NO tools, including the built-in file/shell tools that we
+    // cannot un-advertise. The dispatch seam additionally hard-rejects any native exec case under `none`.
+    lines.push("Do NOT call any tools for this request — neither the advertised tools nor any built-in file, shell, search, or edit tool. Produce your answer directly.");
   }
   if (responseFormat && typeof responseFormat === "object") {
     if (responseFormat.type === "json_object") {
@@ -236,6 +261,10 @@ function constraintInstructions({ toolChoice, responseFormat, stop, maxTokens } 
 
 // effectiveAdvertise restricts what tools the model SEES for a turn based on tool_choice:
 // none -> none; specific:<name> -> just that tool; required/auto/unset -> the full advertised set.
+// H09: a forced specific:<name> that does NOT match the advertised inventory must NOT widen to the full set
+// (the old behavior silently let the model call an unrelated tool while the caller believed a single tool was
+// forced). Instead advertise NOTHING for the missed forced tool; the caller (constraintInstructions) surfaces
+// a model-visible "forced tool unavailable" instruction so the turn degrades honestly rather than mis-routing.
 function effectiveAdvertise(advertise, toolChoice) {
   const adv = Array.isArray(advertise) ? advertise : [];
   const tc = toolChoice || "";
@@ -243,9 +272,33 @@ function effectiveAdvertise(advertise, toolChoice) {
   if (tc.startsWith("specific:")) {
     const nm = tc.slice("specific:".length);
     const only = adv.filter((t) => (t.toolName || t.name) === nm);
-    return only.length ? only : adv;
+    return only; // H09: empty when the forced tool is not advertised (never widen to all)
   }
   return adv;
+}
+
+// forcedToolUnavailable reports whether a forced specific:<name> tool_choice cannot be satisfied by the
+// advertised set (H09). When true the turn must tell the model the tool is unavailable instead of silently
+// offering other tools or pretending the constraint held.
+function forcedToolUnavailable(advertise, toolChoice) {
+  const tc = toolChoice || "";
+  if (!tc.startsWith("specific:")) return false;
+  const nm = tc.slice("specific:".length);
+  const adv = Array.isArray(advertise) ? advertise : [];
+  return !adv.some((t) => (t.toolName || t.name) === nm);
+}
+
+// nativeToolBlockedByChoice (H08, BEST-EFFORT) reports whether a NATIVE Cursor tool (read/shell/write/...) is
+// disallowed for the current turn given tool_choice. Native tools are SDK built-ins (not in the advertise set
+// and not structurally un-advertisable), so we enforce the policy at the dispatch seam: under `none` no tool
+// may run; under `specific:<name>` only that ADVERTISED client tool may run (native built-ins are never the
+// forced advertised tool, so they are blocked); `auto`/`required`/unset leave native tools available. This is
+// best-effort (the model is also instructed via constraintInstructions); it is NOT full structural gating.
+function nativeToolBlockedByChoice(toolChoice) {
+  const tc = toolChoice || "";
+  if (tc === "none") return true;
+  if (tc.startsWith("specific:")) return true;
+  return false;
 }
 
 // ---- session correlation: the global executor learns its session via AsyncLocalStorage ----
@@ -305,13 +358,30 @@ function headlessRequestContext(clientEnv) {
 //                           listMcpResourcesExecArgs, readMcpResourceExecArgs, mcpStateExecArgs,
 //                           smartModeClassifierArgs (TODO: typed default-mode success, live-validate)
 //
+// ccErrorMessageText renders an isError result's content into a single human-readable failure message for
+// the `error: {message}` variant. The Go side may thread the failure reason as a plain string or a small
+// structured object; either way the model must SEE the failure (C01), never a fabricated success shape.
+function ccErrorMessageText(c, fallback) {
+  if (typeof c === "string" && c.trim()) return c;
+  if (c && typeof c === "object") { try { return JSON.stringify(c); } catch { /* fall through */ } }
+  return fallback;
+}
+
 // Native Cursor tool cases routed to CC. ccTool = generic name (CLIProxy maps to the client's exact tool
 // + arg schema). buildResult/buildChunks turn CC's tool_result content into the Cursor result toJson shape.
+// C01/BR8: every buildResult takes (content, state, isError). When the client marked the tool result FAILED
+// (isError), it MUST build a FAILURE shape — the result type's `error` oneof variant (agent.v1.Error =
+// {message}) — so a failed/cancelled/denied read/write/delete reaches the model AS a failure instead of a
+// fabricated native success (which would let the model continue from a false filesystem state). ReadResult /
+// WriteResult / DeleteResult each expose a `result` oneof with `success` plus `error`/`rejected`/typed error
+// variants (verified against @cursor/sdk 1.0.14 proto descriptors); the patched `fromJson` builds whichever
+// oneof key we emit. The shell cases already encode failure via a non-zero exitCode (their success variant is
+// the protocol's failure channel), so they keep their existing exit-code handling.
 const CC_CASES = {
-  readArgs:        { ccTool: "read",  stream: false, buildResult: (c, s) => ({ success: { path: s && s.path, content: String(c ?? ""), totalLines: String(c ?? "").split("\n").length, fileSize: String(Buffer.byteLength(String(c ?? ""))), truncated: false, rangeApplied: false } }) },
-  redactedReadArgs:{ ccTool: "read",  stream: false, buildResult: (c, s) => ({ success: { path: s && s.path, content: String(c ?? ""), totalLines: String(c ?? "").split("\n").length, fileSize: String(Buffer.byteLength(String(c ?? ""))), truncated: false, rangeApplied: false } }) },
-  writeArgs:       { ccTool: "write", stream: false, buildResult: (c, s) => { const t = (s && s.fileText) || ""; const r = { success: { path: s && s.path, linesCreated: t.split("\n").length, fileSize: String(Buffer.byteLength(t)) } }; if (s && s.returnFileContentAfterWrite) r.success.fileContentAfterWrite = t; return r; } },
-  deleteArgs:      { ccTool: "delete", stream: false, buildResult: (c, s) => ({ success: { path: s && s.path, deletedFile: true, fileSize: "0" } }) },
+  readArgs:        { ccTool: "read",  stream: false, buildResult: (c, s, isError) => isError ? { error: { message: ccErrorMessageText(c, "read failed") } } : ({ success: { path: s && s.path, content: String(c ?? ""), totalLines: String(c ?? "").split("\n").length, fileSize: String(Buffer.byteLength(String(c ?? ""))), truncated: false, rangeApplied: false } }) },
+  redactedReadArgs:{ ccTool: "read",  stream: false, buildResult: (c, s, isError) => isError ? { error: { message: ccErrorMessageText(c, "read failed") } } : ({ success: { path: s && s.path, content: String(c ?? ""), totalLines: String(c ?? "").split("\n").length, fileSize: String(Buffer.byteLength(String(c ?? ""))), truncated: false, rangeApplied: false } }) },
+  writeArgs:       { ccTool: "write", stream: false, buildResult: (c, s, isError) => { if (isError) return { error: { message: ccErrorMessageText(c, "write failed") } }; const t = (s && s.fileText) || ""; const r = { success: { path: s && s.path, linesCreated: t.split("\n").length, fileSize: String(Buffer.byteLength(t)) } }; if (s && s.returnFileContentAfterWrite) r.success.fileContentAfterWrite = t; return r; } },
+  deleteArgs:      { ccTool: "delete", stream: false, buildResult: (c, s, isError) => isError ? { error: { message: ccErrorMessageText(c, "delete failed") } } : ({ success: { path: s && s.path, deletedFile: true, fileSize: "0" } }) },
   // BR8/C5: when the client marked the native shell result as failed (isError) but the parsed exitCode is 0,
   // force a non-zero exit so the model sees the failure (a success exit would mask a failed/cancelled tool).
   shellArgs:       { ccTool: "shell", stream: false, buildResult: (c, s, isError) => { const r = parseShellContent(c); const code = isError && r.exitCode === 0 ? 1 : r.exitCode; return { success: { command: s && s.command, workingDirectory: "/workspace", exitCode: code, stdout: r.stdout, stderr: r.stderr } }; } },
@@ -331,6 +401,29 @@ const CONTROL_ALLOW = { shellAllowlistPrecheckArgs: 1, mcpAllowlistPrecheckArgs:
 // TODO(validate-live): smartModeClassifierArgs needs its success shape (default mode) + subagent* a typed
 // error; left as deny-by-default reject until their shapes are derived and exercised against live Cursor.
 const CONTROL_TYPED = { diagnosticsArgs: { rejected: {} }, canvasDiagnosticsArgs: { rejected: {} } };
+// H17: cases the bridge does NOT implement but whose RESULT type exposes an `error` oneof variant
+// (agent.v1.Error{message}, verified against the @cursor/sdk 1.0.14 proto descriptors). For these we return a
+// MODEL-VISIBLE typed unavailable result instead of fail-closing the whole run with a stream error — so the
+// model sees "this tool is unavailable" and picks another path (e.g. shell instead of structured grep/ls).
+// CAVEAT (H17): this is ONLY for cases with a known typed-error result shape. Cases with NO safe result
+// variant (subagent*/forceBackgroundSubagent/recordScreen/computerUse/smartModeClassifier/executeHook, and the
+// streaming-lifecycle force-background-shell) are deliberately LEFT fail-closed below — fabricating a result
+// there could desync the run; the correct degrade for those is to not let the model rely on them. Each case
+// maps to its <X>Result via the SDK's <X>Args -> <X>Result convention; if a mapping were wrong, fromJson
+// throws and it degrades to the same exec error as the old reject (no worse).
+const TYPED_UNAVAILABLE_U = new Set([
+  "grepArgs",                 // GrepResult.error                 (model falls back to shell rg)
+  "lsArgs",                   // LsResult.error                   (model falls back to shell ls)
+  "fetchArgs",                // FetchResult.error
+  "backgroundShellSpawnArgs", // BackgroundShellSpawnResult.error
+  "writeShellStdinArgs",      // WriteShellStdinResult.error
+  "listMcpResourcesExecArgs", // ListMcpResourcesExecResult.error
+  "readMcpResourceExecArgs",  // ReadMcpResourceExecResult.error
+  "mcpStateExecArgs",         // McpStateExecResult.error
+]);
+function typedUnavailableResult(cas) {
+  return { __ccJson: { error: { message: `tool '${cas}' is not available in this environment; use an alternative approach` } } };
+}
 
 function ccArgsFor(cas, s) {
   switch (cas) {
@@ -339,6 +432,21 @@ function ccArgsFor(cas, s) {
     case "writeArgs": return { path: s && s.path, content: s && s.fileText };
     case "deleteArgs": return { path: s && s.path };
     default: return s;
+  }
+}
+
+// blockedNativeResult builds a typed FAILURE result for a native tool the model tried to use while tool_choice
+// disallowed it (H08). It uses the SAME failure channels as a real failed tool — the `error` variant for
+// read/write/delete and a non-zero/aborted exit for shell — so the model SEES the block and chooses another
+// path, never a fabricated success. Returns the unary { __ccJson } shape; the streaming case yields chunks.
+const NATIVE_TOOL_DISABLED_MSG = "tool disabled for this turn by tool_choice policy";
+function blockedNativeResult(cas, s) {
+  switch (cas) {
+    case "shellArgs":
+      return { __ccJson: { success: { command: s && s.command, workingDirectory: "/workspace", exitCode: 1, stdout: "", stderr: NATIVE_TOOL_DISABLED_MSG } } };
+    default:
+      // read/write/delete/redactedRead -> the result type's `error` oneof variant (agent.v1.Error{message}).
+      return { __ccJson: { error: { message: NATIVE_TOOL_DISABLED_MSG } } };
   }
 }
 function caseOf(t) { return t && t.message && t.message.case; }
@@ -350,6 +458,14 @@ globalThis.__CC_EXEC_U = function (n, e, s, t) {
   if (cas === "requestContextArgs") return Promise.resolve(headlessRequestContext(store && store.session && store.session.clientEnv));
   if (CONTROL_ALLOW[cas]) return Promise.resolve({ __ccJson: { allowlisted: true } });
   if (CONTROL_TYPED[cas]) return Promise.resolve({ __ccJson: CONTROL_TYPED[cas] });
+  // H17: cases we don't implement but whose result type has a typed `error` variant -> a MODEL-VISIBLE typed
+  // unavailable result (the model picks another path) instead of fail-closing the whole run. Checked BEFORE
+  // the CC_CASES reject so grep/ls (which carry buildResult:null) also degrade to a typed result rather than a
+  // stream error. (Subagent/computerUse/etc. without a safe result shape still fall through to the reject.)
+  if (TYPED_UNAVAILABLE_U.has(cas)) {
+    dbg("__CC_EXEC_U typed-unavailable result (H17)", "session=" + (store && store.session && store.session.id), "cas=" + cas);
+    return Promise.resolve(typedUnavailableResult(cas));
+  }
   if (cas === "mcpArgs") {
     if (!store) return Promise.reject(new Error("[bridge] mcpArgs outside a session"));
     return store.session.dispatchMcp(s);
@@ -357,6 +473,12 @@ globalThis.__CC_EXEC_U = function (n, e, s, t) {
   const spec = CC_CASES[cas];
   if (!spec || spec.stream || !spec.buildResult || !store) {
     return Promise.reject(new Error(`[bridge] tool '${cas}' not supported by the Claude Code bridge`));
+  }
+  // H08 (best-effort): tool_choice none/specific must gate NATIVE built-in tools too. Return a typed FAILURE
+  // result (model-visible) instead of executing the native tool on the client — never a fabricated success.
+  if (nativeToolBlockedByChoice(store.session.toolChoice)) {
+    dbg("__CC_EXEC_U native tool blocked by tool_choice", "session=" + store.session.id, "cas=" + cas, "toolChoice=" + store.session.toolChoice);
+    return Promise.resolve(blockedNativeResult(cas, s));
   }
   return store.session.dispatchUnary(cas, spec, s);
 };
@@ -366,6 +488,12 @@ globalThis.__CC_EXEC_S = function (n, e, s, t) {
   const store = als.getStore();
   if (!spec || !spec.stream || !spec.buildChunks || !store) {
     return (async function* () { throw new Error(`[bridge] streaming tool '${cas}' not supported by the Claude Code bridge`); })();
+  }
+  // H08 (best-effort): block a native STREAMING tool (shellStream) under none/specific with a typed aborted
+  // exit chunk so the model sees the failure instead of the tool running on the client.
+  if (nativeToolBlockedByChoice(store.session.toolChoice)) {
+    dbg("__CC_EXEC_S native tool blocked by tool_choice", "session=" + store.session.id, "cas=" + cas, "toolChoice=" + store.session.toolChoice);
+    return (async function* () { yield { __ccJson: { stdout: { data: "" } } }; yield { __ccJson: { exit: { code: 1, cwd: "/workspace", aborted: true, localExecutionTimeMs: 1 } } }; })();
   }
   return store.session.dispatchStream(cas, spec, s);
 };
@@ -431,6 +559,13 @@ function enforcePlatformCap() {
 class Session {
   constructor(id, cursorKey) {
     this.id = id;
+    // C05: the DURABLE Cursor agent id is DECOUPLED from the external sessionID. `id` is the stable routing
+    // key the Go executor derives (continuations keep routing here); `agentId` is what we hand to
+    // resumeAgent/createAgent. They start equal, but on ERROR_CONVERSATION_TOO_LONG we ROTATE `agentId`
+    // (e.g. <id>_r2) and tombstone the poisoned durable agent, so the next turn seeds a FRESH agent under a
+    // new id and never resumeAgent()s the over-budget one — while the external sessionID is unchanged.
+    this.agentId = id;
+    this.recoveryEpoch = 0;       // C05: increments each too-long rotation; suffixes the rotated agentId
     this.cursorKey = cursorKey || API_KEY; // the Cursor key whose platform this session runs on
     this.agent = null; this.agentPromise = null; this.run = null;
     this.activeRes = null; this.pending = new Map();
@@ -443,6 +578,11 @@ class Session {
                                   // is benign; only an id NEVER in this set is genuinely unknown -> error turn.
     this.undelivered = [];        // {id,name,input} of tools emitted with no open response (turn closed mid-burst);
                                   // delivered on the next /agent/turn so the client can answer them (Comment 1)
+    this.rawToWireId = new Map();  // H23: raw SDK tool-call id -> the sanitized WIRE id we emitted for it. Same
+                                   // raw id always maps to the same wire id (idempotent); two DIFFERENT raw ids
+                                   // that sanitize to the same wire id get DISAMBIGUATED so neither overwrites
+                                   // the other's pending (the original collision bug at pending.set).
+    this.usedWireIds = new Set();  // H23: every wire id this session has handed out (collision detection set).
     this.turnToken = 0;           // increments per turn; flush is bound to a token
     this.settleTurn = null;
     this.streamedText = "";       // cumulative text streamed in the CURRENT run (reset per user turn)
@@ -457,6 +597,8 @@ class Session {
     this.lastRunError = null;     // BR2: last upstream/run error message; used so a paused run that died upstream
                                   // surfaces as a turn_end{error} on the next tool_results instead of false success
     this.clientEnv = null;        // client's real env (workspace/cwd/shell) for headless requestContext
+    this.toolChoice = "";         // H08: the current turn's resolved tool_choice token (auto|none|required|specific:<n>);
+                                  // read by the dispatch seam to best-effort gate NATIVE tools. Set per send in driveUserSend.
     this.lastActivity = nowMs();
     this.done = false;
     this.tail = Promise.resolve();   // per-session FIFO chain: each new-user turn runs after the prior one's run completes
@@ -475,6 +617,37 @@ class Session {
   notifyLogicalDone() { const ws = this._logicalDone; this._logicalDone = []; for (const w of ws) { try { w(); } catch {} } }
   sse(obj) { if (this.activeRes) { try { this.activeRes.write(`data: ${JSON.stringify(obj)}\n\n`); } catch { /* ignore */ } } }
 
+  // wireToolId derives the per-session WIRE tool-call id from the SDK tool spec, resolving sanitization
+  // collisions (H23). ccToolId sanitizes the raw id to the Claude charset; two distinct raw ids (e.g. "call:a"
+  // and "call_a", or "x.y" and "x_y") can sanitize to the SAME wire id, and the second pending.set would then
+  // overwrite the first — one tool result resolving the wrong pending, the other hanging. We keep a per-session
+  // raw->wire map (idempotent: the same raw id always yields the same wire id, so a re-emit is stable) plus a
+  // used-wire-id set; on a collision with a DIFFERENT raw id we append a short stable hash of the raw id so the
+  // wire id is unique. A spec with no toolCallId mints a fresh tc_<uuid> (already collision-free) and is not
+  // tracked in the map (each mint is unique).
+  wireToolId(s) {
+    const raw = (s && s.toolCallId) || null;
+    if (!raw) return ccToolId(s); // minted uuid path: unique by construction, no collision tracking needed
+    const existing = this.rawToWireId.get(raw);
+    if (existing) return existing; // same raw id -> same wire id (idempotent re-emit)
+    let wire = ccToolId(s);
+    if (this.usedWireIds.has(wire)) {
+      // Collision: a DIFFERENT raw id already owns this sanitized wire id. Disambiguate with a short stable
+      // hash of the raw id, retrying (extremely unlikely) until unique, so neither pending is overwritten.
+      const base = wire;
+      let n = 0;
+      do {
+        const h = createHash("sha256").update(raw + "#" + n).digest("hex").slice(0, 8);
+        wire = `${base}_${h}`;
+        n++;
+      } while (this.usedWireIds.has(wire));
+      dbg("wireToolId collision disambiguated", "session=" + this.id, "raw=" + raw, "wire=" + wire);
+    }
+    this.rawToWireId.set(raw, wire);
+    this.usedWireIds.add(wire);
+    return wire;
+  }
+
   newPending(id, resolveWrap) {
     const timer = setTimeout(() => {
       const p = this.pending.get(id);
@@ -491,8 +664,43 @@ class Session {
     clearTimeout(p.timer); this.pending.delete(id); p.resolve(content, isError === true); return true;
   }
 
+  // matchToolResults is the ONE shared strict tool-result matcher used by BOTH the normal runTurn path AND
+  // the concurrent activeRes fast path (C-TOOLRESULT-MATCH). Having a single matcher is the fix for C04 (the
+  // concurrent path used to clean-ack with no unknown/zero-match safety, faking success). For each result it
+  // applies, in order:
+  //   1. resolve-by-id against session.pending (threading isError) -> matched.
+  //   2. else if the id was EVER emitted/delivered by this session -> a BENIGN ack (watchdog-reaped or already
+  //      resolved); NOT unknown.
+  //   3. else -> unknown (an id this session NEVER issued: a genuine desync/foreign id).
+  // C03: the old unconditional `pending.size === 1` fallback is REMOVED — a non-empty toolCallId is matched
+  // STRICTLY. The ONLY idless escape is an EXPLICIT `tr.idless === true` flag a schema translator sets when it
+  // can PROVE the client carried no id (e.g. a future Gemini path with no functionCall.id); absent the flag,
+  // we never guess. With C02 (Gemini now emits real functionCall.id) the parallel-Gemini case round-trips by
+  // id, so the heuristic fallback is no longer needed.
+  // Returns { matched:int, unknown:string[] } (pending count is read off session.pending by the caller).
+  matchToolResults(results) {
+    let matched = 0;
+    const unknown = [];
+    for (const tr of results || []) {
+      const isErr = tr.isError === true;
+      if (this.resolvePending(tr.toolCallId, tr.content, isErr)) { matched++; continue; }
+      // Explicit idless/minted result: a translator proved there was no client-visible id. Resolve the lone
+      // pending ONLY when exactly one is outstanding (never guess among several). This is the sole survivor of
+      // the removed C03 fallback and fires only behind the explicit flag.
+      if (tr.idless === true && this.pending.size === 1) {
+        const loneId = this.pending.keys().next().value;
+        dbg("matchToolResults idless 1-pending resolve", "session=" + this.id, "resolving=" + loneId);
+        if (this.resolvePending(loneId, tr.content, isErr)) { matched++; continue; }
+      }
+      // BR1: an id that misses but was ever emitted/delivered is benign (reaped or already resolved). Only an
+      // id never issued by this session is genuinely unknown.
+      if (!this.delivered.has(tr.toolCallId) && !this.everEmitted.has(tr.toolCallId)) unknown.push(tr.toolCallId);
+    }
+    return { matched, unknown };
+  }
+
   dispatchUnary(cas, spec, s) {
-    const id = ccToolId(s);
+    const id = this.wireToolId(s); // H23: collision-safe per-session wire id
     return new Promise((resolve, reject) => {
       // C5/BR8: buildResult sees isError so a native tool the client marked failed (e.g. shell) is routed
       // through the failure shape (non-zero exitCode) instead of being reported to the model as success.
@@ -503,7 +711,7 @@ class Session {
     });
   }
   dispatchStream(cas, spec, s) {
-    const id = ccToolId(s);
+    const id = this.wireToolId(s); // H23: collision-safe per-session wire id
     const self = this;
     return (async function* () {
       // C5/BR8: carry isError alongside the streamed content so buildChunks can emit a non-zero exit chunk.
@@ -518,7 +726,7 @@ class Session {
   // The model called one of the client's advertised tools (incl MCPs). Reconcile the (often paraphrased)
   // name against the advertised set, then route to CC. CC's text result becomes the McpResult content.
   dispatchMcp(s) {
-    const id = ccToolId(s);
+    const id = this.wireToolId(s); // H23: collision-safe per-session wire id
     const want = (s && (s.toolName || s.name)) || "";
     const ccName = this.reconcileToolName(want);
     const input = toPlainJson(s && s.args);
@@ -548,10 +756,24 @@ class Session {
     const lw = (want || "").toLowerCase();
     const ci = names.filter((nm) => nm.toLowerCase() === lw);           // case-insensitive
     if (ci.length === 1) return ci[0];
-    if (adv.length === 1) return names[0];                              // only one tool: the model means it
+    const tok = (s) => String(s || "").toLowerCase().split(/[-_.:/ ]+/).filter(Boolean);
+    // H18: the single-advertised-tool rule (the model slightly misnaming the ONLY tool) is INTENTIONAL but is
+    // now GUARDED — apply it ONLY when `want` is a PLAUSIBLE variant of that one tool, NEVER for an arbitrary
+    // unrelated/known-foreign id (e.g. routing `nanobanana_generate` to the only tool `Bash` would turn a
+    // hallucinated action into a real call). Plausible = case/punctuation-insensitive equal, OR token overlap
+    // with the one tool's name. If it does not plausibly match -> null (caller returns a typed isError
+    // "unavailable" result), so a foreign id is rejected rather than routed to a powerful tool.
+    if (adv.length === 1) {
+      const only = names[0];
+      const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (norm(want) === norm(only)) return only;                      // punctuation/case variant of the one tool
+      const wt = tok(lw), ot = new Set(tok(only));
+      if (wt.some((t) => ot.has(t))) return only;                      // shares a token with the one tool
+      dbg("reconcileToolName single-tool guard rejected implausible name", "session=" + this.id, "want=" + want, "only=" + only);
+      return null;                                                     // unrelated/foreign -> typed isError
+    }
     // token-boundary fuzzy: accept ONLY when exactly one advertised tool shares the want's last token.
     // (No substring includes() — that mis-routed e.g. "config" -> "reconfigure_database".)
-    const tok = (s) => s.toLowerCase().split(/[-_.:/ ]+/).filter(Boolean);
     const tail = tok(lw).pop() || lw;
     const matches = names.filter((nm) => tok(nm).includes(tail));
     return matches.length === 1 ? matches[0] : null;                   // ambiguous/none -> typed isError
@@ -624,13 +846,43 @@ class Session {
     this.clearTurnState();
     this.settle();
     this.notifyLogicalDone(); // run terminated (error) -> admit the next queued new-user turn
-    // BR-PL: a conversation-too-long failure poisons this session — every resume hits the same wall. Drop the
-    // session + cancel so the NEXT turn re-seeds a fresh session (bounded history) instead of resuming it.
-    if (isConversationTooLong(msg)) {
-      dbg("onRunError CONVERSATION_TOO_LONG -> self-heal (delete session + cancel)", "session=" + this.id);
+    // C05/BR-PL: a conversation-too-long failure poisons the DURABLE Cursor agent — every resume of it hits
+    // the same over-budget wall. Decouple recovery from the external sessionID: ROTATE the durable agentId
+    // (tombstone the poisoned one, allocate <id>_r2/_r3/...), force seeded=false + drop the fingerprint, and
+    // KEEP the in-memory session (so the same external sessionID still routes here). The NEXT turn then seeds
+    // a FRESH agent from the client's bounded history and NEVER calls resumeAgent(oldAgentId). The error turn
+    // was already surfaced above (no false success). Bounded rotations avoid unbounded agentId churn if even
+    // the bounded history is too large; past the cap we stop rotating and the user keeps seeing the real error.
+    if (isConversationTooLong(msg)) void this.rotateDurableAgent();
+  }
+  // rotateDurableAgent tombstones the poisoned durable agent and allocates a fresh agentId (C05). The session
+  // (external id) is intentionally KEPT in the map so continuations keep routing here; only the durable
+  // agentId the bridge hands to resume/create changes. seeded/seededSystem/historyFingerprint are reset so
+  // the next turn re-seeds the client's bounded history into the fresh agent.
+  async rotateDurableAgent() {
+    const COMPOSER_MAX_RECOVERY_ROTATIONS = 3;
+    if (this.recoveryEpoch >= COMPOSER_MAX_RECOVERY_ROTATIONS) {
+      // Past the cap: stop rotating (avoid unbounded churn) but DROP the session so the next turn starts a
+      // clean in-memory session against the last rotated agentId. Never fake success — the error turn already fired.
+      dbg("rotateDurableAgent cap reached -> drop session", "session=" + this.id, "agentId=" + this.agentId, "epoch=" + this.recoveryEpoch);
       sessions.delete(this.id);
-      void this.cancel();
+      await this.cancel();
+      return;
     }
+    // Set the rotation state SYNCHRONOUSLY (before any await) so the rotated agentId / reset seeded are
+    // observable the moment onRunError returns — the next turn must not race a half-applied rotation. The
+    // async teardown (cancel) follows; only `done` flips after it (a fresh send re-opens the session).
+    const oldAgentId = this.agentId;
+    this.recoveryEpoch++;
+    this.agentId = `${this.id}_r${this.recoveryEpoch + 1}`; // first rotation -> <id>_r2
+    this.seeded = false;          // re-seed the bounded history into the fresh agent
+    this.seededSystem = "";
+    this.historyFingerprint = null;
+    dbg("rotateDurableAgent CONVERSATION_TOO_LONG -> rotate durable agentId (no resumeAgent(old))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId);
+    // Tear down the poisoned live agent/run WITHOUT deleting the session. cancel() nulls agent/run + rejects
+    // pendings; we re-open the session for the next turn afterwards (done=false) so it can re-seed.
+    await this.cancel();
+    this.done = false;            // cancel() set done=true; the next turn must be able to drive a fresh send
   }
   rejectAllPending(why) {
     for (const [, p] of this.pending) { try { p.reject(new Error(`[bridge] ${why}`)); } catch {} }
@@ -660,6 +912,31 @@ class Session {
 
 function nowMs() { return Date.now(); }
 
+// ── H12: durable per-agent history fingerprint (survives a bridge restart) ──────────────────────────────
+// The BR-DS optimization (resume a durable agent that has prior turns -> mark seeded, skip re-prepend) is
+// correct for a NORMAL restart, but after a /compact the durable agent holds the OLD un-compacted body while
+// the client now sends the COMPACTED history; resuming the durable agent silently keeps stale (over-budget)
+// context. A cold in-memory session has no fingerprint to compare against, so we PERSIST the last seeded
+// fingerprint to STATE_ROOT keyed by (key,agentId). On a cold resume we compare the inbound fingerprint to
+// the durable one: if they DIFFER, the retained history was rewritten (a compact) -> re-seed instead of
+// trusting the durable agent. Best-effort: any FS error degrades to BR-DS (trust durable). This is a bounded
+// read/write of a tiny 32-hex file, NOT a network timeout (allowed under AGENTS.md). The full-tree-rewrite
+// race where a restart coincides with the very first compacted turn AND no prior durable fp was ever written
+// remains a flagged limitation (the executor's rewrite-sensitive fingerprint covers the multi-turn case).
+const FP_DIR = path.join(STATE_ROOT, ".cct-fp");
+function fpPathFor(cursorKey, agentId) {
+  const safe = String(agentId || "").replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 200);
+  return path.join(FP_DIR, keyHash(cursorKey) + "_" + safe);
+}
+function readDurableFingerprint(cursorKey, agentId) {
+  try { return readFileSync(fpPathFor(cursorKey, agentId), "utf8").trim() || null; } catch { return null; }
+}
+function writeDurableFingerprint(cursorKey, agentId, fp) {
+  if (!fp) return;
+  try { mkdirSync(FP_DIR, { recursive: true }); writeFileSync(fpPathFor(cursorKey, agentId), String(fp), "utf8"); }
+  catch (e) { dbg("writeDurableFingerprint failed (best-effort)", "agentId=" + agentId, (e && e.message) || String(e)); }
+}
+
 async function ensureAgent(session, model) {
   if (session.agent) return session.agent;
   if (session.agentPromise) return session.agentPromise;          // guard TOCTOU
@@ -677,17 +954,21 @@ async function ensureAgent(session, model) {
     } catch (e) {
       dbg("ensureAgent buildMcpServers failed (continuing native-only)", "session=" + session.id, (e && e.message) || String(e));
     }
-    dbg("ensureAgent resumeAgent", "session=" + session.id, "model=" + model, "mcpServers=" + (opts.mcpServers ? Object.keys(opts.mcpServers).length : 0));
+    // C05: resume/create against the DURABLE agentId (rotates on too-long), not the external session id.
+    const agentId = session.agentId || session.id;
+    dbg("ensureAgent resumeAgent", "session=" + session.id, "agentId=" + agentId, "model=" + model, "mcpServers=" + (opts.mcpServers ? Object.keys(opts.mcpServers).length : 0));
     try {
-      session.agent = await platform.resumeAgent(session.id, opts);       // cold / restart: resume by our stable id
+      session.agent = await platform.resumeAgent(agentId, opts);          // cold / restart: resume by our durable agentId
       // BR-DS: a successful resume of a DURABLE agent that already has prior turns (e.g. after a bridge
       // restart, when this in-memory session has not seeded yet) means the SDK already holds the running
       // conversation. Mark seeded so the next send does NOT re-prepend the entire history on top of it
       // (which would double the context and risk ERROR_CONVERSATION_TOO_LONG). Best-effort + defensive: if
-      // the SDK exposes no message probe (or it throws), leave seeded as-is — never guess.
+      // the SDK exposes no message probe (or it throws), leave seeded as-is — never guess. `reseeding` is set
+      // by runTurn when a /compact (incl. H12 cold-restart compact) must re-prepend the rewritten history;
+      // this probe respects it and does NOT mark seeded then.
       if (!session.seeded && !session.reseeding && typeof platform.getAgentMessages === "function") {
         try {
-          const prior = await platform.getAgentMessages(session.id, { limit: 1 });
+          const prior = await platform.getAgentMessages(agentId, { limit: 1 });
           if (Array.isArray(prior) && prior.length > 0) {
             session.seeded = true;
             dbg("ensureAgent resume found prior turns -> seeded=true (no re-prepend)", "session=" + session.id, "priorCount>=" + prior.length);
@@ -700,10 +981,10 @@ async function ensureAgent(session, model) {
       // Only create-on-not-found. A transient resume error (model resolution / network) must NOT
       // fall through to createAgent (which PK-collides on an existing agent id) — rethrow so CLIProxy retries.
       const msg = (err && err.message) || String(err);
-      dbg("ensureAgent resumeAgent FAILED", "session=" + session.id, msg);
+      dbg("ensureAgent resumeAgent FAILED", "session=" + session.id, "agentId=" + agentId, msg);
       if (!/not found/i.test(msg)) { dbg("ensureAgent rethrow (not 'not found')", "session=" + session.id); throw err; }
-      dbg("ensureAgent createAgent (was not found)", "session=" + session.id);
-      session.agent = await platform.createAgent({ agentId: session.id, ...opts });
+      dbg("ensureAgent createAgent (was not found)", "session=" + session.id, "agentId=" + agentId);
+      session.agent = await platform.createAgent({ agentId, ...opts });
     }
     return session.agent;
   })();
@@ -889,7 +1170,20 @@ async function handleMcp(req, res, sessionId, serverKey) {
     res.end(JSON.stringify(mcpError(null, -32600, "Method Not Allowed (POST only)")));
     return;
   }
-  let raw = ""; for await (const c of req) raw += c;
+  let raw;
+  try { raw = await readBodyBounded(req); } // M26 (completeness): bound the /mcp body read too
+  catch (e) {
+    if (e instanceof PayloadTooLargeError) {
+      dbg("handleMcp -> 413 body too large", "session=" + sessionId, e.message);
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(mcpError(null, -32600, e.message)));
+      return;
+    }
+    dbg("handleMcp -> body read error", "session=" + sessionId, (e && e.message) || String(e));
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(mcpError(null, -32700, "Parse error")));
+    return;
+  }
   let body;
   try { body = JSON.parse(raw); } catch (e) {
     dbg("handleMcp -> -32700 parse error", "session=" + sessionId, (e && e.message) || String(e));
@@ -932,6 +1226,24 @@ function streamCallbacks(session) {
 // error messages) — turn routing decisions and failures only, never request/response bodies.
 function safeJson(a) { try { return typeof a === "string" ? a : JSON.stringify(a); } catch { return String(a); } }
 function dbg(...args) { if (!COMPOSER_DEBUG) return; try { writeSync(1, "[cct] " + args.map(safeJson).join(" ") + "\n"); } catch { /* never throw from logging */ } }
+
+// PayloadTooLargeError marks a request body that exceeded MAX_AGENT_TURN_BYTES so callers can map it to 413.
+class PayloadTooLargeError extends Error { constructor(msg) { super(msg); this.code = "PAYLOAD_TOO_LARGE"; } }
+// readBodyBounded reads a request body but stops + throws once the accumulated BYTE length exceeds
+// MAX_AGENT_TURN_BYTES (M26), so a runaway body can never be fully buffered into memory. Byte length (not
+// char length) is tracked so multibyte/base64 payloads are bounded accurately. Returns the raw string.
+async function readBodyBounded(req) {
+  let raw = "";
+  let bytes = 0;
+  for await (const c of req) {
+    bytes += Buffer.byteLength(c);
+    if (bytes > MAX_AGENT_TURN_BYTES) {
+      throw new PayloadTooLargeError(`request body exceeds MAX_AGENT_TURN_BYTES (${MAX_AGENT_TURN_BYTES} bytes)`);
+    }
+    raw += c;
+  }
+  return raw;
+}
 
 async function handleTurn(req, res, body, cursorKey) {
   const input = body.input || (body.text != null ? { type: "user", text: body.text } : { type: "user", text: "" });
@@ -979,11 +1291,29 @@ async function handleTurn(req, res, body, cursorKey) {
     // the model output on the existing activeRes. Otherwise (the normal case) drive the continuation here.
     if (session.activeRes) {
       res.writeHead(200, SSE_HEADERS);
-      let matched = 0;
-      // C5/BR4: thread tr.isError so a failed client tool reaches the live run AS a failure.
-      for (const tr of input.results || []) { if (session.resolvePending(tr.toolCallId, tr.content, tr.isError === true)) matched++; }
-      dbg("handleTurn tool_results CONCURRENT ack", sessionId, "matched=" + matched, "of=" + ((input.results || []).length));
-      try { res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "end_turn" })}\n\n`); res.write("data: [DONE]\n\n"); res.end(); } catch {}
+      // C04 + Comment 6: the concurrent fast path now uses the SAME strict matcher as runTurn (matchToolResults)
+      // instead of a bespoke clean-ack-everything loop. The model output stream stays on the existing
+      // activeRes; THIS response only ACKS — so an unknown/foreign id (or a nonempty batch that matched nothing
+      // and is not a benign re-ack) must be a TYPED ERROR ack, never a clean end_turn that would let the client
+      // stop retrying while the run never received the result (the old C04 false-success bug).
+      const { matched, unknown } = session.matchToolResults(input.results);
+      const batchLen = (input.results || []).length;
+      dbg("handleTurn tool_results CONCURRENT ack", sessionId, "matched=" + matched, "of=" + batchLen, "unknown=" + safeJson(unknown));
+      // NOTE on input.userText (C1): on the concurrent path the live run already owns activeRes and is
+      // streaming the model's answer; the executor folds any trailing user text into the last tool result
+      // (C1 belt-and-suspenders), so it reaches the live run there. Driving a separate fresh send HERE would
+      // spawn a colliding/orphaned run — so the concurrent path only acks; the live run surfaces userText.
+      try {
+        if (unknown.length > 0) {
+          // Foreign/never-issued id: a genuine desync. Surface it (do NOT fake success) so the client sees it.
+          res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "error", error: `unknown tool_call_id ${unknown[0]}: not issued by this session` })}\n\n`);
+        } else {
+          // matched>0 -> resolved into the live run; matched===0 with no unknown -> all ids were benign
+          // re-acks (already-resolved/duplicate). Either way a clean ack is correct (the run is live).
+          res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "end_turn" })}\n\n`);
+        }
+        res.write("data: [DONE]\n\n"); res.end();
+      } catch { /* socket closed */ }
       return;
     }
     dbg("handleTurn tool_results -> existing session", sessionId, "pending=" + session.pending.size, "runActive=" + !!session.run);
@@ -1064,6 +1394,10 @@ function dedupeByName(tools) {
 
 async function runTurn(req, res, session, model, input, constraints = {}) {
   session.activeRes = res; session.touch(); session.turnToken++;
+  // H08: keep the dispatch seam's native-tool gating current for THIS turn even on a continuation that does
+  // not call driveUserSend (the model may emit new native tool calls while resuming). driveUserSend sets it
+  // again on a send; this top-level set covers the resume-only path too.
+  session.toolChoice = (constraints && constraints.toolChoice) || "";
   res.write(`data: ${JSON.stringify({ type: "session", sessionId: session.id })}\n\n`);
 
   // Typed keepalive (NOT a ": keepalive" comment — the Go executor forwards only "data: " lines, so a
@@ -1104,6 +1438,11 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
     // already settled+cancelled this turn. Bail BEFORE agent.send so we don't spawn an orphan run.
     if (settled) return;
     let text = userText || "";
+    // H11: snapshot the seed flags so we can ROLL BACK if agent.send rejects — otherwise a failed first send
+    // would leave seeded=true and the retry (reusing this in-memory session) would omit the system + history
+    // prelude, answering with missing context. They are committed only after agent.send resolves.
+    const seededBefore = session.seeded;
+    const seededSystemBefore = session.seededSystem;
     if (!session.seeded) {
       const parts = [];
       if (input.system) parts.push(input.system);
@@ -1119,18 +1458,25 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       session.seededSystem = input.system;
     }
     // Enforced per-turn constraints (response_format / stop / token limit / tool_choice) as instructions.
-    const ci = constraintInstructions(constraints);
+    // H08: record the resolved tool_choice on the session so the dispatch seam can best-effort gate native
+    // tools for THIS turn. H09: if a forced specific:<name> tool is not advertised, tell the model it is
+    // unavailable (and effectiveAdvertise advertises nothing) instead of widening to other tools.
+    const turnToolChoice = (constraints && constraints.toolChoice) || "";
+    session.toolChoice = turnToolChoice;
+    const forcedUnavailable = forcedToolUnavailable(session.advertise, turnToolChoice);
+    const ci = constraintInstructions({ ...constraints, forcedUnavailable });
     if (ci) text = text ? text + "\n\n" + ci : ci;
     // Merge images from the input with any extra images (BR9: tool-result images folded into the send).
     const allImages = [...(Array.isArray(input.images) ? input.images : []), ...(Array.isArray(extraImages) ? extraImages : [])];
     // Build the message first (toSdkImages may throw on a malformed image) BEFORE gating advertisement,
     // so a bad image never leaves session.advertise in the restricted state.
     const msg = allImages.length ? { text, images: toSdkImages(allImages) } : text;
-    // tool_choice gates what tools the model SEES this turn (none -> none; specific -> just that one).
-    // Restore the full advertised set right after send: the run-request advertisement is built during
-    // send, and reconcileToolName still resolves any tool the model calls against the full set.
+    // tool_choice gates what tools the model SEES this turn (none -> none; specific -> just that one; H09: a
+    // missed forced tool -> none, never widened). Restore the full advertised set right after send: the
+    // run-request advertisement is built during send, and reconcileToolName still resolves any tool the model
+    // calls against the full set.
     const savedAdvertise = session.advertise;
-    session.advertise = effectiveAdvertise(session.advertise, constraints && constraints.toolChoice);
+    session.advertise = effectiveAdvertise(session.advertise, turnToolChoice);
     dbg("runTurn -> agent.send", "session=" + session.id, "seeded(after)=" + session.seeded,
       "msgTextLen=" + (typeof msg === "string" ? msg.length : (msg.text || "").length),
       "images=" + allImages.length, "effAdvertise=" + session.advertise.length, "model=" + model);
@@ -1139,7 +1485,11 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       try {
         session.run = await agent.send(msg, streamCallbacks(session));
       } catch (sendErr) {
-        dbg("runTurn agent.send THREW", "session=" + session.id, (sendErr && sendErr.stack) || (sendErr && sendErr.message) || String(sendErr));
+        // H11: the send failed — roll the seed flags back to their pre-send values so a retry on this same
+        // in-memory session re-prepends the system + history prelude (the first send never actually landed).
+        session.seeded = seededBefore;
+        session.seededSystem = seededSystemBefore;
+        dbg("runTurn agent.send THREW (rolled back seeded)", "session=" + session.id, "seeded->" + session.seeded, (sendErr && sendErr.stack) || (sendErr && sendErr.message) || String(sendErr));
         throw sendErr;
       } finally {
         session.advertise = savedAdvertise;
@@ -1184,20 +1534,34 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
     // arrives as a NEW-USER turn after the prior run completed (run===null), so this gate lets compaction
     // re-seed while never tearing down an answer-in-progress.
     //
-    // CROSS-FILE DEPENDENCY (flagged): the Go executor's composerHistoryFingerprint hashes the WHOLE
-    // non-system history, so it changes on EVERY normal turn (growth), not only on a rewrite. With a
-    // stable-conversation-id client (persistent session) this fires the re-seed on each new-user turn. That
-    // is not lost work (the user's message is still answered), but it re-prepends history redundantly. For
-    // C2 to fire ONLY on a true rewrite, that fingerprint must be made growth-STABLE (anchor on the earliest
-    // non-system message rather than the full history). See the report's cross-file note.
+    // CROSS-FILE CONTRACT (H13): the Go executor's composerHistoryFingerprint is now GROWTH-STABLE but
+    // REWRITE-SENSITIVE — it hashes a bounded retained head (first N non-system messages' role + short text
+    // prefix), so a normal tail append leaves it unchanged and ONLY a /compact that rewrites the retained body
+    // flips it. So a changed fingerprint here is a genuine rewrite, not normal growth.
+    //
+    // H12 (cold-restart compact): a WARM session compares against its in-memory historyFingerprint (below).
+    // A COLD session (just restarted; in-memory fp is null) has nothing in memory to compare, so the BR-DS
+    // probe would resume the durable agent and skip the re-seed even after a /compact. We instead compare the
+    // inbound fingerprint to the DURABLE one we persisted for this agentId: if they differ, the retained
+    // history was rewritten across the restart -> re-seed the client's compacted history rather than trusting
+    // the stale durable agent. No durable fp (fresh conversation / older bridge) -> fall through (a new
+    // conversation seeds normally on first send; a same-fp restart trusts durable via BR-DS).
     let forceReseed = false;
-    if (typeof input.historyFingerprint === "string" && input.historyFingerprint &&
-        session.historyFingerprint && session.historyFingerprint !== input.historyFingerprint &&
-        session.run === null) {
-      dbg("runTurn HISTORY FINGERPRINT CHANGED (no live run) -> re-seed", "session=" + session.id);
-      await cancelStaleRun();
-      session.seeded = false;
-      forceReseed = true;
+    const inboundFp = (typeof input.historyFingerprint === "string" && input.historyFingerprint) ? input.historyFingerprint : null;
+    if (inboundFp && session.run === null) {
+      const warmChanged = session.historyFingerprint && session.historyFingerprint !== inboundFp;
+      let coldCompact = false;
+      if (!session.historyFingerprint && !session.seeded) {
+        const durableFp = readDurableFingerprint(session.cursorKey, session.agentId || session.id);
+        coldCompact = durableFp && durableFp !== inboundFp;
+        if (coldCompact) dbg("runTurn COLD-RESTART fingerprint differs from durable -> re-seed (H12 compact)", "session=" + session.id, "agentId=" + (session.agentId || session.id));
+      }
+      if (warmChanged || coldCompact) {
+        dbg("runTurn HISTORY FINGERPRINT CHANGED (no live run) -> re-seed", "session=" + session.id, "warm=" + !!warmChanged, "cold=" + !!coldCompact);
+        await cancelStaleRun();
+        session.seeded = false;
+        forceReseed = true;
+      }
     }
 
     if (forceReseed) {
@@ -1213,48 +1577,50 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
         session.reseeding = false;
       }
     } else if (input.type === "tool_results") {
-      // Comment 2: match each result idempotently against pending; resolve what is provided and leave the
-      // rest pending WITHOUT erroring (the client may answer incrementally / across requests). A re-sent
-      // already-resolved id (or an id we delivered earlier/ever emitted) is a benign ack, never a fatal
-      // error. Only an id we NEVER emitted to the client AND that isn't pending is genuinely "unknown".
-      let matched = 0;
-      const unknown = [];
-      for (const tr of input.results || []) {
-        // C5/BR4: thread tr.isError so a failed/cancelled client tool reaches the model AS a failure.
-        if (session.resolvePending(tr.toolCallId, tr.content, tr.isError === true)) matched++;
-        // BR7 (Gemini id mismatch): an id miss with EXACTLY ONE pending is a 1-tool ambiguity (the client's
-        // id, e.g. minted from a Gemini functionResponse, didn't round-trip). Resolve the lone pending with
-        // this result rather than discarding it. Guarded to size===1 so we never guess among several.
-        else if (session.pending.size === 1) {
-          const loneId = session.pending.keys().next().value;
-          dbg("runTurn tool_results 1-pending id fallback", "session=" + session.id, "got=" + tr.toolCallId, "resolving=" + loneId);
-          if (session.resolvePending(loneId, tr.content, tr.isError === true)) matched++;
-        }
-        // BR1: an id that misses but was EVER emitted (or delivered) is benign — watchdog-reaped or already
-        // resolved. Only an id never issued by this session is recorded as unknown -> surfaced as an error.
-        else if (!session.delivered.has(tr.toolCallId) && !session.everEmitted.has(tr.toolCallId)) unknown.push(tr.toolCallId);
-      }
+      // C-TOOLRESULT-MATCH: match the batch with the ONE shared strict matcher (resolve-by-id -> benign-ack if
+      // ever-emitted -> else unknown). C03: the old inline `pending.size===1` fallback is GONE (it lived here);
+      // matchToolResults keeps only an explicit `tr.idless`-marked lone-pending escape. Comment 2 idempotency
+      // (re-sent already-resolved ids are benign, not fatal) is preserved by the everEmitted/delivered checks.
+      const { matched, unknown } = session.matchToolResults(input.results);
       dbg("runTurn tool_results", "session=" + session.id, "matched=" + matched, "of=" + ((input.results || []).length),
         "pending=" + session.pending.size, "undelivered=" + session.undelivered.length, "unknown=" + safeJson(unknown));
       // C1/BR5: a real trailing user message in this mixed turn (set by the executor only for a genuine user
       // message, never a pure system-reminder). If present AND nothing is left to resume (no pending after
       // resolve, or nothing matched at all), drive a fresh user send so the user's message is answered —
-      // instead of an empty end_turn. tool-result images (BR9/EX3) are folded into that send.
+      // instead of an empty end_turn. tool-result images (BR9/EX3) are folded into that send. M28: an
+      // image-only trailing message (empty userText but images present) is ALSO user payload and must drive a
+      // fresh send, so the model answers about the image instead of an empty turn.
       const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
+      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || collectToolResultImages(input).length > 0;
+      const hasUserPayload = hasUserText || hasUserImages;
       // The run will resume and stream the model's answer ONLY when this continuation answered tool(s) and
       // nothing is left pending and the run is still live. In THAT case the trailing user message rode along
       // folded into the last tool result (executor C1 belt-and-suspenders), so a separate fresh send would be
       // redundant AND would cancel the resuming run — so we must NOT drive C1 there.
       const runWillResume = matched > 0 && session.pending.size === 0 && session.run !== null;
       const noneToResume = matched === 0 || session.pending.size === 0;
-      if (hasUserText && noneToResume && !runWillResume) {
-        // The user's trailing message would otherwise produce an empty end_turn (no output is coming). Answer
-        // it with a fresh send. If a run is still live (e.g. matched===0 but unrelated tools are pending), the
-        // user is redirecting — cancel the stale run first so we don't spawn a concurrent / orphaned run, then
-        // send. cancel() nulls the agent + bumps epoch; driveUserSend re-resumes a live agent.
-        dbg("runTurn tool_results -> C1 fresh user send", "session=" + session.id, "matched=" + matched, "pending=" + session.pending.size, "runLive=" + (session.run !== null));
+      // DECISION ORDER (C-TOOLRESULT-MATCH; H06 puts unknown BEFORE the partial-pending clean ack):
+      //   1. C1 fresh-send (user payload + nothing will resume)
+      //   2. unknown.length>0 -> ERROR turn (a foreign id must never hide behind a partial clean ack)
+      //   3. flushUndelivered (late tools delivered this turn)
+      //   4. pending.size>0 -> benign empty end_turn (true incremental answer; run stays paused)
+      //   5. matched===0 && a paused run DIED upstream -> ERROR turn (BR2; never fake success)
+      //   6. else -> benign end_turn (idempotent stale/duplicate ack)
+      if (hasUserPayload && noneToResume && !runWillResume) {
+        // The user's trailing message/image would otherwise produce an empty end_turn (no output is coming).
+        // Answer it with a fresh send. If a run is still live (e.g. matched===0 but unrelated tools are
+        // pending), the user is redirecting — cancel the stale run first so we don't spawn a concurrent /
+        // orphaned run, then send. cancel() nulls the agent + bumps epoch; driveUserSend re-resumes a live agent.
+        dbg("runTurn tool_results -> C1 fresh user send", "session=" + session.id, "matched=" + matched, "pending=" + session.pending.size, "runLive=" + (session.run !== null), "text=" + hasUserText, "images=" + hasUserImages);
         if (session.run !== null) { await cancelStaleRun(); session.seeded = true; }
-        await driveUserSend(input.userText, collectToolResultImages(input));
+        // M28: send "" when there is no text but images are present (driveUserSend folds the images in).
+        await driveUserSend(hasUserText ? input.userText : "", collectToolResultImages(input));
+      } else if (unknown.length > 0) {
+        // H06/BR1: a result for an id this session NEVER issued is a genuine desync (e.g. a wrong/foreign id).
+        // Surface it as a real error turn BEFORE any partial-pending clean ack, so it is NOT consumed as a
+        // clean empty success that silently discards the client's tool work and swallows the bogus id.
+        session.sse({ type: "turn_end", stop_reason: "error", error: `unknown tool_call_id ${unknown[0]}: not issued by this session` });
+        session.settle();
       } else if (session.flushUndelivered()) {
         // Tools the SDK emitted after the prior turn closed (mid-burst) are now delivered as THIS turn's
         // tool_use batch (Comment 1) so the client can answer them; the run stays paused awaiting them.
@@ -1263,12 +1629,6 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
         // will neither stream nor complete this turn. Don't error and don't hang: settle a benign empty turn;
         // the run stays paused (bounded by PENDING_TIMEOUT_MS) and the client may answer the rest next.
         session.sse({ type: "turn_end", stop_reason: "end_turn" });
-        session.settle();
-      } else if (unknown.length > 0) {
-        // BR1: a result for an id this session NEVER issued is a genuine desync (e.g. a wrong/foreign id).
-        // Surface it as a real error turn so it is NOT consumed as a clean empty success that silently
-        // discards the client's tool work.
-        session.sse({ type: "turn_end", stop_reason: "error", error: `unknown tool_call_id ${unknown[0]}: not issued by this session` });
         session.settle();
       } else if (matched === 0) {
         // BR2: nothing matched and nothing pending. If a paused run has since DIED upstream (parallel-tool
@@ -1297,8 +1657,13 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       await driveUserSend(input.text || "", null);
     }
     // C2/BR-C2: record the fingerprint of the history we just seeded/continued, so a LATER changed
-    // fingerprint (a future /compact) is detected. Always update on a successful seed/continue.
-    if (typeof input.historyFingerprint === "string" && input.historyFingerprint) session.historyFingerprint = input.historyFingerprint;
+    // fingerprint (a future /compact) is detected. Always update on a successful seed/continue. H12: ALSO
+    // persist it durably keyed by agentId so a COLD restart can detect a compact that happened while the
+    // bridge was down (the in-memory fp is lost on restart; the durable one survives).
+    if (inboundFp) {
+      session.historyFingerprint = inboundFp;
+      writeDurableFingerprint(session.cursorKey, session.agentId || session.id, inboundFp);
+    }
     await turnSettled;
   } catch (e) {
     dbg("runTurn CATCH exception", "session=" + session.id, (e && e.stack) || (e && e.message) || String(e));
@@ -1334,7 +1699,12 @@ const server = createServer(async (req, res) => {
       }
       res.writeHead(401); res.end("{}"); return;
     }
-    let raw = ""; for await (const c of req) raw += c;
+    let raw;
+    try { raw = await readBodyBounded(req); } // M26: bounded read -> 413 past MAX_AGENT_TURN_BYTES
+    catch (e) {
+      if (e instanceof PayloadTooLargeError) { dbg("POST /agent/turn -> 413 body too large", e.message); res.writeHead(413, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: e.message })); return; }
+      dbg("POST /agent/turn -> 400 body read error", (e && e.message) || String(e)); res.writeHead(400); res.end("{}"); return;
+    }
     let body; try { body = JSON.parse(raw); } catch (e) { dbg("POST /agent/turn -> 400 JSON parse error", (e && e.message) || String(e)); res.writeHead(400); res.end("{}"); return; }
     await handleTurn(req, res, body, cursorKey); return;
   }
@@ -1482,5 +1852,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, headlessRequestContext, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED };
+export { CC_CASES, headlessRequestContext, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, blockedNativeResult, typedUnavailableResult, TYPED_UNAVAILABLE_U, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

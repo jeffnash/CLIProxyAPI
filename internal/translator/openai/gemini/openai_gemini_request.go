@@ -315,6 +315,19 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				msg, _ = sjson.SetRawBytes(msg, "tool_calls", []byte(gjson.GetBytes(toolCallsWrapper, "arr").Raw))
 			}
 
+			// H14: a function-response-ONLY continuation (only functionResponse parts,
+			// no text/image/functionCall) must NOT emit a trailing empty user/assistant
+			// message. The functionResponse parts were already appended directly as
+			// role:"tool" messages above, so the outer msg carries nothing. Emitting an
+			// empty role:"user" here would make the translated history end on an empty
+			// user turn, which the executor's continuation detector reads as a fresh
+			// (empty) user turn instead of a tool_results continuation — the paused run
+			// would never receive the tool output. Append the outer msg only when it has
+			// real content (text/image parts) or tool calls.
+			if contentPartsCount == 0 && toolCallsCount == 0 {
+				return true
+			}
+
 			out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
 			return true
 		})
@@ -344,20 +357,87 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 		})
 	}
 
-	// Tool choice mapping (Gemini doesn't have direct equivalent, but we can handle it)
+	// Tool choice mapping. Gemini's functionCallingConfig.mode maps to OpenAI tool_choice;
+	// allowedFunctionNames (H15) further restricts WHICH tools may be called. Gemini and
+	// OpenAI default to AUTO when the mode is unset, so an allowedFunctionNames restriction
+	// is honored even without an explicit mode.
 	if toolConfig := root.Get("toolConfig"); toolConfig.Exists() {
 		if functionCallingConfig := toolConfig.Get("functionCallingConfig"); functionCallingConfig.Exists() {
-			mode := functionCallingConfig.Get("mode").String()
+			mode := strings.ToUpper(strings.TrimSpace(functionCallingConfig.Get("mode").String()))
+
+			// Collect allowedFunctionNames (H15): the explicit subset of tool names the
+			// model may call. Empty/absent means "no restriction".
+			var allowedNames []string
+			if allowed := functionCallingConfig.Get("allowedFunctionNames"); allowed.Exists() && allowed.IsArray() {
+				allowed.ForEach(func(_, value gjson.Result) bool {
+					if name := strings.TrimSpace(value.String()); name != "" {
+						allowedNames = append(allowedNames, name)
+					}
+					return true
+				})
+			}
+
 			switch mode {
 			case "NONE":
+				// The model may not call any tool; allowedFunctionNames is irrelevant.
 				out, _ = sjson.SetBytes(out, "tool_choice", "none")
-			case "AUTO":
-				out, _ = sjson.SetBytes(out, "tool_choice", "auto")
 			case "ANY":
-				out, _ = sjson.SetBytes(out, "tool_choice", "required")
+				// ANY forces the model to call a tool. With exactly one allowed name we can
+				// express the strongest constraint the bridge understands — force THAT tool
+				// (specific:<name>); the executor resolves the token through the client tools
+				// and the bridge advertises only it. With several allowed names we keep
+				// "required" (must call SOME tool) and additionally restrict the callable set
+				// via allowed_tools (consumed by the executor per the C-TOOLCHOICE contract).
+				if len(allowedNames) == 1 {
+					out, _ = sjson.SetBytes(out, "tool_choice", "specific:"+allowedNames[0])
+				} else {
+					out, _ = sjson.SetBytes(out, "tool_choice", "required")
+					out = setOpenAIAllowedTools(out, allowedNames)
+				}
+			default:
+				// AUTO (explicit or default): the model MAY call a tool. A single allowed
+				// name is NOT a forced call here (the model can still answer in text), so it
+				// is an allow-restriction, not specific:<name>. Restrict the callable set via
+				// allowed_tools when a subset was provided.
+				//
+				// Only emit tool_choice when there is a real signal: an explicit AUTO mode,
+				// or an allowedFunctionNames restriction (which needs "auto" as its base
+				// choice). An empty/unknown mode with no allowed names carries no signal, so
+				// leave tool_choice untouched — preserving the prior behavior where OpenAI's
+				// implicit default (auto) applies and no field is written.
+				if mode == "AUTO" || len(allowedNames) > 0 {
+					out, _ = sjson.SetBytes(out, "tool_choice", "auto")
+					out = setOpenAIAllowedTools(out, allowedNames)
+				}
 			}
 		}
 	}
 
+	return out
+}
+
+// setOpenAIAllowedTools writes a first-class `allowed_tools` object onto the OpenAI body
+// when a restricted set of callable tool names is provided (H15 / C-TOOLCHOICE). Chat
+// Completions has no native allowed_tools field, so — exactly like the Responses request
+// translator — we carry the restriction through verbatim in the OpenAI Responses
+// allowed_tools shape: {"type":"allowed_tools","mode":"auto","tools":[{"type":"function",
+// "name":"<n>"},...]}. The composer executor consumes `allowed_tools.tools[].name` and
+// intersects it with the advertised tools to a restricted advertise set (best-effort
+// gating via the bridge advertise set — Cursor's native built-in tools cannot be
+// structurally un-advertised, so this is not a hard server-side guarantee). The actual
+// force-vs-auto decision is carried separately in tool_choice; the object's own "mode" is
+// kept "auto" so it expresses only the allow-list, not a force. No restriction is written
+// for an empty/nil set so an unrestricted turn still advertises all tools.
+func setOpenAIAllowedTools(out []byte, names []string) []byte {
+	if len(names) == 0 {
+		return out
+	}
+	allowed := []byte(`{"type":"allowed_tools","mode":"auto","tools":[]}`)
+	for _, name := range names {
+		toolRef := []byte(`{"type":"function","name":""}`)
+		toolRef, _ = sjson.SetBytes(toolRef, "name", name)
+		allowed, _ = sjson.SetRawBytes(allowed, "tools.-1", toolRef)
+	}
+	out, _ = sjson.SetRawBytes(out, "allowed_tools", allowed)
 	return out
 }

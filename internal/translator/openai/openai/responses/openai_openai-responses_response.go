@@ -199,6 +199,21 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 
 // ConvertOpenAIChatCompletionsResponseToOpenAIResponses converts OpenAI Chat Completions streaming chunks
 // to OpenAI Responses SSE events (response.*).
+//
+// Contract C-KEEPALIVE (M24): a zero-content delta (e.g. `{"index":0,"delta":{}}`) renders to ZERO wire
+// bytes once the stream envelope is open — the per-delta blocks below only emit on non-empty
+// content/reasoning_content/tool_calls or on finish_reason, so a stray empty delta produces no malformed
+// `response.*` event. The composer keepalive for the Responses schema is therefore emitted as a raw
+// `: keepalive` SSE comment DIRECTLY by the executor (bypassing this translator); this converter stays a
+// no-op for the ping path. Do not "fix" the empty-delta-to-zero-bytes behavior by injecting a synthetic
+// progress event here — a fabricated response.* without correct sequence_number/state threading would
+// corrupt the stream. See internal/runtime/executor/cursor_composer_clienttools.go ping case.
+//
+// Contract C-RESPID (H16): `response.id` MUST be surfaced verbatim from the OpenAI chunk `id`
+// (st.ResponseID = root.Get("id").String() below). The composer executor records
+// composerResponseSessions[tenant+"\x00resp:"+id] = sessionID using this exact id, so a follow-up turn
+// carrying previous_response_id can resume the durable agent. Renaming or synthesizing a different id here
+// would break that mapping (a follow-up would mint a fresh session and silently lose context).
 func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &oaiToResponsesState{
@@ -282,6 +297,9 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 	var out [][]byte
 
 	if !st.Started {
+		// C-RESPID (H16): surface the OpenAI chunk id verbatim as response.id. The composer executor keys
+		// its outward-response-id -> sessionID map on this exact value, so previous_response_id follow-ups
+		// can resume the durable agent. Do not synthesize/rename here.
 		st.ResponseID = root.Get("id").String()
 		st.Created = root.Get("created").Int()
 		// reset aggregation state for a new streaming response
@@ -626,7 +644,12 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 	// Basic response scaffold
 	resp := []byte(`{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"incomplete_details":null}`)
 
-	// id: use provider id if present, otherwise synthesize
+	// id: use provider id if present, otherwise synthesize.
+	// C-RESPID (H16): the upstream id is surfaced verbatim as response.id whenever present. The composer
+	// non-stream path supplies a fixed id (composerResponseID()) and records it as the key of its
+	// outward-response-id -> sessionID map, so previous_response_id follow-ups can resume the durable agent;
+	// overriding a present id here would break that mapping. The synthesize branch only fires for a buggy
+	// upstream that omitted id entirely (non-composer callers), never for composer.
 	id := root.Get("id").String()
 	if id == "" {
 		id = fmt.Sprintf("resp_%x_%d", time.Now().UnixNano(), atomic.AddUint64(&responseIDCounter, 1))

@@ -44,8 +44,30 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
 
+	// H20: carry parallel_tool_calls through verbatim so the executor can enforce it
+	// where structurally possible (tool-advertisement gating). NOTE: the composer path
+	// CANNOT hard-cap how many tool calls Cursor emits in a single turn (Cursor generates
+	// the tokens; the bridge only relays), so parallel_tool_calls:false is a best-effort /
+	// explicit-unsupported signal downstream — not a server-side hard guarantee. We must
+	// still carry it (dropping it would silently lose the client's intent).
 	if parallelToolCalls := root.Get("parallel_tool_calls"); parallelToolCalls.Exists() {
 		out, _ = sjson.SetBytes(out, "parallel_tool_calls", parallelToolCalls.Bool())
+	}
+
+	// H16 / C-RESPID: surface the conversation-stable Responses identifiers onto the
+	// translated body so they remain readable for the executor's response-id->sessionID
+	// map (and any consumer that reads the translated OpenAI body rather than the original
+	// Responses body). The executor primarily reads these directly from opts.OriginalRequest,
+	// so this is additive and must never strip them. previous_response_id is the id the
+	// client echoes from a prior response; conversation_id (or the conversation.id object
+	// form) is stable across a conversation's turns.
+	if prevID := root.Get("previous_response_id"); prevID.Exists() && prevID.Type == gjson.String {
+		if v := strings.TrimSpace(prevID.String()); v != "" {
+			out, _ = sjson.SetBytes(out, "previous_response_id", v)
+		}
+	}
+	if convID := responsesConversationID(root); convID != "" {
+		out, _ = sjson.SetBytes(out, "conversation_id", convID)
 	}
 
 	// Convert instructions to system message
@@ -126,11 +148,14 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 			switch itemType {
 			case "message", "":
-				// Handle regular message conversion
+				// Handle regular message conversion.
+				// H19: do NOT downgrade a Responses `developer` message to `user`. The
+				// developer role carries elevated (system-adjacent) instructions; collapsing
+				// it to a normal user/history message silently strips that priority. Preserve
+				// the role verbatim — downstream composer extraction treats `developer` the
+				// same as `system` (folds it into the composer system prompt), and the OpenAI
+				// Chat schema accepts a `developer` role.
 				role := item.Get("role").String()
-				if role == "developer" {
-					role = "user"
-				}
 				message := []byte(`{"role":"","content":[]}`)
 				message, _ = sjson.SetBytes(message, "role", role)
 
@@ -203,7 +228,19 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 				if output := item.Get("output"); output.Exists() {
-					toolMessage, _ = sjson.SetBytes(toolMessage, "content", output.String())
+					// L34: Responses function_call_output.output may be structured
+					// (an array of content parts, or file/image objects) rather than a
+					// plain string. Do NOT flatten lossily via .String() — preserve the
+					// structured shape so downstream consumers that support array content
+					// (e.g. the composer text extractor reads `text` parts; future
+					// renderers can pick up image/file parts) keep the data. A bare string
+					// stays a string (current, lossless behavior); an array/object is
+					// carried as raw JSON. This is a usable degrade, not a silent drop.
+					if output.IsArray() || output.IsObject() {
+						toolMessage, _ = sjson.SetRawBytes(toolMessage, "content", []byte(output.Raw))
+					} else {
+						toolMessage, _ = sjson.SetBytes(toolMessage, "content", output.String())
+					}
 				}
 
 				out, _ = sjson.SetRawBytes(out, "messages.-1", toolMessage)
@@ -230,12 +267,19 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		var chatCompletionsTools []interface{}
 
 		tools.ForEach(func(_, tool gjson.Result) bool {
-			// Built-in tools (e.g. {"type":"web_search"}) are already compatible with the Chat Completions schema.
 			// Only function tools need structural conversion because Chat Completions nests details under "function".
 			toolType := tool.Get("type").String()
 			if toolType != "" && toolType != "function" && tool.IsObject() {
-				// Almost all providers lack built-in tools, so we just ignore them.
-				// chatCompletionsTools = append(chatCompletionsTools, tool.Value())
+				// H22: do NOT silently drop Responses built-in tools (web_search /
+				// file_search / computer_use / ...). A silent drop becomes inconsistent
+				// with a forced/allowed tool_choice (the client may tool_choice into a tool
+				// the model can no longer see) and hides a real capability gap from the
+				// downstream composer path. Carry the built-in tool through verbatim so the
+				// tool inventory stays consistent; the executor decides whether to translate
+				// it or surface an explicit "unsupported built-in tool" signal (the composer
+				// path has no native equivalent). This is "surface, don't drop", per the
+				// dominant rule — never pretend a declared tool exists when it was discarded.
+				chatCompletionsTools = append(chatCompletionsTools, tool.Value())
 				return true
 			}
 
@@ -274,10 +318,77 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		}
 	}
 
-	// Convert tool_choice if present
+	// Convert tool_choice if present.
+	// H07 / C-TOOLCHOICE: the executor's extractComposerToolChoice reads a STRING tool_choice
+	// ("auto"/"none"/"required") or an OBJECT function shape `tool_choice.function.name` ->
+	// "specific:<name>". Previously this stringified an OBJECT tool_choice (.String()), so the
+	// executor saw `{"type":...}` as a useless string and the forced/allowed restriction was
+	// lost. Preserve the shapes the executor understands:
+	//   - STRING            -> pass through as a string (auto/none/required).
+	//   - {type:function, function:{name:X}} -> emit the object verbatim (Chat Completions shape).
+	//   - {type:function, name:X}            -> move the top-level name under function.name
+	//                                            (Responses variant) so it matches the reader.
+	//   - {type:allowed_tools, mode, tools:[{type:function, name:N}, ...]} -> Chat Completions has
+	//     no native allowed_tools; carry it as a first-class `allowed_tools` raw object for the
+	//     executor to intersect with the advertised set (best-effort gating), and keep tool_choice
+	//     itself as "auto" (it is not a single forced tool). Never silently widen to all tools.
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
-		out, _ = sjson.SetBytes(out, "tool_choice", toolChoice.String())
+		if toolChoice.Type == gjson.String {
+			out, _ = sjson.SetBytes(out, "tool_choice", toolChoice.String())
+		} else if toolChoice.IsObject() {
+			switch toolChoice.Get("type").String() {
+			case "allowed_tools":
+				// Carry the allowed_tools object verbatim for the executor (C-TOOLCHOICE).
+				out, _ = sjson.SetRawBytes(out, "allowed_tools", []byte(toolChoice.Raw))
+				// allowed_tools is a restriction set, not a single forced tool: keep auto.
+				out, _ = sjson.SetBytes(out, "tool_choice", "auto")
+			case "function":
+				// Normalize to the Chat Completions object shape the executor reads:
+				// {"type":"function","function":{"name":"<name>"}}.
+				name := toolChoice.Get("function.name").String()
+				if name == "" {
+					// Responses variant carries the forced name at the top level.
+					name = toolChoice.Get("name").String()
+				}
+				if name != "" {
+					choice := []byte(`{"type":"function","function":{"name":""}}`)
+					choice, _ = sjson.SetBytes(choice, "function.name", name)
+					out, _ = sjson.SetRawBytes(out, "tool_choice", choice)
+				} else {
+					// No resolvable name: pass the object through verbatim rather than a
+					// lossy string, so the executor sees structure (not a fake forced tool).
+					out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(toolChoice.Raw))
+				}
+			default:
+				// Unknown object form: carry verbatim (do not stringify into a useless blob).
+				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(toolChoice.Raw))
+			}
+		}
 	}
 
 	return out
+}
+
+// responsesConversationID extracts a conversation-stable identifier from a Responses
+// request body. The OpenAI Responses API exposes the conversation either as a top-level
+// `conversation_id` string or as a `conversation` value (a string id, or an object with an
+// `id` field). Returns "" when no conversation id is present. Used by H16 / C-RESPID to
+// surface the id onto the translated body.
+func responsesConversationID(root gjson.Result) string {
+	if v := root.Get("conversation_id"); v.Exists() && v.Type == gjson.String {
+		if s := strings.TrimSpace(v.String()); s != "" {
+			return s
+		}
+	}
+	conv := root.Get("conversation")
+	if !conv.Exists() {
+		return ""
+	}
+	if conv.Type == gjson.String {
+		return strings.TrimSpace(conv.String())
+	}
+	if conv.IsObject() {
+		return strings.TrimSpace(conv.Get("id").String())
+	}
+	return ""
 }
