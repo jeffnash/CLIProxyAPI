@@ -168,6 +168,20 @@ test("Session.hasQueuedWaiters drives depth-cap + eviction safety", () => {
   assert.equal(s.hasQueuedWaiters(), true);
 });
 
+test("cancel() invalidates the in-flight run (done + runEpoch bump) so a late wait() cannot tear down a successor turn", async () => {
+  const s = new Session("c1");
+  s.run = { cancel: async () => {} };
+  const ep0 = s.runEpoch;
+  await s.cancel();
+  assert.equal(s.done, true, "cancel must set done so a late onRunComplete short-circuits");
+  assert.ok(s.runEpoch > ep0, "cancel must bump runEpoch to invalidate the cancelled run's wait() callback");
+  // Simulate a successor turn having attached its response, then the OLD run's late wait() settling:
+  let wroteToSuccessor = false;
+  s.activeRes = { write() { wroteToSuccessor = true; } };
+  s.onRunComplete({ status: "finished" }); // done===true -> must be a no-op
+  assert.equal(wroteToSuccessor, false, "a late onRunComplete after cancel must NOT write to the successor turn's stream");
+});
+
 test("headlessRequestContext projects clientEnv and falls back to /workspace", () => {
   const def = headlessRequestContext(null).__ccJson.success.requestContext.env;
   assert.deepEqual(def.workspacePaths, ["/workspace"]);

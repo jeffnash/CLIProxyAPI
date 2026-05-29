@@ -377,6 +377,7 @@ class Session {
     this.tail = Promise.resolve();   // per-session FIFO chain: each new-user turn runs after the prior one's run completes
     this.waiters = 0;                // new-user turns queued but not yet running (single source of truth for depth-cap + eviction safety)
     this._logicalDone = [];          // resolvers fired when the live run TRULY completes (onRunComplete/onRunError/cancel), NOT at a tool-pause
+    this.runEpoch = 0;               // bumped per run + on cancel; a run.wait() callback ignores its result if the epoch advanced (the run was superseded/cancelled and a new turn may already own the session)
   }
 
   touch() { this.lastActivity = nowMs(); }
@@ -502,6 +503,8 @@ class Session {
     this.pending.clear();
   }
   async cancel() {
+    this.done = true;     // short-circuit any late run.wait() settlement (onRunComplete/onRunError no-op on done)
+    this.runEpoch++;      // invalidate the in-flight run's completion callback so it can't mutate a successor turn
     this.rejectAllPending("session cancelled");
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
     try { await (this.run && this.run.cancel && this.run.cancel()); } catch {}
@@ -688,6 +691,9 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       for (const tr of input.results || []) { if (session.resolvePending(tr.toolCallId, tr.content)) matched++; }
       dbg("runTurn tool_results matched=" + matched, "of=" + ((input.results || []).length), "pendingRemaining=" + session.pending.size, "ids=" + safeJson((input.results || []).map((r) => r.toolCallId)));
       if (matched === 0) {
+        // No provided result matched a pending: the run is still blocked on its real tool calls and would
+        // hang until the watchdog, stranding any queued waiter. Terminate it like the partial-batch case.
+        session.rejectAllPending("no pending tool calls matched the provided tool_results");
         session.sse({ type: "turn_end", stop_reason: "error", error: "no pending tool calls matched the provided tool_results" });
         session.settle();
       } else if (session.pending.size > 0) {
@@ -711,6 +717,10 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       session.streamedText = "";   // reset per user turn (NOT across tool-result continuations within a run)
       session.done = false;
       const agent = await ensureAgent(session, model);
+      // ensureAgent's resume/create is a network round-trip; if the client disconnected during it, onClose
+      // already settled+cancelled this turn. Bail BEFORE agent.send so we don't spawn an orphan run that
+      // pins the FIFO slot and blocks eviction until the abandonment watchdog.
+      if (settled) return;
       // First send for this session: prepend the system prompt + prior history so the SDK session starts
       // with full context. Later sends are just the new user text (the SDK holds the running conversation).
       let text = input.text || "";
@@ -738,6 +748,7 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       dbg("runTurn NEW-TURN -> agent.send", "session=" + session.id, "seeded(after)=" + session.seeded,
         "msgTextLen=" + (typeof msg === "string" ? msg.length : (msg.text || "").length),
         "images=" + (Array.isArray(input.images) ? input.images.length : 0), "effAdvertise=" + session.advertise.length, "model=" + model);
+      const ep = ++session.runEpoch; // this run's epoch; its completion callback must ignore a result if cancel() (or a later run) advanced it
       await als.run({ session }, async () => {
         try {
           session.run = await agent.send(msg, streamCallbacks(session));
@@ -747,7 +758,11 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
         } finally {
           session.advertise = savedAdvertise;
         }
-        session.run.wait().then((r) => session.onRunComplete(r)).catch((e) => session.onRunError(e));
+        // Bind completion to THIS run's epoch, not the session: a cancelled/superseded run's late settlement
+        // must not tear down a freshly-promoted queued turn that now owns session.run/activeRes/pending.
+        session.run.wait()
+          .then((r) => { if (ep === session.runEpoch) session.onRunComplete(r); })
+          .catch((e) => { if (ep === session.runEpoch) session.onRunError(e); });
       });
     }
     await turnSettled;

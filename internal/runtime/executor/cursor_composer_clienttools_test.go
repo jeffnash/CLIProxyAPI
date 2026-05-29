@@ -667,6 +667,11 @@ func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 	if i, j := strings.Index(outA, `"type":"message"`), strings.Index(outA, "event: ping"); i < 0 || i > j {
 		t.Fatalf("typed ping must NOT precede the message envelope (msg@%d ping@%d): %q", i, j, outA)
 	}
+	// The stream MUST close with a terminal (message_stop) — the bridge's [DONE] is consumed by the executor,
+	// so it synthesizes one through the translator. Without it the Anthropic SDK hangs waiting to finalize.
+	if !strings.Contains(outA, "message_stop") {
+		t.Fatalf("anthropic stream missing terminal message_stop (client would hang): %q", outA)
+	}
 
 	// OpenAI client: the ping renders as a benign no-op chunk (never a bare comment), and real content survives.
 	oaiReq := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)}

@@ -889,23 +889,18 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 				// ping AFTER message_start, so the first ping lazily opens the envelope (an empty delta ->
 				// message_start) and later pings emit a real ping event; for OpenAI an empty delta is itself a
 				// valid no-op chunk; any other schema falls back to a spec-safe SSE comment.
-				switch from.String() {
-				case "claude", "anthropic":
-					if started {
-						if !emit([][]byte{[]byte("event: ping\ndata: {\"type\": \"ping\"}\n\n")}) {
-							return
-						}
-						continue
-					}
-					choice = map[string]any{"index": 0, "delta": map[string]any{}}
-				case "openai", "openai-response", "codex":
-					choice = map[string]any{"index": 0, "delta": map[string]any{}}
-				default:
-					if !emit([][]byte{[]byte(": keep-alive\n\n")}) {
+				if fr := from.String(); (fr == "claude" || fr == "anthropic") && started {
+					if !emit([][]byte{[]byte("event: ping\ndata: {\"type\": \"ping\"}\n\n")}) {
 						return
 					}
 					continue
 				}
+				// Anthropic first ping AND every non-Anthropic schema: a zero-content delta. Through the
+				// per-schema translator it becomes message_start (Anthropic, opening the envelope before any
+				// typed ping), a benign empty chunk (OpenAI), or a schema no-op — never a raw SSE comment,
+				// which a per-format handler (e.g. Gemini's writeGeminiSSEData) would re-wrap into a malformed
+				// "data: : keep-alive" line.
+				choice = map[string]any{"index": 0, "delta": map[string]any{}}
 			default:
 				continue
 			}
@@ -920,7 +915,16 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 			log.Errorf("[composer %s] STREAM scanner error: %v", responseID, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			return
 		}
+		// Clean end of the bridge stream. The bridge's turn_end carries finish_reason but no usage, and its
+		// [DONE] is consumed above, so the inbound schema's TERMINAL is not emitted yet: the OpenAI->Anthropic
+		// translator sends message_delta+message_stop only on usage or [DONE], and Responses defers
+		// response.completed to [DONE]. Forward a synthetic [DONE] through the SAME translator so every schema
+		// gets a well-formed terminal (Anthropic message_stop / Responses response.completed). OpenAI is a
+		// no-op here (its passthrough returns nothing for [DONE]; the OpenAI handler adds its own).
+		termChunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), oai, []byte("data: [DONE]"), &param)
+		emit(termChunks)
 	}()
 
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
