@@ -17,7 +17,7 @@ func TestRepairChutesJSONString_UnescapedNewline(t *testing.T) {
 	// Simulate a malformed JSON string with literal newline inside
 	input := "{\"content\": \"line1\nline2\"}"
 	result := repairChutesJSONString(input)
-	
+
 	// Verify the result is valid JSON
 	var parsed map[string]interface{}
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
@@ -28,7 +28,7 @@ func TestRepairChutesJSONString_UnescapedNewline(t *testing.T) {
 func TestRepairChutesJSONString_UnescapedTab(t *testing.T) {
 	input := "{\"content\": \"col1\tcol2\"}"
 	result := repairChutesJSONString(input)
-	
+
 	var parsed map[string]interface{}
 	if err := json.Unmarshal([]byte(result), &parsed); err != nil {
 		t.Errorf("repaired JSON should be valid, got error: %v, result: %q", err, result)

@@ -55,4 +55,3 @@ func TestSSEInvariants_GeminiSSEWriter(t *testing.T) {
 
 	assertNoEmptySSEDataLines(t, rec.Body.String())
 }
-

@@ -12,46 +12,46 @@ func TestGetRequestDetails_CopilotPrefixRouting(t *testing.T) {
 	handler := &BaseAPIHandler{}
 
 	tests := []struct {
-		name                   string
-		modelName              string
-		expectedProviders      []string
+		name                    string
+		modelName               string
+		expectedProviders       []string
 		expectedNormalizedModel string
-		expectedForcedProvider bool
+		expectedForcedProvider  bool
 	}{
 		{
-			name:                   "copilot prefix routes to copilot provider",
-			modelName:              "copilot-gemini-3-flash-preview",
-			expectedProviders:      []string{"copilot"},
+			name:                    "copilot prefix routes to copilot provider",
+			modelName:               "copilot-gemini-3-flash-preview",
+			expectedProviders:       []string{"copilot"},
 			expectedNormalizedModel: "gemini-3-flash-preview",
-			expectedForcedProvider: true,
+			expectedForcedProvider:  true,
 		},
 		{
-			name:                   "copilot prefix with gpt model",
-			modelName:              "copilot-gpt-5",
-			expectedProviders:      []string{"copilot"},
+			name:                    "copilot prefix with gpt model",
+			modelName:               "copilot-gpt-5",
+			expectedProviders:       []string{"copilot"},
 			expectedNormalizedModel: "gpt-5",
-			expectedForcedProvider: true,
+			expectedForcedProvider:  true,
 		},
 		{
-			name:                   "copilot prefix with claude model",
-			modelName:              "copilot-claude-sonnet-4",
-			expectedProviders:      []string{"copilot"},
+			name:                    "copilot prefix with claude model",
+			modelName:               "copilot-claude-sonnet-4",
+			expectedProviders:       []string{"copilot"},
 			expectedNormalizedModel: "claude-sonnet-4",
-			expectedForcedProvider: true,
+			expectedForcedProvider:  true,
 		},
 		{
-			name:                   "copilot prefix with gemini-2.5-pro",
-			modelName:              "copilot-gemini-2.5-pro",
-			expectedProviders:      []string{"copilot"},
+			name:                    "copilot prefix with gemini-2.5-pro",
+			modelName:               "copilot-gemini-2.5-pro",
+			expectedProviders:       []string{"copilot"},
 			expectedNormalizedModel: "gemini-2.5-pro",
-			expectedForcedProvider: true,
+			expectedForcedProvider:  true,
 		},
 		{
-			name:                   "copilot prefix with grok model",
-			modelName:              "copilot-grok-code-fast-1",
-			expectedProviders:      []string{"copilot"},
+			name:                    "copilot prefix with grok model",
+			modelName:               "copilot-grok-code-fast-1",
+			expectedProviders:       []string{"copilot"},
 			expectedNormalizedModel: "grok-code-fast-1",
-			expectedForcedProvider: true,
+			expectedForcedProvider:  true,
 		},
 	}
 

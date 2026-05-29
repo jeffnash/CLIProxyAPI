@@ -27,4 +27,3 @@ func TestGetRequestDetails_ChutesPrefixRouting(t *testing.T) {
 		t.Fatalf("metadata[forced_provider]=%v (type %T), want true", metadata["forced_provider"], metadata["forced_provider"])
 	}
 }
-

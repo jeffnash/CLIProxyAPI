@@ -274,7 +274,10 @@ func TestChutesExecutorExecuteStream_ReturnsRetryAfterOn429WhenOutOfRetries(t *t
 		if err == nil {
 			t.Fatalf("expected error")
 		}
-		se, ok := err.(interface{ StatusCode() int; RetryAfter() *time.Duration })
+		se, ok := err.(interface {
+			StatusCode() int
+			RetryAfter() *time.Duration
+		})
 		if !ok {
 			t.Fatalf("expected status error with retry-after, got %T", err)
 		}
@@ -358,7 +361,10 @@ func TestChutesExecutorExecute_ReturnsRetryAfterOn429WhenOutOfRetries(t *testing
 			t.Fatalf("expected error")
 		}
 
-		se, ok := err.(interface{ StatusCode() int; RetryAfter() *time.Duration })
+		se, ok := err.(interface {
+			StatusCode() int
+			RetryAfter() *time.Duration
+		})
 		if !ok {
 			t.Fatalf("expected status error with retry-after, got %T", err)
 		}

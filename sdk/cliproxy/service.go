@@ -454,6 +454,8 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewChutesExecutor(s.cfg))
 	case "xai":
 		s.coreManager.RegisterExecutor(executor.NewXAIExecutor(s.cfg))
+	case "cursor":
+		s.coreManager.RegisterExecutor(executor.NewCursorExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -1291,6 +1293,10 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "xai":
 		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
+	case "cursor":
+		models = registry.GetCursorModels()
+		models = applyExcludedModels(models, excluded)
+		log.Debugf("cursor: registerModelsForAuth provider=%s authID=%s models=%d excluded=%v", provider, a.ID, len(models), excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {

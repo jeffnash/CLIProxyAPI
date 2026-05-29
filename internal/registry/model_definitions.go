@@ -29,6 +29,7 @@ type staticModelsJSON struct {
 	Kimi        []*ModelInfo `json:"kimi"`
 	Antigravity []*ModelInfo `json:"antigravity"`
 	XAI         []*ModelInfo `json:"xai"`
+	Cursor      []*ModelInfo `json:"cursor"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -99,6 +100,23 @@ func GetAntigravityModels() []*ModelInfo {
 // GetXAIModels returns the standard xAI Grok model definitions.
 func GetXAIModels() []*ModelInfo {
 	return WithXAIBuiltins(cloneModelInfos(getModels().XAI))
+}
+
+// GetCursorModels returns the standard Cursor Composer model definitions.
+// Uses hard-coded builtins to survive remote catalog replacements (see model_updater.go).
+func GetCursorModels() []*ModelInfo {
+	return cloneModelInfos(cursorBuiltinModels())
+}
+
+var cursorBuiltinModelDefs = []*ModelInfo{
+	{ID: "composer-2.5", Object: "model", Created: 1779148800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Composer 2.5", Description: "Cursor Composer 2.5 - Default coding model", ContextLength: 200000, MaxCompletionTokens: 64000},
+	{ID: "composer-2.5-fast", Object: "model", Created: 1779148800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Composer 2.5 Fast", Description: "Cursor Composer 2.5 Fast - Faster variant", ContextLength: 200000, MaxCompletionTokens: 64000},
+	{ID: "composer-2", Object: "model", Created: 1779148800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Composer 2", Description: "Cursor Composer 2 - Previous generation", ContextLength: 200000, MaxCompletionTokens: 64000},
+	{ID: "composer-latest", Object: "model", Created: 1779148800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Composer Latest", Description: "Cursor Composer latest alias (currently 2.5)", ContextLength: 200000, MaxCompletionTokens: 64000},
+}
+
+func cursorBuiltinModels() []*ModelInfo {
+	return cursorBuiltinModelDefs
 }
 
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
@@ -261,6 +279,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetAntigravityModels()
 	case "xai", "x-ai", "grok":
 		return GetXAIModels()
+	case "cursor":
+		return GetCursorModels()
 	default:
 		return nil
 	}

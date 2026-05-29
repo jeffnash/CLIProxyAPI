@@ -1477,7 +1477,6 @@ func (h *Handler) DeleteCopilotKey(c *gin.Context) {
 	c.JSON(400, gin.H{"error": "missing or invalid account-type or index query param"})
 }
 
-
 // GetAmpUpstreamAPIKeys returns the ampcode upstream API keys mapping.
 func (h *Handler) GetAmpUpstreamAPIKeys(c *gin.Context) {
 	if h == nil || h.cfg == nil {

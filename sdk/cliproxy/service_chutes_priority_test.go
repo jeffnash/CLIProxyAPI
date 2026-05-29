@@ -74,4 +74,3 @@ func TestService_applyChutesModelPriority_PreservesChutesAliases(t *testing.T) {
 		t.Fatalf("expected chutes-only-chutes-model alias to be preserved")
 	}
 }
-

@@ -84,7 +84,6 @@ func TestCopilotModelPrefixConstant(t *testing.T) {
 	}
 }
 
-
 // mockCopilotTokenFetcher is a test double for copilot token fetching operations.
 // It allows tests to simulate various GetCopilotToken responses without network calls.
 type mockCopilotTokenFetcher struct {
@@ -222,17 +221,17 @@ func TestCopilotExecutor_getCopilotToken_RehydrateFromStorage(t *testing.T) {
 
 	// Create storage with tokens
 	storage := &copilotauth.CopilotTokenStorage{
-		GitHubToken:        "test-github-token",
-		AccountType:        "business",
+		GitHubToken: "test-github-token",
+		AccountType: "business",
 	}
 
 	auth := &cliproxyauth.Auth{
-		ID:       "test-auth",
+		ID: "test-auth",
 		Metadata: map[string]any{
-			"copilot_token": "test-copilot-token", // Token must be in metadata now
+			"copilot_token":        "test-copilot-token", // Token must be in metadata now
 			"copilot_token_expiry": time.Now().Add(1 * time.Hour).Format(time.RFC3339),
 		},
-		Storage:  storage,
+		Storage: storage,
 		Attributes: map[string]string{
 			"account_type": "business",
 		},
@@ -295,16 +294,16 @@ func TestCopilotExecutor_getCopilotToken_AccountTypePrecedence(t *testing.T) {
 
 	// Storage says individual, Attributes says enterprise - Attributes should win
 	storage := &copilotauth.CopilotTokenStorage{
-		AccountType:        "individual",
+		AccountType: "individual",
 	}
 
 	auth := &cliproxyauth.Auth{
-		ID:       "test-auth",
+		ID: "test-auth",
 		Metadata: map[string]any{
-			"copilot_token": "test-token",
+			"copilot_token":        "test-token",
 			"copilot_token_expiry": time.Now().Add(1 * time.Hour).Format(time.RFC3339),
 		},
-		Storage:  storage,
+		Storage: storage,
 		Attributes: map[string]string{
 			"account_type": "enterprise",
 		},
@@ -372,7 +371,7 @@ func TestCopilotExecutor_Refresh_SuccessUpdatesMetadataAndStorage(t *testing.T) 
 	te := newTestCopilotExecutor(&config.Config{}, mockFetcher)
 
 	storage := &copilotauth.CopilotTokenStorage{
-		GitHubToken:        "test-github-token",
+		GitHubToken: "test-github-token",
 	}
 
 	auth := &cliproxyauth.Auth{

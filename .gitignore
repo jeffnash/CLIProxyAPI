@@ -54,13 +54,18 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
-<<<<<<< HEAD
 
 # Go
-.gocache
-
-# Ensure tracked SDK sources are not blocked by ignore rules
-!sdk/**
-=======
 .gocache/
->>>>>>> upstream/main
+
+# Local dev artifacts
+.gomodcache/
+.pi/
+.letta/
+.codex/
+sidecars/cursor-bridge/node_modules/
+
+# Cursor SDK trace harnesses — local-only debug artifacts. Keep these out of
+# source control; if you need them locally they read CURSOR_API_KEY from env.
+sidecars/cursor-bridge/trace-sdk.cjs
+sidecars/cursor-bridge/trace-sdk2.cjs

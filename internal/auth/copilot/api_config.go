@@ -26,8 +26,8 @@ const (
 	CopilotUserPath  = "/copilot_internal/user"
 	UserInfoPath     = "/user"
 
-	CopilotVersion       = "0.0.363"
-	EditorPluginVersion  = "copilot/" + CopilotVersion
+	CopilotVersion      = "0.0.363"
+	EditorPluginVersion = "copilot/" + CopilotVersion
 	// CopilotUserAgent is the default User-Agent used for Copilot-related outbound requests.
 	// It intentionally mirrors VS Code's extension style ("GithubCopilot/<version>").
 	//

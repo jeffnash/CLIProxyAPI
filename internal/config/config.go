@@ -137,6 +137,9 @@ type Config struct {
 	// GrokKey defines Grok (X.AI) API configurations using SSO cookies.
 	GrokKey []GrokKey `yaml:"grok-api-key" json:"grok-api-key"`
 
+	// CursorKey defines Cursor Composer API key configurations.
+	CursorKey []CursorKey `yaml:"cursor-api-key" json:"cursor-api-key"`
+
 	// Grok holds Grok-specific behavioral configuration (headers, timeouts, stream hints).
 	Grok GrokConfig `yaml:"grok" json:"grok"`
 
@@ -694,6 +697,68 @@ type GrokConfig struct {
 	RequestTimeoutSeconds int `yaml:"request-timeout,omitempty" json:"request-timeout,omitempty"`
 }
 
+// CursorKey represents the configuration for a Cursor Composer API key.
+// Authentication uses a Cursor user API key (crsr_*) from cursor.com Integrations settings.
+type CursorKey struct {
+	// APIKey is the Cursor user API key (crsr_*).
+	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Prefix optionally namespaces models for this credential.
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
+	// ProxyURL optionally overrides the global proxy for this API key.
+	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// ChatEndpoint optionally overrides the Cursor chat endpoint URL.
+	ChatEndpoint string `yaml:"chat-endpoint,omitempty" json:"chat-endpoint,omitempty"`
+
+	// BackendBaseURL optionally overrides the Cursor backend base URL.
+	BackendBaseURL string `yaml:"backend-base-url,omitempty" json:"backend-base-url,omitempty"`
+
+	// ComposerBridgeURL optionally overrides the Cursor Composer Client-Tools agent bridge URL
+	// (cursor-agent-bridge.mjs, default http://127.0.0.1:9798). The Cursor Composer Client-Tools path
+	// is the default, safe routing: the @cursor/sdk sidecar owns all Cursor I/O
+	// and every tool executes on the client. Set CURSOR_DIRECT=1 to opt into the
+	// gated, ToS-exposed direct path instead.
+	ComposerBridgeURL string `yaml:"composer-client-tools-bridge-url,omitempty" json:"composer-client-tools-bridge-url,omitempty"`
+
+	// ComposerBridgeToken optionally sets the multi-tenant bridge auth token (sent as X-Bridge-Auth).
+	// When set, the bridge (CURSOR_AGENT_BRIDGE_TOKEN) gates on this token and uses THIS key's Cursor
+	// credential under an isolated SDK platform/stateRoot, so multiple Cursor keys can share one bridge.
+	// Leave empty for the default single-tenant setup (one CURSOR_API_KEY per bridge).
+	ComposerBridgeToken string `yaml:"composer-client-tools-bridge-token,omitempty" json:"composer-client-tools-bridge-token,omitempty"`
+
+	// ToolAliases optionally overrides how Cursor-emitted/generic tool names map to THIS client's tool
+	// names (e.g. {"shell": "RunCommand"}), taking precedence over the built-in alias table when the
+	// target tool is advertised. Also settable globally via env CURSOR_TOOL_ALIASES (JSON object or a
+	// "from=to,from=to" list); the per-key value wins on conflict.
+	ToolAliases map[string]string `yaml:"tool-aliases,omitempty" json:"tool-aliases,omitempty"`
+
+	// Models defines upstream model names and aliases for request routing.
+	Models []CursorModel `yaml:"models,omitempty" json:"models,omitempty"`
+
+	// Headers optionally adds extra HTTP headers for requests sent with this key.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+
+	// ExcludedModels lists model IDs that should be excluded for this provider.
+	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+}
+
+func (k CursorKey) GetAPIKey() string  { return k.APIKey }
+func (k CursorKey) GetBaseURL() string { return k.BackendBaseURL }
+
+// CursorModel describes a mapping between an alias and the actual upstream model name.
+type CursorModel struct {
+	// Name is the upstream model identifier used when issuing requests.
+	Name string `yaml:"name" json:"name"`
+
+	// Alias is the client-facing model name that maps to Name.
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m CursorModel) GetName() string  { return m.Name }
+func (m CursorModel) GetAlias() string { return m.Alias }
+
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
 type GeminiKey struct {
@@ -1105,6 +1170,22 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if env := strings.TrimSpace(os.Getenv("CHUTES_RETRY_BACKOFF")); env != "" {
 		cfg.Chutes.RetryBackoff = env
 	}
+
+	// Cursor API key from environment (useful for Railway deployments).
+	// Must run BEFORE SanitizeCursorKeys so the env-sourced key gets sanitized.
+	if env := strings.TrimSpace(os.Getenv("CURSOR_API_KEY")); env != "" {
+		found := false
+		for i := range cfg.CursorKey {
+			if strings.TrimSpace(cfg.CursorKey[i].APIKey) != "" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			cfg.CursorKey = append(cfg.CursorKey, CursorKey{APIKey: env})
+		}
+	}
+	cfg.SanitizeCursorKeys()
 
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
@@ -1551,6 +1632,27 @@ func (cfg *Config) SanitizeGrokKeys() {
 		out = append(out, entry)
 	}
 	cfg.GrokKey = out
+}
+
+// SanitizeCursorKeys removes entries without an API key and trims whitespace.
+func (cfg *Config) SanitizeCursorKeys() {
+	if cfg == nil || len(cfg.CursorKey) == 0 {
+		return
+	}
+	out := make([]CursorKey, 0, len(cfg.CursorKey))
+	for i := range cfg.CursorKey {
+		entry := cfg.CursorKey[i]
+		entry.APIKey = strings.TrimSpace(entry.APIKey)
+		if entry.APIKey == "" {
+			continue
+		}
+		entry.Prefix = strings.TrimSpace(entry.Prefix)
+		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.ChatEndpoint = strings.TrimSpace(entry.ChatEndpoint)
+		entry.BackendBaseURL = strings.TrimSpace(entry.BackendBaseURL)
+		out = append(out, entry)
+	}
+	cfg.CursorKey = out
 }
 
 // SanitizeGrokConfig applies defaults and normalization for Grok-specific settings.

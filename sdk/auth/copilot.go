@@ -82,8 +82,8 @@ func (a *CopilotAuthenticator) Login(ctx context.Context, cfg *config.Config, op
 				log.Warnf("Invalid account_type '%s' provided in login options, defaulting to '%s'", at, copilot.DefaultAccountType)
 			}
 			accountType = parsed
+		}
 	}
-}
 
 	authSvc := copilot.NewCopilotAuth(cfg)
 
