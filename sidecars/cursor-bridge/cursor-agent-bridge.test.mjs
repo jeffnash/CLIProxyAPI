@@ -12,8 +12,10 @@ import {
   nativeToolBlockedByChoice,
   blockedNativeResult,
   typedUnavailableResult,
+  mcpDispatchResult,
   TYPED_UNAVAILABLE_U,
   parseShellContent,
+  streamCallbacks,
   headlessRequestContext,
   headlessMcpState,
   Session,
@@ -286,6 +288,50 @@ test("cancel() invalidates the in-flight run (done + runEpoch bump) so a late wa
   assert.equal(wroteToSuccessor, false, "a late onRunComplete after cancel must NOT write to the successor turn's stream");
 });
 
+test("finding#5: onDelta forwards a text-delta as an SSE `text` frame and a thinking-delta as `reasoning` (pins the SDK discriminators)", () => {
+  // The model's textual answer reaches the client ONLY via onDelta keying on update.type==='text-delta'. If a
+  // future SDK bump renamed the discriminator (e.g. to 'text'), every text delta would be silently dropped and
+  // a finished run would hand the client an empty-but-successful answer. This pins the discriminator: a
+  // text-delta MUST produce a `text` frame, a thinking-delta a `reasoning` frame.
+  const s = new Session("f5-delta");
+  s.activeRes = { write(line) { this.sse = (this.sse || "") + line; return true; }, sse: "" };
+  const cb = streamCallbacks(s);
+  cb.onDelta({ update: { type: "text-delta", text: "hi" } });
+  assert.match(s.activeRes.sse, /data: \{"type":"text","delta":"hi"\}/, "a text-delta must be forwarded as a `text` SSE frame");
+  assert.equal(s.streamedText, "hi", "text-delta accumulates streamedText so onRunComplete does not double-emit");
+  cb.onDelta({ update: { type: "thinking-delta", text: "mmm" } });
+  assert.match(s.activeRes.sse, /data: \{"type":"reasoning","delta":"mmm"\}/, "a thinking-delta must be forwarded as a `reasoning` SSE frame");
+  // A NON-EMPTY delta with an UNRECOGNIZED discriminator must NOT be emitted as text (it is dropped + logged) —
+  // so if the real discriminator drifts, the text-delta assertion above breaks rather than this silently
+  // matching. Assert no `text` frame is produced for the unknown type (the content does NOT leak as a stop).
+  const before = s.activeRes.sse;
+  cb.onDelta({ update: { type: "totally-new-delta-kind", text: "should-not-appear" } });
+  assert.equal(s.activeRes.sse, before, "an unrecognized non-empty delta type must not emit a frame");
+  assert.doesNotMatch(s.activeRes.sse, /should-not-appear/);
+  s.rejectAllPending("cleanup");
+});
+
+test("finding#5: onRunComplete uses the res.result lump fallback when NO deltas streamed, and does NOT double-emit when deltas DID stream", () => {
+  // The second text-production path: when streaming produced no text-delta (non-streaming edge), onRunComplete
+  // recovers the answer from res.result. Neither path was exercised (every run fake hardcoded
+  // {status:'finished'} with no result). Without this, a finished run with empty text + no result is
+  // indistinguishable from success — so we pin BOTH the fallback AND the no-double-emit guard.
+  const s = new Session("f5-fallback");
+  s.activeRes = { write(line) { this.sse = (this.sse || "") + line; return true; }, sse: "" };
+  // No deltas fired this run (streamedText === "") -> the res.result lump must be emitted as a `text` frame.
+  s.onRunComplete({ status: "finished", result: "lump answer" });
+  assert.match(s.activeRes.sse, /data: \{"type":"text","delta":"lump answer"\}/, "res.result fallback must emit the model's text when no deltas streamed");
+  assert.match(s.activeRes.sse, /"stop_reason":"end_turn"/, "a finished run terminates as end_turn");
+
+  // When deltas DID stream (streamedText set), the res.result lump must NOT be re-emitted (no duplicate text).
+  const s2 = new Session("f5-nodup");
+  s2.activeRes = { write(line) { this.sse = (this.sse || "") + line; return true; }, sse: "" };
+  s2.streamedText = "already streamed";
+  s2.onRunComplete({ status: "finished", result: "already streamed" });
+  assert.doesNotMatch(s2.activeRes.sse, /"type":"text"/, "no res.result fallback text frame when deltas already streamed the answer");
+  assert.match(s2.activeRes.sse, /"stop_reason":"end_turn"/);
+});
+
 test("tool_results for an unknown sessionId must NOT complete as a clean successful turn (Comment 1)", async () => {
   const id = "comment1-unknown-session-regression";
   sessions.delete(id); // guarantee the lookup misses regardless of test ordering
@@ -449,6 +495,36 @@ test("BR4/C5: resolvePending threads isError into the dispatchMcp result", async
   s2.resolvePending([...s2.everEmitted][0], "ok"); // default isError=false
   const out2 = await p2;
   assert.equal(out2.__ccJson.success.isError, false);
+});
+
+test("finding#4: dispatchMcp's resolved + not-advertised wraps use the SHARED mcpDispatchResult builder (so the selftest cannot drift from real traffic)", async () => {
+  // ADD-74: the McpResult wrap had NO shared builder (inline literals), so the selftests hand-retyped the shape;
+  // a drift would pass CI yet crash the first real tool-call. These assert the LIVE dispatchMcp output is
+  // byte-identical to mcpDispatchResult(...) on BOTH paths, so re-inlining a drifted literal would fail here.
+  const s = new Session("f4-mcp");
+  s.advertise = [{ name: "T", toolName: "T" }];
+  // Resolved path (success): content + isError flow through the builder.
+  const p = s.dispatchMcp({ toolName: "T", args: {} });
+  const idOk = [...s.everEmitted][0];
+  s.resolvePending(idOk, "hello");
+  const ok = await p;
+  assert.deepEqual(ok.__ccJson, mcpDispatchResult("hello", false), "resolved success wrap == mcpDispatchResult");
+  // Resolved path (object content -> JSON.stringify) + isError=true.
+  const p2 = s.dispatchMcp({ toolName: "T", args: {} });
+  const idErr = [...s.everEmitted].find((x) => x !== idOk);
+  s.resolvePending(idErr, { k: "v" }, true);
+  const er = await p2;
+  assert.deepEqual(er.__ccJson, mcpDispatchResult({ k: "v" }, true), "resolved object/error wrap == mcpDispatchResult");
+  // Not-advertised path: a foreign tool name -> the isError "not available" wrap, ALSO via the builder.
+  const sEmpty = new Session("f4-mcp-empty");
+  sEmpty.advertise = [{ name: "Real", toolName: "Real" }];
+  const na = await sEmpty.dispatchMcp({ toolName: "nonexistent-tool", args: {} });
+  assert.deepEqual(
+    na.__ccJson,
+    mcpDispatchResult("Tool 'nonexistent-tool' is not available. Available tools: Real.", true),
+    "not-advertised wrap == mcpDispatchResult",
+  );
+  assert.equal(na.__ccJson.success.isError, true);
 });
 
 test("BR8/C5: native shell failure surfaces as a non-zero exit even when content exitCode is 0", () => {
@@ -858,6 +934,47 @@ test("MCP headlessMcpState reports dialed servers + gated tools as connected (th
   assert.ok(empty.success, "empty advertise still yields a success (never the typed-unavailable error)");
   assert.deepEqual(empty.success.servers.map((x) => x.serverIdentifier), ["cc"]);
   assert.deepEqual(empty.success.servers[0].tools, []);
+});
+
+test("ADD-74/finding#1: headlessMcpState's catch-fallback emits the McpStateError shape (NOT a McpStateSuccess), mirroring the live error variant", () => {
+  // headlessMcpState runs on the live session's client-supplied advertise; mcpToolsForServer/buildMcpServers
+  // .map over those entries can throw on malformed input. The catch must return the typed-error variant of the
+  // SAME result case (McpStateExecResult.error == { error: { error: <string> } }), never a success shape — this
+  // is the error variant the selftest now enumerates (mcpState:error). Force the catch with an advertise entry
+  // whose inputSchema getter throws (this trips mcpToolsForServer at access time, inside headlessMcpState's try).
+  const bad = { name: "X", description: "d", get inputSchema() { throw new Error("boom-schema"); } };
+  const out = headlessMcpState({ id: "mcpstate-catch", advertise: [bad] }).__ccJson;
+  assert.ok(out.error && typeof out.error.error === "string", "the catch must emit the McpStateError { error: { error } } shape");
+  assert.ok(!out.success, "the catch must NOT emit a success shape (that would be the wrong oneof variant)");
+  // It must be byte-identical to the result the selftest enumerates for the mcpState:error case, so the seam
+  // validates exactly what production emits (regression: dropped when mcpStateExecArgs left TYPED_UNAVAILABLE_U).
+  assert.deepEqual(out, typedUnavailableResult("mcpStateExecArgs").__ccJson);
+});
+
+test("ADD-74/finding#1: the result-serialization selftest ENUMERATES the mcpState error variant (would fail if the catch shape were unserializable)", async () => {
+  // The selftest must drive the mcpState:error shape through the patched fromJson seam. Prove it does by making
+  // the seam reject the McpStateExecResult.error shape specifically: if the selftest did NOT enumerate that
+  // variant, this would pass; because it DOES, the selftest must fail-fast (the regression guard for the dropped
+  // error-variant coverage). The faithful seam accepts every other case so only the mcpState:error rejection bites.
+  const isKnown = (caseName) => /Result$/.test(caseName) || caseName === "shellStream";
+  const saved = globalThis.__CC_SELFTEST_SERIALIZE;
+  globalThis.__CC_SELFTEST_SERIALIZE = (caseName) => {
+    if (!isKnown(caseName)) throw new Error("unknown result case " + caseName);
+    return (id, value) => {
+      const j = value && typeof value === "object" && "__ccJson" in value ? value.__ccJson : null;
+      // Reject ONLY the McpStateExecResult error variant ({error:{...}}) — emulating a proto-shape drift that
+      // would crash the live catch-fallback. Success/other-error cases serialize fine.
+      if (caseName === "mcpStateExecResult" && j && j.error) throw new Error("invalid result shape for " + caseName);
+      return { id, message: { case: caseName, value: { ok: true } } };
+    };
+  };
+  try {
+    await assert.rejects(
+      () => selfTestResultSerialization(),
+      /mcpStateExecResult|mcpState:error|could not serialize|invalid result shape/,
+      "the selftest must enumerate + fail on an unserializable mcpState error variant",
+    );
+  } finally { globalThis.__CC_SELFTEST_SERIALIZE = saved; }
 });
 
 test("MCP grouping=one: a single 'cc' server whose URL has no serverKey segment + serves ALL tools", () => {
@@ -1639,6 +1756,69 @@ test("ADD-36: concurrent partial-parallel tool_results + userText synthesizes ca
   assert.ok(bCancelled, "the unresolved pending B is synthesized as a cancellation so the run can resume");
   assert.equal(bCancelled.e, true, "B's cancellation is a MODEL-VISIBLE failure (isError), not a fake success");
   assert.equal(s.pending.size, 0, "no pending is left to strand the run behind the watchdog");
+  sessions.delete(id);
+});
+
+// ── finding#6: a concurrent continuation whose results match NOTHING but carries new user payload must NOT
+//    be silently dropped behind a clean end_turn (the in-flight stream predates it; the executor fold reached
+//    no pending). Surface a typed error so the client resends — the concurrent twin of runTurn's C1 redirect. ─
+test("finding#6: concurrent matched===0 + userText must NOT clean-ack (the user instruction would be lost) — typed error so the client retries", async () => {
+  const id = "finding6-text";
+  const cursorKey = "k-finding6";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  installFakePlatform(cursorKey, null);
+  // A run is actively streaming (activeRes set => concurrent fast path).
+  s.activeRes = { write() { return true; } };
+  // The continuation answers a benign, already-reaped (ever-emitted) id -> matched===0, NOT unknown, no pending.
+  s.everEmitted.add("reaped-id");
+  // ...AND carries a NEW user instruction. On the concurrent path the live run cannot receive it (it predates
+  // the payload and matched===0 means the fold reached no pending). It must surface as an ERROR, not end_turn.
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "reaped-id", content: "stale" }], userText: "actually, do X instead" },
+  }, cursorKey);
+  assert.match(res.sse, /"stop_reason":"error"/, "a lost user instruction on the concurrent path must error, not clean-ack (finding#6)");
+  assert.doesNotMatch(res.sse, /"stop_reason":"end_turn"/, "must NOT emit a clean end_turn that drops the user's instruction");
+  assert.match(res.sse, /could not be delivered/);
+  assert.match(res.sse, /\[DONE\]/);
+  sessions.delete(id);
+});
+
+test("finding#6: the new user-payload check covers IMAGES too (matched===0 + image-only continuation -> error, not clean-ack)", async () => {
+  const id = "finding6-img";
+  const cursorKey = "k-finding6-img";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  installFakePlatform(cursorKey, null);
+  s.activeRes = { write() { return true; } };
+  s.everEmitted.add("reaped-2");
+  // No userText, but a NEW top-level image -> still user payload that cannot reach the in-flight run.
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "reaped-2", content: "stale" }], images: [{ data: "QUJD", mimeType: "image/png" }] },
+  }, cursorKey);
+  assert.match(res.sse, /"stop_reason":"error"/, "an image-only continuation that cannot reach the live run must error (finding#6)");
+  assert.doesNotMatch(res.sse, /"stop_reason":"end_turn"/);
+  sessions.delete(id);
+});
+
+test("finding#6 regression guard: a benign re-ack with NO user payload still clean-acks (matched===0 alone is not an error)", async () => {
+  // The new error branch must fire ONLY when user payload would be lost — a pure benign re-ack (a client retry
+  // of an already-resolved/reaped id, no userText/images) is still a clean ack on the live run (C04 contract).
+  const id = "finding6-benign";
+  const cursorKey = "k-finding6-benign";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  installFakePlatform(cursorKey, null);
+  s.activeRes = { write() { return true; } };
+  s.everEmitted.add("seen-1");
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "seen-1", content: "dup" }] },
+  }, cursorKey);
+  assert.match(res.sse, /"stop_reason":"end_turn"/, "a benign re-ack with no user payload still acks cleanly");
+  assert.doesNotMatch(res.sse, /"stop_reason":"error"/, "matched===0 alone (no user payload) must NOT error");
   sessions.delete(id);
 });
 

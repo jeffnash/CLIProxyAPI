@@ -18,7 +18,7 @@ import path from "node:path";
 
 const require = createRequire(import.meta.url);
 const patcher = require("./apply-clienttools-patch.cjs");
-const { applyPatch, PatchError, PINNED_VERSION, EXPECTED_BUNDLE_SHA256, MARK, REQUIRED_SEAM_TOKENS, SHA_OVERRIDE_ENV, edits } = patcher;
+const { applyPatch, PatchError, PINNED_VERSION, EXPECTED_BUNDLE_SHA256, MARK, REQUIRED_SEAM_TOKENS, DISPATCH_EDIT_NAMES, SHA_OVERRIDE_ENV, edits } = patcher;
 
 // Build a synthetic "pristine" bundle that contains EXACTLY the four anchor `from` strings the patcher
 // expects (each once), padded with filler so the anchors are embedded the way they would be in the real
@@ -54,6 +54,22 @@ function makeMarkedBundle({ tokens = REQUIRED_SEAM_TOKENS } = {}) {
 function makePatchedBundle() {
   const res = applyPatch({ src: makeAnchoredBundle(), version: PINNED_VERSION, env: { [SHA_OVERRIDE_ENV[0]]: "1" } });
   return res.patchedSrc;
+}
+
+// Revert one or more dispatch edits' `to`->`from` in an otherwise fully-patched bundle, simulating the
+// native-exec leak the live-site staleness guard must catch: the marker + every REQUIRED_SEAM_TOKEN survive
+// (the appended self-test harness still embeds __CC_EXEC_U/S + the native call verbatim), but a real dispatch
+// call site has been reverted to `n.exec.execute(...)` — a cached/hand-edited bundle that copied the marker
+// but lost the seam. Defaults to reverting BOTH dispatch sites (the worst case).
+function revertDispatchSites(src, names = DISPATCH_EDIT_NAMES) {
+  let out = src;
+  for (const name of names) {
+    const ed = edits.find((e) => e.name === name);
+    assert.ok(ed, `dispatch edit ${name} must exist`);
+    assert.ok(out.includes(ed.to), `fixture precondition: patched bundle must contain the "${name}" to-form before reverting`);
+    out = out.split(ed.to).join(ed.from);
+  }
+  return out;
 }
 
 // Sanity: our synthetic bundle never collides with the recorded pristine hash (otherwise the "drifted"
@@ -265,6 +281,93 @@ test("RBT-042: REQUIRED_SEAM_TOKENS covers the four cross-file seams the bridge 
   const patched = makePatchedBundle();
   for (const token of REQUIRED_SEAM_TOKENS) {
     assert.ok(patched.includes(token), `the patcher's own output must contain the required seam token ${token}`);
+  }
+});
+
+// ADD-102 (live-site staleness): the most security-critical seams are the two REAL dispatch sites
+// (edits[1]/edits[2]) — their absence reintroduces native sidecar exec. A token-presence check CANNOT witness
+// them: the injected __CC_EXEC_U/__CC_EXEC_S identifiers (and the native call) also appear UNCONDITIONALLY in
+// the appended dispatch self-test harness. So a marker-prefixed bundle that carries every REQUIRED_SEAM_TOKEN
+// but whose live dispatch call sites were reverted to native (cached artifact copied with the marker but minus
+// the seam / hand-edited vendor bundle / half-applied patch) used to be wrongly accepted as alreadyPatched and
+// exit 0 — starting the bridge with native exec reintroduced. The already-patched short-circuit must now also
+// assert the dispatch edits' pristine `from` (native-call) forms are ABSENT, and fail CLOSED otherwise.
+test("ADD-102: marker + all tokens but BOTH dispatch sites reverted to native fails closed (stale-bundle, not alreadyPatched)", () => {
+  // The finding's exact repro: makePatchedBundle(), revert the two dispatch-site to->from, expect stale-bundle.
+  const patched = makePatchedBundle();
+  const leaked = revertDispatchSites(patched); // reverts BOTH unary + stream
+
+  // Precondition that makes this test meaningful: the OLD token-only guard would still pass this bundle —
+  // every required seam token AND the marker are still present (only the live call sites changed).
+  assert.ok(leaked.startsWith(MARK), "fixture: reverted bundle must still start with MARK");
+  for (const token of REQUIRED_SEAM_TOKENS) {
+    assert.ok(leaked.includes(token), `fixture: reverted bundle must still contain the seam token ${token} (so a token-only check would mis-accept it)`);
+  }
+
+  let thrown;
+  try {
+    applyPatch({ src: leaked, version: PINNED_VERSION, env: {} });
+  } catch (e) {
+    thrown = e;
+  }
+  assert.ok(thrown instanceof PatchError, "a marked bundle with native-reverted dispatch must throw, not return alreadyPatched");
+  assert.equal(thrown.code, "stale-bundle", "native-reverted dispatch must fail closed as stale-bundle");
+  assert.match(thrown.message, /dispatch site is still in its pristine native form/, "the error must explain the native-form leak");
+  assert.match(thrown.message, /native sidecar exec/, "the error must call out the security consequence (native exec reintroduced)");
+  assert.match(thrown.message, /npm ci|reinstall the SDK/, "the error must give an actionable remediation");
+});
+
+test("ADD-102: EACH dispatch site, when individually reverted to native, fails closed (neither seam can silently leak)", () => {
+  // Sweep: revert exactly one dispatch site at a time. Each must independently trip the reverse-anchor guard
+  // and name the offending site — pinning that BOTH the unary and the stream live sites are checked, not just
+  // one. (A future edit that guarded only one would fail here.)
+  const patched = makePatchedBundle();
+  for (const name of DISPATCH_EDIT_NAMES) {
+    const leaked = revertDispatchSites(patched, [name]);
+    let thrown;
+    try {
+      applyPatch({ src: leaked, version: PINNED_VERSION, env: {} });
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown instanceof PatchError && thrown.code === "stale-bundle", `reverting "${name}" must fail closed as stale-bundle`);
+    assert.match(thrown.message, new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `the error must name the reverted dispatch site "${name}"`);
+  }
+});
+
+test("ADD-102: the live-site guard does NOT false-positive — the GENUINE patched bundle still short-circuits", () => {
+  // Guard against an over-eager fix that rejects the real patcher output. The genuine patched bundle (whose
+  // harness embeds __CC_EXEC_U/S + a native call) must still be accepted as already-patched, because the FULL
+  // pristine `from` strings appear ONLY at an un-replaced live site (the harness strips the o=await / o=+;for
+  // await framing). This is the complement of the failure cases above.
+  const patched = makePatchedBundle();
+  // Sanity: the harness genuinely contains the native call + exec globals, yet the bundle is still accepted —
+  // proving the guard keys off the FULL framed `from`, not the bare native-call substring.
+  assert.ok(patched.includes("n.exec.execute(e,s,{execId:t.execId})"), "fixture: the appended harness embeds the bare native call");
+  assert.ok(patched.includes("__CC_EXEC_U") && patched.includes("__CC_EXEC_S"), "fixture: the harness embeds the exec globals");
+  const res = applyPatch({ src: patched, version: PINNED_VERSION, env: {} });
+  assert.equal(res.alreadyPatched, true, "a genuinely-patched bundle must NOT be flagged stale by the live-site guard");
+  assert.equal(res.observedSha, null, "the short-circuit must still return before computing the SHA");
+});
+
+test("ADD-102: DISPATCH_EDIT_NAMES name exactly the two dispatch edits whose absence reintroduces native exec (contract pin)", () => {
+  // Pin the witness set so it cannot be silently narrowed. Each name must resolve to a real edit, and that
+  // edit's `from` (the native-call form) must NOT be reproducible by the appended harness — i.e. the full
+  // pristine string must be absent from genuine patched output (so its presence is an unambiguous leak signal).
+  assert.deepEqual(
+    [...DISPATCH_EDIT_NAMES].sort(),
+    ["stream tool dispatch -> CC", "unary tool dispatch -> CC"],
+    "the live-site guard must cover exactly the unary + stream dispatch edits",
+  );
+  const patched = makePatchedBundle();
+  for (const name of DISPATCH_EDIT_NAMES) {
+    const ed = edits.find((e) => e.name === name);
+    assert.ok(ed, `DISPATCH_EDIT_NAMES entry "${name}" must resolve to a real edit`);
+    assert.equal(
+      patched.split(ed.from).length - 1,
+      0,
+      `the pristine native "${name}" form must be ABSENT from genuine patched output (else it is not a valid leak witness)`,
+    );
   }
 });
 

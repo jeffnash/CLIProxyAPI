@@ -1564,19 +1564,19 @@ func composerConstraints(oai []byte) map[string]any {
 		unsupported = append(unsupported, "max_tokens hard cap (best-effort prompt only; output length is not capped server-side)")
 	}
 	// ADD-83/87: the Claude/Gemini/Responses request translators normalize a requested thinking budget /
-	// reasoning.effort into reasoning_effort, but the composer path previously dropped it. Carry it through to
-	// the bridge body (composerTurnBody spreads constraints) as reasoningEffort so the bridge can render it as
-	// model guidance — AND flag it unsupported as a HARD param: the @cursor/sdk agent.send takes no
-	// reasoning-effort knob, so it is best-effort prompt-only, never an enforced upstream control.
+	// reasoning.effort into reasoning_effort, but the composer path cannot honor it: the @cursor/sdk agent.send
+	// takes no reasoning-effort knob. The signal is surfaced SOLELY via unsupportedHardGuarantees (rendered by
+	// the bridge's constraintInstructions) — NOT as a dedicated body field. The bridge's constraints allowlist
+	// (cursor-agent-bridge.mjs handleTurn) does not read a reasoningEffort key, so carrying one would be a dead
+	// wire field; this matches the honest-degrade contract (best-effort advisory only, never an enforced control).
 	if re := strings.TrimSpace(gjson.GetBytes(oai, "reasoning_effort").String()); re != "" {
-		c["reasoningEffort"] = re
 		unsupported = append(unsupported, fmt.Sprintf("reasoning_effort=%s best-effort; Cursor composer does not accept a reasoning-effort param", re))
 	}
 	// H20: parallel_tool_calls:false is a documented zero-or-one-tool-per-turn limit. We cannot hard-cap
-	// Cursor's emission, so carry the flag (the bridge renders an instruction) and mark it unsupported as a
-	// hard guarantee. Only the explicit `false` is load-bearing; absent / true needs no signal.
+	// Cursor's emission and the bridge does not read a parallelToolCalls key, so the signal is surfaced SOLELY
+	// via unsupportedHardGuarantees (the bridge renders it as best-effort advisory text) — NOT as a dedicated
+	// body field that would fall on the floor. Only the explicit `false` is load-bearing; absent / true needs no signal.
 	if v := gjson.GetBytes(oai, "parallel_tool_calls"); v.Exists() && !v.Bool() {
-		c["parallelToolCalls"] = false
 		unsupported = append(unsupported, "parallel_tool_calls=false (best-effort prompt only; parallel tool emission is not hard-capped server-side)")
 	}
 	// ADD-72 (owner caveat): the composer path has NO surface to pass sampling/candidate controls to Cursor —

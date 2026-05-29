@@ -460,20 +460,18 @@ function headlessRequestContext(clientEnv) {
     mcpMetaToolOptions: { enabled: true, mcpDescriptors: [] }, nonFileRules: [] } } } };
 }
 
-// ── Coverage of all 29 ExecServerMessage cases (@cursor/sdk 1.0.14; verify via the bundle's
-//    ExecServerMessage .fields.list() on any SDK bump). EVERY case is routed, synthesized, or rejected —
-//    none falls through to native sidecar execution:
-//   ROUTED→CC (CC_CASES):   readArgs, redactedReadArgs, writeArgs, deleteArgs, shellArgs, shellStreamArgs
-//   ROUTED→CC (mcpArgs):    mcpArgs  (client/MCP tools, via dispatchMcp + reconcileToolName)
-//   HEADLESS (synthetic):   requestContextArgs
-//   CONTROL_ALLOW:          shellAllowlistPrecheckArgs, mcpAllowlistPrecheckArgs, webFetchAllowlistPrecheckArgs
-//   CONTROL_TYPED rejected: diagnosticsArgs, canvasDiagnosticsArgs
-//   FAIL-CLOSED reject:     grepArgs, lsArgs (model uses shell instead — structured shapes TODO),
-//                           backgroundShellSpawnArgs, forceBackgroundShellArgs, writeShellStdinArgs,
-//                           executeHookArgs, subagentArgs, subagentAwaitArgs, forceBackgroundSubagentArgs,
-//                           fetchArgs, recordScreenArgs (no GUI), computerUseArgs (no GUI),
-//                           listMcpResourcesExecArgs, readMcpResourceExecArgs, mcpStateExecArgs,
-//                           smartModeClassifierArgs (TODO: typed default-mode success, live-validate)
+// ── ExecServerMessage dispatch. EVERY exec case is routed, synthesized, or rejected — none falls through to
+//    native sidecar execution. The AUTHORITATIVE classification is the live tables below, NOT a hand-maintained
+//    prose list (a duplicated taxonomy drifted: it once still described mcpStateExecArgs as a fail-closed reject
+//    after it became HEADLESS-synthesized, and listed grep/ls/fetch/etc. as rejects after they became
+//    TYPED_UNAVAILABLE_U model-visible results). To classify a case, read: the `caseOf`-keyed branches in
+//    __CC_EXEC_U / __CC_EXEC_S (requestContextArgs + mcpStateExecArgs are HEADLESS-synthesized; mcpArgs ->
+//    dispatchMcp), CC_CASES (ROUTED→CC native fs/shell), CONTROL_ALLOW (precheck "allow"), CONTROL_TYPED
+//    (proactive typed answer), and TYPED_UNAVAILABLE_U (model-visible typed-unavailable result). The actual
+//    GUARANTEE is the deny-by-default fallback at the end of __CC_EXEC_U/__CC_EXEC_S: anything not in those
+//    tables (incl. a future 30th case on an SDK bump) is REJECTED, never executed natively. selfTestResultSerialization
+//    enumerates every emittable result shape straight from those tables (so it cannot drift); on an SDK bump,
+//    verify the case set via the bundle's ExecServerMessage .fields.list() and re-run the self-tests.
 //
 // ccErrorMessageText renders an isError result's content into a single human-readable failure message for
 // the `error: {error}` variant (the *Error oneof member's `error` string field; see fsErrorResult). The Go
@@ -605,10 +603,13 @@ const CONTROL_ALLOW = { shellAllowlistPrecheckArgs: 1, mcpAllowlistPrecheckArgs:
 // TODO(validate-live): smartModeClassifierArgs needs its success shape (default mode) + subagent* a typed
 // error; left as deny-by-default reject until their shapes are derived and exercised against live Cursor.
 const CONTROL_TYPED = { diagnosticsArgs: { rejected: {} }, canvasDiagnosticsArgs: { success: {} } };
-// H17: cases the bridge does NOT implement but whose RESULT type exposes an `error` oneof variant
-// (agent.v1.Error{message}, verified against the @cursor/sdk 1.0.14 proto descriptors). For these we return a
-// MODEL-VISIBLE typed unavailable result instead of fail-closing the whole run with a stream error — so the
-// model sees "this tool is unavailable" and picks another path (e.g. shell instead of structured grep/ls).
+// H17: cases the bridge does NOT implement but whose RESULT type exposes an `error` oneof variant whose member
+// is { error: <message string>, ...optional context } — NOT {message} (see fsErrorResult/typedUnavailableResult;
+// there is NO agent.v1.Error{message}). The shape is pinned at startup by selfTestResultSerialization driving
+// typedUnavailableResult through the real fromJson seam (check #6) — reference THAT, not an unverifiable proto
+// descriptor claim. For these we return a MODEL-VISIBLE typed unavailable result instead of fail-closing the
+// whole run with a stream error — so the model sees "this tool is unavailable" and picks another path (e.g.
+// shell instead of structured grep/ls).
 // CAVEAT (H17): this is ONLY for cases with a known typed-error result shape. Cases with NO safe result
 // variant (subagent*/forceBackgroundSubagent/recordScreen/computerUse/smartModeClassifier/executeHook, and the
 // streaming-lifecycle force-background-shell) are deliberately LEFT fail-closed below — fabricating a result
@@ -632,6 +633,17 @@ function typedUnavailableResult(cas) {
   // (grep/ls/fetch/backgroundShellSpawn/writeShellStdin/listMcpResources/readMcpResource/mcpState — all carry
   // an `error` string field; extra context fields are optional). The message goes in `error`, never `message`.
   return { __ccJson: { error: { error: `tool '${cas}' is not available in this environment; use an alternative approach` } } };
+}
+
+// mcpDispatchResult builds the McpResult `success` wrap the MCP dispatch path emits — { success: { isError,
+// content: [{ text: { text } }] } } (agent.v1.McpResult.success: McpToolResult). It is the SHARED builder for
+// dispatchMcp's resolved result AND the handleMcp "tool not advertised" wrap, so selfTestResultSerialization can
+// drive the SAME function the live run uses instead of a hand-retyped literal (ADD-74: a literal can drift from
+// the real shape and pass CI while the first real tool-call crashes inside fromJson). content is normalized to a
+// string exactly as the live wrap did (object content -> JSON.stringify). isError is strict-true.
+function mcpDispatchResult(content, isError) {
+  const text = typeof content === "string" ? content : JSON.stringify(content ?? "");
+  return { success: { isError: isError === true, content: [{ text: { text } }] } };
 }
 
 function ccArgsFor(cas, s) {
@@ -1141,12 +1153,12 @@ class Session {
       const eff = this.advertiseForGating();
       const names = eff.map((t) => t.toolName || t.name).join(", ");
       dbg("dispatchMcp TOOL NOT AVAILABLE", "want=" + want, "advertisedCount=" + eff.length, "advertised=" + names);
-      return Promise.resolve({ __ccJson: { success: { isError: true, content: [{ text: { text: `Tool '${want}' is not available. Available tools: ${names || "(none)"}.` } }] } } });
+      return Promise.resolve({ __ccJson: mcpDispatchResult(`Tool '${want}' is not available. Available tools: ${names || "(none)"}.`, true) });
     }
     return new Promise((resolve, reject) => {
       // C5/BR4: a client tool that failed/was cancelled (isError) must reach the model AS a failure, so the
       // McpResult's isError mirrors the threaded flag rather than being hardcoded false.
-      const wrap = (content, isError) => resolve({ __ccJson: { success: { isError: isError === true, content: [{ text: { text: typeof content === "string" ? content : JSON.stringify(content ?? "") } }] } } });
+      const wrap = (content, isError) => resolve({ __ccJson: mcpDispatchResult(content, isError) });
       wrap.__reject = reject;
       this.newPending(id, wrap);
       this.emitToolUse(id, ccName, input);
@@ -1820,6 +1832,10 @@ function streamCallbacks(session) {
         const txt = update && (update.text != null ? update.text : (update.value && update.value.text));
         if (ty === "text-delta" && txt) { session.streamedText += txt; session.sse({ type: "text", delta: txt }); }
         else if (ty === "thinking-delta" && txt) session.sse({ type: "reasoning", delta: txt });
+        // A NON-EMPTY delta whose discriminator we don't recognize would otherwise be silently dropped (the
+        // model's answer vanishes behind a clean turn_end). Surface it so a future @cursor/sdk discriminator
+        // rename (text-delta/thinking-delta) is visible in the operational logs instead of failing silently.
+        else if (txt && ty !== "text-delta" && ty !== "thinking-delta") dbg("onDelta UNRECOGNIZED non-empty delta type -> dropped (SDK discriminator drift?)", "session=" + session.id, "type=" + safeJson(ty));
       } catch (e) { dbg("onDelta ERROR", "session=" + session.id, (e && e.message) || String(e)); }
     },
     onStep: () => {},
@@ -1947,7 +1963,10 @@ async function handleTurn(req, res, body, cursorKey) {
       const { matched, unknown } = session.matchToolResults(input.results);
       const batchLen = (input.results || []).length;
       const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
-      dbg("handleTurn tool_results CONCURRENT ack", sessionId, "matched=" + matched, "of=" + batchLen, "unknown=" + safeJson(unknown), "userText=" + hasUserText, "pendingAfter=" + session.pending.size);
+      // The continuation may also carry NEW user images (top-level input.images and/or images folded into tool
+      // results); like userText, these are user payload that must reach the model, not be dropped.
+      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || collectToolResultImages(input).length > 0;
+      dbg("handleTurn tool_results CONCURRENT ack", sessionId, "matched=" + matched, "of=" + batchLen, "unknown=" + safeJson(unknown), "userText=" + hasUserText, "userImages=" + hasUserImages, "pendingAfter=" + session.pending.size);
       // ADD-36: a PARTIAL-PARALLEL mixed turn on the concurrent path — the client answered SOME tools
       // (matched>0), included new user text (hasUserText), but OTHER pendings remain unanswered
       // (pending.size>0, e.g. the client cancelled/backgrounded those tools). Without handling, the live run
@@ -1965,14 +1984,27 @@ async function handleTurn(req, res, body, cursorKey) {
       }
       // NOTE on input.userText (C1): on the concurrent path the live run already owns activeRes and is
       // streaming the model's answer; the executor folds any trailing user text into the last tool result
-      // (C1 belt-and-suspenders), so it reaches the live run there. Driving a separate fresh send HERE would
-      // spawn a colliding/orphaned run — so the concurrent path only acks; the live run surfaces userText.
+      // (C1 belt-and-suspenders), so it reaches the live run WHEN that result actually RESOLVES a pending
+      // (matched>0). Driving a separate fresh send HERE would spawn a colliding/orphaned run, so the concurrent
+      // path only acks. But when NOTHING matched (matched===0: every id was a benign re-ack / reaped / already-
+      // resolved), the fold reached no pending and the in-flight stream began BEFORE this payload arrived — so a
+      // trailing userText/images is NOT in the run anywhere. runTurn's twin handles this via the C1 redirect
+      // (driveUserSend at the `hasUserPayload && noneToResume` branch); the concurrent path cannot drive a fresh
+      // send without colliding with the live stream, so we must NOT clean-ack (which tells the client to stop
+      // retrying while its instruction was silently lost). Surface a typed error so the client re-sends it.
+      const userPayloadLost = (hasUserText || hasUserImages) && matched === 0 && unknown.length === 0;
       try {
         if (unknown.length > 0) {
           // Foreign/never-issued id: a genuine desync. Surface it (do NOT fake success) so the client sees it.
           res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "error", error: `unknown tool_call_id ${unknown[0]}: not issued by this session` })}\n\n`);
+        } else if (userPayloadLost) {
+          // matched===0 + new user payload: the continuation's userText/images could not be delivered to the
+          // in-flight run (it predates this payload, and the concurrent path cannot fresh-send). Error so the
+          // client retries the instruction on a fresh turn — never a clean end_turn that drops it (finding #6).
+          dbg("handleTurn CONCURRENT user payload could not reach the live run -> error ack so the client retries (finding#6)", sessionId, "userText=" + hasUserText, "userImages=" + hasUserImages);
+          res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "error", error: "a new user instruction or image arrived while a run was streaming and could not be delivered to it; resend it as a new turn" })}\n\n`);
         } else {
-          // matched>0 -> resolved into the live run; matched===0 with no unknown -> all ids were benign
+          // matched>0 -> resolved into the live run; matched===0 with no user payload -> all ids were benign
           // re-acks (already-resolved/duplicate). Either way a clean ack is correct (the run is live).
           res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "end_turn" })}\n\n`);
         }
@@ -2694,9 +2726,12 @@ async function selfTestResultSerialization() {
   for (const [cas, val] of Object.entries(CONTROL_TYPED)) add(resultCaseFor(cas), "typed:" + cas, val);
   // 6) TYPED_UNAVAILABLE_U (H17): model-visible typed unavailable result for each.
   for (const cas of TYPED_UNAVAILABLE_U) add(resultCaseFor(cas), "unavailable:" + cas, typedUnavailableResult(cas).__ccJson);
-  // 7) MCP dispatch wrap (handleMcp/mcpDispatch + the "tool not advertised" wrap): success isError false/true.
-  add("mcpResult", "mcp:ok", { success: { isError: false, content: [{ text: { text: "ok" } }] } });
-  add("mcpResult", "mcp:isError", { success: { isError: true, content: [{ text: { text: "tool failed" } }] } });
+  // 7) MCP dispatch wrap (handleMcp/mcpDispatch + the "tool not advertised" wrap): drive the SAME builder the
+  //    live dispatch uses (mcpDispatchResult), not a hand-retyped literal, so the McpResult shape cannot drift
+  //    from real traffic (ADD-74). Cover success isError false/true AND object content (JSON.stringify path).
+  add("mcpResult", "mcp:ok", mcpDispatchResult("ok", false));
+  add("mcpResult", "mcp:isError", mcpDispatchResult("tool failed", true));
+  add("mcpResult", "mcp:object", mcpDispatchResult({ k: "v" }, false));
   // 8) Headless request context (the SDK's first exec on every run).
   add("requestContextResult", "requestContext", headlessRequestContext(null).__ccJson);
   // Headless MCP state (the runtime's mcp_state_exec reply): McpStateExecResult.success with one connected
@@ -2708,6 +2743,13 @@ async function selfTestResultSerialization() {
     mcpStateSession.advertise = [{ name: "mcp__nanobanana__generate_image", description: "gen", inputSchema: { type: "object" } }];
     add("mcpStateExecResult", "mcpState:success", headlessMcpState(mcpStateSession).__ccJson);
     add("mcpStateExecResult", "mcpState:empty", headlessMcpState(new Session("selftest-mcpstate-empty")).__ccJson);
+    // ERROR variant of the SAME result case: headlessMcpState's catch-fallback emits
+    // typedUnavailableResult("mcpStateExecArgs") -> McpStateExecResult.error (McpStateError{error:<string>}).
+    // mcpStateExecArgs was removed from TYPED_UNAVAILABLE_U (check #6) when mcp_state switched to McpStateSuccess,
+    // so nothing else enumerates this error shape; enumerate it explicitly so the seam validates the shape the
+    // live catch still emits (mcpToolsForServer/buildMcpServers can throw on malformed advertise). Without this,
+    // a wrong error shape would throw inside fromJson as a runtime tool failure, not a fail-fast deploy error.
+    add("mcpStateExecResult", "mcpState:error", typedUnavailableResult("mcpStateExecArgs").__ccJson);
   }
 
   for (const c of checks) {
@@ -2761,5 +2803,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, blockedNativeResult, typedUnavailableResult, TYPED_UNAVAILABLE_U, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES };
+export { CC_CASES, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

@@ -1575,9 +1575,10 @@ func TestApplyComposerAllowedTools(t *testing.T) {
 	}
 }
 
-// H20/H21: hard guarantees the composer path cannot enforce server-side (json_schema, stop, max_tokens,
-// parallel_tool_calls:false) are carried as best-effort AND flagged in unsupportedHardGuarantees — never
-// silently pretended-enforced.
+// H20/H21: hard guarantees the composer path cannot enforce server-side are flagged in
+// unsupportedHardGuarantees — never silently pretended-enforced. json_schema/stop/max_tokens additionally
+// carry a bridge-CONSUMED field; parallel_tool_calls:false does NOT (the bridge has no parallelToolCalls knob),
+// so it is advisory-only and must NOT be written as a dead body field.
 func TestComposerConstraintsUnsupportedSignals(t *testing.T) {
 	c := composerConstraints([]byte(`{"response_format":{"type":"json_schema","json_schema":{"name":"x"}},"stop":["END"],"max_tokens":128,"parallel_tool_calls":false}`))
 	notes, _ := c["unsupportedHardGuarantees"].([]string)
@@ -1590,8 +1591,10 @@ func TestComposerConstraintsUnsupportedSignals(t *testing.T) {
 			t.Fatalf("H20/H21: missing unsupported note for %q in %q", want, joined)
 		}
 	}
-	if c["parallelToolCalls"] != false {
-		t.Fatalf("H20: parallel_tool_calls=false must be carried as a field, got %v", c["parallelToolCalls"])
+	// Dead-key regression guard: the bridge's constraints allowlist never reads parallelToolCalls, so it must
+	// NOT be written back as a dedicated (dead) body field — the signal lives only in unsupportedHardGuarantees.
+	if _, ok := c["parallelToolCalls"]; ok {
+		t.Fatalf("H20: parallel_tool_calls=false must NOT be carried as a dead body field, got %v", c["parallelToolCalls"])
 	}
 	// A plain request with no hard guarantees produces no unsupported list.
 	plain := composerConstraints([]byte(`{"response_format":{"type":"json_object"}}`))
@@ -2322,26 +2325,31 @@ func TestADD79_KeyFingerprintFoldedIntoSession(t *testing.T) {
 	}
 }
 
-// ADD-83/87 (exec half): reasoning_effort is carried to the bridge body as reasoningEffort AND flagged as an
-// unsupported hard guarantee (the SDK has no reasoning-effort knob).
-func TestADD83_ReasoningEffortCarriedAndFlagged(t *testing.T) {
+// ADD-83/87 (exec half): reasoning_effort is surfaced SOLELY via unsupportedHardGuarantees (the SDK has no
+// reasoning-effort knob and the bridge does not read a reasoningEffort key, so a dedicated body field would be
+// dead). The failure path asserted here is the dead-key regression: a reasoningEffort field must NOT be set.
+func TestADD83_ReasoningEffortFlaggedNotCarriedAsDeadKey(t *testing.T) {
 	c := composerConstraints([]byte(`{"reasoning_effort":"high"}`))
-	if c["reasoningEffort"] != "high" {
-		t.Fatalf("ADD-87: reasoning_effort must be carried as reasoningEffort, got %#v", c["reasoningEffort"])
+	// Regression guard: the bridge's constraints allowlist never reads reasoningEffort, so writing it back
+	// would be a dead wire field. It must be absent — the signal lives only in unsupportedHardGuarantees.
+	if _, ok := c["reasoningEffort"]; ok {
+		t.Fatalf("ADD-87: reasoningEffort must NOT be carried as a dedicated (dead) body field, got %#v", c["reasoningEffort"])
 	}
 	notes, _ := c["unsupportedHardGuarantees"].([]string)
 	if !strings.Contains(strings.Join(notes, " | "), "reasoning_effort=high") {
 		t.Fatalf("ADD-87: reasoning_effort must be flagged unsupported, got %#v", notes)
 	}
-	// Absent reasoning_effort => no reasoningEffort key, no note.
-	if _, ok := composerConstraints([]byte(`{}`))["reasoningEffort"]; ok {
-		t.Fatalf("ADD-87: no reasoning_effort must not add the key")
+	// Absent reasoning_effort => no note at all.
+	if _, ok := composerConstraints([]byte(`{}`))["unsupportedHardGuarantees"]; ok {
+		t.Fatalf("ADD-87: no reasoning_effort must not add an unsupported note")
 	}
 }
 
-// ADD-83 (exec half): a tool_results CONTINUATION turn must carry responseFormat/stop/maxTokens/system/
-// reasoningEffort to the bridge body (composerInputHinted attaches system; composerTurnBody spreads
-// constraints) so the bridge can apply them on the resume.
+// ADD-83 (exec half): a tool_results CONTINUATION turn must carry the bridge-CONSUMED constraints
+// (responseFormat/stop/maxTokens) plus system to the bridge body (composerInputHinted attaches system;
+// composerTurnBody spreads constraints) so the bridge can apply them on the resume. reasoning_effort is NOT a
+// bridge-consumed field — it is surfaced only via unsupportedHardGuarantees — so it must NOT appear as a dead
+// reasoningEffort body key (the dead-key regression guard below).
 func TestADD83_ContinuationBodyCarriesConstraintsAndSystem(t *testing.T) {
 	oai := []byte(`{
 		"response_format":{"type":"json_object"},
@@ -2370,8 +2378,14 @@ func TestADD83_ContinuationBodyCarriesConstraintsAndSystem(t *testing.T) {
 	if gjson.GetBytes(body, "stop.0").String() != "STOP" || gjson.GetBytes(body, "maxTokens").Int() != 256 {
 		t.Fatalf("ADD-83: continuation body must carry stop/maxTokens, got %s", body)
 	}
-	if gjson.GetBytes(body, "reasoningEffort").String() != "medium" {
-		t.Fatalf("ADD-83: continuation body must carry reasoningEffort, got %s", body)
+	// Dead-key regression guard: reasoning_effort is bridge-advisory only (unsupportedHardGuarantees), so the
+	// continuation body must NOT carry a reasoningEffort field the bridge would never read.
+	if gjson.GetBytes(body, "reasoningEffort").Exists() {
+		t.Fatalf("ADD-83: continuation body must NOT carry a dead reasoningEffort field, got %s", body)
+	}
+	// The advisory note for reasoning_effort must still reach the bridge (so the model is told it is best-effort).
+	if !strings.Contains(gjson.GetBytes(body, "unsupportedHardGuarantees").Raw, "reasoning_effort=medium") {
+		t.Fatalf("ADD-83: continuation body must carry the reasoning_effort advisory in unsupportedHardGuarantees, got %s", body)
 	}
 }
 

@@ -8,6 +8,11 @@
 // The live tests run sequentially (they share globals). RUN_AS_MAIN is false in the bridge here, so importing
 // it does not start the server.
 import { fileURLToPath } from "node:url";
+// Import the SHARED MCP-result builder the live dispatch uses so the mcpResult self-test payload below cannot
+// drift from real traffic (ADD-74; finding #4). This static import is side-effect-safe: the bridge does NOT load
+// @cursor/sdk or start the server on import (loadSdk is lazy + the run-as-main guard is false here), exactly as
+// the bridge unit tests import it. It does NOT trigger the live suite (guarded in runAll's run-as-main check).
+import { mcpDispatchResult } from "../cursor-agent-bridge.mjs";
 
 // Run the full live self-test suite against the installed patched bundle. Kept as a function (not bare
 // top-level) so the unit test can import selfTestResultSerialize() in isolation without triggering the
@@ -86,8 +91,10 @@ export async function selfTestResultSerialize() {
     },
     {
       // MCP dispatch wrap shape (handleMcp/mcpDispatch): McpResult.success.content is a list of typed parts.
+      // Driven through the SHARED mcpDispatchResult builder the live dispatch uses (not a hand-retyped literal),
+      // so this payload tracks the real shape automatically if the wrap changes (ADD-74; finding #4).
       case: "mcpResult",
-      payload: { success: { isError: false, content: [{ text: { text: "ok" } }] } },
+      payload: mcpDispatchResult("ok", false),
     },
   ];
 

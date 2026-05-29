@@ -63,12 +63,26 @@ const MARK = "/*cursor-composer-clienttools-patched-v1*/";
 // edit 1), the unary+stream dispatch self-test harness (__CC_SELFTEST_DISPATCH_U/S, appended), and the
 // advertise/mcp_tools seam (__CC_GET_ADVERTISE__, edit 4). Keep this in sync with the `edits`/harness above:
 // any new seam => add its sentinel token here (no marker bump needed — see the MARK comment).
+//
+// NOTE: token PRESENCE alone cannot witness the two REAL dispatch sites (edits[1]/edits[2]) — the injected
+// `__CC_EXEC_U`/`__CC_EXEC_S` identifiers also appear in the appended harness UNCONDITIONALLY. The live
+// dispatch sites are instead guarded in REVERSE (their pristine native `from` must be ABSENT) via
+// DISPATCH_EDIT_NAMES in the already-patched short-circuit; see that branch in applyPatch.
 const REQUIRED_SEAM_TOKENS = [
   "__CC_SELFTEST_SERIALIZE",
   "__CC_SELFTEST_DISPATCH_U",
   "__CC_SELFTEST_DISPATCH_S",
   "__CC_GET_ADVERTISE__",
 ];
+
+// ADD-102 (live-site staleness): the names of the two REAL dispatch edits (edits[1]/edits[2]). These are the
+// most security-critical seams — their absence reintroduces native sidecar exec — yet REQUIRED_SEAM_TOKENS
+// above can only witness the serialize/advertise seams and the APPENDED dispatch self-test harness, NOT
+// whether the live call sites were actually replaced (their injected `__CC_EXEC_U`/`__CC_EXEC_S` identifiers
+// also appear verbatim in the appended harness). The already-patched short-circuit therefore additionally
+// asserts these edits' pristine `from` (native-call) strings are ABSENT (see applyPatch). Anchored by name
+// to the `edits` table (resolved at call time, after `edits` is declared) so the witness can never drift.
+const DISPATCH_EDIT_NAMES = ["unary tool dispatch -> CC", "stream tool dispatch -> CC"];
 
 // Development escape hatches that downgrade the M27 SHA fail-closed gate to a warning. EITHER name is
 // honored (the audit/spec canonical name plus an alternate); these MUST stay opt-in so production never
@@ -179,6 +193,24 @@ function applyPatch({ src, version, env = {} }) {
         throw new PatchError(
           "stale-bundle",
           `marker present but seam ${token} missing — the @cursor/sdk bundle is partially/stalely patched; ` +
+            "run `npm ci` or reinstall the SDK, then re-run the patcher",
+        );
+      }
+    }
+    // ADD-102 (live-site staleness): the token check above cannot witness the two REAL dispatch sites — only
+    // the appended harness, which embeds `__CC_EXEC_U`/`__CC_EXEC_S` (and the native call) UNCONDITIONALLY.
+    // Run the anchor check IN REVERSE for the dispatch edits: their pristine `from` (native-call) form must be
+    // ABSENT. The harness derives its expressions by stripping the `o=await` / `o=`+`;for await` framing, so
+    // the FULL `from` string appears ONLY at an un-replaced live site. Its presence means a marked bundle's
+    // dispatch was reverted to native (cached artifact / hand-edited vendor bundle / half-applied patch) —
+    // exactly the native-exec leak this short-circuit must NOT accept. Fail CLOSED instead of exiting 0.
+    for (const name of DISPATCH_EDIT_NAMES) {
+      const ed = edits.find((e) => e.name === name);
+      if (src.includes(ed.from)) {
+        throw new PatchError(
+          "stale-bundle",
+          `marker present but the "${name}" dispatch site is still in its pristine native form — the ` +
+            "@cursor/sdk bundle is partially/stalely patched (native sidecar exec would be reintroduced); " +
             "run `npm ci` or reinstall the SDK, then re-run the patcher",
         );
       }
@@ -314,6 +346,7 @@ module.exports = {
   EXPECTED_BUNDLE_SHA256,
   MARK,
   REQUIRED_SEAM_TOKENS,
+  DISPATCH_EDIT_NAMES,
   SHA_OVERRIDE_ENV,
   edits,
 };
