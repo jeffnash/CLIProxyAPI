@@ -190,6 +190,12 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						} else {
 							toolResultJSON, _ = sjson.SetBytes(toolResultJSON, "content", toolResultContent)
 						}
+						// C5: a failed client tool must not reach the model as success. Carry is_error
+						// (snake_case, OpenAI convention) on the role:tool message so it survives to the
+						// composer executor + bridge. Only set when true to keep payloads minimal.
+						if isErr := part.Get("is_error"); isErr.Exists() && isErr.Bool() {
+							toolResultJSON, _ = sjson.SetBytes(toolResultJSON, "is_error", true)
+						}
 						toolResults = append(toolResults, toolResultJSON)
 					}
 					return true

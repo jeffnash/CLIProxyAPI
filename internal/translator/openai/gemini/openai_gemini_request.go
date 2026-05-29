@@ -6,9 +6,7 @@
 package gemini
 
 import (
-	"crypto/rand"
 	"fmt"
-	"math/big"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -26,16 +24,27 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 	root := gjson.ParseBytes(rawJSON)
 
-	// Helper for generating tool call IDs in the form: call_<alphanum>
-	genToolCallID := func() string {
-		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	// Deterministic tool-call id minter from a function name + call ordinal.
+	// Used only when the client truly sends NO id. Because a call and its matching
+	// response derive the SAME id from the same (name, index) pair, the ids agree
+	// and tool-use continuations round-trip even when ids are not preserved upstream.
+	sanitizeToolName := func(name string) string {
 		var b strings.Builder
-		// 24 chars random suffix
-		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-			b.WriteByte(letters[n.Int64()])
+		for _, r := range name {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+				b.WriteRune(r)
+			default:
+				b.WriteByte('_')
+			}
 		}
-		return "call_" + b.String()
+		if b.Len() == 0 {
+			return "fn"
+		}
+		return b.String()
+	}
+	mintDeterministicToolCallID := func(name string, index int) string {
+		return fmt.Sprintf("call_%s_%d", sanitizeToolName(name), index)
 	}
 
 	// Model mapping
@@ -111,8 +120,14 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	// Stream parameter
 	out, _ = sjson.SetBytes(out, "stream", stream)
 
-	// Process contents (Gemini messages) -> OpenAI messages
-	var toolCallIDs []string // Track tool call IDs for matching with tool results
+	// Process contents (Gemini messages) -> OpenAI messages.
+	// Track the tool-call ids we DERIVE (or minted) per function name, in call order,
+	// so a functionResponse with no id of its own can pair with its functionCall by
+	// name+position. mintedByName[name] is a FIFO of ids waiting to be matched by a
+	// response; mintedCountByName[name] counts how many calls we have seen for that
+	// name so the deterministic id ordinal stays consistent across both branches.
+	mintedByName := make(map[string][]string)
+	mintedCountByName := make(map[string]int)
 
 	// System instruction -> OpenAI system message
 	// Gemini may provide `systemInstruction` or `system_instruction`; support both keys.
@@ -209,12 +224,27 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 					// Handle function calls (Gemini) -> tool calls (OpenAI)
 					if functionCall := part.Get("functionCall"); functionCall.Exists() {
-						toolCallID := genToolCallID()
-						toolCallIDs = append(toolCallIDs, toolCallID)
+						fnName := functionCall.Get("name").String()
+
+						// Prefer the client-provided id so the id round-trips: the
+						// matching functionResponse can carry the SAME id and the
+						// upstream bridge sees the exact id it emitted. Only mint a
+						// DETERMINISTIC id (name + ordinal) when the client sent none,
+						// minting it identically here and in the response branch so a
+						// call and its response always agree.
+						var toolCallID string
+						if id := functionCall.Get("id").String(); id != "" {
+							toolCallID = id
+						} else {
+							toolCallID = mintDeterministicToolCallID(fnName, mintedCountByName[fnName])
+							mintedCountByName[fnName]++
+						}
+						// Remember it (FIFO per name) for a later id-less response to pair with.
+						mintedByName[fnName] = append(mintedByName[fnName], toolCallID)
 
 						toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 						toolCall, _ = sjson.SetBytes(toolCall, "id", toolCallID)
-						toolCall, _ = sjson.SetBytes(toolCall, "function.name", functionCall.Get("name").String())
+						toolCall, _ = sjson.SetBytes(toolCall, "function.name", fnName)
 
 						// Convert args to arguments JSON string
 						if args := functionCall.Get("args"); args.Exists() {
@@ -241,16 +271,28 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 							}
 						}
 
-						// Try to match with previous tool call ID
-						_ = functionResponse.Get("name").String() // functionName not used for now
-						if len(toolCallIDs) > 0 {
-							// Use the last tool call ID (simple matching by function name)
-							// In a real implementation, you might want more sophisticated matching
-							toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", toolCallIDs[len(toolCallIDs)-1])
+						// Resolve the tool_call_id so it ROUND-TRIPS with the call.
+						// Priority:
+						//   1. The response's own id (client preserved it) -> use verbatim;
+						//      the bridge sees the exact id it emitted.
+						//   2. The deterministic id we minted for this function name in the
+						//      call branch (FIFO match by name+position) -> a call and its
+						//      id-less response always agree.
+						//   3. A deterministic id from the response name + position, so even an
+						//      orphan response is stable (never the positional last-id heuristic
+						//      that misfired when calls/responses interleave).
+						respName := functionResponse.Get("name").String()
+						var toolCallID string
+						if id := functionResponse.Get("id").String(); id != "" {
+							toolCallID = id
+						} else if q := mintedByName[respName]; len(q) > 0 {
+							toolCallID = q[0]
+							mintedByName[respName] = q[1:]
 						} else {
-							// Generate a tool call ID if none available
-							toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", genToolCallID())
+							toolCallID = mintDeterministicToolCallID(respName, mintedCountByName[respName])
+							mintedCountByName[respName]++
 						}
+						toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", toolCallID)
 
 						out, _ = sjson.SetRawBytes(out, "messages.-1", toolMsg)
 					}

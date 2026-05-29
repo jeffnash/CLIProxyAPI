@@ -235,18 +235,34 @@ func normalizeToolArguments(args map[string]any, tool *cursorToolDefinition) map
 	if tool == nil || tool.Parameters == "" {
 		return args
 	}
-	// Step 1: expand nested wrapper keys ("arguments"/"args"/"input"/"parameters"/
-	// "params"/"targeting" carrying a nested object). Mirrors openai.ts:1280-1296.
-	expanded := expandToolArguments(args)
-
+	// Parse the schema FIRST so wrapper-key expansion can consult the set of
+	// declared property names. A wrapper key (e.g. "input"/"params") that is
+	// itself a REAL declared property must be preserved verbatim — only true
+	// single-wrapper envelopes (keys absent from the schema) are unwrapped.
 	var params map[string]any
 	if err := jsonUnmarshalString(tool.Parameters, &params); err != nil {
-		return expanded
+		// Unparseable schema: fall back to the old unconditional expansion so
+		// genuinely nested envelopes still flatten.
+		return expandToolArguments(args, nil)
 	}
 	schema := extractToolSchema(params)
 	if len(schema.Properties) == 0 {
-		return expanded
+		return expandToolArguments(args, nil)
 	}
+	toolNorm := normalizeToolName(tool.Name)
+	normalizedProps := make(map[string]string, len(schema.Properties))
+	declared := make(map[string]bool, len(schema.Properties))
+	for _, p := range schema.Properties {
+		norm := normalizeToolName(p)
+		normalizedProps[norm] = p
+		declared[norm] = true
+	}
+
+	// Step 1: expand nested wrapper keys ("arguments"/"args"/"input"/"parameters"/
+	// "params"/"targeting" carrying a nested object), skipping any wrapper key
+	// that is a declared property. Mirrors openai.ts:1280-1296.
+	expanded := expandToolArguments(args, declared)
+
 	allowAdditional := false
 	if v, ok := params["additionalProperties"]; ok {
 		if b, ok := v.(bool); ok && b {
@@ -254,11 +270,6 @@ func normalizeToolArguments(args map[string]any, tool *cursorToolDefinition) map
 		} else if _, ok := v.(map[string]any); ok {
 			allowAdditional = true
 		}
-	}
-	toolNorm := normalizeToolName(tool.Name)
-	normalizedProps := make(map[string]string, len(schema.Properties))
-	for _, p := range schema.Properties {
-		normalizedProps[normalizeToolName(p)] = p
 	}
 
 	output := map[string]any{}
@@ -289,19 +300,31 @@ func normalizeToolArguments(args map[string]any, tool *cursorToolDefinition) map
 // expandToolArguments flattens common "nested args" patterns where the model
 // emits a single key carrying the whole argument object (e.g. `{"arguments":
 // {"path":"x"}}` instead of `{"path":"x"}`). Mirrors openai.ts:1280-1296.
-func expandToolArguments(args map[string]any) map[string]any {
+//
+// declared is the set of normalized property names the tool actually declares.
+// A wrapper key that is itself a declared property (e.g. an MCP tool with a
+// real `input`/`params`/`targeting` field) is preserved verbatim rather than
+// unwrapped — only true single-wrapper envelopes (keys NOT in the schema) are
+// flattened. A nil/empty declared set restores the old unconditional behavior.
+func expandToolArguments(args map[string]any, declared map[string]bool) map[string]any {
 	out := map[string]any{}
 	for key, value := range args {
 		norm := normalizeToolName(key)
+		// A declared property named like a wrapper key is a real argument, not
+		// an envelope: keep it untouched.
+		if declared[norm] {
+			out[key] = value
+			continue
+		}
 		nested := recordArgumentValue(value)
 		if nested != nil && in([]string{"arguments", "args", "input", "parameters", "params"}, norm) {
-			for k, v := range expandToolArguments(nested) {
+			for k, v := range expandToolArguments(nested, declared) {
 				out[k] = v
 			}
 			continue
 		}
 		if nested != nil && norm == "targeting" {
-			for k, v := range expandToolArguments(nested) {
+			for k, v := range expandToolArguments(nested, declared) {
 				out[k] = v
 			}
 			continue

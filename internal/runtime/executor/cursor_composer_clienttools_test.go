@@ -119,8 +119,9 @@ func TestDeriveComposerSessionID_UtilityOneShotIsolated(t *testing.T) {
 }
 
 // A stateless new-user turn (no conversation id, no metadata.user_id — curl/SDK/simple UI) must NOT be
-// rejected: it gets a fresh RANDOM session id (collision-free, unlike a content hash). Only an unroutable
-// continuation errors. A stable metadata.user_id still routes deterministically and is content-independent.
+// rejected: it gets a fresh RANDOM session id (collision-free, unlike a content hash). EX6: an unroutable
+// continuation also mints (degrade-gracefully), so no routine turn errors. A stable metadata.user_id still
+// routes deterministically and is content-independent.
 func TestDeriveComposerSessionID_StatelessMint(t *testing.T) {
 	auth := authWith("authA", "keyA")
 	a, err := deriveComposerSessionID(auth, []byte(`{"messages":[{"role":"user","content":"hello"}]}`), cliproxyexecutor.Options{})
@@ -149,7 +150,8 @@ func TestDeriveComposerSessionID_StatelessMint(t *testing.T) {
 }
 
 // Comment 1: a continuation (tool_results) turn with no stable id routes by a previously emitted
-// tool_call_id; an unknown tool_call_id with no stable id errors.
+// tool_call_id. EX6: an unknown tool_call_id with no stable id no longer errors — it DEGRADES GRACEFULLY by
+// minting a fresh session (the continuation carries history+system, so the bridge re-seeds).
 func TestDeriveComposerSessionID_ToolCallContinuation(t *testing.T) {
 	auth := authWith("authA", "keyA")
 	sid, err := deriveComposerSessionID(auth, toolTurn("start"), optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-x"}))
@@ -165,13 +167,23 @@ func TestDeriveComposerSessionID_ToolCallContinuation(t *testing.T) {
 	if got != sid {
 		t.Fatalf("continuation routed to wrong session: %s vs %s", got, sid)
 	}
+	// EX6: an unknown tool_call_id with no stable id MINTS a fresh session (degrade-gracefully, never 500).
 	unknown := []byte(`{"messages":[{"role":"tool","tool_call_id":"tc_unknown","content":"R"}]}`)
-	if _, err := deriveComposerSessionID(auth, unknown, cliproxyexecutor.Options{}); err == nil {
-		t.Fatalf("unknown tool_call_id with no stable id must error")
+	gotU, errU := deriveComposerSessionID(auth, unknown, cliproxyexecutor.Options{})
+	if errU != nil {
+		t.Fatalf("unknown tool_call_id with no stable id must NOT error (EX6 degrade-gracefully): %v", errU)
 	}
-	// L1: the SAME tool_call_id under a DIFFERENT tenant must NOT resolve to the first tenant's session.
-	if _, err := deriveComposerSessionID(authWith("authB", "keyB"), cont, cliproxyexecutor.Options{}); err == nil {
-		t.Fatalf("cross-tenant tool_call_id reuse must not resolve (tenant-scoped map)")
+	if !strings.HasPrefix(gotU, "sess_") {
+		t.Fatalf("unknown continuation must mint a fresh sess_ id, got %q", gotU)
+	}
+	// L1: the SAME tool_call_id under a DIFFERENT tenant must NOT resolve to the first tenant's session. With
+	// EX6 it no longer errors; it mints a fresh session DISTINCT from the first tenant's emitting session.
+	gotB, errB := deriveComposerSessionID(authWith("authB", "keyB"), cont, cliproxyexecutor.Options{})
+	if errB != nil {
+		t.Fatalf("cross-tenant continuation must not error (EX6): %v", errB)
+	}
+	if gotB == sid {
+		t.Fatalf("cross-tenant tool_call_id reuse must NOT resolve to tenant A's session (got %s)", gotB)
 	}
 }
 
@@ -960,5 +972,304 @@ func TestCursorDirectEnabled(t *testing.T) {
 	t.Setenv("CURSOR_DIRECT", "0")
 	if cursorDirectEnabled() {
 		t.Fatalf("CURSOR_DIRECT=0 should not enable direct")
+	}
+}
+
+// EX1/EX2 (C1): a mixed turn whose trailing block is a REAL user message frames it as the user's
+// instruction AND sets inp["userText"]; a trailing block that is purely an auto-injected
+// <system-reminder> uses neutral framing and does NOT set userText (a reminder is context, not an
+// instruction, so it must never drive a fresh send).
+func TestComposerMixedTurnSystemReminderFraming(t *testing.T) {
+	// Real trailing user message.
+	real := composerInput([]byte(`{"messages":[
+		{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
+		{"role":"tool","tool_call_id":"tc_1","content":"R"},
+		{"role":"user","content":"also do X"}
+	]}`))
+	if real["userText"] != "also do X" {
+		t.Fatalf("real trailing user message must set userText, got %v", real["userText"])
+	}
+	results, _ := real["results"].([]map[string]any)
+	if c, _ := results[len(results)-1]["content"].(string); !strings.Contains(c, "their latest instruction") || !strings.Contains(c, "also do X") {
+		t.Fatalf("real trailing message must use instruction framing: %q", c)
+	}
+
+	// Pure system-reminder trailing block: neutral framing, NO userText.
+	rem := composerInput([]byte(`{"messages":[
+		{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
+		{"role":"tool","tool_call_id":"tc_1","content":"R"},
+		{"role":"user","content":"<system-reminder>The file changed on disk.</system-reminder>"}
+	]}`))
+	if _, ok := rem["userText"]; ok {
+		t.Fatalf("a pure system-reminder must NOT set userText, got %v", rem["userText"])
+	}
+	rres, _ := rem["results"].([]map[string]any)
+	c, _ := rres[len(rres)-1]["content"].(string)
+	if !strings.Contains(c, "[System reminder accompanying these tool results:]") {
+		t.Fatalf("system-reminder must use neutral framing, got %q", c)
+	}
+	if strings.Contains(c, "their latest instruction") {
+		t.Fatalf("system-reminder must NOT be labeled as the user's instruction, got %q", c)
+	}
+
+	// isPureSystemReminder unit checks: a reminder plus a real sentence is NOT pure.
+	if !isPureSystemReminder("  <system-reminder>x</system-reminder> ") {
+		t.Fatalf("a lone reminder block must be classified pure")
+	}
+	if isPureSystemReminder("<system-reminder>x</system-reminder> now actually do this") {
+		t.Fatalf("a reminder followed by real text must NOT be pure")
+	}
+	if isPureSystemReminder("just a normal message") {
+		t.Fatalf("plain text must not be a system reminder")
+	}
+}
+
+// EX3/C5: a role:tool message that carries an image part yields a result map with images; one marked
+// is_error:true yields isError:true (camelCase on the bridge wire); a clean result carries neither.
+func TestComposerToolResultImageAndIsError(t *testing.T) {
+	cont := composerInput([]byte(`{"messages":[
+		{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Screenshot"}},{"id":"tc_2","function":{"name":"Read"}}]},
+		{"role":"tool","tool_call_id":"tc_1","content":[{"type":"text","text":"shot"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]},
+		{"role":"tool","tool_call_id":"tc_2","content":"plain","is_error":true}
+	]}`))
+	results, _ := cont["results"].([]map[string]any)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	imgs, _ := results[0]["images"].([]map[string]any)
+	if len(imgs) != 1 || imgs[0]["data"] != "QUJD" || imgs[0]["mimeType"] != "image/png" {
+		t.Fatalf("tool-result image not extracted: %#v", results[0]["images"])
+	}
+	if _, ok := results[0]["isError"]; ok {
+		t.Fatalf("a non-error result must NOT carry isError")
+	}
+	if results[1]["isError"] != true {
+		t.Fatalf("is_error:true must surface as isError:true (camelCase), got %v", results[1]["isError"])
+	}
+	if _, ok := results[1]["images"]; ok {
+		t.Fatalf("a text-only result must NOT carry images")
+	}
+}
+
+// EX4/EX11/EX12 (C4): extractComposerImages emits the inline {data,mimeType} form for a data: URI, the URL
+// {url[,mimeType]} form for an http(s) image, and SKIPS degenerate attachments (empty data / empty mime /
+// empty url) so one bad attachment never fails the turn.
+func TestExtractComposerImagesForms(t *testing.T) {
+	m := gjson.Parse(`{"role":"user","content":[
+		{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}},
+		{"type":"image_url","image_url":{"url":"https://example.com/pic.jpg"}},
+		{"type":"image_url","image_url":{"url":"https://example.com/noext"}},
+		{"type":"image_url","image_url":{"url":"data:image/png;base64,"}},
+		{"type":"image_url","image_url":{"url":"data:;base64,QUJD"}}
+	]}`)
+	imgs := extractComposerImages(m)
+	if len(imgs) != 3 {
+		t.Fatalf("expected 3 valid images (2 degenerate skipped), got %d: %#v", len(imgs), imgs)
+	}
+	if imgs[0]["data"] != "QUJD" || imgs[0]["mimeType"] != "image/png" {
+		t.Fatalf("inline image wrong: %#v", imgs[0])
+	}
+	if imgs[1]["url"] != "https://example.com/pic.jpg" || imgs[1]["mimeType"] != "image/jpeg" {
+		t.Fatalf("URL image with extension wrong: %#v", imgs[1])
+	}
+	if imgs[2]["url"] != "https://example.com/noext" {
+		t.Fatalf("URL image without extension wrong: %#v", imgs[2])
+	}
+	if _, ok := imgs[2]["mimeType"]; ok {
+		t.Fatalf("URL image without a known extension must omit mimeType: %#v", imgs[2])
+	}
+}
+
+// EX4/EX14: a mixed continuation whose trailing user message carries an image (e.g. background-then-type)
+// must carry that image on the continuation input so the bridge's fresh send can attach it.
+func TestComposerContinuationTrailingImage(t *testing.T) {
+	cont := composerInput([]byte(`{"messages":[
+		{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
+		{"role":"tool","tool_call_id":"tc_1","content":"R"},
+		{"role":"user","content":[{"type":"text","text":"look at this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]}
+	]}`))
+	if cont["type"] != "tool_results" {
+		t.Fatalf("mixed turn must classify as tool_results, got %v", cont["type"])
+	}
+	imgs, _ := cont["images"].([]map[string]any)
+	if len(imgs) != 1 || imgs[0]["data"] != "QUJD" {
+		t.Fatalf("trailing continuation image not carried: %#v", cont["images"])
+	}
+	if cont["userText"] != "look at this" {
+		t.Fatalf("trailing user text must still be set: %v", cont["userText"])
+	}
+}
+
+// EX5: each additional conv-id signal (Session_id / Conversation_id / X-Amp-Thread-Id / X-Client-Request-Id
+// headers and body conversation_id / prompt_cache_key / previous_response_id) yields a stable session id;
+// the same conv id is stable across content changes.
+func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
+	auth := authWith("authA", "keyA")
+	headerCases := []string{"Session_id", "Conversation_id", "X-Amp-Thread-Id", "X-Client-Request-Id"}
+	for _, h := range headerCases {
+		o1 := optsWithHeaders(map[string]string{h: "cid-" + h})
+		s1, err := deriveComposerSessionID(auth, toolTurn("hello"), o1)
+		if err != nil || !strings.HasPrefix(s1, "sess_") {
+			t.Fatalf("header %s should route (id=%q err=%v)", h, s1, err)
+		}
+		s2, _ := deriveComposerSessionID(auth, toolTurn("different content"), o1)
+		if s1 != s2 {
+			t.Fatalf("header %s: same conv id must be stable across content (%s vs %s)", h, s1, s2)
+		}
+	}
+	bodyCases := []string{"conversation_id", "prompt_cache_key", "previous_response_id"}
+	for _, k := range bodyCases {
+		payload := []byte(`{"` + k + `":"body-` + k + `"}`)
+		o := cliproxyexecutor.Options{OriginalRequest: payload}
+		s1, err := deriveComposerSessionID(auth, toolTurn("hi"), o)
+		if err != nil || !strings.HasPrefix(s1, "sess_") {
+			t.Fatalf("body %s should route (id=%q err=%v)", k, s1, err)
+		}
+		// Same body id, different inbound message content => stable session.
+		s2, _ := deriveComposerSessionID(auth, toolTurn("totally other"), o)
+		if s1 != s2 {
+			t.Fatalf("body %s: same conv id must be stable across content (%s vs %s)", k, s1, s2)
+		}
+	}
+	// Distinct conv ids (here via Session_id) must differ.
+	a, _ := deriveComposerSessionID(auth, toolTurn("x"), optsWithHeaders(map[string]string{"Session_id": "A"}))
+	b, _ := deriveComposerSessionID(auth, toolTurn("x"), optsWithHeaders(map[string]string{"Session_id": "B"}))
+	if a == b {
+		t.Fatalf("distinct Session_id values must differ: %s == %s", a, b)
+	}
+	// stableConversationID must never derive from message text: no signals => empty.
+	if got := stableConversationID(cliproxyexecutor.Options{OriginalRequest: []byte(`{"messages":[{"role":"user","content":"hi"}]}`)}); got != "" {
+		t.Fatalf("stableConversationID must be empty when no id signal is present, got %q", got)
+	}
+}
+
+// EX6: a continuation with no recorded emitter AND no stable id mints a fresh session, never errors.
+func TestDeriveComposerSessionID_ContinuationMintsOnMiss(t *testing.T) {
+	auth := authWith("authA", "keyA")
+	cont := []byte(`{"messages":[
+		{"role":"assistant","tool_calls":[{"id":"tc_orphan"}]},
+		{"role":"tool","tool_call_id":"tc_orphan","content":"R"}
+	]}`)
+	got, err := deriveComposerSessionID(auth, cont, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("orphan continuation must mint, not error (EX6): %v", err)
+	}
+	if !strings.HasPrefix(got, "sess_") {
+		t.Fatalf("orphan continuation must mint a fresh sess_ id, got %q", got)
+	}
+}
+
+// EX7 (C2): composerHistoryFingerprint anchors on the FIRST non-system message — GROWTH-STABLE (appending
+// turns does NOT change it; only a /compact-style head rewrite does), ignores system/developer messages, and
+// is emitted on BOTH the user and tool_results inputs.
+func TestComposerHistoryFingerprint(t *testing.T) {
+	base := gjson.GetBytes([]byte(`{"messages":[{"role":"system","content":"S"},{"role":"user","content":"a"},{"role":"assistant","content":"b"}]}`), "messages").Array()
+	fp1 := composerHistoryFingerprint(base)
+	if len(fp1) != 32 {
+		t.Fatalf("fingerprint must be 32 hex chars, got %q", fp1)
+	}
+	same := gjson.GetBytes([]byte(`{"messages":[{"role":"system","content":"DIFFERENT SYSTEM"},{"role":"user","content":"a"},{"role":"assistant","content":"b"}]}`), "messages").Array()
+	if composerHistoryFingerprint(same) != fp1 {
+		t.Fatalf("changing only a system message must NOT change the fingerprint")
+	}
+	changed := gjson.GetBytes([]byte(`{"messages":[{"role":"system","content":"S"},{"role":"user","content":"a CHANGED"},{"role":"assistant","content":"b"}]}`), "messages").Array()
+	if composerHistoryFingerprint(changed) == fp1 {
+		t.Fatalf("changing a non-system message MUST change the fingerprint")
+	}
+	if composerHistoryFingerprint(gjson.GetBytes([]byte(`{"messages":[{"role":"system","content":"only system"}]}`), "messages").Array()) != "" {
+		t.Fatalf("no non-system content => empty fingerprint")
+	}
+	// GROWTH-STABLE (P1 regression guard): APPENDING new turns while the opener is unchanged must NOT change
+	// the fingerprint — otherwise a stateful client (Claude Code) would re-seed the whole history every turn
+	// and race ERROR_CONVERSATION_TOO_LONG. Only a /compact-style head rewrite (the `changed` case above) does.
+	appended := gjson.GetBytes([]byte(`{"messages":[{"role":"system","content":"S"},{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"},{"role":"assistant","content":"d"}]}`), "messages").Array()
+	if composerHistoryFingerprint(appended) != fp1 {
+		t.Fatalf("appending new turns must NOT change the fingerprint (growth-stable)")
+	}
+	// Emitted on the new-user input.
+	user := composerInput([]byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if fp, _ := user["historyFingerprint"].(string); len(fp) != 32 {
+		t.Fatalf("user input must carry a 32-hex historyFingerprint, got %q", fp)
+	}
+	// Emitted on the tool_results continuation input.
+	cont := composerInput([]byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_1"}]},{"role":"tool","tool_call_id":"tc_1","content":"R"}]}`))
+	if fp, _ := cont["historyFingerprint"].(string); len(fp) != 32 {
+		t.Fatalf("tool_results input must carry a 32-hex historyFingerprint, got %q", fp)
+	}
+}
+
+// EX8 (C3) + EX10: a tool_results continuation carries the extracted system and a bounded rendered history
+// so the bridge can re-seed a fresh/evicted session before applying the results.
+func TestComposerContinuationCarriesSystemAndHistory(t *testing.T) {
+	cont := composerInput([]byte(`{"messages":[
+		{"role":"system","content":"updated system after ExitPlanMode"},
+		{"role":"user","content":"read the file"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"tc_1","content":"package main"}
+	]}`))
+	if cont["type"] != "tool_results" {
+		t.Fatalf("expected tool_results, got %v", cont["type"])
+	}
+	if cont["system"] != "updated system after ExitPlanMode" {
+		t.Fatalf("continuation must carry the swapped system (C3), got %v", cont["system"])
+	}
+	hist, _ := cont["history"].(string)
+	if !strings.Contains(hist, "USER: read the file") {
+		t.Fatalf("continuation must carry rendered pre-tool-call history (EX10), got %q", hist)
+	}
+	// The trailing tool result the continuation is answering should NOT be re-rendered into the seeded history
+	// (continuationHistoryBound stops before the last assistant tool_calls turn).
+	if strings.Contains(hist, "package main") {
+		t.Fatalf("the answered tool result must not be duplicated into seeded history, got %q", hist)
+	}
+}
+
+// EX9: assistant reasoning_content is preserved (bounded) in the rendered re-seed history.
+func TestRenderComposerHistoryIncludesReasoning(t *testing.T) {
+	messages := gjson.GetBytes([]byte(`{"messages":[
+		{"role":"user","content":"q"},
+		{"role":"assistant","content":"answer","reasoning_content":"because of X and Y"},
+		{"role":"user","content":"next"}
+	]}`), "messages").Array()
+	h := renderComposerHistory(messages, 2)
+	if !strings.Contains(h, "[thinking: because of X and Y]") {
+		t.Fatalf("assistant reasoning_content must appear in rendered history: %q", h)
+	}
+	if !strings.Contains(h, "ASSISTANT: answer") {
+		t.Fatalf("assistant text must still appear: %q", h)
+	}
+	// A bare reasoning-only assistant turn (no text, no tool calls) must still render.
+	only := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":"q"},{"role":"assistant","content":"","reasoning_content":"silent thought"},{"role":"user","content":"n"}]}`), "messages").Array()
+	if h2 := renderComposerHistory(only, 2); !strings.Contains(h2, "[thinking: silent thought]") {
+		t.Fatalf("reasoning-only assistant turn must render: %q", h2)
+	}
+}
+
+// EX13: an oversized historical tool output is truncated in the rendered history so a re-seed cannot blow
+// Cursor's per-message limit (ERROR_CONVERSATION_TOO_LONG).
+func TestRenderComposerHistoryTruncatesToolOutput(t *testing.T) {
+	huge := strings.Repeat("A", 50_000)
+	payload := `{"messages":[{"role":"user","content":"q"},{"role":"assistant","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},{"role":"tool","tool_call_id":"tc_1","content":"` + huge + `"},{"role":"user","content":"next"}]}`
+	messages := gjson.GetBytes([]byte(payload), "messages").Array()
+	h := renderComposerHistory(messages, 3)
+	if len(h) >= len(huge) {
+		t.Fatalf("oversized tool output must be truncated in history (rendered len=%d, raw=%d)", len(h), len(huge))
+	}
+	if !strings.Contains(h, "TOOL[tc_1]:") {
+		t.Fatalf("tool result still tagged: %q", h[:min(200, len(h))])
+	}
+}
+
+// EX15: an image-only turn (no text) emits a placeholder line in rendered history instead of being dropped,
+// keeping positional context for the model on a re-seed.
+func TestRenderComposerHistoryImagePlaceholder(t *testing.T) {
+	messages := gjson.GetBytes([]byte(`{"messages":[
+		{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]},
+		{"role":"assistant","content":"I see it"},
+		{"role":"user","content":"thanks"}
+	]}`), "messages").Array()
+	h := renderComposerHistory(messages, 2)
+	if !strings.Contains(h, "USER: [image x1: image/png]") {
+		t.Fatalf("image-only turn must emit a placeholder in history: %q", h)
 	}
 }

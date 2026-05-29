@@ -596,6 +596,190 @@ func TestConvertClaudeRequestToOpenAI_ToolResultURLImageOnly(t *testing.T) {
 	}
 }
 
+// TestConvertClaudeRequestToOpenAI_ToolResultIsError covers CL1/C5: a Claude
+// tool_result carrying is_error:true must surface as is_error:true on the produced
+// OpenAI role:tool message; absence/false must leave the field unset so a successful
+// tool is not mislabeled and the payload stays minimal.
+func TestConvertClaudeRequestToOpenAI_ToolResultIsError(t *testing.T) {
+	tests := []struct {
+		name        string
+		isErrorJSON string // raw JSON for the is_error field including the comma, or empty
+		wantExists  bool
+		wantValue   bool
+	}{
+		{
+			name:        "is_error true -> field set true",
+			isErrorJSON: `"is_error": true,`,
+			wantExists:  true,
+			wantValue:   true,
+		},
+		{
+			name:        "is_error false -> field omitted",
+			isErrorJSON: `"is_error": false,`,
+			wantExists:  false,
+		},
+		{
+			name:        "is_error absent -> field omitted",
+			isErrorJSON: ``,
+			wantExists:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inputJSON := `{
+				"model": "claude-3-opus",
+				"messages": [
+					{
+						"role": "assistant",
+						"content": [
+							{"type": "tool_use", "id": "call_1", "name": "do_work", "input": {"a": 1}}
+						]
+					},
+					{
+						"role": "user",
+						"content": [
+							{
+								"type": "tool_result",
+								"tool_use_id": "call_1",
+								` + tt.isErrorJSON + `
+								"content": [{"type": "text", "text": "boom"}]
+							}
+						]
+					}
+				]
+			}`
+
+			result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+			resultJSON := gjson.ParseBytes(result)
+			messages := resultJSON.Get("messages").Array()
+
+			if len(messages) != 2 {
+				t.Fatalf("Expected 2 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+			}
+
+			toolMsg := messages[1]
+			if toolMsg.Get("role").String() != "tool" {
+				t.Fatalf("Expected messages[1] to be tool, got %s", toolMsg.Get("role").String())
+			}
+
+			gotErr := toolMsg.Get("is_error")
+			if gotErr.Exists() != tt.wantExists {
+				t.Fatalf("is_error existence = %v, want %v (msg=%s)", gotErr.Exists(), tt.wantExists, toolMsg.Raw)
+			}
+			if tt.wantExists && gotErr.Bool() != tt.wantValue {
+				t.Fatalf("is_error value = %v, want %v", gotErr.Bool(), tt.wantValue)
+			}
+		})
+	}
+}
+
+// TestConvertClaudeRequestToOpenAI_ToolResultIsErrorWithStringContent covers CL1/C5
+// for the string-content tool_result shape: is_error must still be emitted and the
+// content must remain the plain string.
+func TestConvertClaudeRequestToOpenAI_ToolResultIsErrorWithStringContent(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_1", "name": "do_work", "input": {"a": 1}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "call_1", "is_error": true, "content": "failed"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+
+	if len(messages) != 2 {
+		t.Fatalf("Expected 2 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+	}
+
+	toolMsg := messages[1]
+	if got := toolMsg.Get("content").String(); got != "failed" {
+		t.Fatalf("Expected tool content %q, got %q", "failed", got)
+	}
+	if !toolMsg.Get("is_error").Bool() {
+		t.Fatalf("Expected is_error true on string-content tool_result, got %s", toolMsg.Raw)
+	}
+}
+
+// TestConvertClaudeRequestToOpenAI_ToolResultImageArrayNotCollapsed covers CL2: the
+// image part inside a tool_result content array must be preserved as an image_url part
+// (a content ARRAY), never collapsed to a text-only string. This guards the executor's
+// image extraction contract (EX3) which depends on the array surviving translation.
+func TestConvertClaudeRequestToOpenAI_ToolResultImageArrayNotCollapsed(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_1", "name": "do_work", "input": {"a": 1}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "tool_result",
+						"tool_use_id": "call_1",
+						"content": [
+							{"type": "text", "text": "see image"},
+							{
+								"type": "image",
+								"source": {
+									"type": "base64",
+									"media_type": "image/png",
+									"data": "iVBORw0KGgoAAAANSUhEUg=="
+								}
+							}
+						]
+					}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+
+	if len(messages) != 2 {
+		t.Fatalf("Expected 2 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+	}
+
+	toolContent := messages[1].Get("content")
+	// The invariant under test: content MUST be an array (preserving the image), not a
+	// collapsed string.
+	if !toolContent.IsArray() {
+		t.Fatalf("Expected tool content to remain an array (image preserved), got %q: %s", toolContent.Type, toolContent.Raw)
+	}
+
+	// Confirm an image_url part survives anywhere in the array.
+	foundImage := false
+	for _, item := range toolContent.Array() {
+		if item.Get("type").String() == "image_url" {
+			foundImage = true
+			if got := item.Get("image_url.url").String(); got != "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" {
+				t.Fatalf("Unexpected image_url: %q", got)
+			}
+		}
+	}
+	if !foundImage {
+		t.Fatalf("Expected an image_url part preserved in tool content, got %s", toolContent.Raw)
+	}
+}
+
 func TestConvertClaudeRequestToOpenAI_AssistantTextToolUseTextOrder(t *testing.T) {
 	inputJSON := `{
 		"model": "claude-3-opus",

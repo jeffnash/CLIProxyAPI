@@ -132,7 +132,13 @@ func composerDebugf(format string, args ...any) {
 // key. The conversation/session headers are honored first for clients that do set them.
 func stableConversationID(opts cliproxyexecutor.Options) string {
 	if opts.Headers != nil {
-		for _, h := range []string{"X-Conversation-Id", "X-Session-Id", "X-Cc-Conversation-Id"} {
+		// Existing conversation/session headers first, then the additional real conv-id signals that
+		// extractSessionIDs / copilot_headers honor (Codex Session_id, Amp thread id, PI client-request id, a
+		// bare Conversation_id) so a non-Anthropic agentic client keeps a stable session across its turns (EX5).
+		for _, h := range []string{
+			"X-Conversation-Id", "X-Session-Id", "X-Cc-Conversation-Id",
+			"Session_id", "Conversation_id", "X-Amp-Thread-Id", "X-Client-Request-Id",
+		} {
 			if v := strings.TrimSpace(opts.Headers.Get(h)); v != "" {
 				return v
 			}
@@ -140,6 +146,16 @@ func stableConversationID(opts cliproxyexecutor.Options) string {
 	}
 	if id := claudeSessionID(opts.OriginalRequest); id != "" {
 		return id
+	}
+	// Body signals that mirror extractSessionIDs steps 7+ and the Responses continuation key: a
+	// conversation_id, an OpenAI prompt_cache_key, or a Responses previous_response_id are all stable across a
+	// conversation's turns and never derived from message content. Never derive from message text.
+	if len(opts.OriginalRequest) > 0 {
+		for _, k := range []string{"conversation_id", "prompt_cache_key", "previous_response_id"} {
+			if v := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, k).String()); v != "" {
+				return v
+			}
+		}
 	}
 	if opts.Metadata != nil {
 		for _, k := range []string{"conversation_id", "conversationId", "session_id", "sessionId", "request_id", "requestId"} {
@@ -268,12 +284,13 @@ func composerTenant(auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) stri
 }
 
 // deriveComposerSessionID returns the bridge session id for this turn, scoped to the selected credential
-// (tenant boundary) so different users never share a bridge session / SDK stateRoot. It REQUIRES a stable
-// conversation identifier (request header, inbound metadata.user_id, or CLIProxy session metadata) and
-// derives the id deterministically from it. For a continuation (tool_results) turn that carries no stable
-// id, it falls back to the session that emitted the pending tool calls (by tool_call_id). It NEVER routes
-// by message content; when neither a stable id nor a known pending tool call exists it returns an error,
-// so the request fails clearly instead of silently merging unrelated conversations with the same opener.
+// (tenant boundary) so different users never share a bridge session / SDK stateRoot. When a stable
+// conversation identifier is present (request header, inbound metadata.user_id, body conv-id/cache-key, or
+// CLIProxy session metadata) the id is derived deterministically from it. For a continuation (tool_results)
+// turn it first routes by the session that emitted the pending tool calls (by tool_call_id). It NEVER routes
+// by message content. When nothing stable is available it DEGRADES GRACEFULLY by minting a fresh session
+// (the continuation carries history+system so the bridge re-seeds) instead of failing a routine turn — the
+// error return is retained in the signature for callers but is no longer produced on a routine turn.
 func deriveComposerSessionID(auth *cliproxyauth.Auth, oai []byte, opts cliproxyexecutor.Options) (string, error) {
 	tenant := composerTenant(auth, opts)
 	// Isolate non-agentic utility one-shots BEFORE any stable routing. Clients such as Claude Code fire
@@ -299,15 +316,20 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, oai []byte, opts cliproxye
 			return sid, nil
 		}
 		// No recorded emitter (bridge restart / TTL eviction / cross-instance): fall back to the stable conv
-		// id so the bridge can re-seed; else fail clearly rather than silently mis-route an unknown batch.
+		// id so the bridge can re-seed.
 		if id := stableConversationID(opts); id != "" {
 			sum := sha256.Sum256([]byte(tenant + "\x00conv:" + id))
 			sid := "sess_" + hex.EncodeToString(sum[:])[:32]
 			composerDebugf("[composer] deriveSessionID BRANCH=continuation(stable fallback) convID=%q -> sessionID=%s", id, sid)
 			return sid, nil
 		}
-		log.Errorf("[composer] deriveSessionID BRANCH=continuation MISS: tool_results turn, no recorded tool_call_id and no stable id -> ERROR")
-		return "", fmt.Errorf("cursor composer: tool_results turn with no known pending tool call and no stable conversation id (session expired, or the tool call was not issued by this bridge)")
+		// EX6: stateless/restarted client — no recorded emitter AND no stable id. DEGRADE GRACEFULLY: mint a
+		// fresh session instead of 500-ing a routine turn. composerInput carries history+system on the
+		// continuation (EX10/EX8), so the bridge re-seeds the fresh session before applying the tool results
+		// rather than losing the turn. Never error here.
+		sid := mintComposerSessionID()
+		composerDebugf("[composer] deriveSessionID BRANCH=continuation(mint+re-seed, no emitter/no stable id) -> sessionID=%s", sid)
+		return sid, nil
 	}
 	if id := stableConversationID(opts); id != "" {
 		sum := sha256.Sum256([]byte(tenant + "\x00conv:" + id))
@@ -388,8 +410,59 @@ func extractComposerSystem(messages []gjson.Result) string {
 	return b.String()
 }
 
-// extractComposerImages pulls base64 image parts (data URIs) from a message's multimodal content,
-// in the SDK user-message image shape {data, mimeType}.
+// isPureSystemReminder reports whether the trailing text is ONLY auto-injected <system-reminder> block(s)
+// (with no other non-whitespace content). Such a block is context that accompanies tool results, not the
+// user's own instruction — so the mixed-turn fold must NOT label it as "the user's latest instruction"
+// (EX1), and it must NOT drive a fresh C1 userText send.
+func isPureSystemReminder(s string) bool {
+	t := strings.TrimSpace(s)
+	if !strings.HasPrefix(t, "<system-reminder>") {
+		return false
+	}
+	// Strip every <system-reminder>...</system-reminder> block; if nothing non-whitespace remains, it is pure.
+	const open, close = "<system-reminder>", "</system-reminder>"
+	for {
+		i := strings.Index(t, open)
+		if i < 0 {
+			break
+		}
+		j := strings.Index(t[i:], close)
+		if j < 0 {
+			// Unterminated reminder: treat the remainder as part of the block.
+			t = t[:i]
+			break
+		}
+		t = t[:i] + t[i+j+len(close):]
+	}
+	return strings.TrimSpace(t) == ""
+}
+
+// composerHistoryFingerprint returns a 32-hex fingerprint anchored on the conversation's FIRST non-system
+// message (role + text). It is GROWTH-STABLE: a normal multi-turn conversation only APPENDS turns, so the
+// opener never changes and the fingerprint stays constant turn-to-turn. It changes only when the client
+// REPLACES the head of history — e.g. a /compact summary supplanting the original opening turn — which is
+// exactly when the bridge must re-seed (C2). Hashing the WHOLE history instead would change every turn and
+// force a full history re-seed each turn, racing the very ERROR_CONVERSATION_TOO_LONG it aims to avoid.
+// Empty when there is no non-system content (nothing to fingerprint).
+func composerHistoryFingerprint(messages []gjson.Result) string {
+	for _, m := range messages {
+		switch m.Get("role").String() {
+		case "system", "developer":
+			continue
+		}
+		h := sha256.New()
+		h.Write([]byte(m.Get("role").String()))
+		h.Write([]byte{0})
+		h.Write([]byte(cursorMessageText(m)))
+		return hex.EncodeToString(h.Sum(nil))[:32]
+	}
+	return ""
+}
+
+// extractComposerImages pulls image parts from a message's multimodal content. A base64 data: URI is
+// emitted in the SDK inline shape {data, mimeType} (C4); an http(s) URL is emitted in the SDK URL shape
+// {url[, mimeType]} (C4) so non-base64 images survive to the SDK. Degenerate entries (empty data, empty
+// mime on the inline form, or empty url) are skipped so one bad attachment never fails the whole turn (EX12).
 func extractComposerImages(m gjson.Result) []map[string]any {
 	c := m.Get("content")
 	if !c.IsArray() {
@@ -397,22 +470,77 @@ func extractComposerImages(m gjson.Result) []map[string]any {
 	}
 	var out []map[string]any
 	for _, part := range c.Array() {
-		url := part.Get("image_url.url").String()
-		if url == "" {
-			url = part.Get("source.data").String()
+		u := part.Get("image_url.url").String()
+		if u == "" {
+			u = part.Get("source.data").String()
 		}
-		if strings.HasPrefix(url, "data:") {
-			if idx := strings.Index(url, ","); idx > 0 {
-				meta, data := url[5:idx], url[idx+1:]
-				mime := meta
-				if semi := strings.Index(meta, ";"); semi >= 0 {
-					mime = meta[:semi]
-				}
-				out = append(out, map[string]any{"data": data, "mimeType": mime})
+		if strings.HasPrefix(u, "data:") {
+			idx := strings.Index(u, ",")
+			if idx <= 0 {
+				continue
 			}
+			meta, data := u[5:idx], u[idx+1:]
+			mime := meta
+			if semi := strings.Index(meta, ";"); semi >= 0 {
+				mime = meta[:semi]
+			}
+			// EX12: never append an inline image with an empty data or mime field (toSdkImages would throw).
+			if strings.TrimSpace(data) == "" || strings.TrimSpace(mime) == "" {
+				continue
+			}
+			out = append(out, map[string]any{"data": data, "mimeType": mime})
+			continue
+		}
+		// C4: an http(s) URL is carried as a URL-form image. mimeType is best-effort from a trailing
+		// .png/.jpg/... extension; omit the key when unknown.
+		if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+			img := map[string]any{"url": u}
+			if mime := imageMimeFromURL(u); mime != "" {
+				img["mimeType"] = mime
+			}
+			out = append(out, img)
 		}
 	}
 	return out
+}
+
+// imageMimeFromURL derives a best-effort image MIME type from a URL's trailing file extension, or "" when
+// the extension is absent/unknown. Query strings and fragments are stripped before inspecting the path.
+func imageMimeFromURL(u string) string {
+	path := u
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	dot := strings.LastIndex(path, ".")
+	if dot < 0 {
+		return ""
+	}
+	switch strings.ToLower(path[dot+1:]) {
+	case "png":
+		return "image/png"
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	case "gif":
+		return "image/gif"
+	case "webp":
+		return "image/webp"
+	}
+	return ""
+}
+
+// composerImagePlaceholder returns a short "[image xN: <mime>]" placeholder for a message whose content
+// carries image parts (EX15), or "" when there are none. It keeps positional context for the model on a
+// re-seed without embedding the (potentially huge) base64 payload in the rendered transcript.
+func composerImagePlaceholder(m gjson.Result) string {
+	imgs := extractComposerImages(m)
+	if len(imgs) == 0 {
+		return ""
+	}
+	mime, _ := imgs[0]["mimeType"].(string)
+	if mime == "" {
+		mime = "image"
+	}
+	return fmt.Sprintf("[image x%d: %s]", len(imgs), mime)
 }
 
 // renderComposerHistory renders prior conversation turns (everything before the last user message,
@@ -457,12 +585,18 @@ func renderComposerHistory(messages []gjson.Result, lastUserIdx int) string {
 				}
 				calls = append(calls, call)
 			}
-			if txt == "" && len(calls) == 0 {
+			// EX9: preserve the model's prior reasoning on a stateless re-seed (bounded so a long chain of
+			// thought cannot blow the per-message limit).
+			reasoning := truncateCursorToolResultForHistory(m.Get("reasoning_content").String())
+			if txt == "" && reasoning == "" && len(calls) == 0 {
 				continue
 			}
 			line := "ASSISTANT:"
 			if txt != "" {
 				line += " " + txt
+			}
+			if reasoning != "" {
+				line += " [thinking: " + reasoning + "]"
 			}
 			if len(calls) > 0 {
 				line += " [tool_calls: " + strings.Join(calls, "; ") + "]"
@@ -470,14 +604,19 @@ func renderComposerHistory(messages []gjson.Result, lastUserIdx int) string {
 			appendLine(line)
 		case "tool":
 			// Tag tool results with their tool_call_id so they associate with the assistant call above.
+			// EX13: bound replayed tool output so a re-seed cannot push the single accepted bubble past
+			// Cursor's per-message limit (ERROR_CONVERSATION_TOO_LONG).
 			label := "TOOL"
 			if id := m.Get("tool_call_id").String(); id != "" {
 				label = "TOOL[" + id + "]"
 			}
-			appendLine(label + ": " + cursorMessageText(m))
+			appendLine(label + ": " + truncateCursorToolResultForHistory(cursorMessageText(m)))
 		default:
 			if t := cursorMessageText(m); t != "" {
 				appendLine(strings.ToUpper(r) + ": " + t)
+			} else if ph := composerImagePlaceholder(m); ph != "" {
+				// EX15: keep positional context for an image-only turn instead of silently dropping it.
+				appendLine(strings.ToUpper(r) + ": " + ph)
 			}
 		}
 	}
@@ -623,7 +762,18 @@ func extractComposerClientEnv(opts cliproxyexecutor.Options) map[string]any {
 // all use it) so a mixed turn is never misclassified as a fresh user turn (Comment 4).
 func composerToolResults(messages []gjson.Result) (results []map[string]any, trailing string, ok bool) {
 	toolRes := func(m gjson.Result) map[string]any {
-		return map[string]any{"toolCallId": m.Get("tool_call_id").String(), "content": cursorMessageText(m)}
+		r := map[string]any{"toolCallId": m.Get("tool_call_id").String(), "content": cursorMessageText(m)}
+		// C5: a client tool the inbound marked failed must reach the model as a failure, not a clean success.
+		// The oai role:tool message uses snake_case is_error; the bridge wire entry uses camelCase isError.
+		if m.Get("is_error").Bool() {
+			r["isError"] = true
+		}
+		// EX3: an image embedded inside a tool_result (role:tool content array) must not be dropped. The Cursor
+		// tool-result protobuf cannot carry images directly, so the bridge folds these into a follow-up send.
+		if imgs := extractComposerImages(m); len(imgs) > 0 {
+			r["images"] = imgs
+		}
+		return r
 	}
 	// (a) Preferred: the role:tool results that follow the LAST assistant message bearing tool_calls, as long
 	// as the model has not yet replied to them (no later assistant). This is what makes a MIXED turn (tool
@@ -684,19 +834,47 @@ func composerInput(oai []byte) map[string]any {
 	// trailing user text (which translates to a trailing role:user) as a fresh user turn, stranding the
 	// paused run's tools. Collect the results regardless of trailing user text; carry that text intentionally.
 	if results, trailing, ok := composerToolResults(messages); ok {
+		inp := map[string]any{"type": "tool_results", "results": results}
 		// A continuation. A MIXED turn carries tool_results AND a trailing user message in the SAME turn — this
 		// is normal client behavior (e.g. Claude Code when you interrupt a running tool, or background a task,
 		// and then type a new message; it bundles the results for what finished WITH your new text). Anthropic
 		// answers both in a SINGLE assistant turn. The @cursor/sdk has no mid-resume user-message seam, so fold
-		// the user's message into the LAST tool result's content (clearly delimited): the model reads it when it
-		// resumes from the results and responds once — preserving the one-assistant-message-per-response
-		// contract. We must NEVER error here: erroring 500s a routine client turn and triggers a retry storm.
+		// the user's message into the LAST tool result's content (clearly delimited) so the model reads it when
+		// it resumes — AND carry it as a first-class userText (C1) so the bridge can still answer it when no
+		// pending matched / the run was torn down. We must NEVER error here: erroring 500s a routine turn.
 		if t := strings.TrimSpace(trailing); t != "" && len(results) > 0 {
+			// EX1: a trailing block that is purely an auto-injected <system-reminder> is context, not the user's
+			// instruction. Frame it neutrally and do NOT set userText (a reminder must not drive a fresh send).
+			reminder := isPureSystemReminder(t)
 			last := results[len(results)-1]
 			prev, _ := last["content"].(string)
-			last["content"] = strings.TrimRight(prev, "\n") + "\n\n[The user also sent the following message alongside these tool results — treat it as their latest instruction:]\n" + t
+			if reminder {
+				last["content"] = strings.TrimRight(prev, "\n") + "\n\n[System reminder accompanying these tool results:]\n" + t
+			} else {
+				last["content"] = strings.TrimRight(prev, "\n") + "\n\n[The user also sent the following message alongside these tool results — treat it as their latest instruction:]\n" + t
+				inp["userText"] = t // C1 (EX2): a real trailing user message, first-class so it is never lost.
+			}
 		}
-		return map[string]any{"type": "tool_results", "results": results}
+		// EX4/EX14: carry any image attachments from the trailing user message(s) of this continuation so the
+		// bridge's fresh send (or tool-result fold) can attach them. Re-scan the messages after the last
+		// assistant tool_calls turn for role:user image parts (keeps composerToolResults text-only/focused).
+		if imgs := trailingContinuationImages(messages); len(imgs) > 0 {
+			inp["images"] = imgs
+		}
+		// EX8 (C3): a system-prompt swap (e.g. post-ExitPlanMode) on a continuation must reach the model.
+		if sys := extractComposerSystem(messages); sys != "" {
+			inp["system"] = sys
+		}
+		// EX10: carry rendered history so the bridge can seed a fresh session before applying these results
+		// (recovers an evicted/restarted/410'd session). Bounded per EX13 inside renderComposerHistory.
+		if hist := renderComposerHistory(messages, continuationHistoryBound(messages)); hist != "" {
+			inp["history"] = hist
+		}
+		// EX7 (C2): fingerprint the non-system history so a /compact-style rewrite re-seeds the bridge.
+		if fp := composerHistoryFingerprint(messages); fp != "" {
+			inp["historyFingerprint"] = fp
+		}
+		return inp
 	}
 	lastUserIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -718,7 +896,47 @@ func composerInput(oai []byte) map[string]any {
 	if hist := renderComposerHistory(messages, lastUserIdx); hist != "" {
 		inp["history"] = hist
 	}
+	// EX7 (C2): fingerprint the non-system history on the new-user path too.
+	if fp := composerHistoryFingerprint(messages); fp != "" {
+		inp["historyFingerprint"] = fp
+	}
 	return inp
+}
+
+// continuationHistoryBound returns the index up to which renderComposerHistory should render a
+// continuation's history: everything before the LAST assistant message bearing tool_calls (the calls the
+// trailing tool results answer). That keeps the seeded transcript to the pre-tool-call context. Falls back
+// to the full message count when no such assistant message is found.
+func continuationHistoryBound(messages []gjson.Result) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Get("role").String() == "assistant" && m.Get("tool_calls").Exists() {
+			return i
+		}
+	}
+	return len(messages)
+}
+
+// trailingContinuationImages collects image parts from the role:user message(s) that trail the last
+// assistant tool_calls turn of a continuation (EX4/EX14) — the new user text that was bundled with the
+// tool results. Empty when there is no trailing user image.
+func trailingContinuationImages(messages []gjson.Result) []map[string]any {
+	lastTC := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Get("role").String() == "assistant" && m.Get("tool_calls").Exists() {
+			lastTC = i
+			break
+		}
+	}
+	var out []map[string]any
+	for i := lastTC + 1; i < len(messages); i++ {
+		if messages[i].Get("role").String() != "user" {
+			continue
+		}
+		out = append(out, extractComposerImages(messages[i])...)
+	}
+	return out
 }
 
 // composerFunctionDefs returns the function definitions the request exposes, as gjson objects with
