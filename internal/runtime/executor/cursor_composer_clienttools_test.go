@@ -455,19 +455,33 @@ func TestResolveCursorModelAlias(t *testing.T) {
 	}
 }
 
-// RC2: a mixed tool_results+text turn surfaces a clear error (not a silent drop); a pure tool_results turn
-// (no trailing text) is unaffected.
-func TestComposerMixedTurnErrors(t *testing.T) {
+// A mixed tool_results+text turn (Claude Code bundles tool_results AND a new user message when you interrupt
+// a tool or background a task and then type) must NEVER error — erroring 500s a routine client turn. Instead
+// the trailing user text is FOLDED into the last tool result's content so the model answers both in one turn.
+// A pure tool_results turn (no trailing text) is left exactly as-is.
+func TestComposerMixedTurnFoldsTrailingText(t *testing.T) {
 	mixed := composerInput([]byte(`{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},{"role":"tool","tool_call_id":"tc_1","content":"R"},{"role":"user","content":"also do X"}]}`))
 	if mixed["type"] != "tool_results" {
-		t.Fatalf("mixed turn must still classify as tool_results, got %v", mixed["type"])
+		t.Fatalf("mixed turn must classify as tool_results, got %v", mixed["type"])
 	}
-	if composerMixedTurnError(mixed) == nil {
-		t.Fatalf("mixed tool_results+text must produce a clear error, got nil (inp=%v)", mixed)
+	results, _ := mixed["results"].([]map[string]any)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 tool result, got %d", len(results))
 	}
+	if content, _ := results[len(results)-1]["content"].(string); !strings.Contains(content, "R") || !strings.Contains(content, "also do X") {
+		t.Fatalf("trailing user text must be folded into the last tool result content (no error), got %q", content)
+	}
+	if _, hasTrailing := mixed["trailingText"]; hasTrailing {
+		t.Fatalf("trailingText must not be exposed as a separate signal once folded, got %v", mixed["trailingText"])
+	}
+	// A pure tool_results turn (no trailing text) must NOT be modified.
 	pure := composerInput([]byte(`{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},{"role":"tool","tool_call_id":"tc_1","content":"R"}]}`))
-	if composerMixedTurnError(pure) != nil {
-		t.Fatalf("a pure tool_results turn must NOT error: %v", composerMixedTurnError(pure))
+	pres, _ := pure["results"].([]map[string]any)
+	if len(pres) != 1 {
+		t.Fatalf("pure: expected 1 result, got %d", len(pres))
+	}
+	if c, _ := pres[0]["content"].(string); c != "R" {
+		t.Fatalf("a pure tool_results turn must NOT be modified, got content %q", c)
 	}
 }
 
@@ -854,15 +868,15 @@ func TestComposerToolResultsExtractionCount(t *testing.T) {
 		}
 	}
 	// Mixed: tool_results + trailing text must still classify as tool_results (Comment 4), not a fresh user
-	// turn, and the trailing text is carried (not dropped).
+	// turn, and the trailing text must be FOLDED into the last result (carried, never dropped, never an error).
 	oai := sdktranslator.TranslateRequest(from, to, "composer-2.5", mk(2, true), false)
 	inp := composerInput(oai)
 	results, _ := inp["results"].([]map[string]any)
 	if inp["type"] != "tool_results" || len(results) != 2 {
 		t.Fatalf("mixed tool_result+text must classify as tool_results with 2 results, got type=%v count=%d", inp["type"], len(results))
 	}
-	if s, _ := inp["trailingText"].(string); !strings.Contains(s, "continue") {
-		t.Fatalf("mixed turn must carry the trailing user text, got %q", s)
+	if c, _ := results[len(results)-1]["content"].(string); !strings.Contains(c, "continue") {
+		t.Fatalf("mixed turn must fold the trailing user text into the last result content, got %q", c)
 	}
 }
 

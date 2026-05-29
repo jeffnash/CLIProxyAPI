@@ -15,6 +15,8 @@ import {
   authorizeRequestWith,
   platformHasSession,
   keyHash,
+  handleTurn,
+  sessions,
 } from "./cursor-agent-bridge.mjs";
 
 test("reconcileToolName: exact / case-insensitive / single / token-boundary / ambiguous", () => {
@@ -218,6 +220,33 @@ test("cancel() invalidates the in-flight run (done + runEpoch bump) so a late wa
   s.activeRes = { write() { wroteToSuccessor = true; } };
   s.onRunComplete({ status: "finished" }); // done===true -> must be a no-op
   assert.equal(wroteToSuccessor, false, "a late onRunComplete after cancel must NOT write to the successor turn's stream");
+});
+
+test("tool_results for an unknown sessionId must NOT complete as a clean successful turn (Comment 1)", async () => {
+  const id = "comment1-unknown-session-regression";
+  sessions.delete(id); // guarantee the lookup misses regardless of test ordering
+  let status = 0, sse = "", body = "", ended = false;
+  const res = {
+    writeHead(code) { status = code; return this; },
+    write(s) { sse += s; return true; },
+    end(s) { if (s != null) body += s; ended = true; },
+    on() {}, off() {},
+  };
+  const req = { on() {}, off() {} };
+  await handleTurn(req, res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "call_x", content: "RESULT" }] },
+  }, "k");
+  assert.ok(ended, "response must be terminated");
+  assert.ok(!sessions.has(id), "the unknown session must NOT be silently created");
+  // A clean successful terminal == a 2xx response carrying a success turn_end and no error. The bridge never
+  // applied the tool result to a pending run (the session is gone), so it must NOT report success — that would
+  // silently discard the client's tool work.
+  const cleanSuccess = status >= 200 && status < 300 && /"stop_reason":"end_turn"/.test(sse) && !/error/i.test(sse);
+  assert.ok(!cleanSuccess, `unknown-session tool_results must not complete as a clean success (status=${status} sse=${JSON.stringify(sse)} body=${JSON.stringify(body)})`);
+  // It must be surfaced as a hard error: a non-2xx HTTP status (the Go executor rejects any non-2xx /agent/turn
+  // response at its status check, before parsing or synthesizing a terminal for the stream).
+  assert.ok(status >= 400, `expected an HTTP error status for a lost continuation, got status=${status} sse=${JSON.stringify(sse)} body=${JSON.stringify(body)}`);
 });
 
 test("headlessRequestContext projects clientEnv and falls back to /workspace", () => {

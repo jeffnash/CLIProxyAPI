@@ -628,16 +628,15 @@ async function handleTurn(req, res, body, cursorKey) {
     const session = sessions.get(sessionId);
     if (!session) {
       // Unknown/expired session for a tool_results continuation (bridge restart or TTL eviction): the pending
-      // tool calls cannot be reconstructed, so the continuation is genuinely LOST. Comment 5: do NOT fake a
-      // successful empty turn — that hides the lost state and silently discards the client's tool work. Surface
-      // a clear stream ERROR (stop_reason:error) that the Go executor propagates to the caller as a real error,
-      // so the client/operator sees the continuation could not be applied rather than a misleading success.
-      dbg("handleTurn tool_results -> unknown session (surfacing lost continuation as error)", sessionId);
-      res.writeHead(200, SSE_HEADERS);
-      try {
-        res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "error", error: "unknown or expired session: the tool call this result answers was not issued by this bridge (likely a restart or idle eviction); the continuation cannot be resumed" })}\n\n`);
-        res.write("data: [DONE]\n\n"); res.end();
-      } catch {}
+      // tool calls cannot be reconstructed, so the continuation is genuinely LOST. Comment 1: do NOT complete
+      // this as a turn at all. Emitting it as SSE over HTTP 200 — even with stop_reason:"error" — risks being
+      // consumed as a clean terminal (the Go executor synthesizes a [DONE] terminal on any clean stream end),
+      // silently discarding the client's tool work as a success. The tool result was NOT applied to a pending
+      // run, so we must not return success. Headers are NOT written yet on this path, so return a real HTTP
+      // error: the Go executor rejects any non-2xx /agent/turn response at its status check, BEFORE it parses
+      // or synthesizes a terminal for the stream, surfacing the lost continuation as a hard error in BOTH the
+      // streaming and non-streaming paths (rather than relying on a downstream field inspection).
+      fail(410, "unknown or expired session: the tool call this result answers was not issued by this bridge (likely a restart or idle eviction); the continuation cannot be resumed");
       return;
     }
     // Comment 3: tool_results ingestion is NEVER 409'd. Resolving pending tool calls is just promise
@@ -1013,5 +1012,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, headlessRequestContext, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam };
+export { CC_CASES, headlessRequestContext, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, handleTurn, sessions };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

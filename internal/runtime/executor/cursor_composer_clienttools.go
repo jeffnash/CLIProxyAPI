@@ -676,19 +676,6 @@ func composerToolResults(messages []gjson.Result) (results []map[string]any, tra
 	return nil, "", false
 }
 
-// composerMixedTurnError returns a clear error for a tool_results turn that ALSO carries trailing user text
-// (a mixed turn). Such turns cannot be cleanly continued: the @cursor/sdk has no mid-resume user-message
-// mechanism, and folding two logical turns into one response would break the inbound schema's
-// one-assistant-message-per-response contract. So we surface the limitation instead of silently dropping
-// the user's message OR pretending the sidecar consumed it (Comment 2). The trailingText carried by
-// composerInput is therefore an internal signal only — it is never sent to the bridge as if supported.
-func composerMixedTurnError(inp map[string]any) error {
-	if t, _ := inp["trailingText"].(string); strings.TrimSpace(t) != "" {
-		return fmt.Errorf("cursor composer: a tool_results turn that also carries trailing user text (a mixed turn) is not supported — send the user message as a separate turn")
-	}
-	return nil
-}
-
 func composerInput(oai []byte) map[string]any {
 	messages := gjson.GetBytes(oai, "messages").Array()
 	// Tool_results continuation detection (Comment 4): a continuation is the LAST assistant turn bearing
@@ -697,11 +684,19 @@ func composerInput(oai []byte) map[string]any {
 	// trailing user text (which translates to a trailing role:user) as a fresh user turn, stranding the
 	// paused run's tools. Collect the results regardless of trailing user text; carry that text intentionally.
 	if results, trailing, ok := composerToolResults(messages); ok {
-		inp := map[string]any{"type": "tool_results", "results": results}
-		if trailing != "" {
-			inp["trailingText"] = trailing
+		// A continuation. A MIXED turn carries tool_results AND a trailing user message in the SAME turn — this
+		// is normal client behavior (e.g. Claude Code when you interrupt a running tool, or background a task,
+		// and then type a new message; it bundles the results for what finished WITH your new text). Anthropic
+		// answers both in a SINGLE assistant turn. The @cursor/sdk has no mid-resume user-message seam, so fold
+		// the user's message into the LAST tool result's content (clearly delimited): the model reads it when it
+		// resumes from the results and responds once — preserving the one-assistant-message-per-response
+		// contract. We must NEVER error here: erroring 500s a routine client turn and triggers a retry storm.
+		if t := strings.TrimSpace(trailing); t != "" && len(results) > 0 {
+			last := results[len(results)-1]
+			prev, _ := last["content"].(string)
+			last["content"] = strings.TrimRight(prev, "\n") + "\n\n[The user also sent the following message alongside these tool results — treat it as their latest instruction:]\n" + t
 		}
-		return inp
+		return map[string]any{"type": "tool_results", "results": results}
 	}
 	lastUserIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -906,10 +901,6 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		advertise = nil // tool_choice=none: advertise nothing so the model cannot call tools
 	}
 	inp := composerInput(oai)
-	if errMixed := composerMixedTurnError(inp); errMixed != nil {
-		log.Errorf("[composer %s] STREAM mixed tool_results+text (-> error): %v", responseID, errMixed)
-		return nil, errMixed
-	}
 	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, extractComposerClientEnv(opts), composerConstraints(oai))
 	composerDebugf("[composer %s] STREAM sessionID=%s inputType=%v toolChoice=%q advertise=%d -> POST /agent/turn", responseID, sessionID, inp["type"], toolChoice, len(advertise))
 
@@ -1074,9 +1065,6 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 		advertise = nil // tool_choice=none: advertise nothing so the model cannot call tools
 	}
 	inp := composerInput(oai)
-	if errMixed := composerMixedTurnError(inp); errMixed != nil {
-		return cliproxyexecutor.Response{}, errMixed
-	}
 	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, extractComposerClientEnv(opts), composerConstraints(oai))
 
 	httpResp, err := e.postAgentTurn(ctx, auth, apiKey, body)
