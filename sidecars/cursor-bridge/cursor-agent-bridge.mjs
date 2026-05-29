@@ -623,7 +623,9 @@ const TYPED_UNAVAILABLE_U = new Set([
   "writeShellStdinArgs",      // WriteShellStdinResult.error
   "listMcpResourcesExecArgs", // ListMcpResourcesExecResult.error
   "readMcpResourceExecArgs",  // ReadMcpResourceExecResult.error
-  "mcpStateExecArgs",         // McpStateExecResult.error
+  // NOTE: mcpStateExecArgs is deliberately NOT here — it is the runtime's MCP-inventory query and is answered
+  // with a real McpStateSuccess (headlessMcpState). Answering it with a typed error made the backend offer the
+  // model ZERO MCP tools (dispatchMcp=0) even though the loopback servers were dialed + tools/list'd.
 ]);
 function typedUnavailableResult(cas) {
   // Each TYPED_UNAVAILABLE_U case maps to a <X>Result whose `error` oneof member is { error: <string>, ... }
@@ -664,6 +666,10 @@ globalThis.__CC_EXEC_U = function (n, e, s, t) {
   const cas = caseOf(t);
   const store = als.getStore();
   if (cas === "requestContextArgs") return Promise.resolve(headlessRequestContext(store && store.session && store.session.clientEnv));
+  // The runtime's MCP-inventory query: answer with the session's advertised tools as connected loopback
+  // servers so the backend exposes them to the model (see headlessMcpState). Without this the model gets zero
+  // MCP tools. Checked before TYPED_UNAVAILABLE_U (which no longer lists mcpStateExecArgs).
+  if (cas === "mcpStateExecArgs") return Promise.resolve(headlessMcpState(store && store.session));
   if (CONTROL_ALLOW[cas]) return Promise.resolve({ __ccJson: { allowlisted: true } });
   if (CONTROL_TYPED[cas]) return Promise.resolve({ __ccJson: CONTROL_TYPED[cas] });
   // H17: cases we don't implement but whose result type has a typed `error` variant -> a MODEL-VISIBLE typed
@@ -1641,6 +1647,41 @@ function buildMcpServers(session) {
   } catch (e) {
     dbg("buildMcpServers threw (returning {})", "session=" + (session && session.id), (e && e.message) || String(e));
     return {};
+  }
+}
+
+// headlessMcpState answers the SDK runtime's mcp_state_exec CLIENT request — the headless equivalent of the
+// Cursor IDE reporting its MCP inventory. The runtime feeds the model its MCP toolset from THIS reply
+// (mcpStateAccessor.getState); answering it with a typed-unavailable error (the old TYPED_UNAVAILABLE_U
+// behavior) made the backend expose ZERO MCP tools even though the loopback servers were dialed + tools/list'd,
+// so composer never invoked an advertised MCP tool (observed dispatchMcp=0, no tools/call). We report each
+// DIALED loopback server (buildMcpServers is the authoritative set — same keys, INCL. the Comment-6
+// always-register-"cc" and the natural collision-degrade) with its currently-enabled tool slice
+// (mcpToolsForServer is tool_choice-gated, ADD-40). server_identifier == the dialed server key so the runtime
+// correlates a state server to its dialed counterpart; tool name == tool_name and providerIdentifier:"cc"
+// match the run-request mcp_tools advertise so the backend treats them as the SAME tool; status:"connected" is
+// the runtime's "ready" value (a "needsAuth" server is filtered out). Fail-safe: empty/absent advertise (or
+// shim off) -> { servers: [] }, an HONEST "no servers" success (never a fabricated tool, strictly better than
+// the old error); any throw falls back to the typed-unavailable error (no worse than before). HANDLER change
+// only — the exec was already routed to __CC_EXEC_U by the patch, exactly like requestContextArgs.
+function headlessMcpState(session) {
+  try {
+    const dialed = buildMcpServers(session); // authoritative dialed-server set; keys match what the SDK dialed
+    const servers = [];
+    for (const key of Object.keys(dialed)) {
+      const tools = mcpToolsForServer(session, key).map((t) => ({
+        name: t.name,
+        toolName: t.name, // dispatchMcp reconciles by name; keep tool_name == name
+        providerIdentifier: "cc", // matches the run-request mcp_tools provider so it is the SAME tool
+        description: t.description || "",
+        inputSchema: t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : { type: "object" },
+      }));
+      servers.push({ serverName: key, serverIdentifier: key, status: "connected", tools });
+    }
+    return { __ccJson: { success: { servers } } };
+  } catch (e) {
+    dbg("headlessMcpState threw -> typed-unavailable fallback", "session=" + (session && session.id), (e && e.message) || String(e));
+    return typedUnavailableResult("mcpStateExecArgs");
   }
 }
 
@@ -2658,6 +2699,16 @@ async function selfTestResultSerialization() {
   add("mcpResult", "mcp:isError", { success: { isError: true, content: [{ text: { text: "tool failed" } }] } });
   // 8) Headless request context (the SDK's first exec on every run).
   add("requestContextResult", "requestContext", headlessRequestContext(null).__ccJson);
+  // Headless MCP state (the runtime's mcp_state_exec reply): McpStateExecResult.success with one connected
+  // server carrying one tool proves the success oneof + nested McpStateServer/McpToolDefinition/Value
+  // serialize through fromJson — previously only ever exercised as the error variant via TYPED_UNAVAILABLE_U.
+  // Also cover the empty (no-advertise) fail-safe so { servers: [] } stays serializable.
+  {
+    const mcpStateSession = new Session("selftest-mcpstate");
+    mcpStateSession.advertise = [{ name: "mcp__nanobanana__generate_image", description: "gen", inputSchema: { type: "object" } }];
+    add("mcpStateExecResult", "mcpState:success", headlessMcpState(mcpStateSession).__ccJson);
+    add("mcpStateExecResult", "mcpState:empty", headlessMcpState(new Session("selftest-mcpstate-empty")).__ccJson);
+  }
 
   for (const c of checks) {
     let build;
@@ -2710,5 +2761,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, headlessRequestContext, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, blockedNativeResult, typedUnavailableResult, TYPED_UNAVAILABLE_U, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES };
+export { CC_CASES, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, blockedNativeResult, typedUnavailableResult, TYPED_UNAVAILABLE_U, parseShellContent, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

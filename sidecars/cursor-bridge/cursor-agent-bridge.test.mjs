@@ -15,6 +15,7 @@ import {
   TYPED_UNAVAILABLE_U,
   parseShellContent,
   headlessRequestContext,
+  headlessMcpState,
   Session,
   ccToolId,
   authorizeRequestWith,
@@ -827,6 +828,36 @@ test("MCP buildMcpServers (default natural): mcp__server__tool -> its server key
   const empty = buildMcpServers({ id: "empty", advertise: [] });
   assert.deepEqual(Object.keys(empty), ["cc"], "a tool-less turn still registers one session-scoped server (Comment 6)");
   assert.match(empty.cc.url, /\/mcp\/empty$/, "the empty server's URL has no serverKey segment (the cc shape)");
+});
+
+test("MCP headlessMcpState reports dialed servers + gated tools as connected (the mcp_state_exec reply)", () => {
+  // This reply is what makes the backend expose MCP tools to the model; answering it with an error (the old
+  // TYPED_UNAVAILABLE_U behavior) => the model sees zero MCP tools (dispatchMcp=0). The state servers must use
+  // the SAME keys as buildMcpServers so the runtime correlates each state server to its dialed counterpart.
+  const s = { id: "ms", advertise: [{ name: "mcp__nanobanana__generate_image", description: "gen", inputSchema: { type: "object" } }, { name: "Bash", description: "sh" }] };
+  const st = headlessMcpState(s).__ccJson;
+  assert.ok(st.success && !st.error, "mcp_state must be a success, never the typed-unavailable error");
+  assert.deepEqual(
+    st.success.servers.map((x) => x.serverIdentifier).sort(),
+    Object.keys(buildMcpServers(s)).sort(),
+    "state server keys MUST match the dialed servers (routing correlation)",
+  );
+  for (const srv of st.success.servers) {
+    assert.equal(srv.serverName, srv.serverIdentifier);
+    assert.equal(srv.status, "connected", "a needsAuth/other status would be filtered out by the backend");
+    for (const t of srv.tools) {
+      assert.equal(t.providerIdentifier, "cc", "must match the run-request mcp_tools provider");
+      assert.equal(t.toolName, t.name, "tool_name == name (dispatchMcp reconciles by name)");
+      assert.ok(t.inputSchema && typeof t.inputSchema === "object", "inputSchema must be an object");
+    }
+  }
+  const nano = st.success.servers.find((x) => x.serverIdentifier === "nanobanana");
+  assert.deepEqual(nano.tools.map((t) => t.name), ["mcp__nanobanana__generate_image"]);
+  // Fail-safe: empty advertise -> one connected "cc" server with NO tools (honest "no tools", never an error).
+  const empty = headlessMcpState({ id: "e", advertise: [] }).__ccJson;
+  assert.ok(empty.success, "empty advertise still yields a success (never the typed-unavailable error)");
+  assert.deepEqual(empty.success.servers.map((x) => x.serverIdentifier), ["cc"]);
+  assert.deepEqual(empty.success.servers[0].tools, []);
 });
 
 test("MCP grouping=one: a single 'cc' server whose URL has no serverKey segment + serves ALL tools", () => {
