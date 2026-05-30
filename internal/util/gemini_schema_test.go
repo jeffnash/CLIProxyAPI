@@ -681,7 +681,6 @@ func TestCleanJSONSchemaForGemini_PropertyNamesRemoval_Nested(t *testing.T) {
 	}
 }
 
-
 func compareJSON(t *testing.T, expectedJSON, actualJSON string) {
 	var expMap, actMap map[string]interface{}
 	errExp := json.Unmarshal([]byte(expectedJSON), &expMap)

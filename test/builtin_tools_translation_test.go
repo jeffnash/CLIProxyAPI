@@ -34,7 +34,13 @@ func TestOpenAIToCodex_PreservesBuiltinTools(t *testing.T) {
 	}
 }
 
-func TestOpenAIResponsesToOpenAI_IgnoresBuiltinTools(t *testing.T) {
+func TestOpenAIResponsesToOpenAI_PreservesBuiltinTools(t *testing.T) {
+	// H22: Responses built-in tools (web_search / file_search / computer_use / ...) must
+	// NOT be silently dropped when translating to Chat Completions. A silent drop becomes
+	// inconsistent with a forced/allowed tool_choice and hides a real capability gap from
+	// the downstream composer path. The tool is carried through verbatim so the inventory
+	// stays consistent; the executor decides whether to translate it or surface an explicit
+	// "unsupported built-in tool" signal.
 	in := []byte(`{
 		"model":"gpt-5",
 		"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
@@ -43,8 +49,14 @@ func TestOpenAIResponsesToOpenAI_IgnoresBuiltinTools(t *testing.T) {
 
 	out := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, "gpt-5", in, false)
 
-	if got := gjson.GetBytes(out, "tools.#").Int(); got != 0 {
-		t.Fatalf("expected 0 tools (builtin tools not supported in Chat Completions), got %d: %s", got, string(out))
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+		t.Fatalf("expected 1 tool (built-in tools preserved, not dropped), got %d: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "web_search" {
+		t.Fatalf("expected tools[0].type=web_search, got %q: %s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "tools.0.search_context_size").String(); got != "low" {
+		t.Fatalf("expected tools[0].search_context_size=low, got %q: %s", got, string(out))
 	}
 }
 

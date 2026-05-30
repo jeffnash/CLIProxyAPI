@@ -102,7 +102,7 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			providers, model, _, errMsg := handler.getRequestDetails(tt.inputModel)
+			providers, model, _, errMsg := handler.getRequestDetailsWithOptions(tt.inputModel, false)
 			if (errMsg != nil) != tt.wantErr {
 				t.Fatalf("getRequestDetails() error = %v, wantErr %v", errMsg, tt.wantErr)
 			}
@@ -122,7 +122,7 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 func TestGetRequestDetails_ImageModelReturns503(t *testing.T) {
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
 
-	_, _, _, errMsg := handler.getRequestDetails("gpt-image-2")
+	_, _, _, errMsg := handler.getRequestDetailsWithOptions("gpt-image-2", false)
 	if errMsg == nil {
 		t.Fatalf("expected error for gpt-image-2, got nil")
 	}

@@ -46,6 +46,10 @@ type Detail struct {
 	CacheReadTokens     int64
 	CacheCreationTokens int64
 	TotalTokens         int64
+	// Estimated marks a token breakdown APPROXIMATED by the proxy (e.g. the Cursor Composer path, whose
+	// @cursor/sdk exposes no real usage) rather than reported by the upstream provider. It is adequate for UX/
+	// display but is NOT billing-grade; usage sinks should classify or exclude it from authoritative metering.
+	Estimated bool
 }
 
 type requestedModelAliasContextKey struct{}

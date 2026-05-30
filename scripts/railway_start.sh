@@ -42,6 +42,42 @@ decode_base64() {
   fi
 }
 
+# Pinned Node.js for cursor-bridge + optional Electron install (matches railpack.json + .nvmrc).
+NODE_MAJOR_VERSION="${NODE_MAJOR_VERSION:-22}"
+NODE_PINNED_VERSION="${NODE_PINNED_VERSION:-22}"
+
+ensure_node() {
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    local have
+    have="$(node -p "process.versions.node" 2>/dev/null || echo "")"
+    case "${have}" in
+      "${NODE_MAJOR_VERSION}."*)
+        info "Node.js present: v${have} (pinned major ${NODE_MAJOR_VERSION})"
+        return 0
+        ;;
+      *)
+        info "Node.js v${have:-unknown} found; want ${NODE_MAJOR_VERSION}.x (${NODE_PINNED_VERSION})"
+        ;;
+    esac
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    err "Node.js ${NODE_PINNED_VERSION} required but apt-get is unavailable"
+    return 1
+  fi
+
+  info "Installing Node.js ${NODE_MAJOR_VERSION}.x via NodeSource (pin ${NODE_PINNED_VERSION})"
+  apt-get update -y >/dev/null
+  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_VERSION}.x" | bash - >/dev/null
+  apt-get install -y --no-install-recommends nodejs >/dev/null
+
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    err "Node.js install failed"
+    return 1
+  fi
+  info "Node.js installed: $(node --version 2>/dev/null || echo unknown)"
+}
+
 require_any_env "AUTH_ZIP_URL" "AUTH_BUNDLE"
 require_env "API_KEY_1"
 
@@ -77,13 +113,7 @@ ensure_electron() {
   local electron_version="${COPILOT_ELECTRON_VERSION:-40.4.0}"
   info "Installing Node.js + Electron ${electron_version} (INSTALL_ELECTRON=1)"
 
-  # Install Node (20.x) then Electron.
-  # NOTE: railpack.json should include the shared libs Electron needs; this function assumes that.
-  apt-get update -y >/dev/null
-  if ! command -v node >/dev/null 2>&1; then
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
-    apt-get install -y --no-install-recommends nodejs >/dev/null
-  fi
+  ensure_node || return 0
 
   if ! command -v npm >/dev/null 2>&1; then
     info "npm not available after node install; cannot install electron"
@@ -544,6 +574,66 @@ else
   # Persist the SHA so subsequent restarts skip the rebuild.
   printf '%s' "${CURRENT_SHA}" > "${BIN_PATH}.sha"
   info "Build complete; SHA written to ${BIN_PATH}.sha"
+fi
+
+# Cursor Composer Client-Tools is the default, ToS-safe Cursor path: the patched @cursor/sdk sidecar
+# (cursor-agent-bridge.mjs) owns all Cursor I/O and every tool executes on the
+# client. The Go executor defaults to POSTing /agent/turn on this bridge, so it
+# must be running unless the operator explicitly opts into the gated direct path
+# with CURSOR_DIRECT=1.
+# Start the bridge for the default Cursor Composer Client-Tools path when EITHER a single-tenant Cursor key (CURSOR_API_KEY)
+# OR a multi-tenant bridge token (CURSOR_AGENT_BRIDGE_TOKEN) is configured. A deployment with neither
+# (e.g. only other providers) skips this block entirely so `set -u` never aborts on an unset CURSOR_API_KEY.
+if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR_AGENT_BRIDGE_TOKEN:-}" ) ]]; then
+  CURSOR_BRIDGE_DIR="${ROOT_DIR}/sidecars/cursor-bridge"
+  CURSOR_AGENT_BRIDGE_PORT="${CURSOR_AGENT_BRIDGE_PORT:-9798}"
+  CURSOR_AGENT_STATE_ROOT="${CURSOR_AGENT_STATE_ROOT:-${ROOT_DIR}/.cursor-agent-store}"
+  if [[ -d "${CURSOR_BRIDGE_DIR}" ]]; then
+    ensure_node
+    info "Starting Cursor Composer Client-Tools agent bridge on port ${CURSOR_AGENT_BRIDGE_PORT} (Node $(node --version 2>/dev/null || echo unknown))"
+    (
+      cd "${CURSOR_BRIDGE_DIR}"
+      if ! command -v python3 >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 || true
+        apt-get install -y --no-install-recommends python3 make g++ >/dev/null 2>&1 || true
+      fi
+      # npm ci runs the postinstall patcher (scripts/apply-clienttools-patch.cjs) which
+      # patches @cursor/sdk; cursor-agent-bridge.mjs asserts the patch at startup.
+      if [[ -f package-lock.json ]]; then
+        npm ci >/dev/null 2>&1 || npm ci
+      else
+        npm install >/dev/null 2>&1 || npm install
+      fi
+      CURSOR_API_KEY="${CURSOR_API_KEY:-}" \
+        CURSOR_AGENT_BRIDGE_TOKEN="${CURSOR_AGENT_BRIDGE_TOKEN:-}" \
+        CURSOR_AGENT_BRIDGE_PORT="${CURSOR_AGENT_BRIDGE_PORT}" \
+        CURSOR_AGENT_STATE_ROOT="${CURSOR_AGENT_STATE_ROOT}" \
+        CURSOR_COMPOSER_DEBUG="${CURSOR_COMPOSER_DEBUG:-}" \
+        node cursor-agent-bridge.mjs &
+    )
+    sidecar_ready=0
+    for _ in $(seq 1 60); do
+      if command -v curl >/dev/null 2>&1; then
+        if curl -fsS "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/health" >/dev/null 2>&1; then
+          sidecar_ready=1
+          break
+        fi
+      elif command -v wget >/dev/null 2>&1; then
+        if wget -qO- "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/health" >/dev/null 2>&1; then
+          sidecar_ready=1
+          break
+        fi
+      fi
+      sleep 1
+    done
+    if [[ "${sidecar_ready}" != "1" ]]; then
+      info "Cursor Composer Client-Tools bridge not ready — Cursor requests will fail until it is (set CURSOR_DIRECT=1 to use the gated direct path)"
+    else
+      info "Cursor Composer Client-Tools agent bridge is ready"
+    fi
+  else
+    info "Cursor bridge directory not found — Cursor Composer Client-Tools path unavailable"
+  fi
 fi
 
 info "Starting server"

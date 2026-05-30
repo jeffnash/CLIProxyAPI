@@ -29,6 +29,7 @@ type staticModelsJSON struct {
 	Kimi        []*ModelInfo `json:"kimi"`
 	Antigravity []*ModelInfo `json:"antigravity"`
 	XAI         []*ModelInfo `json:"xai"`
+	Cursor      []*ModelInfo `json:"cursor"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -99,6 +100,49 @@ func GetAntigravityModels() []*ModelInfo {
 // GetXAIModels returns the standard xAI Grok model definitions.
 func GetXAIModels() []*ModelInfo {
 	return WithXAIBuiltins(cloneModelInfos(getModels().XAI))
+}
+
+// GetCursorModels returns the standard Cursor Composer model definitions.
+// Uses hard-coded builtins to survive remote catalog replacements (see model_updater.go).
+func GetCursorModels() []*ModelInfo {
+	return cloneModelInfos(cursorBuiltinModels())
+}
+
+var cursorBuiltinModelDefs = []*ModelInfo{
+	{ID: "composer-2.5", Object: "model", Created: 1779148800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Composer 2.5", Description: "Cursor Composer 2.5 - Default coding model", ContextLength: 200000, MaxCompletionTokens: 64000},
+	{ID: "composer-2.5-fast", Object: "model", Created: 1779148800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Composer 2.5 Fast", Description: "Cursor Composer 2.5 Fast - Faster variant", ContextLength: 200000, MaxCompletionTokens: 64000},
+	{ID: "composer-2", Object: "model", Created: 1779148800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Composer 2", Description: "Cursor Composer 2 - Previous generation", ContextLength: 200000, MaxCompletionTokens: 64000},
+	{ID: "composer-latest", Object: "model", Created: 1779148800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Composer Latest", Description: "Cursor Composer latest alias (currently 2.5)", ContextLength: 200000, MaxCompletionTokens: 64000},
+}
+
+// composerReasoningLevels is the GPT-standard reasoning-effort set advertised as composer dash-suffix variants
+// (composer-2.5-<level>, composer-2.5-fast-<level>). The bridge's composerModelSelection maps the suffix to the
+// Cursor SDK `thinking` param and passes the value THROUGH (Cursor validates it), so the exact per-account set
+// can be confirmed with Cursor.models.list() without changing this list.
+var composerReasoningLevels = []string{"low", "medium", "high", "xhigh"}
+
+// cursorBuiltinModels returns the static composer models PLUS the generated reasoning/fast dash-suffix variants
+// (mirrors the codex `-<level>` generation), so a client can select e.g. composer-2.5-high or
+// composer-2.5-fast-xhigh. composer-2.5 itself stays the non-fast (cheaper) full tier — the bridge passes
+// fast=false for it (Cursor's bare default is the costly fast tier; see composerModelSelection).
+func cursorBuiltinModels() []*ModelInfo {
+	out := make([]*ModelInfo, 0, len(cursorBuiltinModelDefs)+len(composerReasoningLevels)*4)
+	out = append(out, cursorBuiltinModelDefs...)
+	for _, base := range []struct{ id, name string }{{"composer-2.5", "Composer 2.5"}, {"composer-2", "Composer 2"}} {
+		for _, fast := range []struct{ suffix, label string }{{"", ""}, {"-fast", " Fast"}} {
+			for _, level := range composerReasoningLevels {
+				out = append(out, &ModelInfo{
+					ID: base.id + fast.suffix + "-" + level, Object: "model", Created: 1779148800,
+					OwnedBy: "cursor", Type: "cursor",
+					DisplayName:         base.name + fast.label + " " + strings.ToUpper(level[:1]) + level[1:],
+					Description:         "Cursor " + base.id + fast.suffix + " (" + level + " reasoning effort)",
+					ContextLength:       200000,
+					MaxCompletionTokens: 64000,
+				})
+			}
+		}
+	}
+	return out
 }
 
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
@@ -261,6 +305,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetAntigravityModels()
 	case "xai", "x-ai", "grok":
 		return GetXAIModels()
+	case "cursor":
+		return GetCursorModels()
 	default:
 		return nil
 	}
