@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -706,6 +707,518 @@ func forgetComposerSessionToolCalls(tenant, sessionID string) {
 	composerOwnership.forgetSession(tenant, sessionID)
 }
 
+// ---------------------------------------------------------------------------
+// Conversation-lineage registry (subordinate same-tenant splitter).
+//
+// PURPOSE (routing only): distinct logical conversations that SHARE one stable
+// conversation id (subagents reusing the parent's metadata.user_id, parallel
+// fan-out, branches) must NOT collapse onto a single durable bridge session.
+// deriveComposerSessionID stays ID-AUTHORITATIVE; this registry only SPLITS a
+// shared baseSid into per-divergent-head lineages and re-resolves each lineage
+// to ONE stable sess_ across all of its own turns. It changes WHICH session a
+// turn routes to; it adds NO new behavior to the tenant boundary.
+//
+// The key is (baseSid, headDigest): a SET of co-resident lineages under one
+// baseSid, each addressable by its own growth-stable head. The base (parent)
+// lineage is just the member whose head equals the parent opener; it is not
+// privileged. A fork's id is PURE CONTENT (sha256 of baseSid + head), so the
+// same subagent re-derives the same forkSid on every one of its new-user turns.
+//
+// TODO(identity-finalplan §5.1/§5.2): the per-conversation join here is keyed
+// only on inbound content within a tenant. Binding a conversation id to the
+// caller's resolved credential (a stored per-caller salt → token, and the same
+// check on the tool_call_id lookup) is a SEPARATE sign-off decision and is NOT
+// implemented here. Process-local registry only (single-instance/sticky; no
+// distributed store), mirroring composerOwnership's cross-replica caveat.
+const (
+	// composerLineagePerTenantCap bounds the number of (baseSid,headDigest) lineages retained PER TENANT.
+	// Mirrors composerToolCallPerTenantCap so a noisy tenant only evicts its own oldest lineages.
+	composerLineagePerTenantCap = 20000
+	// composerLineagePerBaseCap bounds the co-resident lineages under ONE baseSid, so a pathological fan-out
+	// of forks under a single shared conversation id cannot exhaust the per-tenant cap on its own.
+	composerLineagePerBaseCap = 64
+	// composerLineageEntryTTL ages a lineage out even if neither cap is reached. Reuses the
+	// composerToolCallEntryTTL 30m magnitude (a returning turn within minutes re-CONTINUEs; a far-older
+	// lineage is stale). In-memory housekeeping bound, not a data-path wall-clock timeout (AGENTS.md).
+	composerLineageEntryTTL = composerToolCallEntryTTL
+)
+
+// serverSecret keys the lineage head digest (HMAC) so a stored digest is a fixed-width, non-reversible value
+// that never carries raw conversation text. It is process-local crypto/rand and is NEVER logged. On a process
+// restart it rotates, invalidating all stored digests → every turn degrades to a fresh mint/re-seed (never a
+// wrong route); the tenant boundary (composerTenant) is unchanged by this value.
+var serverSecret = func() []byte {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failure would leave keying uninitialised; fall back to a unique-enough seed rather than a
+		// constant key. This path is effectively unreachable on supported platforms.
+		log.Errorf("[composer] lineage serverSecret: crypto/rand failed (%v); using a degraded fallback key", err)
+		fallback := sha256.Sum256([]byte(fmt.Sprintf("composer-lineage-fallback\x00%d\x00%p", time.Now().UnixNano(), &b)))
+		copy(b, fallback[:])
+	}
+	return b
+}()
+
+// lineageEntry is one co-resident lineage under a baseSid: the sess_ id this divergent head routes to plus
+// the bookkeeping for re-resolution, retry tolerance, and the recorded identical-clone collision slot.
+type lineageEntry struct {
+	sid        string    // baseSid for the base lineage, forkSid for a fork
+	headDigest string    // growth-stable HMAC of the first 2 non-system messages
+	priorHead  string    // one-behind headDigest, for retry/duplicate tolerance across a re-key
+	openerFP   string    // fingerprint of the first non-system message (role + prefix) for the compaction signal
+	slot       int       // recorded identical-head collision slot (0 = first claimant, omitted from the id)
+	lastUsed   time.Time // LRU + TTL
+}
+
+// tenantLineage holds one tenant's lineages, keyed by baseSid + "\x00" + headDigest, with an LRU order of
+// those keys. One mutex per tenant (mirrors composerTenantOwnership): contention is low and per-tenant
+// isolation means a noisy tenant never evicts another's lineage.
+type tenantLineage struct {
+	mu         sync.Mutex
+	byBaseHead map[string]*lineageEntry // baseSid + "\x00" + headDigest -> the co-resident lineage for THAT head
+	order      []string                 // LRU of byBaseHead keys (front = oldest)
+}
+
+// composerLineageStore is the tenant-partitioned lineage registry. sync.Map mirrors the composerOwnership
+// tenant partition shape; each tenant submap has its own mutex/LRU/caps.
+type composerLineageStore struct {
+	tenants  sync.Map // tenant -> *tenantLineage
+	nowFn    func() time.Time
+	perCap   int
+	perBase  int
+	entryTTL time.Duration
+}
+
+func newComposerLineageStore() *composerLineageStore {
+	return &composerLineageStore{
+		nowFn:    time.Now,
+		perCap:   composerLineagePerTenantCap,
+		perBase:  composerLineagePerBaseCap,
+		entryTTL: composerLineageEntryTTL,
+	}
+}
+
+var composerLineage = newComposerLineageStore()
+
+func lineageKey(baseSid, headDigest string) string {
+	return baseSid + "\x00" + headDigest
+}
+
+// sha256Sum returns the raw 32-byte SHA-256 of s as a slice (small helper so the stable-conv hashing sites
+// read uniformly: "sess_" + hex(sha256Sum(preimage))[:32]).
+func sha256Sum(s string) []byte {
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
+}
+
+// lineageHeadDigest is the growth-stable HMAC head used as a lineage key component (§1.2). It reuses the
+// SAME head window as composerHistoryFingerprint (the first composerHistoryFingerprintHeadMessages non-system
+// messages, role + a 256-rune text prefix each) so a fork's head is identical across its own turns. fp16 is
+// the existing composerHistoryFingerprint (the compaction signal) folded into the keying so two conversations
+// with the same opener but divergent bodies do not share a head; tenant is folded so the digest is
+// tenant-scoped. crypto/hmac keyed by serverSecret keeps the stored digest a fixed-width, non-reversible value
+// (the raw conversation text is never retained in the registry).
+func lineageHeadDigest(tenant, fp16 string, messages []gjson.Result) string {
+	mac := hmac.New(sha256.New, serverSecret)
+	mac.Write([]byte(tenant))
+	mac.Write([]byte{0})
+	mac.Write([]byte(fp16))
+	mac.Write([]byte{0})
+	count := 0
+	for _, m := range messages {
+		switch m.Get("role").String() {
+		case "system", "developer":
+			continue
+		}
+		mac.Write([]byte(m.Get("role").String()))
+		mac.Write([]byte{0x1f})
+		text := cursorMessageText(m)
+		if r := []rune(text); len(r) > composerHistoryFingerprintPrefixRunes {
+			text = string(r[:composerHistoryFingerprintPrefixRunes])
+		}
+		mac.Write([]byte(text))
+		mac.Write([]byte{0})
+		count++
+		if count >= composerHistoryFingerprintHeadMessages {
+			break
+		}
+	}
+	return hex.EncodeToString(mac.Sum(nil))[:32]
+}
+
+// forkSessionID derives a fork's stable sess_ id from baseSid + the fork's growth-stable head (§1.3c). slot 0
+// is OMITTED for back-compat (the common single-claimant case); a recorded slot N>0 splits a byte-identical
+// concurrent clone that shares both id and head. The id is pure content + a RECORDED slot — never re-minted.
+func forkSessionID(baseSid, headDigest string, slot int) string {
+	pre := baseSid + "\x00fork:" + headDigest
+	if slot > 0 {
+		pre = pre + "\x00slot:" + fmt.Sprint(slot)
+	}
+	sum := sha256.Sum256([]byte(pre))
+	return "sess_" + hex.EncodeToString(sum[:])[:32]
+}
+
+// expireLocked drops lineages older than entryTTL for a tenant. Caller holds to.mu.
+func (s *composerLineageStore) expireLocked(to *tenantLineage) {
+	if s.entryTTL <= 0 {
+		return
+	}
+	cutoff := s.nowFn().Add(-s.entryTTL)
+	kept := to.order[:0]
+	for _, key := range to.order {
+		e, ok := to.byBaseHead[key]
+		if !ok {
+			continue
+		}
+		if e.lastUsed.Before(cutoff) {
+			delete(to.byBaseHead, key)
+			continue
+		}
+		kept = append(kept, key)
+	}
+	to.order = kept
+}
+
+// moveToTail moves an existing LRU key to the tail (most-recently-used). Caller holds to.mu.
+func (to *tenantLineage) moveToTail(key string) {
+	for i, k := range to.order {
+		if k == key {
+			to.order = append(to.order[:i], to.order[i+1:]...)
+			to.order = append(to.order, key)
+			return
+		}
+	}
+}
+
+// countBaseLocked returns how many co-resident lineages currently exist under baseSid. Caller holds to.mu.
+func (to *tenantLineage) countBaseLocked(baseSid string) int {
+	n := 0
+	prefix := baseSid + "\x00"
+	for k := range to.byBaseHead {
+		if strings.HasPrefix(k, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// evictOldestForBaseLocked drops the oldest co-resident lineage under baseSid (front-most in LRU order).
+// Used to bound a pathological fan-out under one conversation id by composerLineagePerBaseCap. Caller holds
+// to.mu.
+func (to *tenantLineage) evictOldestForBaseLocked(baseSid string) {
+	prefix := baseSid + "\x00"
+	for i, key := range to.order {
+		if strings.HasPrefix(key, prefix) {
+			delete(to.byBaseHead, key)
+			to.order = append(to.order[:i], to.order[i+1:]...)
+			return
+		}
+	}
+}
+
+// tenantLineageFor returns the tenant submap, creating it on demand. Mirrors the composerOwnership partition.
+func (s *composerLineageStore) tenantLineageFor(tenant string) *tenantLineage {
+	if v, ok := s.tenants.Load(tenant); ok {
+		return v.(*tenantLineage)
+	}
+	created := &tenantLineage{byBaseHead: map[string]*lineageEntry{}}
+	actual, _ := s.tenants.LoadOrStore(tenant, created)
+	return actual.(*tenantLineage)
+}
+
+// deleteTenantIfEmptyLocked removes the tenant submap when it holds no lineages (mirrors forgetSession). The
+// caller holds to.mu; the sync.Map delete is safe to interleave with that per-tenant lock.
+func (s *composerLineageStore) deleteTenantIfEmptyLocked(tenant string, to *tenantLineage) {
+	if len(to.byBaseHead) == 0 {
+		s.tenants.Delete(tenant)
+	}
+}
+
+// get re-resolves the co-resident lineage for an EXACT (baseSid, headDigest) and touches it (LRU + lastUsed).
+// This is the step-(a) re-attach: a multi-turn fork's growth-stable head lands back on its own entry. It also
+// matches a one-behind priorHead so a re-key in flight (compaction bridge) still re-attaches a racing turn.
+func (s *composerLineageStore) get(tenant, baseSid, headDigest string) *lineageEntry {
+	if tenant == "" {
+		return nil
+	}
+	to := s.tenantLineageFor(tenant)
+	to.mu.Lock()
+	defer to.mu.Unlock()
+	s.expireLocked(to)
+	defer s.deleteTenantIfEmptyLocked(tenant, to)
+	key := lineageKey(baseSid, headDigest)
+	if e, ok := to.byBaseHead[key]; ok {
+		e.lastUsed = s.nowFn()
+		to.moveToTail(key)
+		return e
+	}
+	// Retry/duplicate tolerance: a turn that re-presents the one-behind head (e.g. arriving during a re-key)
+	// still resolves to the same lineage by priorHead.
+	for _, k := range to.order {
+		e := to.byBaseHead[k]
+		if e != nil && e.priorHead == headDigest && strings.HasPrefix(k, baseSid+"\x00") {
+			e.lastUsed = s.nowFn()
+			to.moveToTail(k)
+			return e
+		}
+	}
+	return nil
+}
+
+// putForkSlotted records a FIRST-CLASS fork under (baseSid, headDigest), resolving the identical-clone
+// collision slot (§1.3c). The first claimant of a head gets slot 0 (id omits the slot, back-compat). A
+// SECOND concurrent claimant of the SAME head within the live window — signalled by collide=true — gets the
+// next slot with a RECORDED crypto/rand tie value folded only to disambiguate two byte-identical openings;
+// the slot is recorded, not re-minted, so each clone stays head-stable across its own later turns. Returns
+// the fork's stable sess_ id.
+func (s *composerLineageStore) putForkSlotted(tenant, baseSid, headDigest string, collide bool) string {
+	if tenant == "" {
+		// Empty tenant never reaches here (deriveComposerSessionID mints first); return a deterministic id.
+		return forkSessionID(baseSid, headDigest, 0)
+	}
+	to := s.tenantLineageFor(tenant)
+	to.mu.Lock()
+	defer to.mu.Unlock()
+	s.expireLocked(to)
+	now := s.nowFn()
+	key := lineageKey(baseSid, headDigest)
+	if e, ok := to.byBaseHead[key]; ok {
+		if !collide {
+			// Re-attach to the existing fork for this head (the common multi-turn re-resolve).
+			e.lastUsed = now
+			to.moveToTail(key)
+			return e.sid
+		}
+		// A genuinely concurrent identical-head clone: allocate the next slot and record it as its own
+		// lineage keyed by the SAME (baseSid, headDigest) but stored under a slot-suffixed map key so it is
+		// independently addressable. The slot integer derives from a recorded crypto/rand tie value.
+		var rnd [2]byte
+		_, _ = rand.Read(rnd[:])
+		slot := int(rnd[0])<<8 | int(rnd[1])
+		if slot == 0 {
+			slot = 1
+		}
+		forkSid := forkSessionID(baseSid, headDigest, slot)
+		slotKey := key + "\x00slot:" + fmt.Sprint(slot)
+		for to.countBaseLocked(baseSid) >= s.perBase {
+			to.evictOldestForBaseLocked(baseSid)
+		}
+		ne := &lineageEntry{sid: forkSid, headDigest: headDigest, slot: slot, lastUsed: now}
+		to.byBaseHead[slotKey] = ne
+		to.order = append(to.order, slotKey)
+		for len(to.order) > s.perCap {
+			oldest := to.order[0]
+			to.order = to.order[1:]
+			delete(to.byBaseHead, oldest)
+		}
+		return forkSid
+	}
+	// First claimant of this head: slot 0, id omits the slot for back-compat.
+	for to.countBaseLocked(baseSid) >= s.perBase {
+		to.evictOldestForBaseLocked(baseSid)
+	}
+	forkSid := forkSessionID(baseSid, headDigest, 0)
+	e := &lineageEntry{sid: forkSid, headDigest: headDigest, lastUsed: now}
+	to.byBaseHead[key] = e
+	to.order = append(to.order, key)
+	for len(to.order) > s.perCap {
+		oldest := to.order[0]
+		to.order = to.order[1:]
+		delete(to.byBaseHead, oldest)
+	}
+	return forkSid
+}
+
+// resolveStableSession is the authoritative branch-3 resolver (identity-finalplan §1.3), executed ATOMICALLY
+// under the tenant lock so concurrent turns of one conversation cannot race into divergent sids. It returns
+// the bridge session id for a new-user turn that carries a stable conversation id (baseSid), splitting
+// distinct divergent contexts that share that id into per-lineage sessions and re-resolving each lineage to
+// ONE stable sess_ across all of its own turns.
+//
+// Resolution order:
+//
+//	(a) EXACT head match (base OR a prior fork) -> CONTINUE that lineage's recorded sid (the steady-state
+//	    fast path: turns 3,5,7… of any conversation/fork whose head has stabilised at 2 messages).
+//	(b) OPENER bridge -> a co-resident lineage whose recorded opener fingerprint matches the current opener
+//	    but whose head changed is the SAME conversation/fork with a rewritten or GROWN body (a /compact, OR
+//	    the unavoidable turn-1→turn-3 growth from a 1-message head to a 2-message head). Re-key it to the new
+//	    head and CONTINUE its recorded sid — so a fork's forkSid is computed ONCE at establishment and never
+//	    recomputed (multi-turn fork stability). The base lineage is preferred over a fork on an opener tie.
+//	(c) No co-resident lineage shares this opener -> a genuinely new divergent context. If NO base exists yet
+//	    for baseSid, this head ESTABLISHES the base (sid == baseSid, the legacy single-conversation path).
+//	    Otherwise it is a FIRST-CLASS fork (subagent / branch / parallel fan-out) recorded under
+//	    (baseSid, headDigest) so its later new-user turns re-resolve via (a)/(b).
+func (s *composerLineageStore) resolveStableSession(tenant, baseSid, headDigest, openerFP string) string {
+	if tenant == "" {
+		return baseSid
+	}
+	to := s.tenantLineageFor(tenant)
+	to.mu.Lock()
+	defer to.mu.Unlock()
+	s.expireLocked(to)
+	now := s.nowFn()
+	prefix := baseSid + "\x00"
+
+	// (a) exact head match (current or one-behind), co-resident under this baseSid.
+	key := lineageKey(baseSid, headDigest)
+	if e, ok := to.byBaseHead[key]; ok {
+		e.lastUsed = now
+		to.moveToTail(key)
+		return e.sid
+	}
+	for _, k := range to.order {
+		e := to.byBaseHead[k]
+		if e != nil && e.priorHead == headDigest && strings.HasPrefix(k, prefix) {
+			e.lastUsed = now
+			to.moveToTail(k)
+			return e.sid
+		}
+	}
+
+	// (b) opener bridge: find a co-resident lineage whose opener matches but whose head moved
+	// (compactionSignal) — the same conversation/fork with a rewritten (compact) or grown (turn-1→turn-3)
+	// body. Prefer the BASE (sid == baseSid) over a fork so a base's own growth never re-keys onto a fork by
+	// accident.
+	var match *lineageEntry
+	var matchKey string
+	if openerFP != "" {
+		for _, k := range to.order {
+			e := to.byBaseHead[k]
+			if e == nil || !strings.HasPrefix(k, prefix) || !compactionSignal(e.headDigest, headDigest, e.openerFP, openerFP) {
+				continue
+			}
+			if match == nil || (e.sid == baseSid && match.sid != baseSid) {
+				match, matchKey = e, k
+			}
+		}
+	}
+	if match != nil {
+		// Re-key the matched lineage from its old head to the new head, preserving its recorded sid.
+		oldKey := matchKey
+		newKey := lineageKey(baseSid, headDigest)
+		for i, k := range to.order {
+			if k == oldKey {
+				to.order = append(to.order[:i], to.order[i+1:]...)
+				break
+			}
+		}
+		delete(to.byBaseHead, oldKey)
+		match.priorHead = match.headDigest
+		match.headDigest = headDigest
+		match.lastUsed = now
+		to.byBaseHead[newKey] = match
+		to.order = append(to.order, newKey)
+		return match.sid
+	}
+
+	// (c) genuinely new divergent context for this baseSid.
+	baseExists := false
+	for _, k := range to.order {
+		e := to.byBaseHead[k]
+		if e != nil && e.sid == baseSid && strings.HasPrefix(k, prefix) {
+			baseExists = true
+			break
+		}
+	}
+	for to.countBaseLocked(baseSid) >= s.perBase {
+		to.evictOldestForBaseLocked(baseSid)
+	}
+	sid := baseSid
+	if baseExists {
+		sid = forkSessionID(baseSid, headDigest, 0) // first claimant of this head: slot 0 omitted, back-compat
+	}
+	e := &lineageEntry{sid: sid, headDigest: headDigest, openerFP: openerFP, lastUsed: now}
+	to.byBaseHead[key] = e
+	to.order = append(to.order, key)
+	for len(to.order) > s.perCap {
+		oldest := to.order[0]
+		to.order = to.order[1:]
+		delete(to.byBaseHead, oldest)
+	}
+	return sid
+}
+
+// lookupByReplayedHead returns the sess_ id of a co-resident lineage for (baseSid, headDigest) WITHOUT
+// recording or re-keying — the branch-1 ownership-MISS corroborator (§1.4). It only ROUTES to an
+// already-recorded lineage; on miss the caller falls through to today's behavior unchanged.
+func (s *composerLineageStore) lookupByReplayedHead(tenant, baseSid, headDigest string) string {
+	if e := s.get(tenant, baseSid, headDigest); e != nil {
+		return e.sid
+	}
+	return ""
+}
+
+// forget drops every lineage routing to sid for a tenant (terminal-stop release). Best-effort cleanup; the
+// TTL+LRU age entries out regardless, so this is an optimization, not correctness-critical.
+func (s *composerLineageStore) forget(tenant, sid string) {
+	if tenant == "" || sid == "" {
+		return
+	}
+	v, ok := s.tenants.Load(tenant)
+	if !ok {
+		return
+	}
+	to := v.(*tenantLineage)
+	to.mu.Lock()
+	defer to.mu.Unlock()
+	kept := to.order[:0]
+	for _, key := range to.order {
+		e, ok := to.byBaseHead[key]
+		if !ok {
+			continue
+		}
+		if e.sid == sid {
+			delete(to.byBaseHead, key)
+			continue
+		}
+		kept = append(kept, key)
+	}
+	to.order = kept
+	s.deleteTenantIfEmptyLocked(tenant, to)
+}
+
+// lineageForget drops a tenant's lineages that route to sid (terminal-stop cleanup helper).
+func lineageForget(tenant, sid string) {
+	composerLineage.forget(tenant, sid)
+}
+
+// compactionSignal reports whether a recorded BASE head change is a COMPACTION (same conversation, rewritten
+// body) rather than a genuine divergence (a fork). It mirrors composerHistoryFingerprint's design: a /compact
+// preserves the opener (the first non-system message) verbatim and rewrites the body, so when the recorded
+// base head moved (oldHead != newHead) BUT the first non-system message's role+prefix is unchanged
+// (recordedOpenerFP == currentOpenerFP), we classify it as a compaction and CONTINUE the base (re-key + let
+// inp["historyFingerprint"] drive the bridge warm-reseed at the existing seam). An OPENER edit (first message
+// changed) is NOT a compaction — it falls through to a fork (documented residual context loss).
+func compactionSignal(oldHead, newHead, recordedOpenerFP, currentOpenerFP string) bool {
+	if oldHead == newHead {
+		return false // the recorded base head did not change at all
+	}
+	if recordedOpenerFP == "" || currentOpenerFP == "" {
+		return false // cannot confirm opener preservation -> do not bridge (fork instead)
+	}
+	return recordedOpenerFP == currentOpenerFP
+}
+
+// lineageOpenerFingerprint returns a 16-hex fingerprint of the FIRST non-system message (role + 256-rune
+// prefix) — the growth-stable opener anchor. It never changes as the conversation/fork appends tail turns, so
+// the opener bridge can recognise a body rewrite (opener kept, head moved) and distinguish it from an opener
+// edit (opener changed → a genuine fork). Empty when there is no non-system message.
+func lineageOpenerFingerprint(messages []gjson.Result) string {
+	for _, m := range messages {
+		switch m.Get("role").String() {
+		case "system", "developer":
+			continue
+		}
+		text := cursorMessageText(m)
+		if r := []rune(text); len(r) > composerHistoryFingerprintPrefixRunes {
+			text = string(r[:composerHistoryFingerprintPrefixRunes])
+		}
+		sum := sha256.Sum256([]byte(m.Get("role").String() + "\x1f" + text))
+		return hex.EncodeToString(sum[:])[:16]
+	}
+	return ""
+}
+
 // errMixedSessionBatch is returned when a single continuation batch carries tool_call_ids that were emitted
 // by DIFFERENT bridge sessions (M32). Routing the whole batch to one of them would deliver a partial/wrong
 // batch (the other session never gets its result, or gets a foreign id), so the caller must surface this
@@ -864,6 +1377,15 @@ func composerStableSessionPreimage(tenant, apiKey, convID string) string {
 // continuation carries history+system (composerInput) so the rotated durable agent re-seeds bounded context.
 func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte, opts cliproxyexecutor.Options) (string, error) {
 	tenant := composerTenant(auth, opts)
+	// Empty-tenant fail-closed guard (identity-finalplan §1.4): with no auth.ID/api_key AND no caller
+	// credential there is no isolation boundary, so a stable id from one anonymous caller could be replayed
+	// by another. NEVER share a "" bucket and NEVER consult the lineage registry — mint a fresh session
+	// immediately. The continuation carries history+system so the bridge re-seeds rather than losing the turn.
+	if tenant == "" {
+		sid := mintComposerSessionID()
+		composerDebugf("[composer] deriveSessionID BRANCH=mint(empty tenant, fail-closed) -> sessionID=%s", sid)
+		return sid, nil
+	}
 	// Isolate non-agentic utility one-shots BEFORE any stable routing. Clients such as Claude Code fire
 	// background requests — title generation, topic detection, quota probes — CONCURRENTLY with the real
 	// turn and tagged with the SAME conversation id. Routing them to the conversation's stable session
@@ -917,10 +1439,19 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 		// No recorded emitter (bridge restart / TTL eviction / cross-instance): fall back to the stable conv
 		// id so the bridge can re-seed.
 		if id := stableConversationID(opts); id != "" {
-			sum := sha256.Sum256([]byte(composerStableSessionPreimage(tenant, apiKey, id)))
-			sid := "sess_" + hex.EncodeToString(sum[:])[:32]
-			composerDebugf("[composer] deriveSessionID BRANCH=continuation(stable fallback) convID=%q -> sessionID=%s", id, sid)
-			return sid, nil
+			baseSid := "sess_" + hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, id)))[:32]
+			// identity-finalplan §1.4: ownership-MISS corroborator. Before the bare stable-conv hash, if the
+			// turn's replayed head resolves to a recorded co-resident lineage (a prior fork of this baseSid),
+			// route the continuation there so a forked subagent's tool-result turn re-attaches to its own
+			// session rather than collapsing onto baseSid. On miss, fall through to baseSid unchanged.
+			contMsgs := gjson.GetBytes(oai, "messages").Array()
+			headDigest := lineageHeadDigest(tenant, composerHistoryFingerprint(contMsgs), contMsgs)
+			if sid := composerLineage.lookupByReplayedHead(tenant, baseSid, headDigest); sid != "" {
+				composerDebugf("[composer] deriveSessionID BRANCH=continuation(lineage-by-replayed-head) convID=%q -> sessionID=%s", id, sid)
+				return sid, nil
+			}
+			composerDebugf("[composer] deriveSessionID BRANCH=continuation(stable fallback) convID=%q -> sessionID=%s", id, baseSid)
+			return baseSid, nil
 		}
 		// EX6: stateless/restarted client — no recorded emitter AND no stable id. DEGRADE GRACEFULLY: mint a
 		// fresh session instead of 500-ing a routine turn. composerInput carries history+system on the
@@ -943,15 +1474,25 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 		composerDebugf("[composer] deriveSessionID previous_response_id=%q present but unmapped (restart/evict) -> falling through", pid)
 	}
 	if id := stableConversationID(opts); id != "" {
-		// ADD-62 invariant (C-ADD62-MODEL-ROTATE): the session id is derived from tenant + conversation (+ the
-		// ADD-79 Cursor-key fingerprint), NEVER the model. A model change on the same conversation MUST keep the
-		// same external session id so the BRIDGE can detect the change (session.model != requested) and
-		// rotate/re-seed the durable agent into the new model. Folding the model into this hash would fork
-		// routing and orphan in-flight continuations. ADD-79: the KEY fingerprint IS folded (a key rotation is
-		// a credential/account change that SHOULD re-route to a fresh durable agent, unlike a model change).
-		sum := sha256.Sum256([]byte(composerStableSessionPreimage(tenant, apiKey, id)))
-		sid := "sess_" + hex.EncodeToString(sum[:])[:32]
-		composerDebugf("[composer] deriveSessionID BRANCH=stable convID=%q -> sessionID=%s", id, sid)
+		// ADD-62 invariant (C-ADD62-MODEL-ROTATE): the BASE session id is derived from tenant + conversation
+		// (+ the ADD-79 Cursor-key fingerprint), NEVER the model. A model change on the same conversation MUST
+		// keep the same external session id so the BRIDGE can detect the change (session.model != requested)
+		// and rotate/re-seed the durable agent. Folding the model into this hash would fork routing and orphan
+		// in-flight continuations. ADD-79: the KEY fingerprint IS folded (a key rotation should re-route).
+		baseSid := "sess_" + hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, id)))[:32]
+		// identity-finalplan §1.3: a SUBORDINATE same-tenant splitter. baseSid stays ID-authoritative; the
+		// lineage registry only splits distinct divergent contexts that share this id (subagents reusing the
+		// parent metadata.user_id, parallel fan-out, branches) into per-lineage sessions and re-resolves each
+		// to ONE stable sess_ across all of its own turns. The head reuses the growth-stable
+		// composerHistoryFingerprint window + an opener bridge, so a fork's recorded sid is computed once and
+		// re-resolved turn-to-turn (multi-turn fork stability). The UNCHANGED inp["historyFingerprint"] field
+		// still drives the bridge warm-reseed on the re-key (compaction) path.
+		messages := gjson.GetBytes(oai, "messages").Array()
+		fp16 := composerHistoryFingerprint(messages)
+		headDigest := lineageHeadDigest(tenant, fp16, messages)
+		openerFP := lineageOpenerFingerprint(messages)
+		sid := composerLineage.resolveStableSession(tenant, baseSid, headDigest, openerFP)
+		composerDebugf("[composer] deriveSessionID BRANCH=stable convID=%q -> sessionID=%s (baseSid=%s)", id, sid, baseSid)
 		return sid, nil
 	}
 	// New user turn with no stable id (a stateless client — curl/SDK/simple UI). Mint a FRESH RANDOM session

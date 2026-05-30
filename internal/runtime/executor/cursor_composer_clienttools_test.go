@@ -46,7 +46,8 @@ func TestDeriveComposerSessionID(t *testing.T) {
 	convoOpts := func(conv string) cliproxyexecutor.Options {
 		return optsWithHeaders(map[string]string{"X-Conversation-Id": conv})
 	}
-	// A stable conversation id routes an agentic turn deterministically and is independent of message text.
+	// A stable conversation id routes an agentic turn deterministically: the SAME opener under the SAME id is
+	// always the same session across turns (identity-finalplan: baseSid stays ID-authoritative).
 	a, err := deriveComposerSessionID(authWith("authA", "keyA"), "cursorkey", toolTurn("hello"), convoOpts("conv-1"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -54,9 +55,16 @@ func TestDeriveComposerSessionID(t *testing.T) {
 	if !strings.HasPrefix(a, "sess_") {
 		t.Fatalf("session id should be prefixed sess_, got %s", a)
 	}
-	a2, _ := deriveComposerSessionID(authWith("authA", "keyA"), "cursorkey", toolTurn("different text"), convoOpts("conv-1"))
-	if a != a2 {
-		t.Fatalf("same conversation id must be stable regardless of content: %s vs %s", a, a2)
+	aSame, _ := deriveComposerSessionID(authWith("authA", "keyA"), "cursorkey", toolTurn("hello"), convoOpts("conv-1"))
+	if a != aSame {
+		t.Fatalf("same conversation id + same opener must be stable: %s vs %s", a, aSame)
+	}
+	// identity-finalplan §1.3 (the proven bug fix): a DIFFERENT opener (a divergent context — subagent /
+	// branch / parallel fan-out) sharing the SAME id must SPLIT into a distinct session, not collapse onto
+	// baseSid the way it did before this fix.
+	a2, _ := deriveComposerSessionID(authWith("authA", "keyA"), "cursorkey", toolTurn("a totally different first task"), convoOpts("conv-1"))
+	if a == a2 {
+		t.Fatalf("a divergent opener under the same conversation id must SPLIT to a distinct session: %s == %s", a, a2)
 	}
 	// Different tenant, same conversation id => different id (no cross-tenant collision).
 	b, _ := deriveComposerSessionID(authWith("authB", "keyB"), "cursorkey", toolTurn("hello"), convoOpts("conv-1"))
@@ -135,15 +143,22 @@ func TestDeriveComposerSessionID_StatelessMint(t *testing.T) {
 	if a == b {
 		t.Fatalf("distinct stateless new turns must get distinct minted ids")
 	}
-	// metadata.user_id (Claude session) routes an agentic turn deterministically and is content-independent.
+	// metadata.user_id (Claude session) routes an agentic turn deterministically: the SAME opener under the
+	// same uuid is the same session across turns.
 	o := cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_x_account__session_uuid-1"}}`)}
 	s1, err := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), o)
 	if err != nil || s1 == "" {
 		t.Fatalf("metadata.user_id should route: %v", err)
 	}
-	s1b, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("different"), o)
+	s1b, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), o)
 	if s1 != s1b {
-		t.Fatalf("same Claude session uuid must be stable regardless of content")
+		t.Fatalf("same Claude session uuid + same opener must be stable: %s vs %s", s1, s1b)
+	}
+	// identity-finalplan §1.3: a subagent reusing the parent's metadata.user_id but with its OWN first task
+	// (a divergent opener) must SPLIT to a distinct fork session rather than collapse onto the parent.
+	s1Fork, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("a different subagent task"), o)
+	if s1 == s1Fork {
+		t.Fatalf("a divergent opener sharing the parent uuid must split to a distinct session: %s == %s", s1, s1Fork)
 	}
 	s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_x_account__session_uuid-2"}}`)})
 	if s1 == s2 {
@@ -1151,9 +1166,10 @@ func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
 		if err != nil || !strings.HasPrefix(s1, "sess_") {
 			t.Fatalf("header %s should route (id=%q err=%v)", h, s1, err)
 		}
-		s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("different content"), o1)
+		// Same header conv id + same opener => stable session across turns.
+		s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hello"), o1)
 		if s1 != s2 {
-			t.Fatalf("header %s: same conv id must be stable across content (%s vs %s)", h, s1, s2)
+			t.Fatalf("header %s: same conv id + same opener must be stable (%s vs %s)", h, s1, s2)
 		}
 	}
 	// ADD-48: a request-id-only turn (X-Client-Request-Id, metadata request_id) must NOT be treated as a stable
@@ -1179,10 +1195,10 @@ func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
 		if err != nil || !strings.HasPrefix(s1, "sess_") {
 			t.Fatalf("body %s should route (id=%q err=%v)", k, s1, err)
 		}
-		// Same body id, different inbound message content => stable session.
-		s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("totally other"), o)
+		// Same body id + same opener => stable session across turns.
+		s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), o)
 		if s1 != s2 {
-			t.Fatalf("body %s: same conv id must be stable across content (%s vs %s)", k, s1, s2)
+			t.Fatalf("body %s: same conv id + same opener must be stable (%s vs %s)", k, s1, s2)
 		}
 	}
 	// H16: a bare previous_response_id with NO recorded mapping must NOT be a stable conv-id hash — it mints a
@@ -1498,7 +1514,10 @@ func TestDeriveComposerSessionID_ToollessBodyConvFollowup(t *testing.T) {
 	agentic := []byte(`{"conversation_id":"conv-l35-body","tools":[{"type":"function","function":{"name":"Read"}}],"messages":[{"role":"user","content":"describe the repo"}]}`)
 	bodyOpts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation_id":"conv-l35-body"}`)}
 	stable, _ := deriveComposerSessionID(auth, "cursorkey", agentic, bodyOpts)
-	toolless := []byte(`{"conversation_id":"conv-l35-body","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"summarize"}]}`)
+	// A realistic tool-less follow-up REPLAYS the same opener (the durable conversation grows at the tail).
+	// identity-finalplan: the opener bridge re-keys the same lineage as the head grows, so the follow-up
+	// resolves to the SAME stable session (the L35/H16 durable-resume contract).
+	toolless := []byte(`{"conversation_id":"conv-l35-body","messages":[{"role":"user","content":"describe the repo"},{"role":"assistant","content":"it is a proxy"},{"role":"user","content":"summarize"}]}`)
 	got, err := deriveComposerSessionID(auth, "cursorkey", toolless, bodyOpts)
 	if err != nil {
 		t.Fatalf("L35 follow-up must not error: %v", err)
@@ -2288,12 +2307,12 @@ func TestADD78_PromptCacheKeyNotStable(t *testing.T) {
 	if s1 == s2 {
 		t.Fatalf("ADD-78: prompt_cache_key must NOT mint a stable session (distinct tasks must not merge): %s == %s", s1, s2)
 	}
-	// A real conversation_id is still stable (regression guard for the surviving signal).
+	// A real conversation_id is still stable for the same opener (regression guard for the surviving signal).
 	convOpts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation_id":"conv-real"}`)}
-	c1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("a"), convOpts)
-	c2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("b"), convOpts)
+	c1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("same opener"), convOpts)
+	c2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("same opener"), convOpts)
 	if c1 != c2 {
-		t.Fatalf("ADD-78: conversation_id must remain stable, got %s vs %s", c1, c2)
+		t.Fatalf("ADD-78: conversation_id must remain stable for the same opener, got %s vs %s", c1, c2)
 	}
 }
 
@@ -2306,10 +2325,10 @@ func TestADD79_KeyFingerprintFoldedIntoSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	// Same conv + same key => stable.
-	aAgain, _ := deriveComposerSessionID(auth, "cursor-key-one", toolTurn("different text"), conv)
+	// Same conv + same key + same opener => stable.
+	aAgain, _ := deriveComposerSessionID(auth, "cursor-key-one", toolTurn("hi"), conv)
 	if a != aAgain {
-		t.Fatalf("ADD-79: same conv + same key must be stable, got %s vs %s", a, aAgain)
+		t.Fatalf("ADD-79: same conv + same key + same opener must be stable, got %s vs %s", a, aAgain)
 	}
 	// Same conv + DIFFERENT key => different session (the rotated key re-routes).
 	b, _ := deriveComposerSessionID(auth, "cursor-key-two", toolTurn("hi"), conv)
