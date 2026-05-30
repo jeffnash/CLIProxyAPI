@@ -1,0 +1,53 @@
+name: cursor-bridge patch verify
+
+# Verifies, on a clean tree, that the Cursor Cursor Composer Client-Tools sidecar installs and the @cursor/sdk patch
+# applies correctly (anchors + version pin + SHA). Catches SDK drift before release.
+on:
+  push:
+    paths:
+      - "sidecars/cursor-bridge/**"
+      - ".github/workflows/cursor-bridge-patch.yml"
+  pull_request:
+    paths:
+      - "sidecars/cursor-bridge/**"
+
+jobs:
+  patch-verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sidecars/cursor-bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install build tools for native sqlite3
+        run: sudo apt-get update && sudo apt-get install -y python3 make g++
+      - name: npm ci (runs the postinstall patcher)
+        run: npm ci
+      - name: Unit tests (npm test)
+        run: npm test
+      - name: Verify the loaded CJS bundle is patched
+        run: |
+          node -e '
+            const { createRequire } = require("module");
+            const req = createRequire(process.cwd() + "/cursor-agent-bridge.mjs");
+            const p = req.resolve("@cursor/sdk");
+            if (!p.endsWith("dist/cjs/index.js")) { console.error("resolved non-cjs:", p); process.exit(1); }
+            const fs = require("fs");
+            const src = fs.readFileSync(p, "latin1");
+            for (const m of ["cursor-composer-clienttools-patched-v1", "__CC_EXEC_U", "__CC_EXEC_S", "__CC_GET_ADVERTISE__", "__CC_ALLOW_NATIVE", "__CC_SELFTEST_DISPATCH_U", "__CC_SELFTEST_DISPATCH_S"]) {
+              if (!src.includes(m)) { console.error("MISSING patch marker:", m); process.exit(1); }
+            }
+            console.log("patched bundle verified:", p);
+          '
+      - name: Run bridge fail-closed self-tests against the patched bundle
+        run: npm run selftest
+      - name: node --check patched bundle + bridge + patcher
+        run: |
+          node --check node_modules/@cursor/sdk/dist/cjs/index.js
+          node --check cursor-agent-bridge.mjs
+          node -c scripts/apply-clienttools-patch.cjs
+      - name: Idempotency (re-run patcher is a no-op)
+        run: node scripts/apply-clienttools-patch.cjs

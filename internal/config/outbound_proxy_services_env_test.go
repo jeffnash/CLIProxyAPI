@@ -51,4 +51,3 @@ func TestProxyEnabledFor_EmptyAllowlistMeansAll(t *testing.T) {
 		t.Fatalf("expected ProxyEnabledFor(codex)=true with empty allowlist")
 	}
 }
-

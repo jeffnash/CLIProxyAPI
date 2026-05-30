@@ -67,4 +67,3 @@ func TestOutboundProxyEnvFallbackStandard(t *testing.T) {
 		t.Fatalf("ProxyURL mismatch: got %q", cfg.ProxyURL)
 	}
 }
-

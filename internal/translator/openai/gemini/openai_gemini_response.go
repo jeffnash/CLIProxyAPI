@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -211,13 +212,35 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 				template, _ = sjson.SetBytes(template, "candidates.0.finishReason", geminiFinishReason)
 
 				// If we have accumulated tool calls, output them now
-				if len((*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator) > 0 {
+				accumulators := (*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator
+				if len(accumulators) > 0 {
+					// Emit parts in ASCENDING tool-index order so the part order is
+					// deterministic across runs (a Go map range is nondeterministic and
+					// would reorder parallel calls). C-GEMID / C02 / ADD-69: clients without
+					// functionCall.id pair functionResponse parts by position, so a flaky
+					// part order silently mis-pairs parallel tool results.
+					toolIndexes := make([]int, 0, len(accumulators))
+					for toolIndex := range accumulators {
+						toolIndexes = append(toolIndexes, toolIndex)
+					}
+					sort.Ints(toolIndexes)
+
 					partIndex := 0
-					for _, accumulator := range (*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator {
+					for _, toolIndex := range toolIndexes {
+						accumulator := accumulators[toolIndex]
 						namePath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.name", partIndex)
 						argsPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.args", partIndex)
 						template, _ = sjson.SetBytes(template, namePath, accumulator.Name)
 						template, _ = sjson.SetRawBytes(template, argsPath, []byte(parseArgsToObjectRaw(accumulator.Arguments.String())))
+						// Echo the accumulated OpenAI tool-call id as functionCall.id so the
+						// Gemini client can return it verbatim in the matching
+						// functionResponse.id (round-trips through openai_gemini_request.go's
+						// id-first read path). Only when non-empty; the request side falls back
+						// to a deterministic mint for genuinely id-less calls. Contract C-GEMID.
+						if accumulator.ID != "" {
+							idPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.id", partIndex)
+							template, _ = sjson.SetBytes(template, idPath, accumulator.ID)
+						}
 						partIndex++
 					}
 
@@ -576,7 +599,10 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 				partIndex++
 			}
 
-			// Handle tool calls
+			// Handle tool calls. ADD-69: the non-stream path iterates the OpenAI
+			// tool_calls JSON ARRAY in order (gjson ForEach preserves array order),
+			// so parts are already emitted deterministically here — unlike the
+			// streaming path, this side never accumulates into a Go map.
 			if toolCalls := message.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 				toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 					if toolCall.Get("type").String() == "function" {
@@ -588,6 +614,13 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 						argsPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.args", partIndex)
 						out, _ = sjson.SetBytes(out, namePath, functionName)
 						out, _ = sjson.SetRawBytes(out, argsPath, []byte(parseArgsToObjectRaw(functionArgs)))
+						// Mirror the streaming path: surface the OpenAI tool-call id as
+						// functionCall.id so the Gemini client echoes it as functionResponse.id
+						// and the id round-trips exactly. Only when non-empty. Contract C-GEMID.
+						if toolID := toolCall.Get("id").String(); toolID != "" {
+							idPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.id", partIndex)
+							out, _ = sjson.SetBytes(out, idPath, toolID)
+						}
 						partIndex++
 					}
 					return true

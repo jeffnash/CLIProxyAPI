@@ -454,6 +454,8 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewChutesExecutor(s.cfg))
 	case "xai":
 		s.coreManager.RegisterExecutor(executor.NewXAIExecutor(s.cfg))
+	case "cursor":
+		s.coreManager.RegisterExecutor(executor.NewCursorExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -1291,6 +1293,18 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "xai":
 		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
+	case "cursor":
+		models = registry.GetCursorModels()
+		if entry := s.resolveConfigCursorKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildCursorConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
+		log.Debugf("cursor: registerModelsForAuth provider=%s authID=%s models=%d excluded=%v", provider, a.ID, len(models), excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
@@ -1513,6 +1527,25 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 			if strings.EqualFold(strings.TrimSpace(entry.APIKey), attrKey) {
 				return entry
 			}
+		}
+	}
+	return nil
+}
+
+// resolveConfigCursorKey maps a synthesized cursor auth back to its cursor-api-key[] config entry by the
+// api_key attribute, so registration can use the entry's configured models/excluded-models.
+func (s *Service) resolveConfigCursorKey(auth *coreauth.Auth) *config.CursorKey {
+	if auth == nil || s.cfg == nil || auth.Attributes == nil {
+		return nil
+	}
+	attrKey := strings.TrimSpace(auth.Attributes["api_key"])
+	if attrKey == "" {
+		return nil
+	}
+	for i := range s.cfg.CursorKey {
+		entry := &s.cfg.CursorKey[i]
+		if strings.EqualFold(strings.TrimSpace(entry.APIKey), attrKey) {
+			return entry
 		}
 	}
 	return nil
@@ -1830,6 +1863,13 @@ func buildVertexCompatConfigModels(entry *config.VertexCompatKey) []*ModelInfo {
 		return nil
 	}
 	return buildConfigModels(entry.Models, "google", "vertex")
+}
+
+func buildCursorConfigModels(entry *config.CursorKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "cursor", "cursor")
 }
 
 func buildGeminiConfigModels(entry *config.GeminiKey) []*ModelInfo {

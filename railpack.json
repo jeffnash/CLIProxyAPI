@@ -2,7 +2,8 @@
   "$schema": "https://schema.railpack.com",
   "provider": "go",
   "packages": {
-    "go": "1.26"
+    "go": "1.26",
+    "node": "22"
   },
   "deploy": {
     "aptPackages": [

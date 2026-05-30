@@ -15,9 +15,9 @@ func TestListCopilotAuthIDsFromDisk_FiltersAndSorts(t *testing.T) {
 	files := map[string]string{
 		"copilot_individual_b.json": `{"type":"copilot","github_token":"ghu_b"}`,
 		"copilot_individual_a.json": `{"type":"copilot","github_token":"ghu_a"}`,
-		"kimi-1.json":                 `{"type":"kimi","access_token":"x"}`,
-		"notes.txt":                  `not json`,
-		"broken.json":                `{`,
+		"kimi-1.json":               `{"type":"kimi","access_token":"x"}`,
+		"notes.txt":                 `not json`,
+		"broken.json":               `{`,
 	}
 
 	for name, content := range files {

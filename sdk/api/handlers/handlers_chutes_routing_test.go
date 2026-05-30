@@ -10,7 +10,7 @@ import (
 func TestGetRequestDetails_ChutesPrefixRouting(t *testing.T) {
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
 
-	providers, model, metadata, err := handler.getRequestDetails("chutes-gpt-4.1")
+	providers, model, metadata, err := handler.getRequestDetailsWithOptions("chutes-gpt-4.1", false)
 	if err != nil {
 		t.Fatalf("getRequestDetails(): %v", err)
 	}
@@ -27,4 +27,3 @@ func TestGetRequestDetails_ChutesPrefixRouting(t *testing.T) {
 		t.Fatalf("metadata[forced_provider]=%v (type %T), want true", metadata["forced_provider"], metadata["forced_provider"])
 	}
 }
-

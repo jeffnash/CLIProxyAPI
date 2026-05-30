@@ -270,6 +270,17 @@ func MapToolName(toolNameMap map[string]string, name string) string {
 	if name == "" || toolNameMap == nil {
 		return name
 	}
+	// Exact-match short-circuit: if the incoming name already equals one of the
+	// advertised (original) tool names, return it unchanged. This prevents two
+	// tools that differ only by case or a leading underscore (e.g. "Foo" vs
+	// "_foo", which share the same canonical key) from collapsing onto the
+	// single canonical entry. The map is small (per-request tool count), so the
+	// linear scan is cheap.
+	for _, orig := range toolNameMap {
+		if orig == name {
+			return name
+		}
+	}
 	if mapped, ok := toolNameMap[CanonicalToolName(name)]; ok && mapped != "" {
 		return mapped
 	}

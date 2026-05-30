@@ -55,4 +55,3 @@ func TestWriteGeminiCLISSEChunk_MultilineSplitsIntoDataLines(t *testing.T) {
 		t.Fatalf("unexpected output: %q", got)
 	}
 }
-

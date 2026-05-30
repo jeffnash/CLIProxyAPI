@@ -364,3 +364,176 @@ func TestStreamingTool_StopReasonMixedSuppressedAndValid(t *testing.T) {
 		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
 	}
 }
+
+// ---- ADD-66: thinking emission gated on the inbound request enabling thinking ----
+
+// thinkingStartCount counts content_block_start events of type "thinking" in a
+// stream event slice.
+func thinkingStartCount(events []sseEvent) int {
+	n := 0
+	for _, e := range events {
+		if e.Type == "content_block_start" && gjson.Get(e.Payload, "content_block.type").String() == "thinking" {
+			n++
+		}
+	}
+	return n
+}
+
+// thinkingDeltaCount counts content_block_delta events carrying a thinking_delta.
+func thinkingDeltaCount(events []sseEvent) int {
+	n := 0
+	for _, e := range events {
+		if e.Type == "content_block_delta" && gjson.Get(e.Payload, "delta.type").String() == "thinking_delta" {
+			n++
+		}
+	}
+	return n
+}
+
+func TestThinkingEnabledForClaude(t *testing.T) {
+	cases := []struct {
+		name       string
+		original   string
+		translated string
+		want       bool
+	}{
+		{"no thinking field", `{"stream":true}`, "", false},
+		{"thinking enabled", `{"thinking":{"type":"enabled","budget_tokens":1024}}`, "", true},
+		{"thinking adaptive", `{"thinking":{"type":"adaptive"}}`, "", true},
+		{"thinking auto", `{"thinking":{"type":"auto"}}`, "", true},
+		{"thinking disabled", `{"thinking":{"type":"disabled"}}`, `{"reasoning_effort":"none"}`, false},
+		{"thinking disabled (no fallback)", `{"thinking":{"type":"disabled"}}`, "", false},
+		{"fallback reasoning_effort high", `{"stream":true}`, `{"reasoning_effort":"high"}`, true},
+		{"fallback reasoning_effort none", `{"stream":true}`, `{"reasoning_effort":"none"}`, false},
+		{"fallback reasoning_effort empty", `{"stream":true}`, `{"reasoning_effort":""}`, false},
+		{"upper-case enabled", `{"thinking":{"type":"ENABLED"}}`, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := thinkingEnabledForClaude([]byte(tc.original), []byte(tc.translated))
+			if got != tc.want {
+				t.Fatalf("thinkingEnabledForClaude(%q,%q) = %v, want %v", tc.original, tc.translated, got, tc.want)
+			}
+		})
+	}
+}
+
+// Stream: when the request did NOT enable thinking, reasoning_content deltas
+// must NOT produce any Anthropic thinking blocks (text still flows).
+func TestStream_ThinkingNotRequested_DropsReasoning(t *testing.T) {
+	events := runStream(t, `{"stream":true}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"secret chain of thought"}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"hello"}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+	)
+	if got := thinkingStartCount(events); got != 0 {
+		t.Fatalf("expected zero thinking content_block_start, got %d (events=%+v)", got, events)
+	}
+	if got := thinkingDeltaCount(events); got != 0 {
+		t.Fatalf("expected zero thinking_delta, got %d (events=%+v)", got, events)
+	}
+	// The visible text must still be delivered.
+	var sawText bool
+	for _, e := range events {
+		if e.Type == "content_block_delta" && gjson.Get(e.Payload, "delta.type").String() == "text_delta" {
+			sawText = true
+		}
+	}
+	if !sawText {
+		t.Fatalf("expected text_delta to still flow when thinking suppressed, events=%+v", events)
+	}
+}
+
+// Stream: when thinking IS enabled, reasoning_content deltas produce thinking blocks.
+func TestStream_ThinkingRequested_EmitsReasoning(t *testing.T) {
+	events := runStream(t, `{"stream":true,"thinking":{"type":"enabled","budget_tokens":2048}}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"thinking step"}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"hello"}}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+	)
+	if got := thinkingStartCount(events); got != 1 {
+		t.Fatalf("expected one thinking content_block_start, got %d (events=%+v)", got, events)
+	}
+	if got := thinkingDeltaCount(events); got != 1 {
+		t.Fatalf("expected one thinking_delta, got %d (events=%+v)", got, events)
+	}
+}
+
+// Nonstream (chat-choice path, stream:false): thinking gating.
+func TestNonStreamChoice_ThinkingGating(t *testing.T) {
+	chunk := `{"id":"c1","model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","reasoning_content":"hidden","content":"hi"}}]}`
+
+	// Not requested -> no thinking block.
+	var p1 any
+	out1 := ConvertOpenAIResponseToClaude(context.Background(), "", []byte(`{"stream":false}`), nil, []byte("data: "+chunk), &p1)
+	joined1 := joinBytes(out1)
+	if bytes.Contains(joined1, []byte(`"type":"thinking"`)) {
+		t.Fatalf("expected no thinking block when thinking not requested, got %s", joined1)
+	}
+	if !bytes.Contains(joined1, []byte(`"type":"text"`)) {
+		t.Fatalf("expected text block to remain, got %s", joined1)
+	}
+
+	// Requested -> thinking block present.
+	var p2 any
+	out2 := ConvertOpenAIResponseToClaude(context.Background(), "", []byte(`{"stream":false,"thinking":{"type":"enabled","budget_tokens":1024}}`), nil, []byte("data: "+chunk), &p2)
+	joined2 := joinBytes(out2)
+	if !bytes.Contains(joined2, []byte(`"type":"thinking"`)) {
+		t.Fatalf("expected thinking block when thinking requested, got %s", joined2)
+	}
+}
+
+// ConvertOpenAIResponseToClaudeNonStream: both the message.reasoning_content
+// path and the array-form "reasoning" content path must be gated.
+func TestNonStream_ReasoningContent_Gated(t *testing.T) {
+	body := `{"id":"c1","model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","reasoning_content":"hidden","content":"hi"}}]}`
+
+	off := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "", []byte(`{"stream":false}`), nil, []byte(body), nil)
+	if bytes.Contains(off, []byte(`"type":"thinking"`)) {
+		t.Fatalf("expected no thinking block (reasoning_content) when not requested, got %s", off)
+	}
+	if !bytes.Contains(off, []byte(`"type":"text"`)) {
+		t.Fatalf("expected text block to remain, got %s", off)
+	}
+
+	on := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "", []byte(`{"stream":false,"thinking":{"type":"enabled","budget_tokens":1024}}`), nil, []byte(body), nil)
+	if !bytes.Contains(on, []byte(`"type":"thinking"`)) {
+		t.Fatalf("expected thinking block (reasoning_content) when requested, got %s", on)
+	}
+}
+
+func TestNonStream_ArrayReasoning_Gated(t *testing.T) {
+	// content as an array containing a "reasoning" item.
+	body := `{"id":"c1","model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":[{"type":"reasoning","text":"hidden cot"},{"type":"text","text":"hi"}]}}]}`
+
+	off := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "", []byte(`{"stream":false}`), nil, []byte(body), nil)
+	if bytes.Contains(off, []byte(`"type":"thinking"`)) {
+		t.Fatalf("expected no thinking block (array reasoning) when not requested, got %s", off)
+	}
+	if !bytes.Contains(off, []byte(`"type":"text"`)) {
+		t.Fatalf("expected text block to remain, got %s", off)
+	}
+
+	on := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "", []byte(`{"stream":false,"thinking":{"type":"adaptive"}}`), nil, []byte(body), nil)
+	if !bytes.Contains(on, []byte(`"type":"thinking"`)) {
+		t.Fatalf("expected thinking block (array reasoning) when requested, got %s", on)
+	}
+}
+
+// Fallback signal: a translated request that carries a non-"none"
+// reasoning_effort (but no thinking field on the original) still enables thinking.
+func TestNonStream_ReasoningEffortFallback_Enables(t *testing.T) {
+	body := `{"id":"c1","model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","reasoning_content":"hidden","content":"hi"}}]}`
+	out := ConvertOpenAIResponseToClaudeNonStream(context.Background(), "", []byte(`{"stream":false}`), []byte(`{"reasoning_effort":"high"}`), []byte(body), nil)
+	if !bytes.Contains(out, []byte(`"type":"thinking"`)) {
+		t.Fatalf("expected thinking block via reasoning_effort fallback, got %s", out)
+	}
+}
+
+func joinBytes(chunks [][]byte) []byte {
+	var b bytes.Buffer
+	for _, c := range chunks {
+		b.Write(c)
+	}
+	return b.Bytes()
+}

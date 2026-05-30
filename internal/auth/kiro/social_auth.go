@@ -347,7 +347,7 @@ func (c *SocialAuthClient) LoginWithSocial(ctx context.Context, provider SocialP
 
 	// Try to extract email from JWT access token first
 	email := ExtractEmailFromJWT(tokenResp.AccessToken)
-	
+
 	// If no email in JWT, ask user for account label (only in interactive mode)
 	if email == "" && isInteractiveTerminal() {
 		fmt.Print("\n  Enter account label for file naming (optional, press Enter to skip): ")
@@ -388,7 +388,7 @@ func forceDefaultProtocolHandler() {
 	if runtime.GOOS != "linux" {
 		return // Non-Linux platforms use different handler mechanisms
 	}
-	
+
 	// Set our handler as default using xdg-mime
 	cmd := exec.Command("xdg-mime", "default", "kiro-oauth-handler.desktop", "x-scheme-handler/kiro")
 	if err := cmd.Run(); err != nil {

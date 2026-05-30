@@ -324,6 +324,35 @@ nonstream-keepalive-interval: 0
 #  stream-total-timeout: 0
 #  request-timeout: 120
 
+# Cursor Composer API key configuration.
+# Get your API key from cursor.com Settings > Integrations.
+# The key starts with "crsr_" and provides access to Composer 2.5 and other models.
+#cursor-api-key:
+#  - api-key: "crsr_..."          # your Cursor user API key (required)
+#    prefix: ""                    # optional: namespace models (e.g., "cursor/composer-2.5")
+#    proxy-url: ""                 # optional: per-account proxy override
+#    composer-client-tools-bridge-url: ""         # optional: override the Cursor Composer Client-Tools agent bridge (default http://127.0.0.1:9798)
+#    composer-client-tools-bridge-token: ""       # optional (multi-tenant): bridge auth token sent as X-Bridge-Auth, so
+#                                  # several Cursor keys can share ONE bridge (each isolated to its own SDK
+#                                  # platform + stateRoot). The SAME token MUST be set on BOTH sides — here
+#                                  # (or env CURSOR_AGENT_BRIDGE_TOKEN on the CLIProxy process) AND
+#                                  # CURSOR_AGENT_BRIDGE_TOKEN on the bridge process; a mismatch/omission is
+#                                  # a 401 on every request. Leave empty for the usual one-key-per-bridge setup.
+#    tool-aliases: {}              # optional: override how Cursor-emitted/generic tool names map to THIS
+#                                  # client's tools, e.g. {shell: RunCommand, read: OpenFile}. Wins over the
+#                                  # built-in table. Global default via env CURSOR_TOOL_ALIASES (JSON or
+#                                  # "from=to,from=to"); the per-key value wins on conflict.
+#    headers: {}                   # optional: extra HTTP headers
+#    models: []                    # optional: model name/alias overrides
+#    excluded-models: []           # optional: model IDs to exclude
+# DEFAULT (recommended): Cursor Composer Client-Tools — Cursor requests go to the cursor-agent-bridge.mjs sidecar (port 9798),
+# where the official @cursor/sdk owns ALL Cursor API I/O and every tool executes on YOUR client (Claude
+# Code, etc.). The proxy never calls Cursor's API directly. Start the bridge via scripts/railway_start.sh
+# or the Docker image; install with `cd sidecars/cursor-bridge && npm ci` (runs the SDK patcher).
+# FALLBACK (advanced, ToS-exposed): set env CURSOR_DIRECT=1 to use the direct AgentService path
+# (internal/runtime/executor/cursor_agent.go), which forges IDE/CLI identity headers against Cursor's
+# internal endpoints. It opts OUT of the Cursor Composer Client-Tools posture; a loud startup warning is logged.
+
 # Default headers for Codex OAuth model requests.
 # These are used only for file-backed/OAuth Codex requests when the client
 # does not send the header. `user-agent` applies to HTTP and websocket requests;

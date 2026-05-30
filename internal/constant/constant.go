@@ -30,4 +30,7 @@ const (
 
 	// Kiro represents the AWS CodeWhisperer (Kiro) provider identifier.
 	Kiro = "kiro"
+
+	// Cursor represents the Cursor Composer provider identifier.
+	Cursor = "cursor"
 )

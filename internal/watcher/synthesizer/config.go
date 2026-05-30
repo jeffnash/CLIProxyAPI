@@ -42,6 +42,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeVertexCompat(ctx)...)
 	// Chutes API keys
 	out = append(out, s.synthesizeChutesKeys(ctx)...)
+	// Cursor API keys
+	out = append(out, s.synthesizeCursorKeys(ctx)...)
 	// Passthru routes
 	out = append(out, s.synthesizePassthru(ctx)...)
 
@@ -670,6 +672,86 @@ func (s *ConfigSynthesizer) synthesizeKiroKeys(ctx *SynthesisContext) []*coreaut
 			a.Metadata["refresh_token"] = refreshToken
 		}
 
+		out = append(out, a)
+	}
+	return out
+}
+
+// synthesizeCursorKeys creates Auth entries for Cursor Composer API keys.
+func (s *ConfigSynthesizer) synthesizeCursorKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	log.Debugf("synthesizeCursorKeys: CursorKey count = %d", len(cfg.CursorKey))
+
+	out := make([]*coreauth.Auth, 0, len(cfg.CursorKey))
+	for i := range cfg.CursorKey {
+		entry := cfg.CursorKey[i]
+		key := strings.TrimSpace(entry.APIKey)
+		if key == "" {
+			continue
+		}
+		prefix := strings.TrimSpace(entry.Prefix)
+		proxyURL := strings.TrimSpace(entry.ProxyURL)
+		id, token := idGen.Next("cursor:apikey", key, "")
+		attrs := map[string]string{
+			"source":  fmt.Sprintf("config:cursor[%s]", token),
+			"api_key": key,
+		}
+		if entry.ChatEndpoint != "" {
+			attrs["chat_endpoint"] = strings.TrimSpace(entry.ChatEndpoint)
+		}
+		if entry.BackendBaseURL != "" {
+			attrs["backend_base_url"] = strings.TrimSpace(entry.BackendBaseURL)
+		}
+		if entry.ComposerBridgeURL != "" {
+			attrs["composer_client_tools_bridge_url"] = strings.TrimSpace(entry.ComposerBridgeURL)
+		}
+		if entry.ComposerBridgeToken != "" {
+			attrs["composer_client_tools_bridge_token"] = strings.TrimSpace(entry.ComposerBridgeToken)
+		}
+		if len(entry.ToolAliases) > 0 {
+			if b, errJSON := json.Marshal(entry.ToolAliases); errJSON == nil {
+				attrs["tool_aliases"] = string(b)
+			}
+		}
+		// Cursor model aliases (cursor-api-key[].models): record a hash so a config change re-registers
+		// /v1/models, and a client-facing alias -> upstream-name map the executor uses to route requests.
+		if hash := diff.ComputeCursorModelsHash(entry.Models); hash != "" {
+			attrs["models_hash"] = hash
+		}
+		if len(entry.Models) > 0 {
+			aliasMap := make(map[string]string, len(entry.Models))
+			for _, m := range entry.Models {
+				alias := strings.TrimSpace(m.Alias)
+				name := strings.TrimSpace(m.Name)
+				if alias != "" && name != "" && !strings.EqualFold(alias, name) {
+					aliasMap[alias] = name
+				}
+			}
+			if len(aliasMap) > 0 {
+				if b, errJSON := json.Marshal(aliasMap); errJSON == nil {
+					attrs["model_aliases"] = string(b)
+				}
+			}
+		}
+		addConfigHeadersToAttrs(entry.Headers, attrs)
+		a := &coreauth.Auth{
+			ID:         id,
+			Provider:   "cursor",
+			Label:      "cursor-apikey",
+			Prefix:     prefix,
+			Status:     coreauth.StatusActive,
+			ProxyURL:   proxyURL,
+			Attributes: attrs,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
+		if len(a.Metadata) == 0 {
+			a.Metadata = nil
+		}
 		out = append(out, a)
 	}
 	return out

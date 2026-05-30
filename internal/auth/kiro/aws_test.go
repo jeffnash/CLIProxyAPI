@@ -151,11 +151,11 @@ func TestSanitizeEmailForFilename(t *testing.T) {
 // createTestJWT creates a test JWT token with the given claims
 func createTestJWT(claims map[string]any) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
-	
+
 	payloadBytes, _ := json.Marshal(claims)
 	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
-	
+
 	signature := base64.RawURLEncoding.EncodeToString([]byte("fake-signature"))
-	
+
 	return header + "." + payload + "." + signature
 }

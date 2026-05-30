@@ -15,11 +15,11 @@ func TestApplyCoreAuthAddOrUpdate_PreservesRuntimeState(t *testing.T) {
 
 	// Register an auth with runtime state
 	existingAuth := &coreauth.Auth{
-		ID:            "test-auth-1",
-		Provider:      "iflow",
-		Status:        coreauth.StatusError,
-		StatusMessage: "upstream error",
-		Unavailable:   true,
+		ID:             "test-auth-1",
+		Provider:       "iflow",
+		Status:         coreauth.StatusError,
+		StatusMessage:  "upstream error",
+		Unavailable:    true,
 		NextRetryAfter: time.Now().Add(5 * time.Minute),
 		LastError: &coreauth.Error{
 			Code:    "upstream_error",

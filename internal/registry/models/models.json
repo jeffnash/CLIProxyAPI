@@ -2480,7 +2480,6 @@
         ]
       }
     }
-
   ],
   "xai": [
     {
@@ -2491,7 +2490,7 @@
       "type": "xai",
       "display_name": "Grok Build 0.1",
       "name": "grok-build-0.1",
-      "description": "Grok Build 0.1 is xAI’s fast coding model trained specifically for agentic software engineering workflows.",
+      "description": "Grok Build 0.1 is xAI\u2019s fast coding model trained specifically for agentic software engineering workflows.",
       "context_length": 256000,
       "max_completion_tokens": 256000,
       "thinking": {
@@ -2605,6 +2604,52 @@
           "high"
         ]
       }
+    }
+  ],
+  "cursor": [
+    {
+      "id": "composer-2.5",
+      "object": "model",
+      "created": 1779148800,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Composer 2.5",
+      "description": "Cursor Composer 2.5 - Default coding model",
+      "context_length": 200000,
+      "max_completion_tokens": 64000
+    },
+    {
+      "id": "composer-2.5-fast",
+      "object": "model",
+      "created": 1779148800,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Composer 2.5 Fast",
+      "description": "Cursor Composer 2.5 Fast - Faster variant",
+      "context_length": 200000,
+      "max_completion_tokens": 64000
+    },
+    {
+      "id": "composer-2",
+      "object": "model",
+      "created": 1779148800,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Composer 2",
+      "description": "Cursor Composer 2 - Previous generation",
+      "context_length": 200000,
+      "max_completion_tokens": 64000
+    },
+    {
+      "id": "composer-latest",
+      "object": "model",
+      "created": 1779148800,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Composer Latest",
+      "description": "Cursor Composer latest alias (currently 2.5)",
+      "context_length": 200000,
+      "max_completion_tokens": 64000
     }
   ]
 }

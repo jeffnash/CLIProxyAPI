@@ -421,3 +421,221 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_FunctionCallDoneA
 		t.Fatalf("unexpected completed function_call order: %v", completedOrder)
 	}
 }
+
+// M24 / C-KEEPALIVE: a stray empty-content delta arriving AFTER the stream envelope is open must render to
+// ZERO wire bytes (no malformed response.* event). The composer Responses keepalive is emitted as a raw
+// SSE comment directly by the executor, bypassing this translator; this converter stays a no-op for the
+// ping path. This test locks in that the empty delta produces nothing once started, so a future change that
+// accidentally emits a synthetic (mis-sequenced) progress event here is caught.
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_EmptyDeltaAfterStartIsZeroBytes(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"gpt-5.4"}`)
+	var param any
+
+	// First chunk carries real content and opens the envelope.
+	first := `data: {"id":"resp_ka","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}`
+	if out := ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(first), &param); len(out) == 0 {
+		t.Fatalf("expected the first content chunk to open the envelope, got 0 events")
+	}
+
+	// A subsequent empty-content delta (the shape the executor would route through if it did not emit the
+	// comment directly) must render to zero wire bytes.
+	emptyDelta := `data: {"id":"resp_ka","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":null}]}`
+	out := ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(emptyDelta), &param)
+	if len(out) != 0 {
+		t.Fatalf("expected an empty-delta chunk after start to render zero bytes, got %d events: %q", len(out), out)
+	}
+}
+
+// M24 / C-KEEPALIVE: even when an empty-content delta is the FIRST chunk (e.g. the executor routes a ping
+// through before any real content), the translator must open the envelope with WELL-FORMED events
+// (response.created + response.in_progress) and never emit garbage. This guarantees no malformed response.*
+// event can reach the client from the keepalive path.
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_EmptyDeltaFirstChunkOpensEnvelopeCleanly(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"gpt-5.4"}`)
+	var param any
+
+	emptyDelta := `data: {"id":"resp_ka_first","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":null}]}`
+	out := ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(emptyDelta), &param)
+	if len(out) != 2 {
+		t.Fatalf("expected exactly 2 envelope events (created + in_progress), got %d: %q", len(out), out)
+	}
+	evCreated, dataCreated := parseOpenAIResponsesSSEEvent(t, out[0])
+	if evCreated != "response.created" {
+		t.Fatalf("expected first event response.created, got %q", evCreated)
+	}
+	if dataCreated.Get("response.id").String() != "resp_ka_first" {
+		t.Fatalf("response.created carried wrong id: %q", dataCreated.Get("response.id").String())
+	}
+	evInProg, _ := parseOpenAIResponsesSSEEvent(t, out[1])
+	if evInProg != "response.in_progress" {
+		t.Fatalf("expected second event response.in_progress, got %q", evInProg)
+	}
+
+	// A second empty delta after the envelope is open is now a pure no-op.
+	if more := ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(emptyDelta), &param); len(more) != 0 {
+		t.Fatalf("expected no further events on a second empty delta, got %d: %q", len(more), more)
+	}
+}
+
+// H16 / C-RESPID: the streaming converter must surface response.id verbatim from the inbound OpenAI chunk
+// id across response.created, response.in_progress and response.completed. The composer executor keys its
+// outward-response-id -> sessionID map on this exact id, so any rename/synthesis here would strand
+// previous_response_id follow-ups (a fresh session would be minted and context lost).
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_ResponseIDMatchesUpstreamIDVerbatim(t *testing.T) {
+	t.Parallel()
+
+	const upstreamID = "resp_composer_fixed_id_0123456789"
+	request := []byte(`{"model":"gpt-5.4"}`)
+	in := []string{
+		`data: {"id":"` + upstreamID + `","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+		`data: {"id":"` + upstreamID + `","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`,
+		`data: [DONE]`,
+	}
+
+	var param any
+	seen := map[string]bool{}
+	for _, line := range in {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			ev, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			switch ev {
+			case "response.created", "response.in_progress", "response.completed":
+				seen[ev] = true
+				if got := data.Get("response.id").String(); got != upstreamID {
+					t.Fatalf("%s carried response.id %q, want verbatim %q", ev, got, upstreamID)
+				}
+			}
+		}
+	}
+	for _, ev := range []string{"response.created", "response.in_progress", "response.completed"} {
+		if !seen[ev] {
+			t.Fatalf("expected to observe %s event", ev)
+		}
+	}
+}
+
+// H16 / C-RESPID (non-stream): when the upstream OpenAI body carries an id, the non-stream converter must
+// surface it verbatim as response.id (the composer path always supplies a fixed id and records it). The
+// synthesize fallback is reserved for a buggy upstream that omitted id entirely.
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_ResponseIDMatchesUpstreamIDVerbatim(t *testing.T) {
+	t.Parallel()
+
+	const upstreamID = "resp_composer_nonstream_id_abcdef"
+	request := []byte(`{"model":"gpt-5.4"}`)
+	body := []byte(`{"id":"` + upstreamID + `","object":"chat.completion","created":1773896263,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+
+	out := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, body, nil)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("non-stream output is not valid JSON: %q", out)
+	}
+	if got := gjson.GetBytes(out, "id").String(); got != upstreamID {
+		t.Fatalf("non-stream response.id was %q, want verbatim %q", got, upstreamID)
+	}
+
+	// Sanity: with no upstream id, the converter synthesizes a resp_ id rather than emitting an empty one.
+	bodyNoID := []byte(`{"object":"chat.completion","created":1773896263,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
+	outNoID := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, bodyNoID, nil)
+	synthID := gjson.GetBytes(outNoID, "id").String()
+	if synthID == "" {
+		t.Fatalf("expected a synthesized id when upstream omitted id, got empty")
+	}
+	if !strings.HasPrefix(synthID, "resp_") {
+		t.Fatalf("expected synthesized id to be prefixed resp_, got %q", synthID)
+	}
+}
+
+// ADD-38 (stream false-success guard): when the upstream OpenAI chunk omits id entirely, the streaming
+// converter must NOT emit an empty response.id. An empty id would round-trip as previous_response_id:"" and
+// collapse the executor's composerResponseSessions key to the degenerate tenant+"\x00resp:" pre-image,
+// silently routing every id-less conversation to one bridge session (a wrong-session continuation). It must
+// instead synthesize a unique resp_ id (symmetric with the non-stream fallback). Composer never hits this
+// branch because executeComposerStream always supplies a fixed composerResponseID(); this protects a buggy
+// non-composer upstream that emitted no id.
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_StreamMissingUpstreamIDSynthesizesNonEmpty(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"gpt-5.4"}`)
+	in := []string{
+		`data: {"object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+		`data: {"object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`,
+		`data: [DONE]`,
+	}
+
+	var param any
+	seenID := ""
+	for _, line := range in {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			ev, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			switch ev {
+			case "response.created", "response.in_progress", "response.completed":
+				id := data.Get("response.id").String()
+				if id == "" {
+					t.Fatalf("%s emitted an EMPTY response.id (ADD-38 false-success hazard)", ev)
+				}
+				if !strings.HasPrefix(id, "resp_") {
+					t.Fatalf("%s synthesized response.id %q, want resp_ prefix", ev, id)
+				}
+				if seenID == "" {
+					seenID = id
+				} else if id != seenID {
+					// All envelope events for one streamed response must carry the SAME id, otherwise a
+					// follow-up could record/look up under a different key than the client observed.
+					t.Fatalf("%s carried response.id %q, inconsistent with earlier %q", ev, id, seenID)
+				}
+			}
+		}
+	}
+	if seenID == "" {
+		t.Fatalf("expected at least one response.* envelope event carrying a synthesized id")
+	}
+}
+
+// ADD-65 / C-RESPID (continuation echo): a Responses follow-up that carries previous_response_id must have
+// that value echoed back onto response.previous_response_id in BOTH the streaming response.completed event
+// and the non-stream body. Clients chaining state via previous_response_id rely on this echo; dropping it
+// would break the continuation contract that lets the executor resume the durable agent (the response-id ->
+// sessionID lookup is keyed on the id the client passes back here as previous_response_id).
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_PreviousResponseIDEchoedForContinuation(t *testing.T) {
+	t.Parallel()
+
+	const priorID = "resp_composer_prior_turn_0123456789"
+	// The translated OpenAI request preserves previous_response_id at top level (the request translator does
+	// not strip it); buildResponsesCompletedEvent / the non-stream builder read it from requestRawJSON.
+	request := []byte(`{"model":"gpt-5.4","previous_response_id":"` + priorID + `"}`)
+
+	// Streaming path: assert the echo lands on response.completed.
+	in := []string{
+		`data: {"id":"resp_followup_stream","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"continuing"},"finish_reason":null}]}`,
+		`data: {"id":"resp_followup_stream","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`,
+		`data: [DONE]`,
+	}
+	var param any
+	sawCompleted := false
+	for _, line := range in {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			ev, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			if ev == "response.completed" {
+				sawCompleted = true
+				if got := data.Get("response.previous_response_id").String(); got != priorID {
+					t.Fatalf("stream response.completed previous_response_id was %q, want %q", got, priorID)
+				}
+			}
+		}
+	}
+	if !sawCompleted {
+		t.Fatalf("expected a response.completed event in the stream")
+	}
+
+	// Non-stream path: assert the echo lands on the top-level response body.
+	body := []byte(`{"id":"resp_followup_nonstream","object":"chat.completion","created":1773896263,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"continuing"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+	out := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, body, nil)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("non-stream output is not valid JSON: %q", out)
+	}
+	if got := gjson.GetBytes(out, "previous_response_id").String(); got != priorID {
+		t.Fatalf("non-stream previous_response_id was %q, want %q", got, priorID)
+	}
+}
