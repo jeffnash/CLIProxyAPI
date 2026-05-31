@@ -66,18 +66,8 @@ func resolveToolSpec(name string, tools []cursorToolDefinition, overrides map[st
 	//    it intentionally bypasses the ambiguity guard — but it still prefers an exact target-name match before
 	//    a normalized one so a normalized collision in the inventory cannot silently flip the override target.
 	if len(overrides) > 0 {
-		if target := overrides[normalizeToolName(name)]; target != "" {
-			for i := range tools {
-				if tools[i].Name == target {
-					return &tools[i]
-				}
-			}
-			nt := normalizeToolName(target)
-			for i := range tools {
-				if normalizeToolName(tools[i].Name) == nt {
-					return &tools[i]
-				}
-			}
+		if spec := resolveToolOverride(name, overrides, tools); spec != nil {
+			return spec
 		}
 	}
 	// 1. Exact match (at most one — client tool names are unique).
@@ -107,6 +97,26 @@ func resolveToolSpec(name string, tools []cursorToolDefinition, overrides map[st
 		}
 		if idx == ambiguousToolMatch {
 			return nil
+		}
+	}
+	return nil
+}
+
+// resolveToolOverride maps an emitted tool name via operator-configured overrides.
+func resolveToolOverride(name string, overrides map[string]string, tools []cursorToolDefinition) *cursorToolDefinition {
+	target := overrides[normalizeToolName(name)]
+	if target == "" {
+		return nil
+	}
+	for i := range tools {
+		if tools[i].Name == target {
+			return &tools[i]
+		}
+	}
+	nt := normalizeToolName(target)
+	for i := range tools {
+		if normalizeToolName(tools[i].Name) == nt {
+			return &tools[i]
 		}
 	}
 	return nil
@@ -316,7 +326,7 @@ func normalizeToolArguments(args map[string]any, tool *cursorToolDefinition) map
 	// itself a REAL declared property must be preserved verbatim — only true
 	// single-wrapper envelopes (keys absent from the schema) are unwrapped.
 	var params map[string]any
-	if err := jsonUnmarshalString(tool.Parameters, &params); err != nil {
+	if err := json.Unmarshal([]byte(tool.Parameters), &params); err != nil {
 		// Unparseable schema: fall back to the old unconditional expansion so
 		// genuinely nested envelopes still flatten.
 		return expandToolArguments(args, nil)
@@ -580,10 +590,6 @@ func firstMatchingProperty(candidates, properties []string, normalizedProps map[
 		}
 	}
 	return ""
-}
-
-func jsonUnmarshalString(s string, v any) error {
-	return json.Unmarshal([]byte(s), v)
 }
 
 // --- Workspace mutation heuristic (openai.ts:768-806) ---
