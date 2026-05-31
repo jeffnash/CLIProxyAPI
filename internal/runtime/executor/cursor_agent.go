@@ -238,7 +238,6 @@ func encodeAgentRunFrame(payload *cursorChatPayload, model, conversationID, mess
 		protoStringField(2, messageID),
 	)
 	conversationHistory := buildAgentConversationHistory(payload, lastUserIdx)
-	_ = buildAgentConversationState // canonical recall path is turns[] blobs (TODO)
 	userMessageAction := protoMessage(
 		protoMessageField(1, userMessage),         // user_message
 		protoMessageField(7, conversationHistory), // conversation_history
@@ -260,52 +259,6 @@ func encodeAgentRunFrame(payload *cursorChatPayload, model, conversationID, mess
 	return protoMessage(protoMessageField(1, agentRunRequest)) // AgentClientMessage{run_request=1}
 }
 
-// buildAgentConversationState builds a ConversationStateStructure carrying the
-// prior turns so the model has conversational recall. conversation_history (in
-// the action) is transmitted but NOT consulted by the model for context; the
-// model reads conversation_state. We seed root_prompt_messages_json (field 1,
-// repeated bytes) with {"role","content"} JSON — the server's own stored
-// representation (observed in kv_server_message frames). Excludes the current
-// user turn (which travels as user_message).
-func buildAgentConversationState(payload *cursorChatPayload, excludeUserIdx int) []byte {
-	var entries [][]byte
-	add := func(role, content string) {
-		obj, err := json.Marshal(map[string]string{"role": role, "content": content})
-		if err == nil {
-			entries = append(entries, protoBytesField(1, obj)) // root_prompt_messages_json
-		}
-	}
-	systemPrompt := strings.TrimSpace(payload.SystemPrompt)
-	if systemPrompt != "" {
-		add("system", systemPrompt)
-	}
-	for i, turn := range payload.Turns {
-		if i == excludeUserIdx {
-			continue
-		}
-		switch turn.Role {
-		case "user":
-			add("user", turn.Text)
-		case "assistant":
-			content := turn.Text
-			for _, call := range turn.Calls {
-				content += fmt.Sprintf("\n[called %s(%s)]", call.Name, call.Arguments)
-				if payload.lookupToolResult != nil {
-					if r, ok := payload.lookupToolResult(call.ID); ok && r.Content != "" {
-						add("assistant", content)
-						add("tool", fmt.Sprintf("%s result: %s", call.Name, r.Content))
-						content = ""
-					}
-				}
-			}
-			if content != "" {
-				add("assistant", content)
-			}
-		}
-	}
-	return protoMessage(entries...) // ConversationStateStructure{root_prompt_messages_json repeated}
-}
-
 // agentJSONSchemaStruct converts a tool's JSON-schema parameter string into
 // the wire encoding for McpToolDefinition.input_schema. Returns nil to omit
 // the field (the model can still call the tool from its name/description).
@@ -323,6 +276,18 @@ func hasEarlierUserTurn(turns []cursorTurn, excludeIdx int) bool {
 		}
 	}
 	return false
+}
+
+// wrapAgentExecClientMessage builds AgentClientMessage{exec_client_message: ExecClientMessage{...}}.
+func wrapAgentExecClientMessage(id uint64, execID string, execFields ...[]byte) []byte {
+	fields := execFields
+	if id != 0 {
+		fields = append([][]byte{protoVarintField(1, int(id))}, fields...)
+	}
+	if execID != "" {
+		fields = append(fields, protoStringField(15, execID))
+	}
+	return protoMessage(protoMessageField(2, protoMessage(fields...)))
 }
 
 // buildAgentRequestContextReply builds the AgentClientMessage{exec_client_message:
@@ -350,15 +315,7 @@ func buildAgentRequestContextReply(id uint64, execID string) []byte {
 	)
 	success := protoMessage(protoMessageField(1, reqCtx)) // RequestContextSuccess{request_context=1}
 	result := protoMessage(protoMessageField(1, success)) // RequestContextResult{success=1}
-	fields := [][]byte{protoMessageField(10, result)}     // ExecClientMessage{request_context_result=10}
-	if id != 0 {
-		fields = append([][]byte{protoVarintField(1, int(id))}, fields...)
-	}
-	if execID != "" {
-		fields = append(fields, protoStringField(15, execID))
-	}
-	execClient := protoMessage(fields...)
-	return protoMessage(protoMessageField(2, execClient)) // AgentClientMessage{exec_client_message=2}
+	return wrapAgentExecClientMessage(id, execID, protoMessageField(10, result))
 }
 
 // parseAgentExecRequest extracts id(1), exec_id(15) and the oneof arg field
@@ -573,14 +530,7 @@ func streamCursorAgentEvents(ctx context.Context, cfg *config.Config, auth *clip
 // minimal empty success on the mirrored result field.
 func buildAgentGenericExecReply(id uint64, execID string, argField int) []byte {
 	result := protoMessage(protoMessageField(1, protoMessage())) // {success=1: {}}
-	fields := [][]byte{protoMessageField(argField, result)}
-	if id != 0 {
-		fields = append([][]byte{protoVarintField(1, int(id))}, fields...)
-	}
-	if execID != "" {
-		fields = append(fields, protoStringField(15, execID))
-	}
-	return protoMessage(protoMessageField(2, protoMessage(fields...)))
+	return wrapAgentExecClientMessage(id, execID, protoMessageField(argField, result))
 }
 
 // decodeAgentInteractionUpdate maps an InteractionUpdate oneof into cursorEvents.

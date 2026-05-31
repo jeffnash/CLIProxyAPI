@@ -151,6 +151,7 @@ const COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES = envInt("CURSOR_AGENT_LIVE_TOOL_RESUL
 const COMPOSER_SCHEMA_INLINE_MAX_BYTES = envInt("CURSOR_AGENT_SCHEMA_INLINE_MAX_BYTES", 8 * 1024, { min: 1 });
 // Shared SSE response headers (unbuffered, so keepalives reach the wire end-to-end).
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "X-Accel-Buffering": "no" };
+function formatSseData(obj) { return `data: ${JSON.stringify(obj)}\n\n`; }
 // Multi-tenant (opt-in): when CURSOR_AGENT_BRIDGE_TOKEN is set, X-Bridge-Auth gates access and the
 // Authorization bearer is the PER-USER Cursor key (each gets an isolated SDK platform + stateRoot).
 // When unset (default), behavior is single-tenant: the bearer must equal CURSOR_API_KEY and is the key.
@@ -794,9 +795,7 @@ function blockedNativeResult(cas, s, cwd = "/workspace") {
 function caseOf(t) { return t && t.message && t.message.case; }
 
 // ---- the patched bundle calls these (deny-by-default; never native) ----
-globalThis.__CC_EXEC_U = function (n, e, s, t) {
-  const cas = caseOf(t);
-  const store = als.getStore();
+function unaryExecPreflight(cas, store) {
   if (cas === "requestContextArgs") return Promise.resolve(headlessRequestContext(store && store.session));
   // The runtime's MCP-inventory query: answer with the session's advertised tools as connected loopback
   // servers so the backend exposes them to the model (see headlessMcpState). Without this the model gets zero
@@ -812,6 +811,14 @@ globalThis.__CC_EXEC_U = function (n, e, s, t) {
     dbg("__CC_EXEC_U typed-unavailable result (H17)", "session=" + (store && store.session && store.session.id), "cas=" + cas);
     return Promise.resolve(typedUnavailableResult(cas));
   }
+  return null;
+}
+
+globalThis.__CC_EXEC_U = function (n, e, s, t) {
+  const cas = caseOf(t);
+  const store = als.getStore();
+  const preflight = unaryExecPreflight(cas, store);
+  if (preflight) return preflight;
   if (cas === "mcpArgs") {
     if (!store) return Promise.reject(new Error("[bridge] mcpArgs outside a session"));
     return store.session.dispatchMcp(s);
@@ -1056,6 +1063,8 @@ class Session {
 
   touch() { this.lastActivity = nowMs(); }
   hasQueuedWaiters() { return this.waiters > 0; }
+  resetSeedState() { this.seeded = false; this.seededSystem = ""; this.historyFingerprint = null; }
+  async finishRotationCancel() { await this.cancel(); this.done = false; }
   // whenLogicalDone resolves when the CURRENT live run terminates. If no run is live, it resolves now. This
   // is the queue's admission signal and is deliberately DISTINCT from settle(): settle() also fires when a
   // turn pauses for client tools while the SDK run stays alive awaiting tool_results, so admitting the next
@@ -1070,8 +1079,7 @@ class Session {
   sse(obj) {
     if (!this.activeRes) return false;
     if (this.writeFailed) return false;
-    const payload = `data: ${JSON.stringify(obj)}\n\n`;
-    return this.writePayload(payload);
+    return this.writePayload(formatSseData(obj));
   }
   // writePayload performs the low-level write with backpressure handling. true = accepted or queued; false =
   // failed (threw) or overflowed. On a `false` return from res.write() (backpressure) we queue the payload and
@@ -1633,14 +1641,11 @@ class Session {
     const oldAgentId = this.agentId;
     this.recoveryEpoch++;
     this.agentId = this.composeAgentId(); // first rotation -> <id>_r2 (+ _mN if a model change also happened)
-    this.seeded = false;          // re-seed the bounded history into the fresh agent
-    this.seededSystem = "";
-    this.historyFingerprint = null;
+    this.resetSeedState();
     dbg("rotateDurableAgent CONVERSATION_TOO_LONG -> rotate durable agentId (no resumeAgent(old))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId);
     // Tear down the poisoned live agent/run WITHOUT deleting the session. cancel() nulls agent/run + rejects
     // pendings; we re-open the session for the next turn afterwards (done=false) so it can re-seed.
-    await this.cancel();
-    this.done = false;            // cancel() set done=true; the next turn must be able to drive a fresh send
+    await this.finishRotationCancel();
   }
   // rotateForModelChange (ADD-62) rotates the durable agent when the conversation switches model. The old
   // durable agent is bound to the OLD model (resumeAgent would silently keep answering from it), so we
@@ -1661,12 +1666,9 @@ class Session {
       dbg("rotateForModelChange cap reached -> keep last agentId, force re-seed", "session=" + this.id, "agentId=" + this.agentId, "epoch=" + this.modelEpoch);
     }
     this.model = newModel;
-    this.seeded = false;          // force re-seed the client's history into the fresh agent under the new model
-    this.seededSystem = "";
-    this.historyFingerprint = null;
+    this.resetSeedState();
     dbg("rotateForModelChange -> rotate durable agentId for new model (no resumeAgent(old model's agent))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId, "oldModel=" + oldModel, "newModel=" + newModel);
-    await this.cancel();          // tear down the old-model live agent/run (nulls agent/run, rejects pendings)
-    this.done = false;            // cancel() set done=true; the next turn must drive a fresh send
+    await this.finishRotationCancel();
   }
   // rotateForKeyChange (ADD-79) rotates the durable agent when the upstream Cursor key changes for the SAME
   // external session (a tenant rotates their key, an admin rebinds it, or multi-tenant forwards a different
@@ -1689,12 +1691,9 @@ class Session {
       dbg("rotateForKeyChange cap reached -> keep last agentId, force re-seed", "session=" + this.id, "agentId=" + this.agentId, "epoch=" + this.keyEpoch);
     }
     this.cursorKey = newKey || API_KEY; // run subsequent turns on the NEW key's platform/account
-    this.seeded = false;          // force re-seed the client's history into the fresh agent under the new key
-    this.seededSystem = "";
-    this.historyFingerprint = null;
+    this.resetSeedState();
     dbg("rotateForKeyChange -> rotate durable agentId for new key (no resumeAgent(old key's agent))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId);
-    await this.cancel();          // tear down the old-key live agent/run (nulls agent/run, rejects pendings)
-    this.done = false;            // cancel() set done=true; the next turn must drive a fresh send
+    await this.finishRotationCancel();
   }
   rejectAllPending(why) {
     for (const [, p] of this.pending) { try { p.reject(new Error(`[bridge] ${why}`)); } catch {} }
@@ -2553,10 +2552,7 @@ async function handleTurn(req, res, body, cursorKey) {
     // Refresh the advertised tool set + client env from the continuation body too (the Go executor sends
     // `tools`/`clientEnv` on every turn): a C1 fresh-send or C2 re-seed driven from this continuation must
     // advertise the current tools, and a re-seed needs the current env. Harmless when unchanged.
-    if (Array.isArray(body.tools)) {
-      session.advertise = dedupeByName(body.tools.map((t) => ({ name: t.name, toolName: t.name, providerIdentifier: "cc", description: t.description || "", inputSchema: augmentUnderspecifiedToolSchema(t.name, t.inputSchema || t.parameters || undefined) })));
-    }
-    if (body.clientEnv && typeof body.clientEnv === "object") session.clientEnv = body.clientEnv;
+    refreshSessionFromBody(session, body);
     // Comment 3: tool_results ingestion is NEVER 409'd. Resolving pending tool calls is just promise
     // resolution — safe regardless of any open response. Only the model-output STREAM is single-owner: if a
     // continuation response is already streaming this session's run (concurrent/incremental tool_results),
@@ -2605,17 +2601,17 @@ async function handleTurn(req, res, body, cursorKey) {
       try {
         if (unknown.length > 0) {
           // Foreign/never-issued id: a genuine desync. Surface it (do NOT fake success) so the client sees it.
-          res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "error", error: `unknown tool_call_id ${unknown[0]}: not issued by this session` })}\n\n`);
+          res.write(formatSseData({ type: "turn_end", stop_reason: "error", error: `unknown tool_call_id ${unknown[0]}: not issued by this session` }));
         } else if (userPayloadLost) {
           // matched===0 + new user payload: the continuation's userText/images could not be delivered to the
           // in-flight run (it predates this payload, and the concurrent path cannot fresh-send). Error so the
           // client retries the instruction on a fresh turn — never a clean end_turn that drops it (finding #6).
           dbg("handleTurn CONCURRENT user payload could not reach the live run -> error ack so the client retries (finding#6)", sessionId, "userText=" + hasUserText, "userImages=" + hasUserImages);
-          res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "error", error: "a new user instruction or image arrived while a run was streaming and could not be delivered to it; resend it as a new turn" })}\n\n`);
+          res.write(formatSseData({ type: "turn_end", stop_reason: "error", error: "a new user instruction or image arrived while a run was streaming and could not be delivered to it; resend it as a new turn" }));
         } else {
           // matched>0 -> resolved into the live run; matched===0 with no user payload -> all ids were benign
           // re-acks (already-resolved/duplicate). Either way a clean ack is correct (the run is live).
-          res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "end_turn" })}\n\n`);
+          res.write(formatSseData({ type: "turn_end", stop_reason: "end_turn" }));
         }
         res.write("data: [DONE]\n\n"); res.end();
       } catch { /* socket closed */ }
@@ -2652,10 +2648,7 @@ async function handleTurn(req, res, body, cursorKey) {
       await session.rotateForKeyChange(cursorKey);
     }
   }
-  if (Array.isArray(body.tools)) {
-    session.advertise = dedupeByName(body.tools.map((t) => ({ name: t.name, toolName: t.name, providerIdentifier: "cc", description: t.description || "", inputSchema: augmentUnderspecifiedToolSchema(t.name, t.inputSchema || t.parameters || undefined) })));
-  }
-  if (body.clientEnv && typeof body.clientEnv === "object") session.clientEnv = body.clientEnv;
+  refreshSessionFromBody(session, body);
   // ADD-37 (extended by ADD-106): a plain NEW-USER turn that arrives while a run is still LIVE on this session
   // is an INTERRUPTION, not a concurrent generation — the user is steering, so the old run must yield to the
   // new instruction. Two sub-cases, both now interrupted:
@@ -2710,7 +2703,7 @@ function enqueueTurn(req, res, session, model, input, constraints) {
   session.waiters++;
   session.touch();
   res.writeHead(200, SSE_HEADERS);
-  const ka = setInterval(() => { try { res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`); } catch {} }, SSE_KEEPALIVE_MS);
+  const ka = setInterval(() => { try { res.write(formatSseData({ type: "ping" })); } catch {} }, SSE_KEEPALIVE_MS);
   if (ka.unref) ka.unref();
   let canceled = false;
   // BR3: a queued waiter that disconnects must free its slot + session IMMEDIATELY, not after the 10-min
@@ -2742,7 +2735,7 @@ function enqueueTurn(req, res, session, model, input, constraints) {
     res.off("close", onWaitClose);
     session.waiters = Math.max(0, session.waiters - 1);
     if (canceled) {
-      try { res.write(`data: ${JSON.stringify({ type: "turn_end", stop_reason: "end_turn" })}\n\n`); res.write("data: [DONE]\n\n"); res.end(); } catch {}
+      try { res.write(formatSseData({ type: "turn_end", stop_reason: "end_turn" })); res.write("data: [DONE]\n\n"); res.end(); } catch {}
       return;
     }
     try {
@@ -2756,6 +2749,16 @@ function dedupeByName(tools) {
   const seen = new Set(); const out = [];
   for (const t of tools) { const k = t.toolName || t.name; if (k && !seen.has(k)) { seen.add(k); out.push(t); } }
   return out;
+}
+
+function refreshSessionFromBody(session, body) {
+  if (Array.isArray(body.tools)) {
+    session.advertise = dedupeByName(body.tools.map((t) => ({
+      name: t.name, toolName: t.name, providerIdentifier: "cc", description: t.description || "",
+      inputSchema: augmentUnderspecifiedToolSchema(t.name, t.inputSchema || t.parameters || undefined),
+    })));
+  }
+  if (body.clientEnv && typeof body.clientEnv === "object") session.clientEnv = body.clientEnv;
 }
 
 async function runTurn(req, res, session, model, input, constraints = {}) {
@@ -2790,7 +2793,7 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
     // ADD-98: register the disconnect handler BEFORE the first write so a close during/just-before the initial
     // write is observed and the finally still clears activeRes.
     res.on("close", onClose);
-    res.write(`data: ${JSON.stringify({ type: "session", sessionId: session.id })}\n\n`);
+    res.write(formatSseData({ type: "session", sessionId: session.id }));
     // #14: deliver any text/reasoning the run produced BETWEEN turns (while no response was open), in order,
     // before this turn's own new output — so a resuming turn never starts on a gap of dropped catch-up text.
     session.flushPendingDeltas();
@@ -2798,7 +2801,7 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
     // Typed keepalive (NOT a ": keepalive" comment — the Go executor forwards only "data: " lines, so a
     // comment never reaches the client). The executor renders {"type":"ping"} into the inbound schema's
     // keepalive frame, resetting the client's idle watchdog during long/quiet turns.
-    keepalive = setInterval(() => { try { res.write(`data: ${JSON.stringify({ type: "ping" })}\n\n`); } catch {} }, SSE_KEEPALIVE_MS);
+    keepalive = setInterval(() => { try { res.write(formatSseData({ type: "ping" })); } catch {} }, SSE_KEEPALIVE_MS);
     if (keepalive.unref) keepalive.unref();
 
   // driveUserSend performs a model-visible user send on the EXISTING no-timeout agent: it seeds (prepends

@@ -912,6 +912,18 @@ func sha256Sum(s string) []byte {
 	return sum[:]
 }
 
+// composerRandHex returns n random bytes as lowercase hex (session/response/correlation ids).
+func composerRandHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// composerStableBaseSessionID is the content-pure stable session id for a tenant+key+conversation.
+func composerStableBaseSessionID(tenant, apiKey, convID string) string {
+	return "sess_" + hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, convID)))[:32]
+}
+
 // lineageHeadDigest is the growth-stable HMAC head used as a lineage key component (§1.2). It reuses the
 // SAME head window as composerHistoryFingerprint (the first composerHistoryFingerprintHeadMessages non-system
 // messages, role + a 256-rune text prefix each) so a fork's head is identical across its own turns. fp16 is
@@ -945,6 +957,18 @@ func lineageHeadDigest(tenant, fp16 string, messages []gjson.Result) string {
 		}
 	}
 	return hex.EncodeToString(mac.Sum(nil))[:32]
+}
+
+// lineageHeadDigestFromMessages folds composerHistoryFingerprint + lineageHeadDigest for a message array.
+func lineageHeadDigestFromMessages(tenant string, messages []gjson.Result) string {
+	return lineageHeadDigest(tenant, composerHistoryFingerprint(messages), messages)
+}
+
+// lineageForkKeys returns the head digest and opener fingerprint for fork routing on messages.
+func lineageForkKeys(tenant string, messages []gjson.Result) (headDigest, openerFP string) {
+	headDigest = lineageHeadDigestFromMessages(tenant, messages)
+	openerFP = lineageOpenerFingerprint(messages)
+	return
 }
 
 // forkSessionID derives a fork's stable sess_ id from baseSid + the fork's growth-stable head (§1.3c). slot 0
@@ -1052,37 +1076,6 @@ func (s *composerLineageStore) deleteTenantIfEmptyLocked(tenant string, to *tena
 	if len(to.byBaseHead) == 0 {
 		s.tenants.Delete(tenant)
 	}
-}
-
-// get re-resolves the co-resident lineage for an EXACT (baseSid, headDigest) and touches it (LRU + lastUsed).
-// This is the step-(a) re-attach: a multi-turn fork's growth-stable head lands back on its own entry. It also
-// matches a one-behind priorHead so a re-key in flight (compaction bridge) still re-attaches a racing turn.
-func (s *composerLineageStore) get(tenant, baseSid, headDigest string) *lineageEntry {
-	if tenant == "" {
-		return nil
-	}
-	to := s.tenantLineageFor(tenant)
-	to.mu.Lock()
-	defer to.mu.Unlock()
-	s.expireLocked(to)
-	defer s.deleteTenantIfEmptyLocked(tenant, to)
-	key := lineageKey(baseSid, headDigest)
-	if e, ok := to.byBaseHead[key]; ok {
-		e.lastUsed = s.nowFn()
-		to.moveToTail(key)
-		return e
-	}
-	// Retry/duplicate tolerance: a turn that re-presents the one-behind head (e.g. arriving during a re-key)
-	// still resolves to the same lineage by priorHead.
-	for _, k := range to.order {
-		e := to.byBaseHead[k]
-		if e != nil && e.priorHead == headDigest && strings.HasPrefix(k, baseSid+"\x00") {
-			e.lastUsed = s.nowFn()
-			to.moveToTail(k)
-			return e
-		}
-	}
-	return nil
 }
 
 // putForkSlotted records a FIRST-CLASS fork under (baseSid, headDigest), resolving the identical-clone
@@ -1879,13 +1872,12 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 					}
 				}
 				if id := stableConversationID(opts); id != "" {
-					baseSid := "sess_" + hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, id)))[:32]
+					baseSid := composerStableBaseSessionID(tenant, apiKey, id)
 					// Comment 1: an ambiguous tool-call id (owned by 2+ sessions) can be disambiguated by the lineage
 					// opener bridge when the continuation's opener matches exactly ONE recorded fork — try that before
 					// collapsing to the bare stable-conv hash.
 					contMsgs := gjson.GetBytes(oai, "messages").Array()
-					headDigest := lineageHeadDigest(tenant, composerHistoryFingerprint(contMsgs), contMsgs)
-					openerFP := lineageOpenerFingerprint(contMsgs)
+					headDigest, openerFP := lineageForkKeys(tenant, contMsgs)
 					if sid := composerLineage.resolveForkByOpener(tenant, baseSid, headDigest, openerFP); sid != "" {
 						composerDebugf("[composer] deriveSessionID BRANCH=continuation(ambiguous id disambiguated by opener bridge) -> sessionID=%s", sid)
 						return sid, nil
@@ -1918,15 +1910,14 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 		// No recorded emitter (bridge restart / TTL eviction / cross-instance): fall back to the stable conv
 		// id so the bridge can re-seed.
 		if id := stableConversationID(opts); id != "" {
-			baseSid := "sess_" + hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, id)))[:32]
+			baseSid := composerStableBaseSessionID(tenant, apiKey, id)
 			// Comment 1: re-attach the continuation to ITS fork via the lineage opener bridge (handles a fork
 			// whose head grew past its recorded 1-message opener after ownership was lost). On miss:
 			// Comment 2: a FULL-REPLAY continuation (carries a user opener) RESEEDS to a fork-namespaced id
 			// (never baseSid) so a returning fork cannot collapse onto the parent — the bridge re-seeds from the
 			// replayed history. A THIN continuation (no replayed opener) keeps the baseSid fallback.
 			contMsgs := gjson.GetBytes(oai, "messages").Array()
-			headDigest := lineageHeadDigest(tenant, composerHistoryFingerprint(contMsgs), contMsgs)
-			openerFP := lineageOpenerFingerprint(contMsgs)
+			headDigest, openerFP := lineageForkKeys(tenant, contMsgs)
 			if sid := composerLineage.resolveForkByOpener(tenant, baseSid, headDigest, openerFP); sid != "" {
 				composerDebugf("[composer] deriveSessionID BRANCH=continuation(lineage opener-bridge) convID=%q -> sessionID=%s", id, sid)
 				return sid, nil
@@ -1965,7 +1956,7 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 		// keep the same external session id so the BRIDGE can detect the change (session.model != requested)
 		// and rotate/re-seed the durable agent. Folding the model into this hash would fork routing and orphan
 		// in-flight continuations. ADD-79: the KEY fingerprint IS folded (a key rotation should re-route).
-		baseSid := "sess_" + hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, id)))[:32]
+		baseSid := composerStableBaseSessionID(tenant, apiKey, id)
 		// identity-finalplan §1.3: a SUBORDINATE same-tenant splitter. baseSid stays ID-authoritative; the
 		// lineage registry only splits distinct divergent contexts that share this id (subagents reusing the
 		// parent metadata.user_id, parallel fan-out, branches) into per-lineage sessions and re-resolves each
@@ -2024,7 +2015,7 @@ func deriveComposerSessionIDLive(auth *cliproxyauth.Auth, apiKey string, oai []b
 			// case — sequential resumes — always re-claims the pinned session and preserves its durable context;
 			// only the rare concurrent-resume race degrades to a fresh (context-light) fork instead of a 500.
 			messages := gjson.GetBytes(oai, "messages").Array()
-			headDigest := lineageHeadDigest(tenant, composerHistoryFingerprint(messages), messages)
+			headDigest := lineageHeadDigestFromMessages(tenant, messages)
 			finalSid, owner := composerAcquireOrFork(tenant, sid, sid, headDigest)
 			return finalSid, owner, nil
 		}
@@ -2035,9 +2026,9 @@ func deriveComposerSessionIDLive(auth *cliproxyauth.Auth, apiKey string, oai []b
 	}
 	// Branch-4 new-user stable turn: claim its session or fork onto a free sibling. baseSid+headDigest match
 	// what deriveComposerSessionID just used, so the fork slots off the lineage entry it recorded.
-	baseSid := "sess_" + hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, id)))[:32]
+	baseSid := composerStableBaseSessionID(tenant, apiKey, id)
 	messages := gjson.GetBytes(oai, "messages").Array()
-	headDigest := lineageHeadDigest(tenant, composerHistoryFingerprint(messages), messages)
+	headDigest := lineageHeadDigestFromMessages(tenant, messages)
 	finalSid, owner := composerAcquireOrFork(tenant, sid, baseSid, headDigest)
 	if finalSid != sid {
 		composerDebugf("[composer] deriveSessionID concurrency-fork convID=%q content-sid=%s busy -> sessionID=%s", id, sid, finalSid)
@@ -2047,9 +2038,7 @@ func deriveComposerSessionIDLive(auth *cliproxyauth.Auth, apiKey string, oai []b
 
 // mintComposerSessionID returns a fresh random session id (never derived from request content).
 func mintComposerSessionID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return "sess_" + hex.EncodeToString(b[:])
+	return "sess_" + composerRandHex(16)
 }
 
 // isComposerUtilityOneShot reports whether this request is a non-agentic, single-shot completion that
@@ -2890,9 +2879,32 @@ func truncateCursorToolResultLive(text string) string {
 	return text[:cut] + fmt.Sprintf("\n[tool result truncated by proxy: kept %d/%d bytes]", cut, total)
 }
 
-// composerToolResults is the back-compat entry (no hint): branches (a)/(b) only. See composerToolResultsHinted.
-func composerToolResults(messages []gjson.Result) (results []map[string]any, trailing string, ok bool) {
-	return composerToolResultsHinted(messages, composerContinuationHint{})
+// composerToolResultEntry builds one bridge wire tool-result entry from a role:tool message (ADD-95/EX3/C5).
+func composerToolResultEntry(m gjson.Result) map[string]any {
+	// ADD-95: cap the LIVE tool-result content (authoritative executor-side bound; the bridge has a slightly
+	// higher backstop cap so this one normally wins). A huge live result would otherwise flow unbounded into
+	// Cursor and trip ERROR_CONVERSATION_TOO_LONG with no graceful marker.
+	r := map[string]any{"toolCallId": m.Get("tool_call_id").String(), "content": truncateCursorToolResultLive(cursorMessageText(m))}
+	// C5: a client tool the inbound marked failed must reach the model as a failure, not a clean success.
+	if m.Get("is_error").Bool() {
+		r["isError"] = true
+	}
+	// EX3: an image embedded inside a tool_result must not be dropped.
+	if imgs := extractComposerImages(m); len(imgs) > 0 {
+		r["images"] = imgs
+	}
+	return r
+}
+
+// lastAssistantToolCallsIdx returns the index of the last assistant message bearing tool_calls, or -1.
+func lastAssistantToolCallsIdx(messages []gjson.Result) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Get("role").String() == "assistant" && m.Get("tool_calls").Exists() {
+			return i
+		}
+	}
+	return -1
 }
 
 // composerToolResultsHinted classifies the incoming turn: a trailing tool message means the client returned
@@ -2909,34 +2921,10 @@ func composerToolResults(messages []gjson.Result) (results []map[string]any, tra
 //     previous_response_id is present OR a trailing tool_call_id is owned for this tenant), so an ordinary
 //     conversation that merely ends [tool, user] is not misread.
 func composerToolResultsHinted(messages []gjson.Result, hint composerContinuationHint) (results []map[string]any, trailing string, ok bool) {
-	toolRes := func(m gjson.Result) map[string]any {
-		// ADD-95: cap the LIVE tool-result content (authoritative executor-side bound; the bridge has a slightly
-		// higher backstop cap so this one normally wins). A huge live result would otherwise flow unbounded into
-		// Cursor and trip ERROR_CONVERSATION_TOO_LONG with no graceful marker.
-		r := map[string]any{"toolCallId": m.Get("tool_call_id").String(), "content": truncateCursorToolResultLive(cursorMessageText(m))}
-		// C5: a client tool the inbound marked failed must reach the model as a failure, not a clean success.
-		// The oai role:tool message uses snake_case is_error; the bridge wire entry uses camelCase isError.
-		if m.Get("is_error").Bool() {
-			r["isError"] = true
-		}
-		// EX3: an image embedded inside a tool_result (role:tool content array) must not be dropped. The Cursor
-		// tool-result protobuf cannot carry images directly, so the bridge folds these into a follow-up send.
-		if imgs := extractComposerImages(m); len(imgs) > 0 {
-			r["images"] = imgs
-		}
-		return r
-	}
 	// (a) Preferred: the role:tool results that follow the LAST assistant message bearing tool_calls, as long
 	// as the model has not yet replied to them (no later assistant). This is what makes a MIXED turn (tool
 	// results + trailing user text) classify as a continuation instead of a fresh user turn (Comment 4).
-	lastTC := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		m := messages[i]
-		if m.Get("role").String() == "assistant" && m.Get("tool_calls").Exists() {
-			lastTC = i
-			break
-		}
-	}
+	lastTC := lastAssistantToolCallsIdx(messages)
 	if lastTC >= 0 {
 		var sb strings.Builder
 		res := make([]map[string]any, 0)
@@ -2944,7 +2932,7 @@ func composerToolResultsHinted(messages []gjson.Result, hint composerContinuatio
 		for i := lastTC + 1; i < len(messages); i++ {
 			switch messages[i].Get("role").String() {
 			case "tool":
-				res = append(res, toolRes(messages[i]))
+				res = append(res, composerToolResultEntry(messages[i]))
 			case "user":
 				if t := cursorMessageText(messages[i]); t != "" {
 					if sb.Len() > 0 {
@@ -2968,7 +2956,7 @@ func composerToolResultsHinted(messages []gjson.Result, hint composerContinuatio
 			if messages[i].Get("role").String() != "tool" {
 				break
 			}
-			res = append([]map[string]any{toolRes(messages[i])}, res...)
+			res = append([]map[string]any{composerToolResultEntry(messages[i])}, res...)
 		}
 		if len(res) > 0 {
 			return res, "", true
@@ -3002,7 +2990,7 @@ func composerToolResultsHinted(messages []gjson.Result, hint composerContinuatio
 			switch messages[i].Get("role").String() {
 			case "tool":
 				seenTool = true
-				tr := toolRes(messages[i])
+				tr := composerToolResultEntry(messages[i])
 				res = append(res, tr)
 				if hint.ownsToolCallID != nil {
 					if id, _ := tr["toolCallId"].(string); strings.TrimSpace(id) != "" && hint.ownsToolCallID(id) {
@@ -3390,6 +3378,30 @@ func mapComposerToolCall(name string, input gjson.Result, defs []cursorToolDefin
 	return spec.Name, string(b)
 }
 
+// composerAdvertisePrep holds advertise/toolChoice/constraints after allow-list and tool_choice gating.
+type composerAdvertisePrep struct {
+	advertise   []map[string]any
+	toolChoice  string
+	constraints map[string]any
+}
+
+// prepareComposerAdvertise builds the advertise set and response constraints for a /agent/turn body.
+func prepareComposerAdvertise(oai []byte, defs []cursorToolDefinition, toolAliases map[string]string) composerAdvertisePrep {
+	advertise := composerAdvertise(oai)
+	toolChoice := resolveComposerToolChoice(oai, defs, toolAliases)
+	constraints := composerConstraints(oai)
+	if toolChoice == "none" {
+		advertise = nil
+	} else {
+		var unsupportedTools bool
+		advertise, unsupportedTools = applyComposerAllowedTools(advertise, oai, defs, toolAliases)
+		if unsupportedTools {
+			constraints = appendUnsupportedGuarantee(constraints, "allowed_tools requested but none of the allowed tools are available (no tools advertised; do not call any tool)")
+		}
+	}
+	return composerAdvertisePrep{advertise: advertise, toolChoice: toolChoice, constraints: constraints}
+}
+
 // composerTurnBody builds the JSON body for a POST /agent/turn. constraints carries the enforced
 // response constraints (responseFormat/stop/maxTokens) as explicit top-level fields; the bridge
 // converts them (and toolChoice) into model instructions and tool-advertisement gating.
@@ -3440,7 +3452,7 @@ func composerReseedLostContinuation(tenant, apiKey string, oai []byte, opts clip
 	// a stable conversation id is present, else a fresh random mint (stateless client).
 	var reseedSid string
 	if id := stableConversationID(opts); id != "" {
-		baseSid := "sess_" + hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, id)))[:32]
+		baseSid := composerStableBaseSessionID(tenant, apiKey, id)
 		headDigest := lineageHeadDigest(tenant, composerHistoryFingerprint(contMsgs), contMsgs)
 		openerFP := lineageOpenerFingerprint(contMsgs)
 		reseedSid = composerLineage.reseedLostFork(tenant, baseSid, headDigest, openerFP)
@@ -3464,9 +3476,7 @@ func composerReseedLostContinuation(tenant, apiKey string, oai []byte, opts clip
 // composerResponseID returns a unique id per request. Clients that correlate streaming chunks to their
 // non-stream counterpart (or dedupe by id) must not see the same id across unrelated responses.
 func composerResponseID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return "chatcmpl-composer-" + hex.EncodeToString(b[:])
+	return "chatcmpl-composer-" + composerRandHex(16)
 }
 
 // oaiChunk wraps an OpenAI chat.completion.chunk choice delta as an SSE "data:" line.
@@ -3621,26 +3631,8 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 	// H16/#21 (C-RESPID): the outward-response-id -> sessionID mapping is recorded AFTER the bridge accepts a
 	// valid SSE stream (below), NOT here — a dispatch that fails (transport / non-2xx / non-SSE) must not leave a
 	// phantom mapping that a later previous_response_id would then resume onto a session that never ran.
-	advertise := composerAdvertise(oai)
-	toolChoice := resolveComposerToolChoice(oai, defs, toolAliases)
-	constraints := composerConstraints(oai)
-	if toolChoice == "none" {
-		// tool_choice=none: advertise nothing so the model cannot call CLIENT tools. H08 (best-effort): the
-		// `none`/`specific:` token is also forwarded to the bridge (composerTurnBody.toolChoice), which gates
-		// the model's NATIVE built-ins via constraintInstructions + by rejecting native exec cases. Native
-		// Cursor tools are SDK built-ins not in the advertise set, so they cannot be structurally
-		// un-advertised here — the gating of native tools is best-effort and owned by the bridge.
-		advertise = nil
-	} else {
-		// H07/H22: restrict the advertise set to the client's allowed_tools allow-list (if any). Never widen
-		// silently — an empty intersection is surfaced as explicit-unsupported (advertise nothing) so the
-		// model is told the requested tools are unavailable rather than handed unrelated ones.
-		var unsupportedTools bool
-		advertise, unsupportedTools = applyComposerAllowedTools(advertise, oai, defs, toolAliases)
-		if unsupportedTools {
-			constraints = appendUnsupportedGuarantee(constraints, "allowed_tools requested but none of the allowed tools are available (no tools advertised; do not call any tool)")
-		}
-	}
+	prep := prepareComposerAdvertise(oai, defs, toolAliases)
+	advertise, toolChoice, constraints := prep.advertise, prep.toolChoice, prep.constraints
 	// ADD-65: build input with the SAME tenant continuation hint deriveComposerSessionID used, so a Responses
 	// server-side-chained [..., tool, user] turn is sent as tool_results (with userText) — not a fresh user turn
 	// behind a paused run.
@@ -4379,9 +4371,7 @@ func sanitizeBridgeBody(b []byte) string {
 // server-side diagnostic (M25): the client sees only the id, the operator finds the full (redacted) detail
 // in the logs under the same id.
 func composerCorrelationID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
+	return composerRandHex(8)
 }
 
 // postAgentTurn POSTs a turn body to the bridge's /agent/turn endpoint (SSE response).

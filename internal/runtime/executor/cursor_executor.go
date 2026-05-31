@@ -49,6 +49,49 @@ func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
 // Identifier returns the executor identifier.
 func (e *CursorExecutor) Identifier() string { return "cursor" }
 
+// cursorDirectSession holds shared state for the CURSOR_DIRECT=1 AgentService path.
+type cursorDirectSession struct {
+	accessToken    string
+	chatPayload    *cursorChatPayload
+	model          string
+	requestID      string
+	conversationID string
+	messageID      string
+	mode           string
+}
+
+// prepareCursorDirect exchanges the API key, normalizes the request to OpenAI shape, and parses the chat payload.
+func (e *CursorExecutor) prepareCursorDirect(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, req *cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*cursorDirectSession, error) {
+	proxyClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	accessToken, err := cursorauth.ExchangeCursorApiKey(ctx, apiKey, proxyClient)
+	if err != nil {
+		return nil, fmt.Errorf("cursor executor: failed to exchange API key: %w", err)
+	}
+
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("openai")
+	originalBytes := len(req.Payload)
+	originalMsgs := countJSONMessages(req.Payload)
+	req.Payload = sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
+	log.Infof("cursor e2e (xlate): from=%s to=openai original=%d bytes msgs=%d translated=%d bytes msgs=%d",
+		from, originalBytes, originalMsgs, len(req.Payload), countJSONMessages(req.Payload))
+
+	chatPayload := parseCursorChatPayload(*req)
+	if errMsg := cursorImageErrorMessage(chatPayload); errMsg != "" {
+		return nil, fmt.Errorf("cursor executor: %s", errMsg)
+	}
+
+	return &cursorDirectSession{
+		accessToken:    accessToken,
+		chatPayload:    chatPayload,
+		model:          resolveCursorModelName(resolveCursorModelAlias(auth, req.Model)),
+		requestID:      generateUUID(),
+		conversationID: cursorConversationID(*req),
+		messageID:      generateUUID(),
+		mode:           cursorChatMode(*req),
+	}, nil
+}
+
 // isCursorSidecarBackend reports whether requests should be proxied to a
 // local Node SDK bridge instead of going direct to api2.cursor.sh over
 // Connect/protobuf.
@@ -72,49 +115,18 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		return e.executeComposer(ctx, auth, apiKey, req, opts)
 	}
 
-	// CURSOR_DIRECT=1 gated fallback: the AgentService direct path (cursor_agent.go). The legacy
-	// OpenAI sidecar (executeSidecar) is retired — the safe path is Cursor Composer Client-Tools above.
-	proxyClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	accessToken, err := cursorauth.ExchangeCursorApiKey(ctx, apiKey, proxyClient)
-	if err != nil {
-		return resp, fmt.Errorf("cursor executor: failed to exchange API key: %w", err)
+	// CURSOR_DIRECT=1 gated fallback: AgentService direct path (cursor_agent.go).
+	sess, errPrep := e.prepareCursorDirect(ctx, auth, apiKey, &req, opts, false)
+	if errPrep != nil {
+		return resp, errPrep
 	}
 
-	// Cursor's protobuf encoder works only on OpenAI-shape requests
-	// (messages[], tools[] with type:function, etc.). The sidecar path
-	// translates via sdktranslator.TranslateRequest before sending — the
-	// direct protobuf path must do the same, otherwise an Anthropic-shaped
-	// request from Claude Code loses its tools[] and the model falls back
-	// to Cursor's built-in tool inventory.
-	from := opts.SourceFormat
-	to := sdktranslator.FromString("openai")
-	originalBytes := len(req.Payload)
-	originalMsgs := countJSONMessages(req.Payload)
-	translatedPayload := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
-	req.Payload = translatedPayload
-	log.Infof("cursor e2e (xlate): from=%s to=openai original=%d bytes msgs=%d translated=%d bytes msgs=%d",
-		from, originalBytes, originalMsgs, len(translatedPayload), countJSONMessages(translatedPayload))
-
-	chatPayload := parseCursorChatPayload(req)
-	if errMsg := cursorImageErrorMessage(chatPayload); errMsg != "" {
-		return resp, fmt.Errorf("cursor executor: %s", errMsg)
-	}
-	model := resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
-	requestID := generateUUID()
-	conversationID := cursorConversationID(req)
-	messageID := generateUUID()
-
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), sess.model, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	// AgentService (agent.v1.AgentService/Run) is the primary path: it accepts
-	// the full structured conversation history (multi-turn, no flattening, no
-	// ERROR_CONVERSATION_TOO_LONG) and natively advertises CC's tools. See
-	// cursor_agent.go.
-	mode := cursorChatMode(req)
 	log.Infof("cursor agent (exec): req=%s model=%s mode=%s turns=%d tools=%d images=%d",
-		requestID, model, mode, len(chatPayload.Turns), len(chatPayload.Tools), len(chatPayload.Images))
-	events := streamCursorAgentEvents(ctx, e.cfg, auth, accessToken, model, chatPayload, conversationID, messageID, nil)
+		sess.requestID, sess.model, sess.mode, len(sess.chatPayload.Turns), len(sess.chatPayload.Tools), len(sess.chatPayload.Images))
+	events := streamCursorAgentEvents(ctx, e.cfg, auth, sess.accessToken, sess.model, sess.chatPayload, sess.conversationID, sess.messageID, nil)
 	text, thinking, toolCalls, reportedUsage, err := aggregateCursorEvents(events)
 	if err != nil {
 		return resp, fmt.Errorf("cursor executor: failed to read stream: %w", err)
@@ -136,7 +148,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		for i, tc := range toolCalls {
 			id := tc.ID
 			if id == "" {
-				id = fmt.Sprintf("call_%s_%d", requestID[:8], i)
+				id = fmt.Sprintf("call_%s_%d", sess.requestID[:8], i)
 			}
 			args := tc.Arguments
 			if args == "" {
@@ -163,7 +175,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		"id":      responseID,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
-		"model":   model,
+		"model":   sess.model,
 		"choices": []map[string]any{
 			{
 				"index":         0,
@@ -171,21 +183,14 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 				"finish_reason": finishReason,
 			},
 		},
-		"usage": firstNonNilUsage(reportedUsage, estimateUsage(len(chatPayload.Prompt), completionChars)),
+		"usage": firstNonNilUsage(reportedUsage, estimateUsage(len(sess.chatPayload.Prompt), completionChars)),
 	}
 	payload, err := json.Marshal(openaiResp)
 	if err != nil {
 		return resp, fmt.Errorf("cursor executor: failed to marshal response: %w", err)
 	}
 
-	inputTokens := int64(estimateTokens(len(chatPayload.Prompt)))
-	outputTokens := int64(estimateTokens(completionChars))
-	if pt, ok := reportedUsage["prompt_tokens"]; ok {
-		inputTokens = pt
-	}
-	if ct, ok := reportedUsage["completion_tokens"]; ok {
-		outputTokens = ct
-	}
+	inputTokens, outputTokens := cursorUsageTokens(len(sess.chatPayload.Prompt), completionChars, reportedUsage)
 	reporter.Publish(ctx, usage.Detail{
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
@@ -206,43 +211,21 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return e.executeComposerStream(ctx, auth, apiKey, req, opts)
 	}
 
-	// CURSOR_DIRECT=1 gated fallback: AgentService direct path. The legacy OpenAI sidecar is retired.
-	proxyClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	accessToken, err := cursorauth.ExchangeCursorApiKey(ctx, apiKey, proxyClient)
-	if err != nil {
-		return nil, fmt.Errorf("cursor executor: failed to exchange API key: %w", err)
+	// CURSOR_DIRECT=1 gated fallback: AgentService direct path.
+	sess, errPrep := e.prepareCursorDirect(ctx, auth, apiKey, &req, opts, true)
+	if errPrep != nil {
+		return nil, errPrep
 	}
 
-	// Normalize the request to OpenAI format before the protobuf encoder
-	// touches it (see Execute() for rationale).
-	streamFrom := opts.SourceFormat
-	streamTo := sdktranslator.FromString("openai")
-	originalBytes := len(req.Payload)
-	originalMsgs := countJSONMessages(req.Payload)
-	req.Payload = sdktranslator.TranslateRequest(streamFrom, streamTo, req.Model, bytes.Clone(req.Payload), true)
-	log.Infof("cursor e2e (xlate): from=%s to=openai original=%d bytes msgs=%d translated=%d bytes msgs=%d",
-		streamFrom, originalBytes, originalMsgs, len(req.Payload), countJSONMessages(req.Payload))
-
-	chatPayload := parseCursorChatPayload(req)
-	if errMsg := cursorImageErrorMessage(chatPayload); errMsg != "" {
-		return nil, fmt.Errorf("cursor executor: %s", errMsg)
-	}
-	model := resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
-	requestID := generateUUID()
-	conversationID := cursorConversationID(req)
-	messageID := generateUUID()
-
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), sess.model, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
-	// AgentService is the primary streaming path (see cursor_agent.go).
-	mode := cursorChatMode(req)
 	log.Infof("cursor agent (stream): req=%s model=%s mode=%s turns=%d tools=%d images=%d",
-		requestID, model, mode, len(chatPayload.Turns), len(chatPayload.Tools), len(chatPayload.Images))
+		sess.requestID, sess.model, sess.mode, len(sess.chatPayload.Turns), len(sess.chatPayload.Tools), len(sess.chatPayload.Images))
 
 	responseID := fmt.Sprintf("chatcmpl-%s", generateUUID()[:24])
 	out := make(chan cliproxyexecutor.StreamChunk)
-	promptLen := len(chatPayload.Prompt)
+	promptLen := len(sess.chatPayload.Prompt)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
@@ -251,7 +234,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// already-OpenAI payload double-translates and corrupts the request (Comment 4). Apply only model/stream.
 	// (from/to are still needed below for the RESPONSE stream translation back to the client format.)
 	translatedReq := bytes.Clone(req.Payload)
-	translatedReq, _ = sjson.SetBytes(translatedReq, "model", model)
+	translatedReq, _ = sjson.SetBytes(translatedReq, "model", sess.model)
 	translatedReq, _ = sjson.SetBytes(translatedReq, "stream", true)
 
 	go func() {
@@ -263,12 +246,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var translatorState any
 
 		diag := &cursorStreamDiag{
-			RequestID:     requestID,
-			Model:         model,
-			Mode:          mode,
-			PromptChars:   len(chatPayload.Prompt),
-			ToolDefs:      len(chatPayload.Tools),
-			ImageCount:    len(chatPayload.Images),
+			RequestID:     sess.requestID,
+			Model:         sess.model,
+			Mode:          sess.mode,
+			PromptChars:   len(sess.chatPayload.Prompt),
+			ToolDefs:      len(sess.chatPayload.Tools),
+			ImageCount:    len(sess.chatPayload.Images),
 			StallThreshMs: 3000, // warn on any 3s+ gap (CC spinner-disappear threshold)
 		}
 
@@ -297,7 +280,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 
 		// Initial chunk with role.
-		if !emit(buildCursorOpenAIChunk(responseID, model, map[string]any{"role": "assistant"}, "")) {
+		if !emit(buildCursorOpenAIChunk(responseID, sess.model, map[string]any{"role": "assistant"}, "")) {
 			return
 		}
 
@@ -305,22 +288,22 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		reportedUsage := map[string]int64{}
 		hadToolCall := false
 
-		emitter := newCursorToolCallEmitter(requestID)
-		for event := range streamCursorAgentEvents(ctx, e.cfg, auth, accessToken, model, chatPayload, conversationID, messageID, diag) {
+		emitter := newCursorToolCallEmitter(sess.requestID)
+		for event := range streamCursorAgentEvents(ctx, e.cfg, auth, sess.accessToken, sess.model, sess.chatPayload, sess.conversationID, sess.messageID, diag) {
 			switch event.Type {
 			case "text":
 				if event.Text == "" {
 					continue
 				}
 				totalText += event.Text
-				if !emit(buildCursorOpenAIChunk(responseID, model, map[string]any{"content": event.Text}, "")) {
+				if !emit(buildCursorOpenAIChunk(responseID, sess.model, map[string]any{"content": event.Text}, "")) {
 					return
 				}
 			case "thinking":
 				if event.Text == "" {
 					continue
 				}
-				if !emit(buildCursorOpenAIChunk(responseID, model, map[string]any{"reasoning_content": event.Text}, "")) {
+				if !emit(buildCursorOpenAIChunk(responseID, sess.model, map[string]any{"reasoning_content": event.Text}, "")) {
 					return
 				}
 			case "tool_call_partial", "tool_call":
@@ -328,17 +311,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if !ok {
 					continue
 				}
-				if !emit(buildCursorOpenAIChunk(responseID, model, delta, "")) {
+				if !emit(buildCursorOpenAIChunk(responseID, sess.model, delta, "")) {
 					return
 				}
 				hadToolCall = true
 			case "usage":
-				if event.PromptTokens > 0 {
-					reportedUsage["prompt_tokens"] = event.PromptTokens
-				}
-				if event.CompletionTokens > 0 {
-					reportedUsage["completion_tokens"] = event.CompletionTokens
-				}
+				mergeCursorStreamUsage(reportedUsage, event)
 			case "error":
 				out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("cursor stream error: %s", event.Text)}
 				return
@@ -349,20 +327,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if hadToolCall {
 			finishReason = "tool_calls"
 		}
-		emit(buildCursorOpenAIChunk(responseID, model, map[string]any{}, finishReason))
+		emit(buildCursorOpenAIChunk(responseID, sess.model, map[string]any{}, finishReason))
 
-		emit(buildCursorOpenAIUsageChunk(responseID, model, firstNonNilUsage(reportedUsage, estimateUsage(promptLen, len(totalText)))))
+		emit(buildCursorOpenAIUsageChunk(responseID, sess.model, firstNonNilUsage(reportedUsage, estimateUsage(promptLen, len(totalText)))))
 
 		emit([]byte("data: [DONE]"))
 
-		promptToks := int64(estimateTokens(promptLen))
-		completionToks := int64(estimateTokens(len(totalText)))
-		if pt, ok := reportedUsage["prompt_tokens"]; ok {
-			promptToks = pt
-		}
-		if ct, ok := reportedUsage["completion_tokens"]; ok {
-			completionToks = ct
-		}
+		promptToks, completionToks := cursorUsageTokens(promptLen, len(totalText), reportedUsage)
 		reporter.Publish(ctx, usage.Detail{
 			InputTokens:  promptToks,
 			OutputTokens: completionToks,
@@ -1125,6 +1096,16 @@ func (e *cursorToolCallEmitter) OnEvent(event cursorEvent) (map[string]any, bool
 	return map[string]any{"tool_calls": []map[string]any{call}}, true
 }
 
+// mergeCursorStreamUsage folds a usage event into the reported token map.
+func mergeCursorStreamUsage(reported map[string]int64, event cursorEvent) {
+	if event.PromptTokens > 0 {
+		reported["prompt_tokens"] = event.PromptTokens
+	}
+	if event.CompletionTokens > 0 {
+		reported["completion_tokens"] = event.CompletionTokens
+	}
+}
+
 // extractCursorEndStreamUsage pulls prompt/completion token counts out of the
 // JSON metadata that Connect's end-stream frame can carry. Returns nil when
 // no recognizable usage block is present. Accepts the common shapes
@@ -1229,9 +1210,6 @@ func encodeConnectFrame(payload []byte) []byte {
 	copy(frame[5:], payload)
 	return frame
 }
-
-// cursorMaxConnectFrameBytes is the maximum allowed Connect frame size (64 MiB).
-const cursorMaxConnectFrameBytes = 64 << 20
 
 // cursorStreamDiag carries per-request context used in failure logs so a single
 // error line tells you what was sent, how much we already received, and which
@@ -1364,12 +1342,7 @@ func aggregateCursorEvents(events <-chan cursorEvent) (string, string, []cursorA
 		case "tool_call_partial":
 			upsertToolCall(event.CallID, event.Name, "")
 		case "usage":
-			if event.PromptTokens > 0 {
-				reported["prompt_tokens"] = event.PromptTokens
-			}
-			if event.CompletionTokens > 0 {
-				reported["completion_tokens"] = event.CompletionTokens
-			}
+			mergeCursorStreamUsage(reported, event)
 		case "error":
 			return result.String(), thinkingB.String(), toolCalls, reported, fmt.Errorf("%s", event.Text)
 		}
@@ -1395,19 +1368,12 @@ type cursorTextSanitizer struct {
 	buf strings.Builder
 }
 
-// cursorControlTokens lists the canonical (unpadded) marker forms used only
-// for the prefix-buffering check. The runtime *match* uses
+// cursorControlTokenCandidates lists canonical and whitespace-padded marker
+// forms for the prefix-buffering check. The runtime *match* uses
 // composerControlTokenPattern, which is regex-based and accepts whitespace
 // between bracket and pipe (e.g. `< | final | >`) plus full-width variants.
-// We list both ASCII and full-width unpadded forms here so any prefix of
-// them is held back across chunk boundaries.
-var cursorControlTokens = []string{"</think>", "<|final|>", "<｜final｜>"}
-
-// cursorControlTokenCandidates extends cursorControlTokens with common
-// whitespace-padded forms so the prefix-buffering check holds back partial
-// markers like `< | final` arriving across chunks. Without these, a regex
-// match in Push could find a padded marker mid-buffer but a chunk-split
-// prefix wouldn't be held back to wait for the rest.
+// Padded variants are included so a chunk-split prefix like `< | final` is
+// held back until the next chunk completes the marker.
 var cursorControlTokenCandidates = []string{
 	"</think>",
 	"<|final|>",
@@ -1706,46 +1672,59 @@ func buildCursorPrompt(req cliproxyexecutor.Request) string {
 // Mirrors the prelude portion of buildCursorPromptWithTools (lines preceding
 // the message iteration loop). The mode-toggle env var CURSOR_PROMPT_MODE is
 // honored here too so A/B testing still works.
+
+// cursorPromptDirectiveLines returns system-directive and tool-inventory lines
+// for the given CURSOR_PROMPT_MODE. Mirrors the switch in buildCursorFramingPrelude.
+func cursorPromptDirectiveLines(hasTools, agentMode bool, mode string, tools []cursorToolDefinition, choice cursorToolChoice) []string {
+	switch mode {
+	case "bare":
+		return nil
+	case "noinventory":
+		return []string{cursorAgentSystemDirective}
+	default:
+		var lines []string
+		switch {
+		case hasTools:
+			lines = append(lines, cursorToolSystemDirective)
+		case agentMode:
+			lines = append(lines, cursorAgentSystemDirective)
+		default:
+			lines = append(lines, cursorSystemDirective)
+		}
+		if hasTools {
+			lines = append(lines, "", renderCursorToolInventory(tools, choice))
+		}
+		return lines
+	}
+}
+
+// cursorWorkspaceMutationLines returns WORKSPACE MUTATION REQUIRED prose when active.
+func cursorWorkspaceMutationLines(messages []any, hasTools bool, mode string) []string {
+	if !(hasTools && hasCursorWorkspaceMutationIntent(messages)) || mode != "" {
+		return nil
+	}
+	wsMutationDone := hasCursorWorkspaceMutationToolCall(messages)
+	lines := []string{
+		"",
+		"WORKSPACE MUTATION REQUIRED:",
+		"The user is asking you to create or change project files. You must perform the change with the client's write/edit/bash tools.",
+		"If the workspace is empty, create the necessary starter files directly. Do not output a standalone file for the user to save.",
+	}
+	if wsMutationDone {
+		lines = append(lines, "A file-mutating tool call has already been made. After tool results confirm the change, briefly summarize what you created.")
+	} else {
+		lines = append(lines, "No file-mutating tool call has been made yet. Your next assistant response must be a write/edit/bash tool call, not prose.")
+	}
+	return lines
+}
+
 func buildCursorFramingPrelude(messages []any, tools []cursorToolDefinition, choice cursorToolChoice) string {
 	hasTools := len(tools) > 0
 	agentMode := hasTools
 	mode := strings.ToLower(strings.TrimSpace(os.Getenv("CURSOR_PROMPT_MODE")))
 
-	var parts []string
-	switch mode {
-	case "bare":
-		// no scaffolding
-	case "noinventory":
-		parts = append(parts, cursorAgentSystemDirective)
-	default:
-		switch {
-		case hasTools:
-			parts = append(parts, cursorToolSystemDirective)
-		case agentMode:
-			parts = append(parts, cursorAgentSystemDirective)
-		default:
-			parts = append(parts, cursorSystemDirective)
-		}
-		if hasTools {
-			parts = append(parts, "", renderCursorToolInventory(tools, choice))
-		}
-	}
-
-	wsMutationRequired := hasTools && hasCursorWorkspaceMutationIntent(messages)
-	wsMutationDone := wsMutationRequired && hasCursorWorkspaceMutationToolCall(messages)
-	if wsMutationRequired && mode == "" {
-		parts = append(parts,
-			"",
-			"WORKSPACE MUTATION REQUIRED:",
-			"The user is asking you to create or change project files. You must perform the change with the client's write/edit/bash tools.",
-			"If the workspace is empty, create the necessary starter files directly. Do not output a standalone file for the user to save.",
-		)
-		if wsMutationDone {
-			parts = append(parts, "A file-mutating tool call has already been made. After tool results confirm the change, briefly summarize what you created.")
-		} else {
-			parts = append(parts, "No file-mutating tool call has been made yet. Your next assistant response must be a write/edit/bash tool call, not prose.")
-		}
-	}
+	parts := cursorPromptDirectiveLines(hasTools, agentMode, mode, tools, choice)
+	parts = append(parts, cursorWorkspaceMutationLines(messages, hasTools, mode)...)
 
 	if agentMode && mode == "" {
 		parts = append(parts, cursorAgentModePrimer...)
@@ -1811,46 +1790,9 @@ func buildCursorPromptWithTools(req cliproxyexecutor.Request, tools []cursorTool
 	// inventory + primer but keep the directive.
 	mode := strings.ToLower(strings.TrimSpace(os.Getenv("CURSOR_PROMPT_MODE")))
 
-	var transcript []string
-	switch mode {
-	case "bare":
-		// Skip all composer-api scaffolding — see if pure translation is enough.
-	case "noinventory":
-		transcript = append(transcript, cursorAgentSystemDirective)
-	default:
-		switch {
-		case hasTools:
-			transcript = append(transcript, cursorToolSystemDirective)
-		case agentMode:
-			transcript = append(transcript, cursorAgentSystemDirective)
-		default:
-			transcript = append(transcript, cursorSystemDirective)
-		}
-		if hasTools {
-			transcript = append(transcript, "", renderCursorToolInventory(tools, choice))
-		}
-	}
-
-	// Workspace mutation block (composer-api openai.ts:631-642). When the
-	// user asked for file edits and the prior turns don't already include a
-	// file-mutating tool call, push an explicit "your next response must be
-	// a write/edit/bash call" directive. Without it Composer often emits a
-	// fenced code block instead of calling the client's write tool.
-	wsMutationRequired := hasTools && hasCursorWorkspaceMutationIntent(messages)
-	wsMutationDone := wsMutationRequired && hasCursorWorkspaceMutationToolCall(messages)
-	if wsMutationRequired && mode == "" {
-		transcript = append(transcript,
-			"",
-			"WORKSPACE MUTATION REQUIRED:",
-			"The user is asking you to create or change project files. You must perform the change with the client's write/edit/bash tools.",
-			"If the workspace is empty, create the necessary starter files directly. Do not output a standalone file for the user to save.",
-		)
-		if wsMutationDone {
-			transcript = append(transcript, "A file-mutating tool call has already been made. After tool results confirm the change, briefly summarize what you created.")
-		} else {
-			transcript = append(transcript, "No file-mutating tool call has been made yet. Your next assistant response must be a write/edit/bash tool call, not prose.")
-		}
-	}
+	transcript := cursorPromptDirectiveLines(hasTools, agentMode, mode, tools, choice)
+	// Workspace mutation block (composer-api openai.ts:631-642).
+	transcript = append(transcript, cursorWorkspaceMutationLines(messages, hasTools, mode)...)
 
 	if mode != "bare" {
 		transcript = append(transcript, "", "Conversation:")
@@ -1916,11 +1858,11 @@ func buildCursorPromptWithTools(req cliproxyexecutor.Request, tools []cursorTool
 			// When the conversation is mid-mutation, append a per-message
 			// reminder so the next assistant response calls a write/edit/bash
 			// tool instead of drifting back to prose.
-			if wsMutationRequired && mode == "" {
+			if reminder := buildCursorWorkspaceMutationReminder(messages, tools); reminder != "" {
 				if text == "" {
 					text = "[empty]"
 				}
-				text = text + "\n\nWorkspace action required: create or update the necessary project files directly with write/edit/bash tools. Do not output code for the user to save."
+				text = text + "\n\n" + reminder
 			}
 			transcript = append(transcript, "USER: "+text)
 		}
@@ -2178,6 +2120,28 @@ func estimateTokens(chars int) int {
 	return tokens
 }
 
+// cursorUsageTokens prefers reported stream usage, falling back to char estimates.
+func cursorUsageTokens(promptChars, completionChars int, reported map[string]int64) (int64, int64) {
+	input := int64(estimateTokens(promptChars))
+	output := int64(estimateTokens(completionChars))
+	if pt, ok := reported["prompt_tokens"]; ok {
+		input = pt
+	}
+	if ct, ok := reported["completion_tokens"]; ok {
+		output = ct
+	}
+	return input, output
+}
+
+// marshalCursorSSEData JSON-encodes an object as an SSE data: line.
+func marshalCursorSSEData(obj map[string]any) []byte {
+	b, err := json.Marshal(obj)
+	if err != nil {
+		return []byte("data: {}")
+	}
+	return append([]byte("data: "), b...)
+}
+
 // extractCursorErrorMessage extracts the most detailed error message from a Cursor error response.
 func estimateUsage(promptChars, completionChars int) map[string]any {
 	promptTokens := estimateTokens(promptChars)
@@ -2217,25 +2181,16 @@ func buildCursorOpenAIChunk(responseID, model string, delta map[string]any, fini
 		"model":   model,
 		"choices": []map[string]any{choice},
 	}
-	b, err := json.Marshal(chunk)
-	if err != nil {
-		return []byte("data: {}")
-	}
-	return append([]byte("data: "), b...)
+	return marshalCursorSSEData(chunk)
 }
 
 // buildCursorOpenAIUsageChunk emits the final usage SSE chunk.
 func buildCursorOpenAIUsageChunk(responseID, model string, usage map[string]any) []byte {
-	chunk := map[string]any{
+	return marshalCursorSSEData(map[string]any{
 		"id":      responseID,
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
 		"model":   model,
 		"usage":   usage,
-	}
-	b, err := json.Marshal(chunk)
-	if err != nil {
-		return []byte("data: {}")
-	}
-	return append([]byte("data: "), b...)
+	})
 }

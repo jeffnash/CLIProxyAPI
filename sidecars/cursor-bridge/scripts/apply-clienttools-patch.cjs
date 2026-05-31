@@ -154,6 +154,101 @@ function assertAscii(label, str) {
   }
 }
 
+function findEdit(name) {
+  const ed = edits.find((e) => e.name === name);
+  if (!ed) throw new PatchError("internal", `edit not found: ${name}`);
+  return ed;
+}
+
+function assertRequiredSeamsPresent(src) {
+  for (const token of REQUIRED_SEAM_TOKENS) {
+    if (!src.includes(token)) {
+      throw new PatchError(
+        "stale-bundle",
+        `marker present but seam ${token} missing — the @cursor/sdk bundle is partially/stalely patched; ` +
+          "run `npm ci` or reinstall the SDK, then re-run the patcher",
+      );
+    }
+  }
+}
+
+function assertDispatchSitesPatched(src) {
+  for (const name of DISPATCH_EDIT_NAMES) {
+    const ed = findEdit(name);
+    if (src.includes(ed.from)) {
+      throw new PatchError(
+        "stale-bundle",
+        `marker present but the "${name}" dispatch site is still in its pristine native form — the ` +
+          "@cursor/sdk bundle is partially/stalely patched (native sidecar exec would be reintroduced); " +
+          "run `npm ci` or reinstall the SDK, then re-run the patcher",
+      );
+    }
+  }
+}
+
+// ADD-102 / Comment 7: marker + CAPABILITY check (replaces the old marker-only short-circuit).
+function tryAlreadyPatchedShortCircuit(src) {
+  if (!src.startsWith(MARK)) return null;
+  assertRequiredSeamsPresent(src);
+  assertDispatchSitesPatched(src);
+  return { alreadyPatched: true, patchedSrc: src, observedSha: null, messages: [{ level: "log", text: "already patched" }] };
+}
+
+// M27: fail-closed SHA gate (development override downgrades to a warning).
+function verifyPristineBundleSha(src, env) {
+  const messages = [];
+  const observedSha = crypto.createHash("sha256").update(src, "latin1").digest("hex");
+  if (observedSha !== EXPECTED_BUNDLE_SHA256) {
+    if (!shaOverrideEnabled(env)) {
+      throw new PatchError(
+        "sha-mismatch",
+        `pristine bundle sha256=${observedSha} != recorded ${EXPECTED_BUNDLE_SHA256}. @cursor/sdk has changed ` +
+          `(or was already modified) — re-verify the anchors, then update PINNED_VERSION + EXPECTED_BUNDLE_SHA256. ` +
+          `Refusing to patch a drifted bundle. To override for local development only, set ` +
+          `${SHA_OVERRIDE_ENV[0]}=1 (or ${SHA_OVERRIDE_ENV[1]}=1).`,
+      );
+    }
+    messages.push({
+      level: "warn",
+      text:
+        `WARNING: pristine bundle sha256=${observedSha} != recorded ${EXPECTED_BUNDLE_SHA256}, but ` +
+        `${SHA_OVERRIDE_ENV.find((k) => env[k] === "1")}=1 is set — proceeding with an UNVERIFIED @cursor/sdk ` +
+        `(development override). Re-verify anchors and update the recorded hash before shipping.`,
+    });
+  } else {
+    messages.push({ level: "log", text: `pristine bundle sha256 verified (${observedSha.slice(0, 16)}…)` });
+  }
+  return { observedSha, messages };
+}
+
+function assertAnchorCounts(src) {
+  for (const ed of edits) {
+    const count = src.split(ed.from).length - 1;
+    if (count !== ed.expect) {
+      throw new PatchError(
+        "anchor-mismatch",
+        `anchor "${ed.name}": found ${count}, expected ${ed.expect}. SDK bundle changed — re-verify.`,
+      );
+    }
+  }
+}
+
+function replaceAnchors(src) {
+  let out = src;
+  for (const ed of edits) out = out.split(ed.from).join(ed.to);
+  return out;
+}
+
+function buildDispatchSelfTestHarness() {
+  const unaryExpr = findEdit("unary tool dispatch -> CC").to.replace(/^o=await/, "");
+  const streamExpr = findEdit("stream tool dispatch -> CC").to.replace(/^o=/, "").replace(/;for await$/, "");
+  const harness =
+    `\n;globalThis.__CC_SELFTEST_DISPATCH_U=function(n,e,s,t){return Promise.resolve(${unaryExpr})};` +
+    `globalThis.__CC_SELFTEST_DISPATCH_S=function(n,e,s,t){return ${streamExpr}};\n`;
+  assertAscii("self-test harness", harness);
+  return harness;
+}
+
 // Core, side-effect-free patch logic. Takes the pristine bundle text + SDK version + an env map and returns
 // the patched text plus the messages the CLI should print, OR throws a PatchError on any fail-closed
 // condition. Kept pure (no fs/process) so the self-tests can drive the SHA gate and anchor checks against
@@ -182,98 +277,17 @@ function applyPatch({ src, version, env = {} }) {
     );
   }
 
-  // ADD-102 / Comment 7: marker + CAPABILITY check (replaces the old marker-only short-circuit). A bundle that
-  // starts with MARK is only idempotently already-patched when it ALSO carries every required seam token; if
-  // any is missing the bundle is partially/stalely patched (marker written but a seam dropped) and we fail
-  // CLOSED with 'stale-bundle' — never exit 0 on a half-patched bundle (which would start the bridge with a
-  // broken seam as a silent behavior bug). This is the static counterpart to the bridge's runtime self-tests.
-  if (src.startsWith(MARK)) {
-    for (const token of REQUIRED_SEAM_TOKENS) {
-      if (!src.includes(token)) {
-        throw new PatchError(
-          "stale-bundle",
-          `marker present but seam ${token} missing — the @cursor/sdk bundle is partially/stalely patched; ` +
-            "run `npm ci` or reinstall the SDK, then re-run the patcher",
-        );
-      }
-    }
-    // ADD-102 (live-site staleness): the token check above cannot witness the two REAL dispatch sites — only
-    // the appended harness, which embeds `__CC_EXEC_U`/`__CC_EXEC_S` (and the native call) UNCONDITIONALLY.
-    // Run the anchor check IN REVERSE for the dispatch edits: their pristine `from` (native-call) form must be
-    // ABSENT. The harness derives its expressions by stripping the `o=await` / `o=`+`;for await` framing, so
-    // the FULL `from` string appears ONLY at an un-replaced live site. Its presence means a marked bundle's
-    // dispatch was reverted to native (cached artifact / hand-edited vendor bundle / half-applied patch) —
-    // exactly the native-exec leak this short-circuit must NOT accept. Fail CLOSED instead of exiting 0.
-    for (const name of DISPATCH_EDIT_NAMES) {
-      const ed = edits.find((e) => e.name === name);
-      if (src.includes(ed.from)) {
-        throw new PatchError(
-          "stale-bundle",
-          `marker present but the "${name}" dispatch site is still in its pristine native form — the ` +
-            "@cursor/sdk bundle is partially/stalely patched (native sidecar exec would be reintroduced); " +
-            "run `npm ci` or reinstall the SDK, then re-run the patcher",
-        );
-      }
-    }
-    return { alreadyPatched: true, patchedSrc: src, observedSha: null, messages: [{ level: "log", text: "already patched" }] };
-  }
+  const already = tryAlreadyPatchedShortCircuit(src);
+  if (already) return already;
 
-  // --- M27: fail-closed SHA gate, BEFORE the anchor-count checks below. ---
-  const observedSha = crypto.createHash("sha256").update(src, "latin1").digest("hex");
-  if (observedSha !== EXPECTED_BUNDLE_SHA256) {
-    if (!shaOverrideEnabled(env)) {
-      // Hard-fail: the byte-stream the anchors were verified against has changed. Do NOT proceed to the
-      // anchor replacements — a coincidental anchor match on a semantically-different bundle could ship a
-      // partially-patched (or native-exec-leaking) SDK.
-      throw new PatchError(
-        "sha-mismatch",
-        `pristine bundle sha256=${observedSha} != recorded ${EXPECTED_BUNDLE_SHA256}. @cursor/sdk has changed ` +
-          `(or was already modified) — re-verify the anchors, then update PINNED_VERSION + EXPECTED_BUNDLE_SHA256. ` +
-          `Refusing to patch a drifted bundle. To override for local development only, set ` +
-          `${SHA_OVERRIDE_ENV[0]}=1 (or ${SHA_OVERRIDE_ENV[1]}=1).`,
-      );
-    }
-    // Override set: development-only escape hatch. The anchor-count checks below still guard structurally,
-    // but the operator has explicitly accepted an unverified byte-stream.
-    messages.push({
-      level: "warn",
-      text:
-        `WARNING: pristine bundle sha256=${observedSha} != recorded ${EXPECTED_BUNDLE_SHA256}, but ` +
-        `${SHA_OVERRIDE_ENV.find((k) => env[k] === "1")}=1 is set — proceeding with an UNVERIFIED @cursor/sdk ` +
-        `(development override). Re-verify anchors and update the recorded hash before shipping.`,
-    });
-  } else {
-    messages.push({ level: "log", text: `pristine bundle sha256 verified (${observedSha.slice(0, 16)}…)` });
-  }
+  const sha = verifyPristineBundleSha(src, env);
+  messages.push(...sha.messages);
 
   for (const ed of edits) assertAscii(ed.name + ".to", ed.to);
+  assertAnchorCounts(src);
 
-  // --- anchor-count checks (structural guard); only reached AFTER the SHA gate. ---
-  for (const ed of edits) {
-    const count = src.split(ed.from).length - 1;
-    if (count !== ed.expect) {
-      throw new PatchError(
-        "anchor-mismatch",
-        `anchor "${ed.name}": found ${count}, expected ${ed.expect}. SDK bundle changed — re-verify.`,
-      );
-    }
-  }
-
-  let out = src;
-  for (const ed of edits) out = out.split(ed.from).join(ed.to);
-
-  // Bundle-level self-test harness: expose the EXACT unary/stream seam expressions (the same strings just
-  // applied at the real dispatch sites) as globals, so the bridge can drive the real patched dispatch logic
-  // at startup and prove native exec.execute() is unreachable. Derived from the same `to` strings, so the
-  // harness can never drift from the live seam; the anchor-count checks above guarantee the live seam exists.
-  const unaryExpr = edits.find((e) => e.name === "unary tool dispatch -> CC").to.replace(/^o=await/, "");
-  const streamExpr = edits.find((e) => e.name === "stream tool dispatch -> CC").to.replace(/^o=/, "").replace(/;for await$/, "");
-  const harness =
-    `\n;globalThis.__CC_SELFTEST_DISPATCH_U=function(n,e,s,t){return Promise.resolve(${unaryExpr})};` +
-    `globalThis.__CC_SELFTEST_DISPATCH_S=function(n,e,s,t){return ${streamExpr}};\n`;
-  assertAscii("self-test harness", harness);
-  out += harness;
-
+  let out = replaceAnchors(src);
+  out += buildDispatchSelfTestHarness();
   out = MARK + out;
 
   messages.push({
@@ -281,7 +295,7 @@ function applyPatch({ src, version, env = {} }) {
     text: `patched @cursor/sdk@${version}: CC tool routing (unary+stream) + fromJson result construction`,
   });
 
-  return { alreadyPatched: false, patchedSrc: out, observedSha, messages };
+  return { alreadyPatched: false, patchedSrc: out, observedSha: sha.observedSha, messages };
 }
 
 function emit(messages) {

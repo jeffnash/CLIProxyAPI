@@ -45,18 +45,15 @@ const (
 	// Set to http://127.0.0.1:9797 in config to use the Node sidecar instead.
 	DefaultBackendBaseURL = "https://api2.cursor.sh"
 
-	// CursorDirectBackendBaseURL is the Cursor internal API used for protobuf chat
-	// and auth exchange when not routing through the sidecar.
-	CursorDirectBackendBaseURL = "https://api2.cursor.sh"
+	// CursorDirectBackendBaseURL is the Cursor internal API used for auth exchange
+	// and protobuf chat when not routing through the sidecar.
+	CursorDirectBackendBaseURL = DefaultBackendBaseURL
 
 	// DefaultChatEndpoint is the OpenAI-compatible chat completions path (sidecar).
 	DefaultChatEndpoint = "/v1/chat/completions"
 
 	// DefaultCursorDirectChatEndpoint is the Connect RPC path for direct cursor.sh backends.
 	DefaultCursorDirectChatEndpoint = "/aiserver.v1.ChatService/StreamUnifiedChatWithTools"
-
-	// SidecarPort is the default port for the cursor-sdk-bridge sidecar.
-	SidecarPort = "9797"
 )
 
 // CursorTokenStorage implements auth.TokenStorage for persisting Cursor credentials.
@@ -79,50 +76,39 @@ func CursorAPIKeyFromAuth(auth *cliproxyauth.Auth) string {
 			return v
 		}
 	}
-	if auth.Metadata != nil {
-		if v, ok := auth.Metadata["api_key"].(string); ok && strings.TrimSpace(v) != "" {
+	if auth.Metadata == nil {
+		return ""
+	}
+	v, _ := auth.Metadata["api_key"].(string)
+	return strings.TrimSpace(v)
+}
+
+func resolveCursorConfigValue(auth *cliproxyauth.Auth, cfg *config.Config, attrKey string, fromEntry func(*config.CursorKey) string, fallback string) string {
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes[attrKey]); v != "" {
 			return v
 		}
 	}
-	return ""
+	if cfg != nil {
+		for i := range cfg.CursorKey {
+			if v := fromEntry(&cfg.CursorKey[i]); v != "" {
+				return v
+			}
+		}
+	}
+	return fallback
 }
 
 // ResolveBackendBaseURL returns the backend base URL for the given auth entry,
 // falling back to the default.
 func ResolveBackendBaseURL(auth *cliproxyauth.Auth, cfg *config.Config) string {
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["backend_base_url"]); v != "" {
-			return v
-		}
-	}
-	if cfg != nil {
-		for i := range cfg.CursorKey {
-			entry := &cfg.CursorKey[i]
-			if entry.BackendBaseURL != "" {
-				return entry.BackendBaseURL
-			}
-		}
-	}
-	return DefaultBackendBaseURL
+	return resolveCursorConfigValue(auth, cfg, "backend_base_url", func(e *config.CursorKey) string { return e.BackendBaseURL }, DefaultBackendBaseURL)
 }
 
 // ResolveChatEndpoint returns the chat endpoint path for the given auth entry,
 // falling back to the default.
 func ResolveChatEndpoint(auth *cliproxyauth.Auth, cfg *config.Config) string {
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["chat_endpoint"]); v != "" {
-			return v
-		}
-	}
-	if cfg != nil {
-		for i := range cfg.CursorKey {
-			entry := &cfg.CursorKey[i]
-			if entry.ChatEndpoint != "" {
-				return entry.ChatEndpoint
-			}
-		}
-	}
-	return DefaultChatEndpoint
+	return resolveCursorConfigValue(auth, cfg, "chat_endpoint", func(e *config.CursorKey) string { return e.ChatEndpoint }, DefaultChatEndpoint)
 }
 
 // ResolveCursorChatEndpoint returns the correct chat endpoint path for the
@@ -179,14 +165,36 @@ func ExchangeCursorApiKey(ctx context.Context, apiKey string, httpClient *http.C
 	return exchangeCursorApiKey(ctx, apiKey, CursorDirectBackendBaseURL, httpClient)
 }
 
+func cursorHTTPClient(httpClient *http.Client) *http.Client {
+	if httpClient != nil {
+		return httpClient
+	}
+	return &http.Client{Timeout: 30 * time.Second}
+}
+
+func setCursorIdentityHeaders(req *http.Request) {
+	for k, v := range BuildCursorIdentityHeaders() {
+		req.Header.Set(k, v)
+	}
+}
+
+func cursorHTTPError(resp *http.Response, unauthorizedMsg, op string) error {
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("cursor: %s", unauthorizedMsg)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("cursor: %s failed with status %d: %s", op, resp.StatusCode, string(body))
+	}
+	return nil
+}
+
 // exchangeCursorApiKey exchanges a Cursor user API key for an internal access token.
 func exchangeCursorApiKey(ctx context.Context, apiKey, backendBaseURL string, httpClient *http.Client) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
-	}
+	httpClient = cursorHTTPClient(httpClient)
 	if backendBaseURL == "" {
 		backendBaseURL = CursorDirectBackendBaseURL
 	}
@@ -200,9 +208,7 @@ func exchangeCursorApiKey(ctx context.Context, apiKey, backendBaseURL string, ht
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	for k, v := range BuildCursorIdentityHeaders() {
-		req.Header.Set(k, v)
-	}
+	setCursorIdentityHeaders(req)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -214,12 +220,8 @@ func exchangeCursorApiKey(ctx context.Context, apiKey, backendBaseURL string, ht
 		}
 	}()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		return "", fmt.Errorf("cursor: invalid API key")
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("cursor: exchange failed with status %d: %s", resp.StatusCode, string(body))
+	if err := cursorHTTPError(resp, "invalid API key", "exchange"); err != nil {
+		return "", err
 	}
 
 	var result struct {
@@ -241,9 +243,6 @@ func VerifyCursorApiKey(ctx context.Context, apiKey string, httpClient *http.Cli
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
-	}
 
 	url := CursorAPIBase + "/v1/me"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -252,11 +251,9 @@ func VerifyCursorApiKey(ctx context.Context, apiKey string, httpClient *http.Cli
 	}
 
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	for k, v := range BuildCursorIdentityHeaders() {
-		req.Header.Set(k, v)
-	}
+	setCursorIdentityHeaders(req)
 
-	resp, err := httpClient.Do(req)
+	resp, err := cursorHTTPClient(httpClient).Do(req)
 	if err != nil {
 		return fmt.Errorf("cursor: verify request failed: %w", err)
 	}
@@ -266,13 +263,5 @@ func VerifyCursorApiKey(ctx context.Context, apiKey string, httpClient *http.Cli
 		}
 	}()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("cursor: invalid API key")
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("cursor: verify failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	return nil
+	return cursorHTTPError(resp, "invalid API key", "verify")
 }
