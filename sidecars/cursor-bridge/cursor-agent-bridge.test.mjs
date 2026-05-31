@@ -15,6 +15,8 @@ import {
   argContractFor,
   augmentToolDescription,
   augmentWorkflowResultOnFailure,
+  snapWorkflowAgentTypes,
+  appendRulesReminder,
   forcedToolUnavailable,
   nativeToolBlockedByChoice,
   blockedNativeResult,
@@ -267,6 +269,35 @@ test("augmentWorkflowResultOnFailure appends a targeted fix on Workflow failures
   // fail-safe: non-string content + errors never throw, and an unrecognized failure is left alone.
   assert.equal(augmentWorkflowResultOnFailure(null, false), null);
   assert.equal(augmentWorkflowResultOnFailure("some other neutral output", false), "some other neutral output");
+});
+
+test("snapWorkflowAgentTypes fixes known-wrong agentType/subagent_type values; leaves custom names + structure alone", () => {
+  // the exact failure from the run: generalPurpose -> general-purpose (in an agentType position).
+  assert.equal(snapWorkflowAgentTypes("agent('x', { agentType: 'generalPurpose' })"), "agent('x', { agentType: 'general-purpose' })");
+  // case/punctuation variants of registered names snap to the EXACT name.
+  assert.equal(snapWorkflowAgentTypes('{ subagent_type: "explore" }'), '{ subagent_type: "Explore" }');
+  assert.equal(snapWorkflowAgentTypes("agentType:'general_purpose'"), "agentType:'general-purpose'");
+  // already-correct values are untouched.
+  assert.equal(snapWorkflowAgentTypes("{ agentType: 'general-purpose' }"), "{ agentType: 'general-purpose' }");
+  // a CUSTOM/unknown agent name is left alone (no false snap).
+  assert.equal(snapWorkflowAgentTypes("{ agentType: 'my-team-reviewer' }"), "{ agentType: 'my-team-reviewer' }");
+  // 'generalPurpose' OUTSIDE an agentType/subagent_type position is NOT touched.
+  assert.equal(snapWorkflowAgentTypes("const note = 'generalPurpose is the default'"), "const note = 'generalPurpose is the default'");
+  // every occurrence snapped.
+  assert.equal((snapWorkflowAgentTypes("a({agentType:'generalPurpose'}); b({agentType:'generalPurpose'})").match(/general-purpose/g) || []).length, 2);
+  // fail-safe: non-string in -> returned as-is.
+  assert.equal(snapWorkflowAgentTypes(null), null);
+});
+
+test("appendRulesReminder appends the reminder to a non-empty user message; off when unset/empty", () => {
+  const R = "Re-read the tool rules and the workflow contract this turn.";
+  assert.equal(appendRulesReminder("refactor the auth code", R), "refactor the auth code\n\n" + R);
+  // empty user message (a pure tool-results resume) -> nothing to append to.
+  assert.equal(appendRulesReminder("", R), "");
+  // unset/empty reminder (default OFF) -> userText unchanged.
+  assert.equal(appendRulesReminder("hello", ""), "hello");
+  // fail-safe: non-string user text returned as-is.
+  assert.equal(appendRulesReminder(null, R), null);
 });
 
 test("normalizeToolArgsToSchema coerces a string-typed arg sent as a wrapper object (ADD-109)", () => {

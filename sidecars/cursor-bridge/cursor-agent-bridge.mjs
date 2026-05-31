@@ -1375,6 +1375,12 @@ class Session {
     // leaving genuinely object/array-typed args untouched. Schema-driven, so it never corrupts a real object arg.
     const advTool = (this.advertise || []).find((t) => (t.toolName || t.name) === name);
     if (advTool && advTool.inputSchema) input = normalizeToolArgsToSchema(name, input, advTool.inputSchema);
+    // Workflow value-snap: rewrite a known-wrong agentType/subagent_type VALUE in the script (e.g. generalPurpose
+    // -> general-purpose) so the workflow does not fail with "agent type '...' not found".
+    if (name === "Workflow" && input && typeof input.script === "string") {
+      const snapped = snapWorkflowAgentTypes(input.script);
+      if (snapped !== input.script) { input = { ...input, script: snapped }; dbg("emitToolUse: snapped workflow agentType value(s)", "session=" + this.id); }
+    }
     if (!this.activeRes || this.writeFailed) {
       // No open client-facing response (the prior turn already closed mid-burst), or the write path is dead.
       // Writing the tool_call to a dead/absent socket would silently create a pending the client can never
@@ -2380,6 +2386,39 @@ function augmentWorkflowResultOnFailure(content, isError) {
   }
 }
 
+// WORKFLOW_AGENT_TYPES: the standard CC registered agent names. snapWorkflowAgentTypes rewrites a known-WRONG
+// agentType/subagent_type VALUE in a Workflow script to its exact registered name (e.g. 'generalPurpose' ->
+// 'general-purpose', 'explore' -> 'Explore') so a workflow does not fail with "agent type '...' not found".
+// Conservative: only an UNAMBIGUOUS case/punctuation variant of a known name is snapped; a custom/unknown agent
+// name is left untouched. The model is inconsistent about this value run-to-run, and it lives INSIDE the script
+// string (so the bridge can't schema-snap it like a top-level tool arg — a targeted value rewrite is the lever).
+const WORKFLOW_AGENT_TYPES = ["claude", "claude-code-guide", "codex:codex-rescue", "Explore", "general-purpose", "Plan", "statusline-setup"];
+function snapAgentTypeValue(v) {
+  if (typeof v !== "string" || WORKFLOW_AGENT_TYPES.includes(v)) return null; // not a string, or already exact
+  const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const nv = norm(v);
+  const m = WORKFLOW_AGENT_TYPES.filter((c) => norm(c) === nv);
+  return m.length === 1 ? m[0] : null; // unambiguous case/punctuation variant -> the exact registered name
+}
+function snapWorkflowAgentTypes(script) {
+  try {
+    if (typeof script !== "string") return script;
+    return script.replace(/\b(agentType|subagent_type)(\s*:\s*)(['"`])([A-Za-z0-9_:-]+)\3/g, (full, key, sep, q, val) => {
+      const snapped = snapAgentTypeValue(val);
+      return snapped ? key + sep + q + snapped + q : full;
+    });
+  } catch { return script; }
+}
+
+// CURSOR_COMPOSER_USER_MSG_REMINDER (default empty = off): when set, its text is appended to the END of every
+// NON-EMPTY user message sent to the model (driveUserSend) — e.g. a standing "re-read the rules / tool contract
+// this turn" nudge that rides every turn live, instead of only the tool descriptions (which cache at session start).
+const USER_MSG_REMINDER = (process.env.CURSOR_COMPOSER_USER_MSG_REMINDER || "").trim();
+function appendRulesReminder(userText, reminder = USER_MSG_REMINDER) {
+  if (!reminder || typeof userText !== "string" || userText.length === 0) return userText;
+  return userText + "\n\n" + reminder;
+}
+
 // argContractFor builds one concise, unambiguous "how to call this tool" sentence FROM the tool's own inputSchema,
 // so composer-2.5 uses the EXACT argument keys/types this tool declares and never borrows another tool's shape
 // (the root of the agent({...}) conflation, and a nudge against scalars arriving object-wrapped). Schema-driven, so
@@ -2811,6 +2850,7 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
   // new-user turn, the C1 mixed-turn fresh-send, and the C2/C3 re-seed — so they never drift. extraImages
   // (BR9) are merged in addition to input.images (e.g. images carried inside tool results).
   const driveUserSend = async (userText, extraImages) => {
+    userText = appendRulesReminder(userText); // CURSOR_COMPOSER_USER_MSG_REMINDER: standing per-turn nudge (off by default)
     session.streamedText = "";   // reset per user turn (NOT across tool-result continuations within a run)
     session.reasonedThisRun = false; // #15: mirror streamedText — reasoning-produced tracking spans this run
     session.resetLoopBounds();   // ADD-106: a fresh send begins a new logical run -> reset the agentic-loop counters
@@ -3458,5 +3498,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, snapWorkflowAgentTypes, appendRulesReminder };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }
