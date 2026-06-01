@@ -291,17 +291,23 @@ test("augmentWorkflowResultOnFailure appends a targeted fix on Workflow failures
 test("augmentBackgroundLaunchResult: a 'running in background' result gets a live WAIT interrupt; real results pass through", () => {
   // The reliable lever (vs the cached description): when a tool returns its background-launch notice, append a
   // model-visible "STILL RUNNING — wait, don't relaunch or redo" the turn composer is deciding what to do next.
-  const wf = augmentBackgroundLaunchResult("Running in background · /workflows to monitor and save");
+  const wf = augmentBackgroundLaunchResult("Workflow started: wf_1185bcdc-f0e — Running in background · /workflows to monitor", "Workflow");
   assert.match(wf, /STILL RUNNING IN THE BACKGROUND/);
   assert.match(wf, /Do NOT launch it again/);
   assert.match(wf, /do NOT redo its work yourself/);
-  assert.equal(augmentBackgroundLaunchResult(wf), wf, "idempotent — never double-appends");
-  // a backgrounded Bash command (the multiple-builds case)
-  assert.match(augmentBackgroundLaunchResult("Command running in background with id bash_1"), /STILL RUNNING/);
+  assert.match(wf, /`Workflow` you launched/);     // names the tool
+  assert.match(wf, /wf_1185bcdc-f0e/);             // surfaces the run id so it is clear WHICH is running
+  assert.equal(augmentBackgroundLaunchResult(wf, "Workflow"), wf, "idempotent — never double-appends");
+  // a backgrounded Bash command (the multiple-builds case): tool name + handle surfaced
+  const bash = augmentBackgroundLaunchResult("Command running in background with id bash_1", "Bash");
+  assert.match(bash, /STILL RUNNING/);
+  assert.match(bash, /`Bash` you launched/);
+  assert.match(bash, /bash_1/);
+  // no tool name / no id -> a generic but still-actionable interrupt
   assert.match(augmentBackgroundLaunchResult("the build is now running in the background"), /STILL RUNNING/);
   // a normal tool result is untouched
   const real = "## findings\n- bug A\n- bug B";
-  assert.equal(augmentBackgroundLaunchResult(real), real);
+  assert.equal(augmentBackgroundLaunchResult(real, "Bash"), real);
   // fail-safe: non-string / empty pass through
   assert.deepEqual(augmentBackgroundLaunchResult({ a: 1 }), { a: 1 });
   assert.equal(augmentBackgroundLaunchResult(""), "");
