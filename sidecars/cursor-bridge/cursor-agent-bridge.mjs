@@ -1352,7 +1352,7 @@ class Session {
       // McpResult's isError mirrors the threaded flag rather than being hardcoded false.
       const wrap = (content, isError) => {
         let out = ccName === "Workflow" ? augmentWorkflowResultOnFailure(content, isError) : content;
-        out = augmentBackgroundLaunchResult(out); // a background launch (Workflow, or a backgrounded Bash) -> tell the model to WAIT, not relaunch or redo the work
+        out = augmentBackgroundLaunchResult(out, ccName); // a background launch (Workflow, or a backgrounded Bash) -> tell the model to WAIT, not relaunch or redo the work (named + id so it is clear WHICH)
         resolve({ __ccJson: mcpDispatchResult(out, isError) });
       };
       wrap.__reject = reject;
@@ -2418,14 +2418,21 @@ const BACKGROUND_LAUNCH_RE = /running in (the )?background|\/workflows to monito
 // augmentBackgroundLaunchResult appends a LIVE, model-visible interrupt to a "running in the background" tool
 // result so composer WAITS for it instead of relaunching it or redoing its work. This rides the tool RESULT (not
 // the cached tool description), so it reaches the model the very turn it is deciding what to do next — far stronger
-// than a description nudge composer rationalizes away. Fail-safe: only a STRING result that matches the pattern and
-// is not already augmented is touched; objects, empty, and non-matching results pass through unchanged. Idempotent.
-function augmentBackgroundLaunchResult(content) {
+// than a description nudge composer rationalizes away. It names the TOOL and the extracted task/run id, so when
+// several things are running concurrently it is unambiguous WHICH one this is about. Fail-safe: only a STRING
+// result that matches the pattern and is not already augmented is touched; everything else passes through. Idempotent.
+function augmentBackgroundLaunchResult(content, toolName) {
   try {
     if (typeof content !== "string" || !content) return content;
     if (content.includes("[BRIDGE] STILL RUNNING")) return content; // never double-append
     if (!BACKGROUND_LAUNCH_RE.test(content)) return content;
-    return content + "\n\n[BRIDGE] STILL RUNNING IN THE BACKGROUND — this is NOT finished. Do NOT launch it again, and do NOT redo its work yourself in the meantime (no parallel edits, builds, or commands for what it is handling). WAIT for it to complete, then use its result. Re-running it or doing the work yourself duplicates effort and causes conflicts.";
+    const idm =
+      content.match(/\bwf_[a-z0-9-]{4,}\b/i) ||                                  // workflow run id
+      content.match(/\b(?:bash|task|run|proc|shell)_[a-z0-9-]+\b/i) ||           // bash_1 / task_x handle
+      content.match(/\b(?:id[:=]|with id\s+)\s*["']?([a-z0-9][a-z0-9_-]{2,})/i); // "id: xyz" / "with id xyz"
+    const id = idm ? (idm[1] !== undefined ? idm[1] : idm[0]).trim() : "";
+    const who = (toolName ? "the `" + toolName + "` you launched" : "this") + (id ? " (id: " + id + ")" : "");
+    return content + "\n\n[BRIDGE] STILL RUNNING IN THE BACKGROUND — " + who + " is NOT finished. Do NOT launch it again, and do NOT redo its work yourself in the meantime (no parallel edits, builds, or commands for what it is handling). WAIT for it to complete, then use its result. Re-running it or doing the work yourself duplicates effort and causes conflicts.";
   } catch { return content; }
 }
 
