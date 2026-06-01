@@ -235,6 +235,13 @@ test("argContractFor + augmentToolDescription inject a schema-derived per-tool a
   assert.match(wf, /phase\('title'\)/);            // phase() takes a title, not a callback
   assert.match(wf, /0-agent/);                     // the empty-workflow symptom of a phase callback
   assert.match(wf, /COPY THIS SHAPE EXACTLY/);     // the annotated multi-phase example composer can pattern-match
+  // Decomposition-depth guidance: push composer off its shallow 1-step / 1-2-agent default toward many phases +
+  // wide parallel fan-out (the whole point of a workflow).
+  assert.match(wf, /SCALE FIRST/);                 // prominent: scale before anything else
+  assert.match(wf, /DECOMPOSE/);                   // extras: break the task into many parallel jobs
+  assert.match(wf, /parallel lane/);               // one lane per mapped item
+  assert.ok((wf.match(/phase\('(map|investigate|verify|synthesize)'\)/g) || []).length >= 4, "the example demonstrates several phases (deep), not one");
+  assert.ok((wf.match(/await parallel\(/g) || []).length >= 3, "the example fans out wide in multiple phases");
   // The PROMINENT block is PREPENDED (read first) with explicit RIGHT/WRONG contrasts for the two confirmed bugs.
   assert.match(wf, /READ THIS FIRST/);
   assert.match(wf, /✅ RIGHT/);
