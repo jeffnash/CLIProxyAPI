@@ -242,6 +242,9 @@ test("argContractFor + augmentToolDescription inject a schema-derived per-tool a
   assert.match(wf, /parallel lane/);               // one lane per mapped item
   assert.ok((wf.match(/phase\('(map|investigate|verify|synthesize)'\)/g) || []).length >= 4, "the example demonstrates several phases (deep), not one");
   assert.ok((wf.match(/await parallel\(/g) || []).length >= 3, "the example fans out wide in multiple phases");
+  // Delegation: a launched workflow runs in the background — composer must WAIT, not also do the work itself.
+  assert.match(wf, /DELEGATE/);
+  assert.match(wf, /RETURNS IMMEDIATELY|runs in the BACKGROUND/);
   // The PROMINENT block is PREPENDED (read first) with explicit RIGHT/WRONG contrasts for the two confirmed bugs.
   assert.match(wf, /READ THIS FIRST/);
   assert.match(wf, /✅ RIGHT/);
@@ -252,6 +255,11 @@ test("argContractFor + augmentToolDescription inject a schema-derived per-tool a
   assert.match(ag, /DIFFERENT/);
   assert.match(ag, /subagent_type/);
   assert.match(ag, /general-purpose/);
+  assert.match(ag, /DELEGATE|let IT do that work/);   // spawn an Agent -> let it work, don't double-do
+  // Bash gets background-task awareness so composer stops firing duplicate concurrent builds.
+  const bashDesc = augmentToolDescription("Bash", "", { type: "object", properties: { command: { type: "string" } } });
+  assert.match(bashDesc, /BACKGROUND-TASK AWARENESS|STILL RUNNING/);
+  assert.match(bashDesc, /concurrent build|Do NOT launch the same command again/);
   // A tool with no props and no extra -> base description returned unchanged (identity, no trailing noise).
   assert.equal(augmentToolDescription("Read", "Read a file.", { type: "object" }), "Read a file.");
   // Fail-safe: malformed inputs never throw.
