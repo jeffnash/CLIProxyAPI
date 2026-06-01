@@ -15,6 +15,7 @@ import {
   argContractFor,
   augmentToolDescription,
   augmentWorkflowResultOnFailure,
+  augmentBackgroundLaunchResult,
   snapWorkflowAgentTypes,
   appendRulesReminder,
   forcedToolUnavailable,
@@ -245,6 +246,7 @@ test("argContractFor + augmentToolDescription inject a schema-derived per-tool a
   // Delegation: a launched workflow runs in the background — composer must WAIT, not also do the work itself.
   assert.match(wf, /DELEGATE/);
   assert.match(wf, /RETURNS IMMEDIATELY|runs in the BACKGROUND/);
+  assert.match(wf, /to be safe|to make sure it completes/);   // names the belt-and-suspenders rationalization
   // The PROMINENT block is PREPENDED (read first) with explicit RIGHT/WRONG contrasts for the two confirmed bugs.
   assert.match(wf, /READ THIS FIRST/);
   assert.match(wf, /✅ RIGHT/);
@@ -284,6 +286,26 @@ test("augmentWorkflowResultOnFailure appends a targeted fix on Workflow failures
   // fail-safe: non-string content + errors never throw, and an unrecognized failure is left alone.
   assert.equal(augmentWorkflowResultOnFailure(null, false), null);
   assert.equal(augmentWorkflowResultOnFailure("some other neutral output", false), "some other neutral output");
+});
+
+test("augmentBackgroundLaunchResult: a 'running in background' result gets a live WAIT interrupt; real results pass through", () => {
+  // The reliable lever (vs the cached description): when a tool returns its background-launch notice, append a
+  // model-visible "STILL RUNNING — wait, don't relaunch or redo" the turn composer is deciding what to do next.
+  const wf = augmentBackgroundLaunchResult("Running in background · /workflows to monitor and save");
+  assert.match(wf, /STILL RUNNING IN THE BACKGROUND/);
+  assert.match(wf, /Do NOT launch it again/);
+  assert.match(wf, /do NOT redo its work yourself/);
+  assert.equal(augmentBackgroundLaunchResult(wf), wf, "idempotent — never double-appends");
+  // a backgrounded Bash command (the multiple-builds case)
+  assert.match(augmentBackgroundLaunchResult("Command running in background with id bash_1"), /STILL RUNNING/);
+  assert.match(augmentBackgroundLaunchResult("the build is now running in the background"), /STILL RUNNING/);
+  // a normal tool result is untouched
+  const real = "## findings\n- bug A\n- bug B";
+  assert.equal(augmentBackgroundLaunchResult(real), real);
+  // fail-safe: non-string / empty pass through
+  assert.deepEqual(augmentBackgroundLaunchResult({ a: 1 }), { a: 1 });
+  assert.equal(augmentBackgroundLaunchResult(""), "");
+  assert.equal(augmentBackgroundLaunchResult(null), null);
 });
 
 test("snapWorkflowAgentTypes fixes known-wrong agentType/subagent_type values; leaves custom names + structure alone", () => {
