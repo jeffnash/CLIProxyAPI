@@ -2375,19 +2375,24 @@ const TOOL_USAGE_EXTRAS = {
   // mode we've observed (export-in-body -> "Unexpected keyword export"; object-shape agent() -> "[object Object]";
   // bad agentType -> "agent type not found"; promises in parallel -> "expects an array of functions").
   Workflow:
+    "DECOMPOSE — a workflow's whole purpose is to BREAK A TASK INTO MANY SMALL PARALLEL JOBS, not to run one or two agents. Before writing the script, MAP the work into a concrete list (the files / modules / areas / hypotheses / test cases involved). Then structure SEVERAL phases (e.g. map → investigate → verify → synthesize) and, in EACH phase, fan out ONE agent PER item with `parallel([...])` — typically anywhere from 4–20 parallel lanes per phase, scaled to how many items you mapped. A single-phase or 1–2-agent workflow defeats the purpose; a phase should rarely hold just one agent (the final synthesize step is the usual exception). More independent subtasks ⇒ more parallel lanes.\n" +
     "WORKFLOW `script` RULES — the runtime PARSES your script; breaking any one fails the launch:\n" +
     "1. The FIRST statement MUST be `export const meta = { name, description, phases }`, a PURE LITERAL (no variables, function calls, spreads, or template strings inside meta; name + description are non-empty strings; phases is an array, e.g. [{ title: 'Scan' }]).\n" +
     "2. Use `export` EXACTLY ONCE — only for meta. Everything AFTER meta is the BODY; the runtime wraps it in an async function and runs it for you. So NEVER write `export` again (no `export function`, no `export default`, no exported helpers) and do NOT wrap the body in `async function` or an IIFE yourself — a second `export` or a self-wrap throws 'Unexpected keyword export' and the workflow never launches. Use `await` directly in the body.\n" +
     "3. `phase('title')` takes ONLY a string title and runs NO callback. NEVER `phase('name', () => {...})` or `phase('name', async () => {...})` — the callback is never called, so NO agents spawn (a 0-agent empty workflow). Call `phase('name')` on its own to label a section, then write the `agent()`/`parallel()` calls DIRECTLY in the body.\n" +
     "4. `agent()` is POSITIONAL: `agent(promptString, { label, schema, model, agentType })` — the prompt STRING is the FIRST arg. NEVER `agent({ description, prompt, subagent_type })` (that single-object shape is the `Agent` TOOL's, not this function's — it makes the agent's prompt `[object Object]`). If you set `agentType`, copy an EXACT registered agent name verbatim, case-sensitive (e.g. 'general-purpose', 'Explore', 'Plan'); 'explore' or 'generalPurpose' are rejected as 'agent type not found'.\n" +
     "5. `parallel()`/`pipeline()` take an array of THUNKS: `parallel([() => agent(...), () => agent(...)])` — never bare `agent(...)` (a promise).\n" +
-    "6. No markdown fences. COPY THIS SHAPE EXACTLY — a multi-phase fan-out-then-synthesize workflow that avoids EVERY pitfall above (one `export`; each `phase('x')` is a bare label, never a callback; `parallel` gets `() =>` thunks; every `agent` is positional with an exact `agentType`):\n" +
-    "export const meta = { name: 'audit', description: 'Multi-file audit', phases: [{ title: 'research' }, { title: 'synthesize' }] }\n" +
-    "const files = ['a.go', 'b.go']\n" +
-    "phase('research')\n" +
-    "const reports = await parallel(files.map((f) => () => agent('Audit ' + f + ' for bugs', { label: f, agentType: 'general-purpose' })))\n" +
+    "6. No markdown fences. COPY THIS SHAPE EXACTLY (swap in your OWN mapped items) — a DEEP, WIDE workflow: SEVERAL phases, each fanning out one parallel lane per item, and it avoids EVERY pitfall above (one `export`; each `phase('x')` is a bare label, never a callback; `parallel` gets `() =>` thunks; every `agent` is positional with an exact `agentType`):\n" +
+    "export const meta = { name: 'audit', description: 'Decompose and audit a subsystem', phases: [{ title: 'map' }, { title: 'investigate' }, { title: 'verify' }, { title: 'synthesize' }] }\n" +
+    "const areas = ['auth', 'session', 'routing', 'storage', 'streaming', 'usage']  // MAP the work — more items ⇒ more parallel lanes below\n" +
+    "phase('map')\n" +
+    "const surveys = await parallel(areas.map((a) => () => agent('Survey the ' + a + ' code: list its files, risks, and 3 things to investigate', { label: 'map:' + a, agentType: 'general-purpose' })))\n" +
+    "phase('investigate')\n" +
+    "const findings = await parallel(areas.map((a, i) => () => agent('Deep-dive ' + a + ' for bugs and races. Survey: ' + surveys[i], { label: 'dig:' + a, agentType: 'general-purpose' })))\n" +
+    "phase('verify')\n" +
+    "const verified = await parallel(findings.map((f, i) => () => agent('Adversarially verify these ' + areas[i] + ' findings; drop the unreproducible: ' + f, { label: 'verify:' + areas[i], agentType: 'general-purpose' })))\n" +
     "phase('synthesize')\n" +
-    "return await agent('Synthesize these reports: ' + reports.join(' --- '), { label: 'synth', agentType: 'general-purpose' })",
+    "return await agent('Synthesize the verified findings into one ranked report: ' + verified.join(' --- '), { label: 'synth', agentType: 'general-purpose' })",
   Agent:
     "IMPORTANT — `Agent` (capitalized, THIS tool) and the workflow `agent()` function are DIFFERENT. `Agent` is invoked as a tool call with the object arguments above; `subagent_type` must be an EXACT registered agent name copied verbatim, case-sensitive (e.g. 'general-purpose', 'Explore', 'Plan') — NEVER 'explore' or 'generalPurpose'. The lowercase `agent()` is a SEPARATE positional function (`agent(promptString, {opts})`, e.g. inside a Workflow `script`); never give it this tool's object shape.",
 };
@@ -2475,7 +2480,9 @@ function argContractFor(name, schema) {
 // object-shape agent() and bare-call parallel — as explicit ✅RIGHT / ❌WRONG contrasts so there is zero ambiguity.
 const TOOL_USAGE_PROMINENT = {
   Workflow:
-    "━━━━━━━━━━ WORKFLOW SCRIPT — READ THIS FIRST (two mistakes break every workflow) ━━━━━━━━━━\n" +
+    "━━━━━━━━━━ WORKFLOW SCRIPT — READ THIS FIRST ━━━━━━━━━━\n" +
+    "SCALE FIRST — a workflow exists to DECOMPOSE a task into MANY small parallel jobs, NOT to run one or two agents. Use SEVERAL phases (steps) and fan out MANY agents PER phase — one per file / area / case / hypothesis — with `parallel([...])`. A single-phase or 1–2-agent workflow wastes the tool: MAP the work into a list FIRST, then spawn one parallel lane per item. Aim for 3+ phases and typically anywhere from 4–20 parallel lanes per phase, scaled to the work; only a final synthesize step should be a lone agent.\n" +
+    "Then two mistakes that BREAK every workflow:\n" +
     "(1) `agent()` is a POSITIONAL function — the prompt STRING is the FIRST argument:\n" +
     "      ✅ RIGHT:  agent('Audit the auth code for bugs', { agentType: 'general-purpose' })\n" +
     "      ❌ WRONG:  agent({ description: '…', prompt: '…', subagent_type: '…' })\n" +
