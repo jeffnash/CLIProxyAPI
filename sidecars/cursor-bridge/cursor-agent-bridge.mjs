@@ -1280,6 +1280,27 @@ class Session {
     return { matched, unknown };
   }
 
+  // allToolResultsForeign peeks (NON-mutating) whether EVERY result in the batch carries a concrete id this
+  // session never issued — not pending, not delivered, not ever-emitted — and no idless-lone-pending escape
+  // applies. That is exactly the set matchToolResults would push entirely into `unknown` while resolving
+  // nothing: the orphan / mis-route signal. It happens when the run that OWNED these tool calls died and the Go
+  // executor cleared its tool_call ownership (composerApplyLeaseStop -> forgetSession on an error stop), so the
+  // tool result got routed by lineage to a DIFFERENT session that cannot own it. Used to return HTTP 410 BEFORE
+  // the SSE headers are written — the same lost-continuation signal as an unknown session — so the executor's
+  // reseed-on-410 replays the conversation as a fresh user turn instead of emitting an "unknown tool_call_id"
+  // error over HTTP 200 that the client then retries forever (the result has no live owner anywhere).
+  allToolResultsForeign(results) {
+    const batch = results || [];
+    if (batch.length === 0) return false;
+    for (const tr of batch) {
+      if (!tr) return false;
+      if (tr.idless === true && this.pending.size === 1) return false; // would resolve the lone pending
+      const id = tr.toolCallId;
+      if (this.pending.has(id) || this.delivered.has(id) || this.everEmitted.has(id)) return false;
+    }
+    return true;
+  }
+
   dispatchUnary(cas, spec, s) {
     const id = this.wireToolId(s); // H23: collision-safe per-session wire id
     // ADD-57: resolve the result context (real cwd) at emit time from the session's client env.
@@ -2600,6 +2621,30 @@ async function handleTurn(req, res, body, cursorKey) {
     // `tools`/`clientEnv` on every turn): a C1 fresh-send or C2 re-seed driven from this continuation must
     // advertise the current tools, and a re-seed needs the current env. Harmless when unchanged.
     refreshSessionFromBody(session, body);
+    // ORPHAN GUARD (P0 — lost-owner reseed): the session exists but issued NONE of the ids in this batch, and
+    // there is no trailing user payload to drive a fresh send. This is the mis-route the bug produced — the run
+    // that owned these tool calls died, the Go executor cleared its ownership (forgetSession on the error stop),
+    // and the result was routed by lineage to a session that cannot own it. Forwarding it would emit an
+    // "unknown tool_call_id" error over HTTP 200 (headers already written at the activeRes/runTurn writeHead),
+    // which the client retries forever. Headers are NOT written yet here, so return 410 — the same
+    // lost-continuation signal as the `!session` branch above — to drive the executor's reseed-on-410, which
+    // replays the conversation as a fresh user turn (the orphaned result is already visible in that replayed
+    // history, so no context is lost). A continuation WITH user payload is left alone: runTurn's C1 path
+    // fresh-sends it and recovers on its own.
+    // Scope: an IDLE session only — no live run, nothing pending, no concurrent stream. A LIVE session that
+    // receives a foreign id is a genuine desync that must still surface as an "unknown tool_call_id" error
+    // (C03/C04/M32: never a silent misroute or false success); only a fully-idle session with a wholly-foreign
+    // batch is the orphan-by-dead-run case where reseeding is the correct (and only) recovery.
+    if (session.run === null && !session.activeRes && session.pending.size === 0) {
+      const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
+      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || collectToolResultImages(input).length > 0;
+      if (!hasUserText && !hasUserImages && session.allToolResultsForeign(input.results)) {
+        dbg("tool_results ALL-FOREIGN on idle session + no user payload -> 410 reseed (orphaned: owning run died, ownership lost)",
+          "session=" + sessionId, "ids=" + safeJson((input.results || []).map((r) => r && r.toolCallId)));
+        fail(410, "orphaned tool_call_id: none of these results were issued by this session (the owning run has ended); the continuation must be re-seeded");
+        return;
+      }
+    }
     // Comment 3: tool_results ingestion is NEVER 409'd. Resolving pending tool calls is just promise
     // resolution — safe regardless of any open response. Only the model-output STREAM is single-owner: if a
     // continuation response is already streaming this session's run (concurrent/incremental tool_results),
