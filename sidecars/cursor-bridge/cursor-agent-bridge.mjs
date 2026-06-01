@@ -1350,7 +1350,11 @@ class Session {
     return new Promise((resolve, reject) => {
       // C5/BR4: a client tool that failed/was cancelled (isError) must reach the model AS a failure, so the
       // McpResult's isError mirrors the threaded flag rather than being hardcoded false.
-      const wrap = (content, isError) => resolve({ __ccJson: mcpDispatchResult(ccName === "Workflow" ? augmentWorkflowResultOnFailure(content, isError) : content, isError) });
+      const wrap = (content, isError) => {
+        let out = ccName === "Workflow" ? augmentWorkflowResultOnFailure(content, isError) : content;
+        out = augmentBackgroundLaunchResult(out); // a background launch (Workflow, or a backgrounded Bash) -> tell the model to WAIT, not relaunch or redo the work
+        resolve({ __ccJson: mcpDispatchResult(out, isError) });
+      };
       wrap.__reject = reject;
       this.newPending(id, wrap);
       this.emitToolUse(id, ccName, input);
@@ -2376,7 +2380,7 @@ const TOOL_USAGE_EXTRAS = {
   // bad agentType -> "agent type not found"; promises in parallel -> "expects an array of functions").
   Workflow:
     "DECOMPOSE — a workflow's whole purpose is to BREAK A TASK INTO MANY SMALL PARALLEL JOBS, not to run one or two agents. Before writing the script, MAP the work into a concrete list (the files / modules / areas / hypotheses / test cases involved). Then structure SEVERAL phases (e.g. map → investigate → verify → synthesize) and, in EACH phase, fan out ONE agent PER item with `parallel([...])` — typically anywhere from 4–20 parallel lanes per phase, scaled to how many items you mapped. A single-phase or 1–2-agent workflow defeats the purpose; a phase should rarely hold just one agent (the final synthesize step is the usual exception). More independent subtasks ⇒ more parallel lanes.\n" +
-    "DELEGATE — when you launch this workflow to do work, the WORKFLOW'S AGENTS do it, not you. The tool returns IMMEDIATELY while they run in the BACKGROUND; that is NOT a cue to start editing or building yourself. Launch it, WAIT for it to finish, then synthesize its output. Doing the same work in the main agent in parallel wastes tokens and creates conflicting edits to the same files; if the user asked you to fan out, fanning out is the WHOLE job — do not also hand-apply the changes.\n" +
+    "DELEGATE — when you launch this workflow to do work, the WORKFLOW'S AGENTS do it, not you. The tool returns IMMEDIATELY while they run in the BACKGROUND; that is NOT a cue to start editing or building yourself. Launch it, WAIT for it to finish, then synthesize its output. Doing the same work in the main agent in parallel wastes tokens and creates conflicting edits to the same files; if the user asked you to fan out, fanning out is the WHOLE job — do not also hand-apply the changes. Do NOT do the work yourself 'to be safe' or 'to make sure it completes end-to-end' — that exact reasoning IS the mistake; trust the workflow and WAIT for it.\n" +
     "WORKFLOW `script` RULES — the runtime PARSES your script; breaking any one fails the launch:\n" +
     "1. The FIRST statement MUST be `export const meta = { name, description, phases }`, a PURE LITERAL (no variables, function calls, spreads, or template strings inside meta; name + description are non-empty strings; phases is an array, e.g. [{ title: 'Scan' }]).\n" +
     "2. Use `export` EXACTLY ONCE — only for meta. Everything AFTER meta is the BODY; the runtime wraps it in an async function and runs it for you. So NEVER write `export` again (no `export function`, no `export default`, no exported helpers) and do NOT wrap the body in `async function` or an IIFE yourself — a second `export` or a self-wrap throws 'Unexpected keyword export' and the workflow never launches. Use `await` directly in the body.\n" +
@@ -2405,6 +2409,26 @@ const TOOL_USAGE_EXTRAS = {
 // result composer reads, so its NEXT move corrects the actual mistake (far higher-signal than the static tool
 // description it has been ignoring). Fail-safe: only a RECOGNIZED failure is augmented; a real workflow result
 // (agents ran) passes through untouched, and any error returns the content unchanged.
+// BACKGROUND_LAUNCH_RE matches the "I started it; it is running in the background" notice a tool returns when its
+// work was BACKGROUNDED — the Workflow tool (which always runs async) and a backgrounded Bash command. composer
+// reads such a result and, instead of waiting, either relaunches the command (the duplicate-concurrent-builds bug)
+// or hand-does the work itself in the main agent "to be safe" (the fan-out-then-also-do-it-yourself anti-pattern).
+const BACKGROUND_LAUNCH_RE = /running in (the )?background|\/workflows to monitor|running in background with id|started in the background/i;
+
+// augmentBackgroundLaunchResult appends a LIVE, model-visible interrupt to a "running in the background" tool
+// result so composer WAITS for it instead of relaunching it or redoing its work. This rides the tool RESULT (not
+// the cached tool description), so it reaches the model the very turn it is deciding what to do next — far stronger
+// than a description nudge composer rationalizes away. Fail-safe: only a STRING result that matches the pattern and
+// is not already augmented is touched; objects, empty, and non-matching results pass through unchanged. Idempotent.
+function augmentBackgroundLaunchResult(content) {
+  try {
+    if (typeof content !== "string" || !content) return content;
+    if (content.includes("[BRIDGE] STILL RUNNING")) return content; // never double-append
+    if (!BACKGROUND_LAUNCH_RE.test(content)) return content;
+    return content + "\n\n[BRIDGE] STILL RUNNING IN THE BACKGROUND — this is NOT finished. Do NOT launch it again, and do NOT redo its work yourself in the meantime (no parallel edits, builds, or commands for what it is handling). WAIT for it to complete, then use its result. Re-running it or doing the work yourself duplicates effort and causes conflicts.";
+  } catch { return content; }
+}
+
 function augmentWorkflowResultOnFailure(content, isError) {
   try {
     const text = typeof content === "string" ? content : safeJson(content);
@@ -2485,7 +2509,7 @@ const TOOL_USAGE_PROMINENT = {
   Workflow:
     "━━━━━━━━━━ WORKFLOW SCRIPT — READ THIS FIRST ━━━━━━━━━━\n" +
     "SCALE FIRST — a workflow exists to DECOMPOSE a task into MANY small parallel jobs, NOT to run one or two agents. Use SEVERAL phases (steps) and fan out MANY agents PER phase — one per file / area / case / hypothesis — with `parallel([...])`. A single-phase or 1–2-agent workflow wastes the tool: MAP the work into a list FIRST, then spawn one parallel lane per item. Aim for 3+ phases and typically anywhere from 4–20 parallel lanes per phase, scaled to the work; only a final synthesize step should be a lone agent.\n" +
-    "DELEGATE, DON'T DOUBLE — the Workflow tool RETURNS IMMEDIATELY and runs in the BACKGROUND. That does NOT mean it finished, and it does NOT mean you should do the work yourself. Its agents ARE doing the work; WAIT for the completion notification, then use their results. NEVER make the same edits or run the same commands in the main agent while a workflow (or a subagent you spawned) is still running — it duplicates the work and produces conflicting changes. If the user asked you to fan out, fanning out IS the job: do not also hand-apply the changes.\n" +
+    "DELEGATE, DON'T DOUBLE — the Workflow tool RETURNS IMMEDIATELY and runs in the BACKGROUND. That does NOT mean it finished, and it does NOT mean you should do the work yourself. Its agents ARE doing the work; WAIT for the completion notification, then use their results. NEVER make the same edits or run the same commands in the main agent while a workflow (or a subagent you spawned) is still running — it duplicates the work and produces conflicting changes. If the user asked you to fan out, fanning out IS the job: do not also hand-apply the changes. Do NOT do it yourself 'to be safe' or 'to make sure it completes' — that exact reasoning is the mistake.\n" +
     "Then two mistakes that BREAK every workflow:\n" +
     "(1) `agent()` is a POSITIONAL function — the prompt STRING is the FIRST argument:\n" +
     "      ✅ RIGHT:  agent('Audit the auth code for bugs', { agentType: 'general-purpose' })\n" +
@@ -3562,5 +3586,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, snapWorkflowAgentTypes, appendRulesReminder };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }
