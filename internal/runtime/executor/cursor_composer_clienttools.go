@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -91,12 +92,25 @@ func (e *composerBridgeProtocolError) Error() string {
 // response), so the conductor/handler does not collapse it to a generic 500 or retry it as a transient fault.
 func (e *composerBridgeProtocolError) StatusCode() int { return http.StatusBadGateway }
 
+// composerBridgeLogProtocol logs a protocol violation and returns its correlation id.
+func composerBridgeLogProtocol(responseID, reason, detail string) string {
+	corr := composerCorrelationID()
+	log.Errorf("[composer %s] bridge PROTOCOL VIOLATION corr=%s reason=%s detail=%s", responseID, corr, reason, sanitizeBridgeBody([]byte(detail)))
+	return corr
+}
+
+// composerBridgeLogTransport logs a transport failure and returns its correlation id.
+func composerBridgeLogTransport(responseID string, cause error) string {
+	corr := composerCorrelationID()
+	log.Errorf("[composer %s] bridge TRANSPORT FAILURE corr=%s (-> 503): %s", responseID, corr, sanitizeBridgeBody([]byte(cause.Error())))
+	return corr
+}
+
 // newComposerBridgeProtocolError builds the typed protocol error AND emits a single redacted diagnostic under
 // the correlation id (never the bridge body to the client). corr ties the client-visible generic error to the
 // server-side log line. The detail is sanitized via sanitizeBridgeBody so no credential leaks into logs.
 func newComposerBridgeProtocolError(responseID, reason, detail string) *composerBridgeProtocolError {
-	corr := composerCorrelationID()
-	log.Errorf("[composer %s] bridge PROTOCOL VIOLATION corr=%s reason=%s detail=%s", responseID, corr, reason, sanitizeBridgeBody([]byte(detail)))
+	corr := composerBridgeLogProtocol(responseID, reason, detail)
 	return &composerBridgeProtocolError{reason: reason, correlation: corr}
 }
 
@@ -176,16 +190,25 @@ func (e *composerBridgeUnavailableError) Unwrap() error { return e.cause }
 // newComposerBridgeUnavailableError builds the typed transport error and emits one redacted diagnostic under the
 // correlation id (the cause may carry the bridge URL/host, so it is sanitized via sanitizeBridgeBody).
 func newComposerBridgeUnavailableError(responseID string, cause error) *composerBridgeUnavailableError {
-	corr := composerCorrelationID()
-	log.Errorf("[composer %s] bridge TRANSPORT FAILURE corr=%s (-> 503): %s", responseID, corr, sanitizeBridgeBody([]byte(cause.Error())))
+	corr := composerBridgeLogTransport(responseID, cause)
 	return &composerBridgeUnavailableError{correlation: corr, cause: cause}
+}
+
+// composerEnvTruthy reports whether a trimmed env/attribute value is truthy (1 or true, case-insensitive).
+func composerEnvTruthy(v string) bool {
+	v = strings.TrimSpace(v)
+	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// composerEnvTruthyRaw matches composerDebugEnabled's legacy check (no trim, no EqualFold).
+func composerEnvTruthyRaw(v string) bool {
+	return v == "1" || v == "true"
 }
 
 // cursorDirectEnabled reports whether the gated, ToS-exposed direct Cursor path
 // is explicitly opted into. Default (unset) is the safe Cursor Composer Client-Tools sidecar path.
 func cursorDirectEnabled() bool {
-	v := strings.TrimSpace(os.Getenv("CURSOR_DIRECT"))
-	return v == "1" || strings.EqualFold(v, "true")
+	return composerEnvTruthy(os.Getenv("CURSOR_DIRECT"))
 }
 
 // resolveComposerBridgeURL returns the agent-bridge base URL for the selected auth entry.
@@ -225,16 +248,15 @@ func isLoopbackBridgeURL(rawURL string) bool {
 // credentials never leave the host/link, so ADD-41's HTTPS requirement is relaxed there. Any routable host
 // (a real remote bridge) must use HTTPS unless insecure transport is explicitly opted into.
 func isLocalBridgeHost(rawURL string) bool {
+	if isLoopbackBridgeURL(rawURL) {
+		return true
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return false
 	}
-	host := u.Hostname()
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	if ip := net.ParseIP(u.Hostname()); ip != nil {
+		return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 	}
 	return false
 }
@@ -251,12 +273,11 @@ func isLocalBridgeHost(rawURL string) bool {
 func composerBridgeInsecureAllowed(auth *cliproxyauth.Auth) bool {
 	if auth != nil && auth.Attributes != nil {
 		v := strings.TrimSpace(auth.Attributes["composer_client_tools_allow_insecure_bridge"])
-		if v == "1" || strings.EqualFold(v, "true") {
+		if composerEnvTruthy(v) {
 			return true
 		}
 	}
-	v := strings.TrimSpace(os.Getenv("CURSOR_AGENT_BRIDGE_ALLOW_INSECURE"))
-	return v == "1" || strings.EqualFold(v, "true")
+	return composerEnvTruthy(os.Getenv("CURSOR_AGENT_BRIDGE_ALLOW_INSECURE"))
 }
 
 // buildComposerTurnURL validates the configured bridge base URL and returns the fully-joined /agent/turn URL.
@@ -609,17 +630,15 @@ func recordComposerResponseSession(tenant, outwardResponseID, sessionID string) 
 	key := tenant + "\x00resp:" + outwardResponseID
 	composerResponseSessionMu.Lock()
 	defer composerResponseSessionMu.Unlock()
-	if _, ok := composerResponseSessions[key]; ok {
-		composerResponseSessions[key] = sessionID
-		return
+	if _, ok := composerResponseSessions[key]; !ok {
+		composerResponseSessionOrder = append(composerResponseSessionOrder, key)
+		if len(composerResponseSessionOrder) > composerResponseSessionCap {
+			oldest := composerResponseSessionOrder[0]
+			composerResponseSessionOrder = composerResponseSessionOrder[1:]
+			delete(composerResponseSessions, oldest)
+		}
 	}
 	composerResponseSessions[key] = sessionID
-	composerResponseSessionOrder = append(composerResponseSessionOrder, key)
-	if len(composerResponseSessionOrder) > composerResponseSessionCap {
-		oldest := composerResponseSessionOrder[0]
-		composerResponseSessionOrder = composerResponseSessionOrder[1:]
-		delete(composerResponseSessions, oldest)
-	}
 }
 
 // lookupComposerResponseSession returns the session id recorded for a tenant-scoped outward response id, or
@@ -637,8 +656,7 @@ func lookupComposerResponseSession(tenant, outwardResponseID string) string {
 // OFF by default so production logs stay clean; set CURSOR_COMPOSER_DEBUG=1 to enable. Error-level logs
 // (bridge non-2xx, transport/scanner errors) are NOT gated — they always report.
 var composerDebugEnabled = func() bool {
-	v := os.Getenv("CURSOR_COMPOSER_DEBUG")
-	return v == "1" || v == "true"
+	return composerEnvTruthyRaw(os.Getenv("CURSOR_COMPOSER_DEBUG"))
 }()
 
 func composerDebugf(format string, args ...any) {
@@ -655,8 +673,7 @@ func composerDebugf(format string, args ...any) {
 // restore the EX9 behavior if a regression appears. Either way the model still gets answer text + tool-call
 // intent; only the raw thinking is omitted (replaced with a neutral marker) by default.
 var composerReplayReasoningEnabled = func() bool {
-	v := strings.TrimSpace(os.Getenv("CURSOR_COMPOSER_REPLAY_REASONING"))
-	return v == "1" || strings.EqualFold(v, "true")
+	return composerEnvTruthy(os.Getenv("CURSOR_COMPOSER_REPLAY_REASONING"))
 }()
 
 // composerLiveUsageEnabled (CURSOR_COMPOSER_LIVE_USAGE, default OFF) forwards a RUNNING token ESTIMATE DURING the
@@ -665,8 +682,7 @@ var composerReplayReasoningEnabled = func() bool {
 // emitted incrementally. OFF by default until the interim message_delta.usage is confirmed to render cleanly in the
 // client (it interleaves with content frames, which not every renderer expects mid-stream).
 var composerLiveUsageEnabled = func() bool {
-	v := strings.TrimSpace(os.Getenv("CURSOR_COMPOSER_LIVE_USAGE"))
-	return v == "1" || strings.EqualFold(v, "true")
+	return composerEnvTruthy(os.Getenv("CURSOR_COMPOSER_LIVE_USAGE"))
 }()
 
 // composerLiveUsageStepChars throttles the live estimate: emit one running-usage frame per this many new completion
@@ -765,17 +781,6 @@ func claudeSessionID(payload []byte) string {
 		}
 	}
 	return ""
-}
-
-// recordComposerToolCall remembers which bridge session emitted a tool call (ADD-50/70/71). It delegates to
-// the per-tenant ownership store, keyed by tenant + session + tool-call id.
-func recordComposerToolCall(tenant, toolCallID, sessionID string) {
-	composerOwnership.record(tenant, toolCallID, sessionID)
-}
-
-// forgetComposerSessionToolCalls drops a tenant's ownership entries for a finished bridge session (ADD-71).
-func forgetComposerSessionToolCalls(tenant, sessionID string) {
-	composerOwnership.forgetSession(tenant, sessionID)
 }
 
 // ---------------------------------------------------------------------------
@@ -937,25 +942,7 @@ func lineageHeadDigest(tenant, fp16 string, messages []gjson.Result) string {
 	mac.Write([]byte{0})
 	mac.Write([]byte(fp16))
 	mac.Write([]byte{0})
-	count := 0
-	for _, m := range messages {
-		switch m.Get("role").String() {
-		case "system", "developer":
-			continue
-		}
-		mac.Write([]byte(m.Get("role").String()))
-		mac.Write([]byte{0x1f})
-		text := cursorMessageText(m)
-		if r := []rune(text); len(r) > composerHistoryFingerprintPrefixRunes {
-			text = string(r[:composerHistoryFingerprintPrefixRunes])
-		}
-		mac.Write([]byte(text))
-		mac.Write([]byte{0})
-		count++
-		if count >= composerHistoryFingerprintHeadMessages {
-			break
-		}
-	}
+	composerWriteFingerprintHead(mac, composerNonSystemHeadMessages(messages))
 	return hex.EncodeToString(mac.Sum(nil))[:32]
 }
 
@@ -1586,19 +1573,13 @@ func compactionSignal(oldHead, newHead, recordedOpenerFP, currentOpenerFP string
 // the opener bridge can recognise a body rewrite (opener kept, head moved) and distinguish it from an opener
 // edit (opener changed → a genuine fork). Empty when there is no non-system message.
 func lineageOpenerFingerprint(messages []gjson.Result) string {
-	for _, m := range messages {
-		switch m.Get("role").String() {
-		case "system", "developer":
-			continue
-		}
-		text := cursorMessageText(m)
-		if r := []rune(text); len(r) > composerHistoryFingerprintPrefixRunes {
-			text = string(r[:composerHistoryFingerprintPrefixRunes])
-		}
-		sum := sha256.Sum256([]byte(m.Get("role").String() + "\x1f" + text))
-		return hex.EncodeToString(sum[:])[:16]
+	head := composerNonSystemHeadMessages(messages)
+	if len(head) == 0 {
+		return ""
 	}
-	return ""
+	m := head[0]
+	sum := sha256.Sum256([]byte(m.Get("role").String() + "\x1f" + composerHeadMessageText(m)))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 // composerContinuationCarriesOpener reports whether a continuation REPLAYS the conversation from the top — its
@@ -1608,14 +1589,11 @@ func lineageOpenerFingerprint(messages []gjson.Result) string {
 // assistant/tool — only the tail tool exchange, no opener) carries no re-seedable context beyond the
 // conversation id, so it keeps the baseSid fallback (the only signal it has). (Review Comment 2.)
 func composerContinuationCarriesOpener(messages []gjson.Result) bool {
-	for _, m := range messages {
-		switch m.Get("role").String() {
-		case "system", "developer":
-			continue
-		}
-		return m.Get("role").String() == "user"
+	head := composerNonSystemHeadMessages(messages)
+	if len(head) == 0 {
+		return false
 	}
-	return false
+	return head[0].Get("role").String() == "user"
 }
 
 // errMixedSessionBatch is returned when a single continuation batch carries tool_call_ids that were emitted
@@ -2230,6 +2208,19 @@ var composerHistoryFingerprintHeadMessages = func() int {
 // pasted opener does not dominate and a later in-place EDIT of an early message still flips the hash.
 const composerHistoryFingerprintPrefixRunes = 256
 
+func composerExcludedRole(role string) bool {
+	return role == "system" || role == "developer"
+}
+
+// composerHeadMessageText returns the bounded text prefix of a message for lineage/fingerprint hashing.
+func composerHeadMessageText(m gjson.Result) string {
+	text := cursorMessageText(m)
+	if r := []rune(text); len(r) > composerHistoryFingerprintPrefixRunes {
+		text = string(r[:composerHistoryFingerprintPrefixRunes])
+	}
+	return text
+}
+
 // composerHistoryFingerprint returns a 32-hex fingerprint that is GROWTH-STABLE (a normal multi-turn
 // conversation only APPENDS turns at the tail, so it stays constant) BUT REWRITE-SENSITIVE: it changes when
 // the client REWRITES EARLIER RETAINED history — e.g. a /compact summary supplanting the conversation body
@@ -2246,34 +2237,42 @@ const composerHistoryFingerprintPrefixRunes = 256
 // a /compact that rewrites ONLY content BEYOND the head bound while preserving the first N messages verbatim
 // can still slip through; an explicit compact-epoch signal (if any inbound schema exposed one) would be
 // preferred, but none does today — flagged as best-effort. Empty when there is no non-system content.
-func composerHistoryFingerprint(messages []gjson.Result) string {
-	nonSystem := make([]gjson.Result, 0, len(messages))
+// composerNonSystemHeadMessages returns conversation messages with system/developer roles removed,
+// preserving order. Shared by lineage/fingerprint helpers that use the same head window.
+func composerNonSystemHeadMessages(messages []gjson.Result) []gjson.Result {
+	out := make([]gjson.Result, 0, len(messages))
 	for _, m := range messages {
-		switch m.Get("role").String() {
-		case "system", "developer":
+		if composerExcludedRole(m.Get("role").String()) {
 			continue
 		}
-		nonSystem = append(nonSystem, m)
+		out = append(out, m)
 	}
-	if len(nonSystem) == 0 {
-		return ""
-	}
-	h := sha256.New()
-	limit := len(nonSystem)
+	return out
+}
+
+// composerWriteFingerprintHead writes the bounded retained-prefix head (role + text prefix per message)
+// into w. The byte layout matches composerHistoryFingerprint and lineageHeadDigest.
+func composerWriteFingerprintHead(w io.Writer, head []gjson.Result) {
+	limit := len(head)
 	if limit > composerHistoryFingerprintHeadMessages {
 		limit = composerHistoryFingerprintHeadMessages
 	}
 	for i := 0; i < limit; i++ {
-		m := nonSystem[i]
-		h.Write([]byte(m.Get("role").String()))
-		h.Write([]byte{0x1f})
-		text := cursorMessageText(m)
-		if r := []rune(text); len(r) > composerHistoryFingerprintPrefixRunes {
-			text = string(r[:composerHistoryFingerprintPrefixRunes])
-		}
-		h.Write([]byte(text))
-		h.Write([]byte{0})
+		m := head[i]
+		_, _ = io.WriteString(w, m.Get("role").String())
+		_, _ = w.Write([]byte{0x1f})
+		_, _ = io.WriteString(w, composerHeadMessageText(m))
+		_, _ = w.Write([]byte{0})
 	}
+}
+
+func composerHistoryFingerprint(messages []gjson.Result) string {
+	head := composerNonSystemHeadMessages(messages)
+	if len(head) == 0 {
+		return ""
+	}
+	h := sha256.New()
+	composerWriteFingerprintHead(h, head)
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
@@ -3589,45 +3588,175 @@ func composerStreamResponseHeaders() http.Header {
 
 // executeComposerStream drives one /agent/turn against the bridge and translates the
 // bridge SSE events into the client's streaming wire format.
-func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	model := resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
-	responseID := composerResponseID()
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth)
+// composerApplyLeaseStop releases or extends the session lease based on the terminal stop_reason.
+func composerApplyLeaseStop(tenant, sessionID, leaseStop string, leaseOwner uint64, ctx context.Context) {
+	switch {
+	case leaseStop == "tool_use":
+		composerInflight.touch(tenant, sessionID, leaseOwner)
+	case leaseStop != "":
+		composerInflight.release(tenant, sessionID, leaseOwner)
+		composerOwnership.forgetSession(tenant, sessionID)
+	case ctx.Err() != nil:
+		composerInflight.release(tenant, sessionID, leaseOwner)
+	}
+}
 
+// composerDebugLogAdvertisedTools logs advertised tool names when debug is enabled (stream path).
+func composerDebugLogAdvertisedTools(responseID string, advertise []map[string]any) {
+	if !composerDebugEnabled {
+		return
+	}
+	names := make([]string, 0, len(advertise))
+	noSchema := 0
+	for _, a := range advertise {
+		n, _ := a["name"].(string)
+		names = append(names, n)
+		if s, ok := a["inputSchema"]; !ok || s == nil {
+			noSchema++
+		}
+	}
+	composerDebugf("[composer %s] STREAM advertised %d tools (%d missing schema): %s", responseID, len(names), noSchema, strings.Join(names, ","))
+}
+
+// composerInboundTurn holds validated per-turn state shared by executeComposer and executeComposerStream.
+type composerInboundTurn struct {
+	model       string
+	responseID  string
+	tenant      string
+	contHint    composerContinuationHint
+	oai         []byte
+	defs        []cursorToolDefinition
+	toolAliases map[string]string
+	sessionID   string
+	leaseOwner  uint64
+}
+
+// prepareComposerInbound validates and routes an inbound turn before POST /agent/turn.
+func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (composerInboundTurn, error) {
+	var turn composerInboundTurn
+	turn.model = resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
+	turn.responseID = composerResponseID()
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
-	oai := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-	// ADD-94 / Comment 4: reject store:false BEFORE any durable Cursor state is created (never silently persist).
-	if errStore := composerRejectStoreFalse(oai); errStore != nil {
-		log.Errorf("[composer %s] STREAM store:false unsupported -> 400", responseID)
-		return nil, errStore
+	turn.oai = sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
+	if errStore := composerRejectStoreFalse(turn.oai); errStore != nil {
+		return turn, errStore
 	}
-	// Comment 5: compute the tenant + continuation hint BEFORE the image-only check so the check classifies
-	// continuations with the SAME hinted classifier deriveComposerSessionID/composerInputHinted use (a
-	// previous_response_id-chained or tool-ownership-hinted continuation with a malformed trailing image must
-	// not be rejected as image-only-invalid before its tool output is handled).
-	tenant := composerTenant(auth, opts)
-	contHint := composerContinuationHintFor(tenant, oai)
-	// ADD-56: an image-only turn whose every image is malformed/unsupported must NOT become a silent empty
-	// turn (which the model would answer with irrelevant output). Reject it with a typed 400 instead.
-	if lastUserTurnImageOnlyInvalid(gjson.GetBytes(oai, "messages").Array(), contHint) {
-		log.Errorf("[composer %s] STREAM image-only turn has no valid image -> 400", responseID)
-		return nil, errComposerImageOnlyInvalid
+	turn.tenant = composerTenant(auth, opts)
+	turn.contHint = composerContinuationHintFor(turn.tenant, turn.oai)
+	if lastUserTurnImageOnlyInvalid(gjson.GetBytes(turn.oai, "messages").Array(), turn.contHint) {
+		return turn, errComposerImageOnlyInvalid
 	}
-	defs := composerToolDefs(oai)
-	toolAliases := composerToolAliases(auth)
-	// ISOLATION: the live resolver applies concurrency-based forking — a new-user turn that resolves to a
-	// session already running a logical run is a DIFFERENT agent and is forked onto a distinct sibling session
-	// so the two run in parallel (the lease is freed at the run's terminal end in the goroutine below).
-	sessionID, leaseOwner, err := deriveComposerSessionIDLive(auth, apiKey, oai, opts)
+	turn.defs = composerToolDefs(turn.oai)
+	turn.toolAliases = composerToolAliases(auth)
+	var err error
+	turn.sessionID, turn.leaseOwner, err = deriveComposerSessionIDLive(auth, apiKey, turn.oai, opts)
 	if err != nil {
-		// ADD-97: publish this pre-bridge failure too (a routing-ambiguity error never reaches the goroutine's
-		// deferred EnsurePublished). Rare on a routine turn, but it must still be accounted for.
-		reporter.PublishFailure(ctx, err)
-		reporter.EnsurePublished(ctx)
-		log.Errorf("[composer %s] STREAM deriveSessionID ERROR (-> 500): %v", responseID, err)
+		return turn, err
+	}
+	return turn, nil
+}
+
+// composerAgentTurnDial POSTs /agent/turn and applies P0-1 reseed-on-410. Mutates sessionID,
+// leaseOwner, and body when reseed succeeds. The caller owns the returned response body.
+func (e *CursorExecutor) composerAgentTurnDial(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	apiKey, responseID, tenant string,
+	sessionID *string,
+	leaseOwner *uint64,
+	body *[]byte,
+	oai []byte,
+	opts cliproxyexecutor.Options,
+	contHint composerContinuationHint,
+	model string,
+	advertise []map[string]any,
+	toolChoice string,
+	constraints map[string]any,
+	stream bool,
+) (*http.Response, error) {
+	httpResp, err := e.postAgentTurn(ctx, auth, apiKey, *body)
+	if err != nil {
 		return nil, err
 	}
+	if httpResp.StatusCode == composerBridgeStatusGone {
+		if rsid, rbody, ok := composerReseedLostContinuation(tenant, apiKey, oai, opts, contHint, model, advertise, toolChoice, constraints); ok {
+			if newOwner, claimed := composerInflight.claim(tenant, rsid); claimed {
+				_, _ = io.Copy(io.Discard, io.LimitReader(httpResp.Body, composerBridgeMaxErrorBodyBytes))
+				_ = httpResp.Body.Close()
+				composerInflight.release(tenant, *sessionID, *leaseOwner)
+				*sessionID, *leaseOwner, *body = rsid, newOwner, rbody
+				if stream {
+					log.Warnf("[composer %s] STREAM reseed-on-410: lost continuation re-seeded -> sid=%s", responseID, *sessionID)
+				} else {
+					log.Warnf("[composer %s] reseed-on-410: lost continuation re-seeded -> sid=%s", responseID, *sessionID)
+				}
+				httpResp, err = e.postAgentTurn(ctx, auth, apiKey, *body)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return httpResp, nil
+}
+
+// composerValidateAgentTurnPreStream rejects non-2xx and non-SSE bridge responses before SSE scanning.
+// When closeBody is true the response body is closed on failure (streaming path).
+func composerValidateAgentTurnPreStream(resp *http.Response, responseID string, stream, closeBody bool) error {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, composerBridgeMaxErrorBodyBytes))
+		if closeBody {
+			_ = resp.Body.Close()
+		}
+		corr := composerCorrelationID()
+		if stream {
+			log.Errorf("[composer %s] STREAM bridge NON-2xx corr=%s status=%d body=%s", responseID, corr, resp.StatusCode, sanitizeBridgeBody(errBody))
+		} else {
+			log.Errorf("[composer %s] bridge NON-2xx corr=%s status=%d body=%s", responseID, corr, resp.StatusCode, sanitizeBridgeBody(errBody))
+		}
+		return &composerBridgeStatusError{status: resp.StatusCode, correlation: corr}
+	}
+	if !composerResponseIsSSE(resp) {
+		ctHdr := resp.Header.Get("Content-Type")
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, composerBridgeMaxErrorBodyBytes))
+		if closeBody {
+			_ = resp.Body.Close()
+		}
+		return newComposerBridgeProtocolError(responseID, "non-SSE 2xx response", "content-type="+ctHdr+" body="+string(errBody))
+	}
+	return nil
+}
+
+func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	turn, err := e.prepareComposerInbound(auth, apiKey, req, opts, true)
+	if err != nil {
+		if errors.Is(err, errComposerImageOnlyInvalid) {
+			log.Errorf("[composer %s] STREAM image-only turn has no valid image -> 400", turn.responseID)
+			return nil, err
+		}
+		if gjson.GetBytes(turn.oai, "store").Exists() && !gjson.GetBytes(turn.oai, "store").Bool() {
+			log.Errorf("[composer %s] STREAM store:false unsupported -> 400", turn.responseID)
+			return nil, err
+		}
+		reporter := helps.NewUsageReporter(ctx, e.Identifier(), turn.model, auth)
+		reporter.PublishFailure(ctx, err)
+		reporter.EnsurePublished(ctx)
+		log.Errorf("[composer %s] STREAM deriveSessionID ERROR (-> 500): %v", turn.responseID, err)
+		return nil, err
+	}
+	model := turn.model
+	responseID := turn.responseID
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth)
+	oai := turn.oai
+	tenant := turn.tenant
+	contHint := turn.contHint
+	defs := turn.defs
+	toolAliases := turn.toolAliases
+	sessionID := turn.sessionID
+	leaseOwner := turn.leaseOwner
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("openai")
 	// H16/#21 (C-RESPID): the outward-response-id -> sessionID mapping is recorded AFTER the bridge accepts a
 	// valid SSE stream (below), NOT here — a dispatch that fails (transport / non-2xx / non-SSE) must not leave a
 	// phantom mapping that a later previous_response_id would then resume onto a session that never ran.
@@ -3639,92 +3768,21 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 	inp := composerInputHinted(oai, contHint)
 	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, extractComposerClientEnv(opts), constraints)
 	composerDebugf("[composer %s] STREAM sessionID=%s inputType=%v toolChoice=%q advertise=%d -> POST /agent/turn", responseID, sessionID, inp["type"], toolChoice, len(advertise))
-	if composerDebugEnabled {
-		// Log the ADVERTISED tool names (+ how many lost their schema). This is the only way to tell whether a
-		// harness tool the model should call (e.g. Task/Agent for subagents) is actually offered to composer,
-		// vs. dropped upstream — counts alone hide it. A tool with a mangled/absent inputSchema is one the model
-		// will typically refuse to call.
-		names := make([]string, 0, len(advertise))
-		noSchema := 0
-		for _, a := range advertise {
-			n, _ := a["name"].(string)
-			names = append(names, n)
-			if s, ok := a["inputSchema"]; !ok || s == nil {
-				noSchema++
-			}
-		}
-		composerDebugf("[composer %s] STREAM advertised %d tools (%d missing schema): %s", responseID, len(names), noSchema, strings.Join(names, ","))
-	}
+	composerDebugLogAdvertisedTools(responseID, advertise)
 
-	httpResp, err := e.postAgentTurn(ctx, auth, apiKey, body)
+	httpResp, err := e.composerAgentTurnDial(ctx, auth, apiKey, responseID, tenant, &sessionID, &leaseOwner, &body, oai, opts, contHint, model, advertise, toolChoice, constraints, true)
 	if err != nil {
-		// P0-4: a TRANSPORT failure dialing the bridge (sidecar down / restarting / unreachable) is a retryable
-		// upstream outage, not a model error — surface it as a typed 503 instead of an opaque 500 so a bridge
-		// restart reads as "unavailable" rather than a 500 storm. ADD-97: publish the failure HERE (this early
-		// return precedes the goroutine that defers EnsurePublished) so a bridge outage stays accounted for.
 		unavailErr := newComposerBridgeUnavailableError(responseID, err)
 		reporter.PublishFailure(ctx, unavailErr)
 		reporter.EnsurePublished(ctx)
-		composerInflight.release(tenant, sessionID, leaseOwner) // dispatch failed (no bridge run) -> free the lease so a retry re-attaches to this sid, not a phantom fork
+		composerInflight.release(tenant, sessionID, leaseOwner)
 		return nil, unavailErr
 	}
-	// P0-1 (reseed-on-410): a lost tool_results continuation — the bridge no longer holds the session this result
-	// answers (ESC-interrupt, bridge restart, or idle eviction) — gets ONE bounded retry, re-framed as a fresh
-	// user seed, instead of dead-ending the turn. The 410 fires PRE-STREAM (no headers committed, no [DONE] emitted
-	// yet), so the retry is safe. A turn that cannot be reseeded (not a continuation, or a thin continuation with no
-	// replayed opener) and a reseed that ALSO fails still surface as the typed 410 below — never a fabricated [DONE].
-	if httpResp.StatusCode == composerBridgeStatusGone {
-		if rsid, rbody, ok := composerReseedLostContinuation(tenant, apiKey, oai, opts, contHint, model, advertise, toolChoice, constraints); ok {
-			if newOwner, claimed := composerInflight.claim(tenant, rsid); claimed {
-				_, _ = io.Copy(io.Discard, io.LimitReader(httpResp.Body, composerBridgeMaxErrorBodyBytes))
-				_ = httpResp.Body.Close()
-				composerInflight.release(tenant, sessionID, leaseOwner) // free the lost sid's lease before re-POSTing to the fresh seed
-				sessionID, leaseOwner, body = rsid, newOwner, rbody
-				log.Warnf("[composer %s] STREAM reseed-on-410: lost continuation re-seeded -> sid=%s", responseID, sessionID)
-				httpResp, err = e.postAgentTurn(ctx, auth, apiKey, body)
-				if err != nil {
-					unavailErr := newComposerBridgeUnavailableError(responseID, err)
-					reporter.PublishFailure(ctx, unavailErr)
-					reporter.EnsurePublished(ctx)
-					composerInflight.release(tenant, sessionID, leaseOwner)
-					return nil, unavailErr
-				}
-			}
-		}
-	}
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		// ADD-46: bound the diagnostic read so a hostile/faulty bridge cannot make us allocate an unbounded
-		// error body. The returned error carries only a correlation id, not the body.
-		errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, composerBridgeMaxErrorBodyBytes))
-		_ = httpResp.Body.Close()
-		// M25: keep a REDACTED diagnostic in the logs (status + sanitized body) and return a SHORT GENERIC
-		// client error carrying only a correlation id — never the raw body (it may carry crsr_/sk-/bearer/
-		// signed-url/bridge tokens) and never the bridge URL with credentials.
-		// ADD-59 (C-ADD59-TYPED-STATUS): this check runs BEFORE the goroutine opens the stream / commits
-		// headers, so a typed StatusError propagates as a REAL client HTTP status (a 410 lost-continuation
-		// stays a 410, not a generic 500). The bridge's 410 semantics are preserved end-to-end.
-		corr := composerCorrelationID()
-		log.Errorf("[composer %s] STREAM bridge NON-2xx corr=%s status=%d body=%s", responseID, corr, httpResp.StatusCode, sanitizeBridgeBody(errBody))
-		statusErr := &composerBridgeStatusError{status: httpResp.StatusCode, correlation: corr}
-		// ADD-97: this return also precedes the goroutine's deferred EnsurePublished — record the failure now.
-		reporter.PublishFailure(ctx, statusErr)
+	if err := composerValidateAgentTurnPreStream(httpResp, responseID, true, true); err != nil {
+		reporter.PublishFailure(ctx, err)
 		reporter.EnsurePublished(ctx)
-		composerInflight.release(tenant, sessionID, leaseOwner) // P0-4: bridge rejected (non-2xx, no run) -> free the lease
-		return nil, statusErr
-	}
-	// ADD-88 (Comment 1, RBT-012): a 2xx response that is NOT text/event-stream is a bridge protocol violation,
-	// not an empty turn. Reject it BEFORE the goroutine opens the stream so a misconfigured bridge / proxy /
-	// CDN that answers 200 text/html (login page) or 200 application/json ({"ok":true}) can never be scanned
-	// into a clean empty completion. The typed protocol error carries only a correlation id (never the body).
-	if !composerResponseIsSSE(httpResp) {
-		ctHdr := httpResp.Header.Get("Content-Type")
-		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, composerBridgeMaxErrorBodyBytes))
-		_ = httpResp.Body.Close()
-		protoErr := newComposerBridgeProtocolError(responseID, "non-SSE 2xx response", "content-type="+ctHdr+" body="+string(body))
-		reporter.PublishFailure(ctx, protoErr)
-		reporter.EnsurePublished(ctx)
-		composerInflight.release(tenant, sessionID, leaseOwner) // P0-4: non-SSE protocol failure (no usable run) -> free the lease
-		return nil, protoErr
+		composerInflight.release(tenant, sessionID, leaseOwner)
+		return nil, err
 	}
 
 	// #21 (C-RESPID): the bridge has now accepted a valid SSE stream, so record outward-response-id -> sessionID
@@ -3755,24 +3813,8 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		}()
 		defer reporter.EnsurePublished(ctx)
 		defer func() {
-			switch {
-			case leaseStop == "tool_use":
-				composerInflight.touch(tenant, sessionID, leaseOwner) // paused for tools: keep the lease alive
-			case leaseStop != "":
-				composerInflight.release(tenant, sessionID, leaseOwner) // terminal end -> free the session
-				// #9 (review): the logical run ended on a NON-tool_use terminal, so its tool-call ownership can never
-				// be answered again. Forget it now (NOT on tool_use, where pending calls must stay routable) so a
-				// later session reusing a duplicate visible tool id is not falsely flagged ambiguous by a dead owner.
-				forgetComposerSessionToolCalls(tenant, sessionID)
-			case ctx.Err() != nil:
-				// P0-2: the client disconnected; the bridge cancels the live run on response close, so the logical
-				// run is gone -> release now rather than holding the lease for the full TTL (which would phantom-
-				// fork an immediate retry onto a sibling). Ownership is left for the TTL (a retry may re-attach).
-				composerInflight.release(tenant, sessionID, leaseOwner)
-			default:
-				// No terminal AND not a disconnect (a truncated/protocol-broken stream): the run state is uncertain,
-				// so leave the lease for the TTL self-heal rather than risk releasing a still-live run.
-			}
+			// No terminal AND not a disconnect: leave the lease for TTL self-heal (see composerApplyLeaseStop).
+			composerApplyLeaseStop(tenant, sessionID, leaseStop, leaseOwner, ctx)
 		}()
 
 		emit := func(srcChunks [][]byte) bool {
@@ -3837,7 +3879,7 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 				name, args := mapComposerToolCall(rawName, ev.Get("input"), defs, toolAliases)
 				completionChars += len(name) + len(args) // a tool call is generated output too
 				composerDebugf("[composer %s] STREAM tool_call emitted by model: raw=%q -> mapped=%q id=%s", responseID, rawName, name, ev.Get("id").String())
-				recordComposerToolCall(tenant, ev.Get("id").String(), sessionID) // route the continuation turn back here
+				composerOwnership.record(tenant, ev.Get("id").String(), sessionID) // route the continuation turn back here
 				choice = map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []map[string]any{{
 					"index": toolIdx, "id": ev.Get("id").String(), "type": "function",
 					"function": map[string]any{"name": name, "arguments": args},
@@ -4024,56 +4066,41 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 // executeComposer drives one /agent/turn and accumulates the bridge stream into a
 // single non-streaming response.
 func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	model := resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
 	// One response id for the whole turn: it is both the body id (resp["id"]) the client sees as response.id
 	// AND the H16 (C-RESPID) map key. Minting it separately at body-build time would let the recorded key
 	// drift from the client-visible id, breaking previous_response_id resume.
-	responseID := composerResponseID()
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth)
-	from := opts.SourceFormat
-	to := sdktranslator.FromString("openai")
-	oai := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
-	// ADD-94 / Comment 4: reject store:false BEFORE any durable Cursor state is created (never silently persist).
-	if errStore := composerRejectStoreFalse(oai); errStore != nil {
-		log.Errorf("[composer %s] store:false unsupported -> 400", responseID)
-		return cliproxyexecutor.Response{}, errStore
-	}
-	// Comment 5: compute tenant + continuation hint BEFORE the image-only check so a hinted continuation with a
-	// malformed trailing image is not rejected as image-only-invalid (see the streaming path for rationale).
-	tenant := composerTenant(auth, opts)
-	contHint := composerContinuationHintFor(tenant, oai)
-	// ADD-56: reject an image-only turn whose every image is invalid (see the streaming path for rationale).
-	if lastUserTurnImageOnlyInvalid(gjson.GetBytes(oai, "messages").Array(), contHint) {
-		log.Errorf("[composer %s] image-only turn has no valid image -> 400", responseID)
-		return cliproxyexecutor.Response{}, errComposerImageOnlyInvalid
-	}
-	defs := composerToolDefs(oai)
-	toolAliases := composerToolAliases(auth)
-	// ISOLATION: the live resolver applies concurrency-based forking (see executeComposerStream). The lease it
-	// claims for a new-user turn is freed at the run's terminal end / touched on a tool_use pause by leaseStop.
-	sessionID, leaseOwner, err := deriveComposerSessionIDLive(auth, apiKey, oai, opts)
+	turn, err := e.prepareComposerInbound(auth, apiKey, req, opts, false)
 	if err != nil {
-		reporter.PublishFailure(ctx, err) // ADD-97: account for the pre-bridge routing failure
+		if errors.Is(err, errComposerImageOnlyInvalid) {
+			log.Errorf("[composer %s] image-only turn has no valid image -> 400", turn.responseID)
+			return cliproxyexecutor.Response{}, err
+		}
+		if gjson.GetBytes(turn.oai, "store").Exists() && !gjson.GetBytes(turn.oai, "store").Bool() {
+			log.Errorf("[composer %s] store:false unsupported -> 400", turn.responseID)
+			return cliproxyexecutor.Response{}, err
+		}
+		reporter := helps.NewUsageReporter(ctx, e.Identifier(), turn.model, auth)
+		reporter.PublishFailure(ctx, err)
 		reporter.EnsurePublished(ctx)
 		return cliproxyexecutor.Response{}, err
 	}
+	model := turn.model
+	responseID := turn.responseID
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), model, auth)
+	oai := turn.oai
+	tenant := turn.tenant
+	contHint := turn.contHint
+	defs := turn.defs
+	toolAliases := turn.toolAliases
+	sessionID := turn.sessionID
+	leaseOwner := turn.leaseOwner
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("openai")
 	// leaseStop mirrors the streaming path: free the session's logical-run lease on a terminal end, touch it on
 	// a tool_use pause, and on no terminal ("") leave it for the TTL (the bridge run may still be alive). All
 	// touch/release calls carry leaseOwner so only the claiming run can mutate the lease (P0-1: no clobber).
 	leaseStop := ""
-	defer func() {
-		switch {
-		case leaseStop == "tool_use":
-			composerInflight.touch(tenant, sessionID, leaseOwner)
-		case leaseStop != "":
-			composerInflight.release(tenant, sessionID, leaseOwner)
-			forgetComposerSessionToolCalls(tenant, sessionID) // #9: terminal (non-tool_use) -> forget ownership (mirrors the stream path)
-		case ctx.Err() != nil:
-			// P0-2: the client disconnected before a terminal frame — release rather than strand a phantom lease
-			// for the full TTL (a sibling would otherwise be forced to fork around a run that is already gone).
-			composerInflight.release(tenant, sessionID, leaseOwner)
-		}
-	}()
+	defer func() { composerApplyLeaseStop(tenant, sessionID, leaseStop, leaseOwner, ctx) }()
 	// H16/#21 (C-RESPID): the outward-response-id -> sessionID mapping is recorded AFTER the bridge accepts a
 	// valid SSE stream (below), not here — a failed dispatch must leave no phantom mapping (mirrors the stream path).
 	advertise := composerAdvertise(oai)
@@ -4100,18 +4127,15 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 	inp := composerInputHinted(oai, contHint)
 	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, extractComposerClientEnv(opts), constraints)
 
-	httpResp, err := e.postAgentTurn(ctx, auth, apiKey, body)
+	httpResp, err := e.composerAgentTurnDial(ctx, auth, apiKey, responseID, tenant, &sessionID, &leaseOwner, &body, oai, opts, contHint, model, advertise, toolChoice, constraints, false)
 	if err != nil {
-		// P0-4: a transport failure dialing the bridge is a retryable upstream outage -> typed 503 (see
-		// executeComposerStream). ADD-97: publish the failure so a bridge outage / DNS / TLS failure is accounted for.
 		unavailErr := newComposerBridgeUnavailableError(responseID, err)
 		reporter.PublishFailure(ctx, unavailErr)
 		reporter.EnsurePublished(ctx)
-		composerInflight.release(tenant, sessionID, leaseOwner) // dispatch failed (no bridge run) -> free the lease so a retry re-attaches
+		composerInflight.release(tenant, sessionID, leaseOwner)
 		return cliproxyexecutor.Response{}, unavailErr
 	}
 	defer func() {
-		// P0-1: a reseed re-POST transport error (below) leaves httpResp nil — there is nothing to close.
 		if httpResp == nil {
 			return
 		}
@@ -4119,51 +4143,11 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 			log.Errorf("cursor composer: close bridge response body error: %v", errClose)
 		}
 	}()
-	// P0-1 (reseed-on-410): see executeComposerStream. One bounded retry re-framed as a fresh user seed for a lost
-	// tool_results continuation; a non-reseedable or re-failed 410 still surfaces below as the typed error.
-	if httpResp.StatusCode == composerBridgeStatusGone {
-		if rsid, rbody, ok := composerReseedLostContinuation(tenant, apiKey, oai, opts, contHint, model, advertise, toolChoice, constraints); ok {
-			if newOwner, claimed := composerInflight.claim(tenant, rsid); claimed {
-				_, _ = io.Copy(io.Discard, io.LimitReader(httpResp.Body, composerBridgeMaxErrorBodyBytes))
-				_ = httpResp.Body.Close()
-				composerInflight.release(tenant, sessionID, leaseOwner)
-				sessionID, leaseOwner, body = rsid, newOwner, rbody
-				log.Warnf("[composer %s] reseed-on-410: lost continuation re-seeded -> sid=%s", responseID, sessionID)
-				httpResp, err = e.postAgentTurn(ctx, auth, apiKey, body)
-				if err != nil {
-					unavailErr := newComposerBridgeUnavailableError(responseID, err)
-					reporter.PublishFailure(ctx, unavailErr)
-					reporter.EnsurePublished(ctx)
-					composerInflight.release(tenant, sessionID, leaseOwner)
-					return cliproxyexecutor.Response{}, unavailErr
-				}
-			}
-		}
-	}
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		// ADD-46: bound the diagnostic read (see the streaming path for rationale).
-		errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, composerBridgeMaxErrorBodyBytes))
-		// M25: redacted diagnostic in logs; short generic client error with a correlation id (never the raw body).
-		// ADD-59 (C-ADD59-TYPED-STATUS): typed StatusError preserves the bridge status to the client (a 410
-		// lost-continuation stays a 410). The non-stream path has not committed any response yet here.
-		corr := composerCorrelationID()
-		log.Errorf("[composer %s] bridge NON-2xx corr=%s status=%d body=%s", responseID, corr, httpResp.StatusCode, sanitizeBridgeBody(errBody))
-		statusErr := &composerBridgeStatusError{status: httpResp.StatusCode, correlation: corr}
-		reporter.PublishFailure(ctx, statusErr) // ADD-97
+	if err := composerValidateAgentTurnPreStream(httpResp, responseID, false, false); err != nil {
+		reporter.PublishFailure(ctx, err)
 		reporter.EnsurePublished(ctx)
-		composerInflight.release(tenant, sessionID, leaseOwner) // P0-4: bridge rejected (non-2xx, no run) -> free the lease
-		return cliproxyexecutor.Response{}, statusErr
-	}
-	// ADD-88 (Comment 1, RBT-012): reject a 2xx that is not text/event-stream — never scan a 200 HTML/JSON
-	// body into an empty assistant message. The typed protocol error carries only a correlation id.
-	if !composerResponseIsSSE(httpResp) {
-		ctHdr := httpResp.Header.Get("Content-Type")
-		body, _ := io.ReadAll(io.LimitReader(httpResp.Body, composerBridgeMaxErrorBodyBytes))
-		protoErr := newComposerBridgeProtocolError(responseID, "non-SSE 2xx response", "content-type="+ctHdr+" body="+string(body))
-		reporter.PublishFailure(ctx, protoErr)
-		reporter.EnsurePublished(ctx)
-		composerInflight.release(tenant, sessionID, leaseOwner) // P0-4: non-SSE protocol failure (no usable run) -> free the lease
-		return cliproxyexecutor.Response{}, protoErr
+		composerInflight.release(tenant, sessionID, leaseOwner)
+		return cliproxyexecutor.Response{}, err
 	}
 
 	// #21 (C-RESPID): the bridge accepted a valid SSE stream -> NOW record outward-response-id -> sessionID, so a
@@ -4208,7 +4192,7 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 			reasoning.WriteString(ev.Get("delta").String())
 		case "tool_call":
 			name, args := mapComposerToolCall(ev.Get("name").String(), ev.Get("input"), defs, toolAliases)
-			recordComposerToolCall(tenant, ev.Get("id").String(), sessionID) // route the continuation turn back here
+			composerOwnership.record(tenant, ev.Get("id").String(), sessionID) // route the continuation turn back here
 			toolCalls = append(toolCalls, map[string]any{
 				"id": ev.Get("id").String(), "type": "function",
 				"function": map[string]any{"name": name, "arguments": args},

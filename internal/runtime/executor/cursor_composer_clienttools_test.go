@@ -175,7 +175,7 @@ func TestDeriveComposerSessionID_ToolCallContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	recordComposerToolCall(composerTenant(auth, cliproxyexecutor.Options{}), "tc_42", sid)
+	composerOwnership.record(composerTenant(auth, cliproxyexecutor.Options{}), "tc_42", sid)
 	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_42"}]},{"role":"tool","tool_call_id":"tc_42","content":"R"}]}`)
 	got, err := deriveComposerSessionID(auth, "cursorkey", cont, cliproxyexecutor.Options{})
 	if err != nil {
@@ -924,7 +924,7 @@ func TestDeriveComposerSessionID_ContinuationOwnershipWins(t *testing.T) {
 	convA := optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-A"})
 	sessionA, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), convA)
 	sessionB := "sess_ownerB000000000000000000000000"
-	recordComposerToolCall(composerTenant(auth, convA), "tc_owned_by_B", sessionB)
+	composerOwnership.record(composerTenant(auth, convA), "tc_owned_by_B", sessionB)
 	// A continuation carrying conv-A metadata (which derives sessionA) but answering a tool emitted by B.
 	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_owned_by_B"}]},{"role":"tool","tool_call_id":"tc_owned_by_B","content":"R"}]}`)
 	got, err := deriveComposerSessionID(auth, "cursorkey", cont, convA)
@@ -937,7 +937,7 @@ func TestDeriveComposerSessionID_ContinuationOwnershipWins(t *testing.T) {
 	// ADD-70: re-emitting the SAME id under session A makes it owned by {A,B} — now AMBIGUOUS, not
 	// latest-writer-wins. Because this continuation carries the conv-A stable id, the ambiguity is
 	// disambiguated by routing to the conv-A stable session (which is sessionA), never by guessing.
-	recordComposerToolCall(composerTenant(auth, convA), "tc_owned_by_B", sessionA)
+	composerOwnership.record(composerTenant(auth, convA), "tc_owned_by_B", sessionA)
 	if got2, _ := deriveComposerSessionID(auth, "cursorkey", cont, convA); got2 != sessionA {
 		t.Fatalf("ambiguous re-emitted id with a stable conv id must route to the conv-A session A (%s), got %s", sessionA, got2)
 	}
@@ -1536,8 +1536,8 @@ func TestDeriveComposerSessionID_ToollessBodyConvFollowup(t *testing.T) {
 func TestDeriveComposerSessionID_MixedSessionBatchErrors(t *testing.T) {
 	auth := authWith("authB", "keyB")
 	tenant := composerTenant(auth, cliproxyexecutor.Options{})
-	recordComposerToolCall(tenant, "tc_sessA", "sess_A0000000000000000000000000000000")
-	recordComposerToolCall(tenant, "tc_sessB", "sess_B0000000000000000000000000000000")
+	composerOwnership.record(tenant, "tc_sessA", "sess_A0000000000000000000000000000000")
+	composerOwnership.record(tenant, "tc_sessB", "sess_B0000000000000000000000000000000")
 	mixed := []byte(`{"messages":[
 		{"role":"assistant","tool_calls":[{"id":"tc_sessA"},{"id":"tc_sessB"}]},
 		{"role":"tool","tool_call_id":"tc_sessA","content":"RA"},
@@ -1551,8 +1551,8 @@ func TestDeriveComposerSessionID_MixedSessionBatchErrors(t *testing.T) {
 		t.Fatalf("M32: error must identify the mixed-session cause, got %v", err)
 	}
 	// A batch whose recognized ids all belong to the SAME session routes normally (no error).
-	recordComposerToolCall(tenant, "tc_same1", "sess_S0000000000000000000000000000000")
-	recordComposerToolCall(tenant, "tc_same2", "sess_S0000000000000000000000000000000")
+	composerOwnership.record(tenant, "tc_same1", "sess_S0000000000000000000000000000000")
+	composerOwnership.record(tenant, "tc_same2", "sess_S0000000000000000000000000000000")
 	same := []byte(`{"messages":[
 		{"role":"assistant","tool_calls":[{"id":"tc_same1"},{"id":"tc_same2"}]},
 		{"role":"tool","tool_call_id":"tc_same1","content":"R1"},
@@ -2115,7 +2115,7 @@ func TestADD65_OwnershipSignalRoutesContinuation(t *testing.T) {
 	auth := authWith("authA65", "keyA65")
 	owner := "sess_owner65000000000000000000000000"
 	tenant := composerTenant(auth, cliproxyexecutor.Options{})
-	recordComposerToolCall(tenant, "call_owned65", owner)
+	composerOwnership.record(tenant, "call_owned65", owner)
 	oai := []byte(`{"messages":[
 		{"role":"user","content":"start"},
 		{"role":"tool","tool_call_id":"call_owned65","content":"R"},
@@ -2139,8 +2139,8 @@ func TestADD65_OwnershipSignalRoutesContinuation(t *testing.T) {
 func TestADD70_AmbiguousOwnershipRejectedWithoutDisambiguator(t *testing.T) {
 	auth := authWith("authA70", "keyA70")
 	tenant := composerTenant(auth, cliproxyexecutor.Options{})
-	recordComposerToolCall(tenant, "call_dup70", "sess_a70000000000000000000000000000")
-	recordComposerToolCall(tenant, "call_dup70", "sess_b70000000000000000000000000000")
+	composerOwnership.record(tenant, "call_dup70", "sess_a70000000000000000000000000000")
+	composerOwnership.record(tenant, "call_dup70", "sess_b70000000000000000000000000000")
 	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"call_dup70"}]},{"role":"tool","tool_call_id":"call_dup70","content":"R"}]}`)
 	// No stable id and no previous_response_id -> ambiguous -> typed error.
 	_, err := deriveComposerSessionID(auth, "cursorkey", cont, cliproxyexecutor.Options{})
@@ -2229,14 +2229,14 @@ func TestADD71_TTLAndSessionForget(t *testing.T) {
 	}
 }
 
-// ADD-71: the exported forgetComposerSessionToolCalls wrapper drops a session's entries from the global store.
+// ADD-71: the exported composerOwnership.forgetSession drops a session's entries from the global store.
 func TestADD71_ForgetWrapper(t *testing.T) {
 	tenant := "tnt_forget_wrapper"
-	recordComposerToolCall(tenant, "fw_id", "sess_fw")
+	composerOwnership.record(tenant, "fw_id", "sess_fw")
 	if !composerOwnership.ownsTool(tenant, "fw_id") {
 		t.Fatalf("ADD-71: setup — id must be owned before forget")
 	}
-	forgetComposerSessionToolCalls(tenant, "sess_fw")
+	composerOwnership.forgetSession(tenant, "sess_fw")
 	if composerOwnership.ownsTool(tenant, "fw_id") {
 		t.Fatalf("ADD-71: forgetComposerSessionToolCalls must drop the session's id from the global store")
 	}

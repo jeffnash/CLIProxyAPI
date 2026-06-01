@@ -45,10 +45,6 @@ const (
 	// Set to http://127.0.0.1:9797 in config to use the Node sidecar instead.
 	DefaultBackendBaseURL = "https://api2.cursor.sh"
 
-	// CursorDirectBackendBaseURL is the Cursor internal API used for auth exchange
-	// and protobuf chat when not routing through the sidecar.
-	CursorDirectBackendBaseURL = DefaultBackendBaseURL
-
 	// DefaultChatEndpoint is the OpenAI-compatible chat completions path (sidecar).
 	DefaultChatEndpoint = "/v1/chat/completions"
 
@@ -162,7 +158,7 @@ func BuildCursorIdentityHeaders() map[string]string {
 // against the direct Cursor backend (api2.cursor.sh). httpClient is injected by
 // the executor to ensure proxy awareness.
 func ExchangeCursorApiKey(ctx context.Context, apiKey string, httpClient *http.Client) (string, error) {
-	return exchangeCursorApiKey(ctx, apiKey, CursorDirectBackendBaseURL, httpClient)
+	return exchangeCursorApiKey(ctx, apiKey, DefaultBackendBaseURL, httpClient)
 }
 
 func cursorHTTPClient(httpClient *http.Client) *http.Client {
@@ -170,12 +166,6 @@ func cursorHTTPClient(httpClient *http.Client) *http.Client {
 		return httpClient
 	}
 	return &http.Client{Timeout: 30 * time.Second}
-}
-
-func setCursorIdentityHeaders(req *http.Request) {
-	for k, v := range BuildCursorIdentityHeaders() {
-		req.Header.Set(k, v)
-	}
 }
 
 func cursorHTTPError(resp *http.Response, unauthorizedMsg, op string) error {
@@ -196,7 +186,7 @@ func exchangeCursorApiKey(ctx context.Context, apiKey, backendBaseURL string, ht
 	}
 	httpClient = cursorHTTPClient(httpClient)
 	if backendBaseURL == "" {
-		backendBaseURL = CursorDirectBackendBaseURL
+		backendBaseURL = DefaultBackendBaseURL
 	}
 	backendBaseURL = strings.TrimRight(backendBaseURL, "/")
 
@@ -208,7 +198,9 @@ func exchangeCursorApiKey(ctx context.Context, apiKey, backendBaseURL string, ht
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	setCursorIdentityHeaders(req)
+	for k, v := range BuildCursorIdentityHeaders() {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -251,7 +243,9 @@ func VerifyCursorApiKey(ctx context.Context, apiKey string, httpClient *http.Cli
 	}
 
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	setCursorIdentityHeaders(req)
+	for k, v := range BuildCursorIdentityHeaders() {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := cursorHTTPClient(httpClient).Do(req)
 	if err != nil {
