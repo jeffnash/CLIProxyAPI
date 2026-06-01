@@ -917,15 +917,52 @@ test("C03: an EXPLICIT idless result with exactly one pending resolves the lone 
   sessions.delete(id);
 });
 
-test("BR1: tool_results for a never-emitted id surfaces an error turn (not a clean success)", async () => {
+test("BR1/orphan: an IDLE session with a wholly-foreign batch (no payload) 410s to drive reseed — never a false success", async () => {
+  // An IDLE session (no run, nothing pending, no active stream) that receives a tool_result for an id it never
+  // issued is the orphan-by-dead-run case: the run that owned the call died, the executor cleared ownership
+  // (forgetSession on the error stop) and routed the result here by lineage. Surfacing "unknown tool_call_id"
+  // over HTTP 200 made the client retry forever (the result has no live owner anywhere). The bridge now returns
+  // 410 — the same lost-continuation signal as an unknown session — so the executor's reseed-on-410 replays the
+  // conversation as a fresh user turn. Still NEVER a clean/false success that would strand the tool work.
   const id = "br1-unknown";
   const cursorKey = "k-br1";
   seedSession(id, cursorKey, { seeded: true });
   installFakePlatform(cursorKey, null);
   const res = makeRes();
   await drainTurn(makeReq(), res, { sessionId: id, input: { type: "tool_results", results: [{ toolCallId: "never-issued", content: "x" }] } }, cursorKey);
-  assert.match(res.sse, /"stop_reason":"error"/, "an id never issued by this session must be an error turn");
-  assert.match(res.sse, /unknown tool_call_id never-issued/);
+  assert.equal(res.status, 410, "an idle session + wholly-foreign batch must 410 to drive the reseed-on-410 recovery");
+  assert.match(res.sse, /orphaned tool_call_id/, "the 410 body names the orphan");
+  assert.doesNotMatch(res.sse, /"stop_reason":"end_turn"/, "never a clean/false success that strands the tool work");
+});
+
+test("orphan guard: idle+foreign 410s, but a LIVE session (pending) or a benign re-ack is left to the strict matcher", async () => {
+  // Pins the idle-vs-live boundary the 410 reseed guard depends on (allToolResultsForeign + idle gates).
+  const cursorKey = "k-orphan-boundary";
+  installFakePlatform(cursorKey, null);
+  // (a) LIVE session (has a pending) + foreign id -> NOT 410: a genuine desync still surfaces as unknown.
+  const live = seedSession("orphan-live", cursorKey, { seeded: true });
+  const w = (c) => { void c; }; w.__reject = () => {};
+  live.newPending("mine", w); live.everEmitted.add("mine"); live.delivered.add("mine");
+  const resLive = makeRes();
+  await drainTurn(makeReq(), resLive, { sessionId: "orphan-live", input: { type: "tool_results", results: [{ toolCallId: "foreign", content: "x" }] } }, cursorKey);
+  assert.notEqual(resLive.status, 410, "a live session (pending) must NOT 410 — the desync is surfaced, not reseeded");
+  assert.match(resLive.sse, /unknown tool_call_id foreign/);
+  live.rejectAllPending("test cleanup"); sessions.delete("orphan-live");
+  // (b) IDLE session + a benign already-emitted id -> NOT 410: a re-ack of resolved work acks cleanly.
+  const idle = seedSession("orphan-reack", cursorKey, { seeded: true });
+  idle.everEmitted.add("seen");
+  const resReack = makeRes();
+  await drainTurn(makeReq(), resReack, { sessionId: "orphan-reack", input: { type: "tool_results", results: [{ toolCallId: "seen", content: "x" }] } }, cursorKey);
+  assert.notEqual(resReack.status, 410, "an ever-emitted (benign) id must NOT 410");
+  assert.match(resReack.sse, /"stop_reason":"end_turn"/, "a benign re-ack is a clean end_turn");
+  sessions.delete("orphan-reack");
+  // (c) allToolResultsForeign direct: true only when every id is genuinely foreign on an idle session.
+  const probe = seedSession("orphan-probe", cursorKey, { seeded: true });
+  probe.everEmitted.add("known");
+  assert.equal(probe.allToolResultsForeign([{ toolCallId: "a" }, { toolCallId: "b" }]), true, "all-foreign batch");
+  assert.equal(probe.allToolResultsForeign([{ toolCallId: "a" }, { toolCallId: "known" }]), false, "a known id makes it non-foreign");
+  assert.equal(probe.allToolResultsForeign([]), false, "empty batch is not foreign");
+  sessions.delete("orphan-probe");
 });
 
 test("BR1: a watchdog-reaped / already-emitted id is benign (no error, no false success masking)", async () => {
