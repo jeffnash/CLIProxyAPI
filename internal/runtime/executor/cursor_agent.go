@@ -182,9 +182,7 @@ func buildAgentConversationHistory(payload *cursorChatPayload, excludeUserIdx in
 // description=2, input_schema=3 (message), provider_identifier=4, tool_name=5}}.
 // The model issues these as mcp_tool_call; we forward them to CC.
 //
-// input_schema is a structured message (not a JSON string); we attach the
-// tool's JSON-schema parameters via agentJSONSchemaStruct so the model knows
-// each tool's argument shape.
+// input_schema (field 3) is omitted until the wire message type is confirmed.
 func buildAgentMcpTools(tools []cursorToolDefinition) []byte {
 	if len(tools) == 0 {
 		return nil
@@ -196,9 +194,6 @@ func buildAgentMcpTools(tools []cursorToolDefinition) []byte {
 			protoStringField(2, t.Description), // description
 			protoStringField(4, "client"),      // provider_identifier
 			protoStringField(5, t.Name),        // tool_name
-		}
-		if schema := agentJSONSchemaStruct(t.Parameters); schema != nil {
-			fields = append(fields, protoMessageField(3, schema)) // input_schema
 		}
 		defs = append(defs, protoMessageField(1, protoMessage(fields...))) // McpTools.mcp_tools(1)
 	}
@@ -257,14 +252,6 @@ func encodeAgentRunFrame(payload *cursorChatPayload, model, conversationID, mess
 	}
 	agentRunRequest := protoMessage(runFields...)
 	return protoMessage(protoMessageField(1, agentRunRequest)) // AgentClientMessage{run_request=1}
-}
-
-// agentJSONSchemaStruct converts a tool's JSON-schema parameter string into
-// the wire encoding for McpToolDefinition.input_schema. Returns nil to omit
-// the field (the model can still call the tool from its name/description).
-// TODO: encode the schema once the input_schema message type is confirmed.
-func agentJSONSchemaStruct(jsonSchema string) []byte {
-	return nil
 }
 
 // hasEarlierUserTurn reports whether any user turn exists at an index other

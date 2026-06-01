@@ -199,7 +199,6 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	return cliproxyexecutor.Response{Payload: payload}, nil
 }
 
-// executeSidecar forwards JSON chat requests to the cursor-sdk-bridge sidecar.
 func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	apiKey := cursorauth.CursorAPIKeyFromAuth(auth)
 	if apiKey == "" {
@@ -242,7 +241,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 		// Translator state must persist across the entire stream so the
 		// target-format translator receives continuous context — matches
-		// the sidecar streaming path (see executeSidecarStream).
+		// the composer streaming path (see executeComposerStream).
 		var translatorState any
 
 		diag := &cursorStreamDiag{
@@ -408,13 +407,7 @@ type cursorEvent struct {
 	CompletionTokens int64
 }
 
-// cursorInternalHeaders builds the headers the real Cursor Agent CLI sends
-// on chat requests, verified against the bundled interceptor in
-// proto-audit/agent-cli/cursor-agent-svc.js. Phantom headers like
-// x-cursor-checksum, x-session-id, x-client-key, x-cursor-config-version,
-// x-cursor-timezone, x-amzn-trace-id, and the x-cursor-client-os/arch/* trio
-// were removed: zero references in either the agent-cli bundle or the
-// @cursor/sdk bundle.
+// cursorToolDefinition is a parsed OpenAI-style tool schema entry for Cursor encoding.
 type cursorToolDefinition struct {
 	Name        string
 	Description string
@@ -515,11 +508,10 @@ type cursorImage struct {
 // 1 MB cap because we're a backend proxy, not a browser canvas; the upper
 // bound exists to bound abuse rather than match a render budget.
 const (
-	cursorMaxImageBytes        = 5 << 20  // 5 MiB per image
-	cursorMaxTotalImageBytes   = 20 << 20 // 20 MiB across all images in a request
-	cursorMaxImagesPerRequest  = 10
-	cursorMaxImageDimension    = 8192
-	cursorAllowedImageMIMEsKey = "_cursorImageMIMEs" // sentinel; see allow-list below
+	cursorMaxImageBytes       = 5 << 20  // 5 MiB per image
+	cursorMaxTotalImageBytes  = 20 << 20 // 20 MiB across all images in a request
+	cursorMaxImagesPerRequest = 10
+	cursorMaxImageDimension   = 8192
 
 	// Cursor's direct StreamUnifiedChat path validates the whole flattened
 	// transcript as ONE ConversationMessage.text bubble. Long sessions
@@ -2142,7 +2134,7 @@ func marshalCursorSSEData(obj map[string]any) []byte {
 	return append([]byte("data: "), b...)
 }
 
-// extractCursorErrorMessage extracts the most detailed error message from a Cursor error response.
+// estimateUsage builds a token usage map from character counts when the stream reported none.
 func estimateUsage(promptChars, completionChars int) map[string]any {
 	promptTokens := estimateTokens(promptChars)
 	completionTokens := estimateTokens(completionChars)
@@ -2165,7 +2157,7 @@ func firstNonNilUsage(reported map[string]int64, fallback map[string]any) map[st
 	}
 }
 
-// jsonEscape escapes a string for embedding in a JSON string value.
+// buildCursorOpenAIChunk emits one OpenAI chat.completion.chunk SSE data line.
 func buildCursorOpenAIChunk(responseID, model string, delta map[string]any, finishReason string) []byte {
 	choice := map[string]any{
 		"index": 0,

@@ -309,6 +309,18 @@ function truncateLiveToolResult(content, cap = COMPOSER_LIVE_TOOL_RESULT_MAX_BYT
   return kept + `\n[tool result truncated by proxy: kept ${Buffer.byteLength(kept)}/${total} bytes]`;
 }
 
+const TOOL_CHOICE_SPECIFIC_PREFIX = "specific:";
+
+function toolChoiceSpecificName(toolChoice) {
+  const tc = toolChoice || "";
+  if (!tc.startsWith(TOOL_CHOICE_SPECIFIC_PREFIX)) return null;
+  return tc.slice(TOOL_CHOICE_SPECIFIC_PREFIX.length);
+}
+
+function advertisedToolName(t) {
+  return t.toolName || t.name;
+}
+
 // constraintInstructions turns the OpenAI-style enforced constraints the SDK has no first-class params
 // for (response_format / stop / token limit / tool_choice required|specific|none) into a model instruction
 // block appended to the user turn, so the Cursor agent honors what the request asked for.
@@ -323,15 +335,14 @@ function truncateLiveToolResult(content, cap = COMPOSER_LIVE_TOOL_RESULT_MAX_BYT
 function constraintInstructions({ toolChoice, responseFormat, stop, maxTokens, forcedUnavailable, unsupportedHardGuarantees } = {}) {
   const lines = [];
   const tc = toolChoice || "";
-  if (forcedUnavailable && tc.startsWith("specific:")) {
+  const specificNm = toolChoiceSpecificName(tc);
+  if (forcedUnavailable && specificNm != null) {
     // H09: never widen to other tools; tell the model the forced tool cannot be used this turn.
-    const nm = tc.slice("specific:".length);
-    lines.push(`The tool "${nm}" was required for this request but is NOT available. Do not call any other tool as a substitute; explain that the requested tool is unavailable.`);
+    lines.push(`The tool "${specificNm}" was required for this request but is NOT available. Do not call any other tool as a substitute; explain that the requested tool is unavailable.`);
   } else if (tc === "required") {
     lines.push("You MUST call one of the available tools to fulfill this request; do not produce a final answer until you have called at least one tool.");
-  } else if (tc.startsWith("specific:")) {
-    const nm = tc.slice("specific:".length);
-    lines.push(`You MUST call the tool named "${nm}" to fulfill this request, and you may call only that tool.`);
+  } else if (specificNm != null) {
+    lines.push(`You MUST call the tool named "${specificNm}" to fulfill this request, and you may call only that tool.`);
   } else if (tc === "none") {
     // H08 (best-effort): instruct the model to use NO tools, including the built-in file/shell tools that we
     // cannot un-advertise. The dispatch seam additionally hard-rejects any native exec case under `none`.
@@ -380,10 +391,9 @@ function effectiveAdvertise(advertise, toolChoice) {
   const adv = Array.isArray(advertise) ? advertise : [];
   const tc = toolChoice || "";
   if (tc === "none") return [];
-  if (tc.startsWith("specific:")) {
-    const nm = tc.slice("specific:".length);
-    const only = adv.filter((t) => (t.toolName || t.name) === nm);
-    return only; // H09: empty when the forced tool is not advertised (never widen to all)
+  const nm = toolChoiceSpecificName(tc);
+  if (nm != null) {
+    return adv.filter((t) => advertisedToolName(t) === nm); // H09: empty when forced tool not advertised
   }
   return adv;
 }
@@ -392,11 +402,10 @@ function effectiveAdvertise(advertise, toolChoice) {
 // advertised set (H09). When true the turn must tell the model the tool is unavailable instead of silently
 // offering other tools or pretending the constraint held.
 function forcedToolUnavailable(advertise, toolChoice) {
-  const tc = toolChoice || "";
-  if (!tc.startsWith("specific:")) return false;
-  const nm = tc.slice("specific:".length);
+  const nm = toolChoiceSpecificName(toolChoice);
+  if (nm == null) return false;
   const adv = Array.isArray(advertise) ? advertise : [];
-  return !adv.some((t) => (t.toolName || t.name) === nm);
+  return !adv.some((t) => advertisedToolName(t) === nm);
 }
 
 // nativeToolBlockedByChoice (H08, BEST-EFFORT) reports whether a NATIVE Cursor tool (read/shell/write/...) is
@@ -408,7 +417,7 @@ function forcedToolUnavailable(advertise, toolChoice) {
 function nativeToolBlockedByChoice(toolChoice) {
   const tc = toolChoice || "";
   if (tc === "none") return true;
-  if (tc.startsWith("specific:")) return true;
+  if (toolChoiceSpecificName(tc) != null) return true;
   return false;
 }
 
@@ -693,9 +702,10 @@ function fsErrorResult(message, path) {
 // working directory (ADD-57) instead of a hard-coded "/workspace". Read/write delegate to the ADD-43 honest
 // builders (preserve structured truncated/range/actual-content; degrade to truncated:true for an unverifiable
 // bounded string read; never fabricate full-file success).
+const CC_READ_CASE = { ccTool: "read", stream: false, buildResult: (c, s, isError) => isError ? fsErrorResult(ccErrorMessageText(c, "read failed"), s && s.path) : buildReadSuccess(c, s) };
 const CC_CASES = {
-  readArgs:        { ccTool: "read",  stream: false, buildResult: (c, s, isError) => isError ? fsErrorResult(ccErrorMessageText(c, "read failed"), s && s.path) : buildReadSuccess(c, s) },
-  redactedReadArgs:{ ccTool: "read",  stream: false, buildResult: (c, s, isError) => isError ? fsErrorResult(ccErrorMessageText(c, "read failed"), s && s.path) : buildReadSuccess(c, s) },
+  readArgs: CC_READ_CASE,
+  redactedReadArgs: CC_READ_CASE,
   writeArgs:       { ccTool: "write", stream: false, buildResult: (c, s, isError) => isError ? fsErrorResult(ccErrorMessageText(c, "write failed"), s && s.path) : buildWriteSuccess(c, s) },
   // agent.v1.DeleteSuccess.deleted_file is a STRING scalar (not bool) and file_size is fabricated when the
   // client returns no metadata, so we omit it rather than assert a false "0" size; deletedFile:"true" conveys
@@ -706,10 +716,7 @@ const CC_CASES = {
   // ADD-57: report ctx.cwd (the session's real processWorkingDirectory) in workingDirectory / exit.cwd.
   shellArgs:       { ccTool: "shell", stream: false, buildResult: (c, s, isError, ctx) => { const r = parseShellContent(c); const code = isError && r.exitCode === 0 ? 1 : r.exitCode; return { success: { command: s && s.command, workingDirectory: (ctx && ctx.cwd) || "/workspace", exitCode: code, stdout: r.stdout, stderr: r.stderr } }; } },
   shellStreamArgs: { ccTool: "shell", stream: true,  buildChunks: (c, isError, ctx) => { const r = parseShellContent(c); const code = isError && r.exitCode === 0 ? 1 : r.exitCode; const aborted = isError ? true : r.aborted; const out = [{ stdout: { data: r.stdout } }]; if (r.stderr) out.push({ stderr: { data: r.stderr } }); out.push({ exit: { code, cwd: (ctx && ctx.cwd) || "/workspace", aborted, localExecutionTimeMs: 1 } }); return out; } },
-  // grep/ls have complex structured results (workspace_results / directory_tree_root); v1 leaves them
-  // fail-closed (rejected) and the model uses the shell tool (rg/ls). TODO: implement structured shapes.
-  grepArgs:        { ccTool: "grep", stream: false, buildResult: null },
-  lsArgs:          { ccTool: "ls",   stream: false, buildResult: null },
+  // grep/ls: routed via TYPED_UNAVAILABLE_U in unaryExecPreflight (not CC_CASES).
 };
 // Control-flow exec cases the server may send: answer with a typed "allow" so the run proceeds (a bare
 // error reject can deny the action / desync). allowlisted is a bool.
@@ -814,6 +821,16 @@ function unaryExecPreflight(cas, store) {
   return null;
 }
 
+function blockedNativeExecIfNeeded(store, cas, s, stream) {
+  if (!store || !nativeToolBlockedByChoice(store.session.toolChoice)) return null;
+  const cwd = composerWorkspaceCwd(store.session.clientEnv);
+  dbg("__CC_EXEC_" + (stream ? "S" : "U") + " native tool blocked by tool_choice", "session=" + store.session.id, "cas=" + cas, "toolChoice=" + store.session.toolChoice);
+  if (stream) {
+    return (async function* () { yield { __ccJson: { stdout: { data: "" } } }; yield { __ccJson: { exit: { code: 1, cwd, aborted: true, localExecutionTimeMs: 1 } } }; })();
+  }
+  return Promise.resolve(blockedNativeResult(cas, s, cwd));
+}
+
 globalThis.__CC_EXEC_U = function (n, e, s, t) {
   const cas = caseOf(t);
   const store = als.getStore();
@@ -827,12 +844,8 @@ globalThis.__CC_EXEC_U = function (n, e, s, t) {
   if (!spec || spec.stream || !spec.buildResult || !store) {
     return Promise.reject(new Error(`[bridge] tool '${cas}' not supported by the Claude Code bridge`));
   }
-  // H08 (best-effort): tool_choice none/specific must gate NATIVE built-in tools too. Return a typed FAILURE
-  // result (model-visible) instead of executing the native tool on the client — never a fabricated success.
-  if (nativeToolBlockedByChoice(store.session.toolChoice)) {
-    dbg("__CC_EXEC_U native tool blocked by tool_choice", "session=" + store.session.id, "cas=" + cas, "toolChoice=" + store.session.toolChoice);
-    return Promise.resolve(blockedNativeResult(cas, s, composerWorkspaceCwd(store.session.clientEnv)));
-  }
+  const blocked = blockedNativeExecIfNeeded(store, cas, s, false);
+  if (blocked) return blocked;
   return store.session.dispatchUnary(cas, spec, s);
 };
 globalThis.__CC_EXEC_S = function (n, e, s, t) {
@@ -842,13 +855,8 @@ globalThis.__CC_EXEC_S = function (n, e, s, t) {
   if (!spec || !spec.stream || !spec.buildChunks || !store) {
     return (async function* () { throw new Error(`[bridge] streaming tool '${cas}' not supported by the Claude Code bridge`); })();
   }
-  // H08 (best-effort): block a native STREAMING tool (shellStream) under none/specific with a typed aborted
-  // exit chunk so the model sees the failure instead of the tool running on the client.
-  if (nativeToolBlockedByChoice(store.session.toolChoice)) {
-    dbg("__CC_EXEC_S native tool blocked by tool_choice", "session=" + store.session.id, "cas=" + cas, "toolChoice=" + store.session.toolChoice);
-    const blockedCwd = composerWorkspaceCwd(store.session.clientEnv); // ADD-57: real cwd in the aborted exit chunk
-    return (async function* () { yield { __ccJson: { stdout: { data: "" } } }; yield { __ccJson: { exit: { code: 1, cwd: blockedCwd, aborted: true, localExecutionTimeMs: 1 } } }; })();
-  }
+  const blocked = blockedNativeExecIfNeeded(store, cas, s, true);
+  if (blocked) return blocked;
   return store.session.dispatchStream(cas, spec, s);
 };
 

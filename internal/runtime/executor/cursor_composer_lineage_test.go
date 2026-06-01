@@ -128,7 +128,7 @@ func TestLineage2_MultiTurnForkStability(t *testing.T) {
 		t.Fatalf("turn1 fork must split from the parent (fork=%s parent=%s)", forkSid1, parentSid)
 	}
 	// The fork's turn-1 tool call is owned by the fork session.
-	recordComposerToolCall(tenant, "fork_tc_1", forkSid1)
+	composerOwnership.record(tenant, "fork_tc_1", forkSid1)
 
 	// Turn 2: tool-results continuation answering the fork's pending tool call -> ownership routes back to the
 	// fork (branch 1), NOT branch 3. Built explicitly (the assistant carries tool_calls + a trailing result).
@@ -164,7 +164,7 @@ func TestLineage2_MultiTurnForkStability(t *testing.T) {
 	}
 
 	// Turn 4: another tool loop on the fork — ownership keeps it on the same forkSid.
-	recordComposerToolCall(tenant, "fork_tc_2", forkSid3)
+	composerOwnership.record(tenant, "fork_tc_2", forkSid3)
 	t4 := []byte(`{"messages":[` +
 		`{"role":"system","content":"S"},` +
 		`{"role":"user","content":"FORK: implement feature X"},` +
@@ -486,7 +486,7 @@ func TestLineage9_OwnershipUnchangedAndCorroborator(t *testing.T) {
 	tenant := composerTenant(auth, cliproxyexecutor.Options{})
 
 	// Ownership wins: a continuation whose id is owned routes by ownership, ignoring any conv id.
-	recordComposerToolCall(tenant, "tc_owned9", "sess_owned9")
+	composerOwnership.record(tenant, "tc_owned9", "sess_owned9")
 	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_owned9"}]},{"role":"tool","tool_call_id":"tc_owned9","content":"R"}]}`)
 	got, _ := deriveComposerSessionID(auth, "ckey", cont, optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-ignored9"}))
 	if got != "sess_owned9" {
@@ -765,9 +765,9 @@ func TestContinuityForkReattachByOpenerAfterOwnershipLoss(t *testing.T) {
 	if forkSid == parentSid {
 		t.Fatalf("setup: fork must split from parent (fork=%s parent=%s)", forkSid, parentSid)
 	}
-	recordComposerToolCall(tenant, "tc_reattach", forkSid)
+	composerOwnership.record(tenant, "tc_reattach", forkSid)
 	// LOSE ownership (TTL eviction / restart) but the lineage survives.
-	forgetComposerSessionToolCalls(tenant, forkSid)
+	composerOwnership.forgetSession(tenant, forkSid)
 	// Full-replay continuation of the fork: opener + the assistant tool_call + the now-UNOWNED result. Its head
 	// has GROWN past the recorded 1-message opener, so it must re-attach via the opener bridge (b), not (a).
 	cont := []byte(`{"messages":[` +
@@ -796,10 +796,10 @@ func TestContinuityReseedNotCollapseAfterStateLoss(t *testing.T) {
 	if forkSid == parentSid {
 		t.Fatalf("setup: fork must split")
 	}
-	recordComposerToolCall(tenant, "tc_lost", forkSid)
+	composerOwnership.record(tenant, "tc_lost", forkSid)
 	// FULL state loss: drop the whole lineage registry for the tenant AND the ownership.
 	composerLineage.tenants.Delete(tenant)
-	forgetComposerSessionToolCalls(tenant, forkSid)
+	composerOwnership.forgetSession(tenant, forkSid)
 	// The returning fork's full-replay continuation: ownership gone, lineage gone -> MUST reseed, NOT baseSid.
 	cont := []byte(`{"messages":[` +
 		`{"role":"user","content":"subagent fork opener xyz"},` +
@@ -840,7 +840,7 @@ func TestConcurrencyForkContinuationDoesNotFork(t *testing.T) {
 	opts := claudeUUIDOpts("uuid-cont-nofork")
 	// A fork session that emitted a tool call (ownership recorded), with its logical run in flight (lease held).
 	forkSid := "sess_forkcont0001"
-	recordComposerToolCall(tenant, "tc_cont1", forkSid)
+	composerOwnership.record(tenant, "tc_cont1", forkSid)
 	owner, _ := composerInflight.claim(tenant, forkSid)
 
 	// A continuation answering that tool call must re-attach to the emitting fork by OWNERSHIP — NOT concurrency-
