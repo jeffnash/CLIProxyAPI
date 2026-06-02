@@ -243,11 +243,22 @@ test("argContractFor + augmentToolDescription inject a schema-derived per-tool a
   assert.match(wf, /COPY THIS SHAPE EXACTLY/);     // the annotated multi-phase example composer can pattern-match
   // Decomposition-depth guidance: push composer off its shallow 1-step / 1-2-agent default toward many phases +
   // wide parallel fan-out (the whole point of a workflow).
-  assert.match(wf, /SCALE FIRST/);                 // prominent: scale before anything else
+  assert.match(wf, /PROBE WIDE|SCALE FIRST/);      // prominent: wide probe before anything else
   assert.match(wf, /DECOMPOSE/);                   // extras: break the task into many parallel jobs
-  assert.match(wf, /parallel lane/);               // one lane per mapped item
-  assert.ok((wf.match(/phase\('(map|investigate|verify|synthesize)'\)/g) || []).length >= 4, "the example demonstrates several phases (deep), not one");
-  assert.ok((wf.match(/await parallel\(/g) || []).length >= 3, "the example fans out wide in multiple phases");
+  assert.match(wf, /parallel lane|one agent PER|probe lanes/); // one lane per mapped item
+  assert.ok((wf.match(/phase\('(probe|verify|synthesize|map|investigate)'\)/g) || []).length >= 3, "the example demonstrates several phases (deep), not one");
+  assert.ok((wf.match(/await parallel\(/g) || []).length >= 2, "the example fans out wide in multiple phases");
+  // RIGOR (the measured composer gap): the guidance must teach DERIVING the seams + per-lane structured output +
+  // a structural adversarial verify + threading — not just breadth. The upgraded example demonstrates all of it.
+  assert.match(wf, /SEAMS/, "teaches deriving the independent units of THIS task");
+  assert.match(wf, /schema: (FIND|VERDICT)/, "every fan-out lane returns structured DATA, not prose");
+  assert.match(wf, /DEFAULT isReal=false|REFUTE/, "the verify phase is adversarial + defaults to refuted");
+  assert.match(wf, /\.filter\(/, "keeps only the survivors");
+  assert.match(wf, /CONFIRMED/, "the synthesis reads the confirmed set, not the raw findings");
+  assert.match(wf, /DEEP PROMPTS|const CTX/, "subagents only see agent() strings — teach CTX + verbose lane briefs");
+  assert.match(wf, /one-liner|150\+/, "warn against tiny per-lane prompts");
+  assert.match(wf, /lanePrompt|CTX \+.*LANE:/, "example uses lanePrompt or CTX + lane slice");
+  assert.match(wf, /function lanePrompt/, "example teaches a reusable lane prompt builder");
   // Delegation: a launched workflow runs in the background — composer must WAIT, not also do the work itself.
   assert.match(wf, /DELEGATE/);
   assert.match(wf, /RETURNS IMMEDIATELY|runs in the BACKGROUND/);
