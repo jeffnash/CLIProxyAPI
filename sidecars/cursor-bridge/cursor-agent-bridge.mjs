@@ -2367,6 +2367,14 @@ function normalizeToolArgsToSchema(name, input, schema) {
 // argument contract appended to each tool's MCP description below. Disable only to shrink the tools/list payload;
 // the per-tool EXTRAS (critical conflation fixes) still apply when disabled.
 const TOOL_ARG_CONTRACT_ENABLED = !["0", "false", "off", "no"].includes(String(process.env.CURSOR_COMPOSER_TOOL_ARG_CONTRACT || "").toLowerCase());
+// argContract reinforces a tool's exact arg KEYS/types, which only matters for the few tools composer CONFLATES
+// (it borrows the Agent tool's object shape onto the workflow agent() function, invents Agent args, etc.). Every
+// other tool (chrome-devtools, Read, Bash, Write, …) already conveys its shape via the schema, so the contract
+// would just bloat the advertised description with no behavior gain — gate it to the handful that need it (~54 -> 3+).
+const ARG_CONTRACT_TOOLS = new Set(["Workflow", "Agent"]);
+function toolNeedsArgContract(name) {
+  return ARG_CONTRACT_TOOLS.has(name) || (typeof name === "string" && name.startsWith("Task"));
+}
 
 // TOOL_USAGE_EXTRAS carries per-tool calling guidance the JSON schema alone CANNOT express — chiefly the calling
 // convention of a function that lives INSIDE a string argument (Workflow.script's agent()), a recurring conflation
@@ -2535,7 +2543,7 @@ function augmentToolDescription(name, description, schema) {
     const base = typeof description === "string" ? description : "";
     const prominent = (TOOL_USAGE_PROMINENT && TOOL_USAGE_PROMINENT[name]) || ""; // PREPENDED: read first, before CC's own docs
     const extra = (TOOL_USAGE_EXTRAS && TOOL_USAGE_EXTRAS[name]) || "";
-    const contract = TOOL_ARG_CONTRACT_ENABLED ? argContractFor(name, schema) : "";
+    const contract = (TOOL_ARG_CONTRACT_ENABLED && toolNeedsArgContract(name)) ? argContractFor(name, schema) : "";
     const parts = [prominent, base, contract, extra].filter(Boolean);
     return parts.join("\n\n");
   } catch { return typeof description === "string" ? description : ""; }
@@ -3378,6 +3386,20 @@ async function shutdown() {
 }
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
+
+// CRASH BACKSTOP (P0): the @cursor/sdk validates advertised tool schemas with ajv in STRICT mode and can THROW
+// from INSIDE its own async callbacks (e.g. a malformed inputSchema reaching tools/list) — a path the bridge
+// cannot wrap per-seam because it lives inside the SDK. An uncaught throw there would KILL this Node process and
+// take the whole bridge down, so the Go executor then 503s every session until a manual redeploy (the schema-
+// compaction incident). Keep the process ALIVE and log LOUDLY — full stack, always, never silent, so a real bug
+// stays visible rather than masked. The bridge's OWN seams still surface a typed error turn to the client; a
+// single wedged turn is bounded by the per-tool PENDING_TIMEOUT / session-TTL guards, but a dead process is not.
+process.on("uncaughtException", (err, origin) => {
+  try { console.error("[cursor-agent-bridge] FATAL uncaughtException (process kept alive) origin=" + origin + ":", (err && err.stack) ? err.stack : err); } catch { /* a logger throw must never re-crash the handler */ }
+});
+process.on("unhandledRejection", (reason) => {
+  try { console.error("[cursor-agent-bridge] unhandledRejection (process kept alive):", (reason && reason.stack) ? reason.stack : reason); } catch { /* never throw from the handler */ }
+});
 
 // Startup self-test (part 1, direct-global): client execution is guaranteed by the dispatch-seam patch
 // (__CC_EXEC_U/S route every tool to CC, and native exec is fail-closed behind __CC_ALLOW_NATIVE) — NOT

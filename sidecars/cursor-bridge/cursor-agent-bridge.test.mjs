@@ -220,10 +220,15 @@ test("argContractFor + augmentToolDescription inject a schema-derived per-tool a
   assert.equal(argContractFor("X", { type: "object" }), "");
   assert.equal(argContractFor("X", {}), "");
   assert.equal(argContractFor("X", null), "");
-  // augmentToolDescription appends the contract AFTER the verbatim base description.
-  const d = augmentToolDescription("Bash", "Run a shell command.", bash);
-  assert.match(d, /^Run a shell command\./);
-  assert.match(d, /Call `Bash` with exactly these argument keys/);
+  // augmentToolDescription appends the contract AFTER the verbatim base description — but ONLY for the conflation-
+  // prone tools (Workflow/Agent/Task*); a generic tool keeps its base description with no contract noise.
+  const agentSchema = { type: "object", properties: { description: { type: "string" }, subagent_type: { type: "string" } }, required: ["description"] };
+  const dAgent = augmentToolDescription("Agent", "Spawn a subagent.", agentSchema);
+  assert.match(dAgent, /^Spawn a subagent\./);
+  assert.match(dAgent, /Call `Agent` with exactly these argument keys/);
+  const dBash = augmentToolDescription("Bash", "Run a shell command.", bash);
+  assert.match(dBash, /^Run a shell command\./);
+  assert.doesNotMatch(dBash, /Call `Bash` with exactly these argument keys/, "argContract is gated to conflation-prone tools — not Bash");
   // Workflow carries the PRESCRIPTIVE script contract (verified against CC's real runtime): every observed failure
   // mode is covered — the meta/export structure, the [object Object] object-shape trap, agentType, and thunks.
   const wf = augmentToolDescription("Workflow", "", { type: "object", properties: { script: { type: "string" }, scriptPath: { type: "string" } } });
@@ -1483,10 +1488,10 @@ test("MCP tools/list returns the session's advertised tools with an object input
   // The "nanobanana" serverKey serves only the image tool, preserving its provided schema.
   const nb = await mcpDispatch({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, id, "nanobanana");
   assert.deepEqual(nb.result.tools.map((t) => t.name), ["mcp__nanobanana__generate_image"]);
-  // The verbatim base description is preserved, with the schema-derived arg contract appended (ADD-110).
+  // The verbatim base description is preserved; the schema-derived arg contract is gated to conflation-prone tools
+  // (Workflow/Agent/Task*), so a generic MCP tool like this one gets NO contract (ADD-110 + the gating cleanup).
   assert.match(nb.result.tools[0].description, /^make an image/);
-  assert.match(nb.result.tools[0].description, /Call `mcp__nanobanana__generate_image` with exactly these argument keys/);
-  assert.match(nb.result.tools[0].description, /`prompt` \(string\)/);
+  assert.doesNotMatch(nb.result.tools[0].description, /Call `mcp__nanobanana__generate_image` with exactly these argument keys/, "argContract is gated out of generic tools");
   assert.deepEqual(nb.result.tools[0].inputSchema.properties.prompt, { type: "string" });
   // Empty serverKey ("cc"/grouping-one shape) returns ALL tools regardless of grouping.
   const all = await mcpDispatch({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} }, id, "");
