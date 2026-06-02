@@ -106,6 +106,17 @@ const COMPOSER_DEBUG = process.env.CURSOR_COMPOSER_DEBUG === "1" || process.env.
 // today's native-only path. The /mcp route is dialed by the in-process SDK runtime over loopback only.
 const MCP_SHIM_RAW = String(process.env.CURSOR_COMPOSER_MCP_SHIM ?? "").trim().toLowerCase();
 const MCP_SHIM_ENABLED = !(MCP_SHIM_RAW === "0" || MCP_SHIM_RAW === "false");
+// EX3 (clean image path): a tool-result IMAGE is folded into the proto McpToolResult as McpImageContent, so the
+// model sees it on RESUME — no fresh-send side-channel, and multi-tool/partial batches need no special handling
+// (each tool's image rides its OWN dispatchMcp result). ON by default — VERIFIED end-to-end that Cursor forwards
+// McpImageContent to composer-2.5 (composer read a token image returned this way). Set
+// CURSOR_COMPOSER_MCP_IMAGE_RESULTS=0 to fall back to the fresh-send fold (kept intact as the escape hatch, and
+// always used for url-form images, which McpImageContent's base64 `data` field cannot carry). Read at call time
+// (not a load-time const) so tests can exercise both paths.
+function mcpImageResultsEnabled() {
+  const v = process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+  return v !== "0" && v !== "false";
+}
 // Grouping: how advertised tools are partitioned across MCP servers — one|natural|per-tool (default natural).
 //   one      -> a single server "cc" advertising ALL tools (one MCP connection).
 //   natural  -> reconstruct the user's real MCP topology from mcp__<server>__<tool> names; non-mcp tools
@@ -769,9 +780,22 @@ function typedUnavailableResult(cas) {
 // drive the SAME function the live run uses instead of a hand-retyped literal (ADD-74: a literal can drift from
 // the real shape and pass CI while the first real tool-call crashes inside fromJson). content is normalized to a
 // string exactly as the live wrap did (object content -> JSON.stringify). isError is strict-true.
-function mcpDispatchResult(content, isError) {
+function mcpDispatchResult(content, isError, images) {
   const text = typeof content === "string" ? content : JSON.stringify(content ?? "");
-  return { success: { isError: isError === true, content: [{ text: { text } }] } };
+  const parts = [];
+  // EX3 (clean path A): inline base64 tool-result images as McpImageContent — the content oneof's `image`
+  // member (agent.v1.McpImageContent = { data: bytes(T:12), mime_type: string }; protobuf-es fromJson decodes a
+  // base64 STRING into the bytes field). Placed BEFORE the text part. url-form images carry no base64 `data`
+  // here, so they are skipped and fall back to the (flag-off) fresh-send path. Caller gates whether images flow.
+  if (Array.isArray(images)) {
+    for (const im of images) {
+      if (im && typeof im.data === "string" && im.data && typeof im.mimeType === "string" && im.mimeType) {
+        parts.push({ image: { data: im.data, mimeType: im.mimeType } });
+      }
+    }
+  }
+  if (text || parts.length === 0) parts.push({ text: { text } });
+  return { success: { isError: isError === true, content: parts } };
 }
 
 function ccArgsFor(cas, s) {
@@ -1014,6 +1038,7 @@ class Session {
     this.usedWireIds = new Set();  // H23: every wire id this session has handed out (collision detection set).
     this.turnToken = 0;           // increments per turn; flush is bound to a token
     this.settleTurn = null;
+    this.stashedToolResultImages = []; // EX3: tool-result images from a PARTIAL batch, held until the batch completes
     this.streamedText = "";       // cumulative text streamed in the CURRENT run (reset per user turn)
     this.reasonedThisRun = false; // #15: whether the CURRENT run emitted any reasoning (reset per user turn).
                                   // Reasoning counts as produced output, so a reasoning-only finished run is not
@@ -1225,14 +1250,16 @@ class Session {
   // resolvePending answers a pending client tool call. isError (C5/BR4) flags a FAILED/cancelled client tool
   // so the result reaches the model AS a failure (the resolve wrappers in dispatchUnary/Stream/Mcp route it
   // into the Cursor result's isError / non-zero exit shapes) instead of being reported as a clean success.
-  resolvePending(id, content, isError = false) {
+  resolvePending(id, content, isError = false, images = null) {
     const p = this.pending.get(id);
     if (!p) return false;
     // ADD-95 (bridge backstop): cap an oversized live tool-result string before it resolves into the resuming
     // run (the executor cap normally wins; this only trims content that bypassed it). Same 'truncated by proxy'
     // marker on both halves. Structured object content is passed through untouched.
     const capped = truncateLiveToolResult(content);
-    if (p.timer) clearTimeout(p.timer); this.pending.delete(id); p.resolve(capped, isError === true);
+    // EX3: forward any tool-result images to the resolve wrap (3rd arg) so the /mcp tools/call response can
+    // carry them as MCP image content when COMPOSER_MCP_IMAGE_RESULTS is on. Wraps that ignore it are unaffected.
+    if (p.timer) clearTimeout(p.timer); this.pending.delete(id); p.resolve(capped, isError === true, images);
     // ADD-60: a streaming client can answer a tool BEFORE the TOOL_BATCH_MS debounce flushes (the concurrent
     // activeRes path resolves it into the live run). If that id is still sitting in turnBatch, the pending
     // flush would later emit a STALE `turn_end{tool_use, tool_calls:[id]}` for an already-answered call (the
@@ -1264,14 +1291,14 @@ class Session {
     const unknown = [];
     for (const tr of results || []) {
       const isErr = tr.isError === true;
-      if (this.resolvePending(tr.toolCallId, tr.content, isErr)) { matched++; continue; }
+      if (this.resolvePending(tr.toolCallId, tr.content, isErr, tr.images)) { matched++; continue; }
       // Explicit idless/minted result: a translator proved there was no client-visible id. Resolve the lone
       // pending ONLY when exactly one is outstanding (never guess among several). This is the sole survivor of
       // the removed C03 fallback and fires only behind the explicit flag.
       if (tr.idless === true && this.pending.size === 1) {
         const loneId = this.pending.keys().next().value;
         dbg("matchToolResults idless 1-pending resolve", "session=" + this.id, "resolving=" + loneId);
-        if (this.resolvePending(loneId, tr.content, isErr)) { matched++; continue; }
+        if (this.resolvePending(loneId, tr.content, isErr, tr.images)) { matched++; continue; }
       }
       // BR1: an id that misses but was ever emitted/delivered is benign (reaped or already resolved). Only an
       // id never issued by this session is genuinely unknown.
@@ -1350,10 +1377,15 @@ class Session {
     return new Promise((resolve, reject) => {
       // C5/BR4: a client tool that failed/was cancelled (isError) must reach the model AS a failure, so the
       // McpResult's isError mirrors the threaded flag rather than being hardcoded false.
-      const wrap = (content, isError) => {
+      const wrap = (content, isError, images) => {
+        // EX3 (clean path A): this is the LIVE client-tool path (the SDK runtime execs tools in-process via the
+        // patched bundle, NOT the HTTP /mcp server). When enabled, fold a tool-result image into the proto
+        // McpToolResult as McpImageContent so the model sees it on RESUME — no fresh-send side-channel.
+        const imgs = mcpImageResultsEnabled() && Array.isArray(images) && images.length ? images : null;
+        if (imgs) dbg("EX3 dispatchMcp folding image into McpToolResult (path A)", "session=" + this.id, "name=" + ccName, "images=" + imgs.length);
         let out = ccName === "Workflow" ? augmentWorkflowResultOnFailure(content, isError) : content;
         out = augmentBackgroundLaunchResult(out, ccName); // a background launch (Workflow, or a backgrounded Bash) -> tell the model to WAIT, not relaunch or redo the work (named + id so it is clear WHICH)
-        resolve({ __ccJson: mcpDispatchResult(out, isError) });
+        resolve({ __ccJson: mcpDispatchResult(out, isError, imgs) });
       };
       wrap.__reject = reject;
       this.newPending(id, wrap);
@@ -1544,7 +1576,7 @@ class Session {
   // resetLoopBounds clears the per-logical-run agentic-loop counters (ADD-106). Called when a FRESH send starts a
   // new logical run (driveUserSend) — NOT on a tool_results resume, which continues the SAME logical run and so
   // keeps accumulating rounds. A cancel/supersession also resets them via the next fresh send.
-  resetLoopBounds() { this.toolRounds = 0; this.lastToolSig = null; this.repeatToolCount = 0; this.loopTripped = false; }
+  resetLoopBounds() { this.toolRounds = 0; this.lastToolSig = null; this.repeatToolCount = 0; this.loopTripped = false; this.stashedToolResultImages = []; }
 
   // checkLoopBound (ADD-106) counts ONE tool-result round (the batch about to be delivered in pauseForTools) and
   // enforces the per-logical-run bounds. Returns true when a bound TRIPPED (the run was terminated as an error
@@ -2114,13 +2146,27 @@ async function mcpDispatch(msg, sessionId, serverKey) {
         // turn) fulfills `wrap`; rejectAllPending (run completed/errored/cancelled/abandoned) -> __reject.
         const callId = ccToolId(undefined);
         try {
-          const content = await new Promise((resolve, reject) => {
-            const wrap = (c) => resolve(c);
+          const out = await new Promise((resolve, reject) => {
+            const wrap = (c, _e, imgs) => resolve({ content: c, images: imgs });
             wrap.__reject = reject;
             session.newPending(callId, wrap);
             session.emitToolUse(callId, ccName, input);
           });
-          return mcpResult(id, { content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content ?? "") }], isError: false });
+          // EX3 (clean path B): return inline base64 tool-result images as MCP image content, BEFORE the text, so
+          // the model sees the image on RESUME. Standard MCP CallToolResult content part {type:"image",data,mimeType}.
+          // url-form images are not base64 here, so they fall through to the text + the (flag-off) fresh-send path.
+          const parts = [];
+          if (mcpImageResultsEnabled() && Array.isArray(out.images)) {
+            for (const im of out.images) {
+              if (im && typeof im.data === "string" && im.data && typeof im.mimeType === "string" && im.mimeType) {
+                parts.push({ type: "image", data: im.data, mimeType: im.mimeType });
+              }
+            }
+            if (parts.length) console.error("[cct] EX3 mcp tools/call (path B) returning image content session=" + sessionId + " name=" + ccName + " images=" + parts.length);
+          }
+          const text = typeof out.content === "string" ? out.content : JSON.stringify(out.content ?? "");
+          if (text || parts.length === 0) parts.push({ type: "text", text });
+          return mcpResult(id, { content: parts, isError: false });
         } catch (rejErr) {
           // Run completed/errored/cancelled/abandoned before the client answered: a typed failure (per MCP,
           // tool-execution failures are RESULTS with isError, not protocol errors), so the runtime never hangs.
@@ -3153,7 +3199,21 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       // image-only trailing message (empty userText but images present) is ALSO user payload and must drive a
       // fresh send, so the model answers about the image instead of an empty turn.
       const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
-      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || collectToolResultImages(input).length > 0;
+      // EX3 (partial-batch safe): the tool-result images awaiting delivery THIS logical turn = any stashed from an
+      // EARLIER partial batch + this batch's images. A PARTIAL batch (other tools still pending) must not fold its
+      // image yet — that would cancel the still-pending tools' in-flight work — so it is stashed and folded only
+      // when the batch finally completes (the run would otherwise resume). The NON-image results still reach the
+      // model via their own /mcp tools/call responses, so only the image has to wait for the batch to finish.
+      const stashedToolResultImages = Array.isArray(session.stashedToolResultImages) ? session.stashedToolResultImages : [];
+      // EX3: a base64 tool-result image rides its OWN dispatchMcp result as McpImageContent (delivered at
+      // resolvePending), so it is NOT a fresh-send payload when the clean path is on — let the run resume. url-form
+      // images can't be McpImageContent (no base64 `data`), so they ALWAYS fall back to the fresh-send fold here
+      // (this batch + any earlier partial-batch stash). When the clean path is off, ALL images fold.
+      const allTurnToolResultImages = stashedToolResultImages.concat(collectToolResultImages(input));
+      const turnToolResultImages = mcpImageResultsEnabled()
+        ? allTurnToolResultImages.filter((im) => !(im && typeof im.data === "string" && im.data))
+        : allTurnToolResultImages;
+      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || turnToolResultImages.length > 0;
       const hasUserPayload = hasUserText || hasUserImages;
       // ADD-89 (bridge half): pre-scan — BEFORE matchToolResults mutates `pending` — whether any result that
       // WILL resolve a pending carries isError. A reply built on a FAILED tool must not silently resume the
@@ -3163,6 +3223,14 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       const answeredError = (input.results || []).some((tr) =>
         tr && tr.isError === true && (session.pending.has(tr.toolCallId) || (tr.idless === true && session.pending.size === 1)));
       const forceFreshOnError = hasUserPayload && answeredError; // ADD-89
+      // EX3 (warm half): a tool result carrying an IMAGE cannot ride the text-only Cursor tool-result protobuf
+      // into a resuming run, so resuming would silently drop the image — the model never sees the screenshot and
+      // re-reads the file (the reported "can't read photos from a file" bug). Force the C1 fresh-send (which folds
+      // turnToolResultImages) instead of resuming, exactly as forceFreshOnError does for a failed tool. The
+      // cold/reseed twin is composerReseedLostContinuation (executor). noneToResume stays the C1 gate below, so a
+      // PARTIAL batch never cancels its still-pending tools — its image waits in the stash until the batch
+      // completes (the run would resume), at which point the whole stash is folded.
+      const forceFreshOnImage = turnToolResultImages.length > 0;
       // The run will resume and stream the model's answer ONLY when this continuation answers the LAST pending
       // tool(s) and a run is still live. Pre-compute that here (still BEFORE matching) so ADD-77/ADD-83 can
       // inject a changed-system / per-turn-constraint preamble into the LAST tool result content BEFORE it is
@@ -3174,7 +3242,7 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
         else if (tr && tr.idless === true && session.pending.size === 1) answeredPendingCount++;
       }
       const willResolveAllPending = session.pending.size > 0 && answeredPendingCount >= session.pending.size;
-      const willResume = willResolveAllPending && session.run !== null && !forceFreshOnError;
+      const willResume = willResolveAllPending && session.run !== null && !forceFreshOnError && !forceFreshOnImage;
       // ADD-77 + ADD-83 (bridge half): when this continuation will RESUME the live run, the resumed run answers
       // under the system + constraints the run was STARTED with — but the client may have changed its system
       // prompt (e.g. ExitPlanMode) or per-turn constraints (response_format/stop/max_tokens/tool_choice) on THIS
@@ -3208,7 +3276,7 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       // nothing is left pending and the run is still live AND we are not forcing a fresh send on a failed tool.
       // In THAT case the trailing user message rode along folded into the last tool result (executor C1
       // belt-and-suspenders), so a separate fresh send would be redundant AND would cancel the resuming run.
-      const runWillResume = matched > 0 && session.pending.size === 0 && session.run !== null && !forceFreshOnError;
+      const runWillResume = matched > 0 && session.pending.size === 0 && session.run !== null && !forceFreshOnError && !forceFreshOnImage;
       const noneToResume = matched === 0 || session.pending.size === 0;
       // DECISION ORDER (C-TOOLRESULT-MATCH; H06 puts unknown BEFORE the partial-pending clean ack):
       //   1. C1 fresh-send (user payload + nothing will resume, OR ADD-89 forced fresh on a failed tool)
@@ -3224,8 +3292,15 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
         // orphaned run, then send. cancel() nulls the agent + bumps epoch; driveUserSend re-resumes a live agent.
         dbg("runTurn tool_results -> C1 fresh user send", "session=" + session.id, "matched=" + matched, "pending=" + session.pending.size, "runLive=" + (session.run !== null), "text=" + hasUserText, "images=" + hasUserImages);
         if (session.run !== null) { await cancelStaleRun(); session.seeded = true; }
-        // M28: send "" when there is no text but images are present (driveUserSend folds the images in).
-        await driveUserSend(hasUserText ? input.userText : "", collectToolResultImages(input));
+        // M28: send "" for a user-pasted image-only turn (driveUserSend folds input.images in). EX3: for a
+        // tool-result image with no trailing user text, mark the image's provenance with a NON-directive
+        // parenthetical — NOT an instruction. The user's real task lives in the durable context (or userText); a
+        // "read it and continue"-style directive here overrides it (observed: the model abandoned the task to
+        // "continue" with a self-invented one). Folds the whole stash (this batch + any earlier partial batches).
+        const freshText = hasUserText ? input.userText
+          : (turnToolResultImages.length > 0 ? "(The attached image is the output of a tool call you made.)" : "");
+        session.stashedToolResultImages = []; // folding now — clear the partial-batch stash
+        await driveUserSend(freshText, turnToolResultImages);
       } else if (unknown.length > 0) {
         // H06/BR1: a result for an id this session NEVER issued is a genuine desync (e.g. a wrong/foreign id).
         // Surface it as a real error turn BEFORE any partial-pending clean ack, so it is NOT consumed as a
@@ -3239,6 +3314,9 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
         // Some delivered tools remain unanswered (true incremental answer). The run is still blocked, so it
         // will neither stream nor complete this turn. Don't error and don't hang: settle a benign empty turn;
         // the run stays paused (bounded by PENDING_TIMEOUT_MS) and the client may answer the rest next.
+        // EX3: a tool-result image in THIS partial batch cannot be folded now (that would cancel the still-
+        // pending tools), so carry it in the stash — it is folded when the batch completes and the run resumes.
+        session.stashedToolResultImages = turnToolResultImages;
         session.sse({ type: "turn_end", stop_reason: "end_turn" });
         session.settle();
       } else if (matched === 0) {
@@ -3549,6 +3627,9 @@ async function selfTestResultSerialization() {
   add("mcpResult", "mcp:ok", mcpDispatchResult("ok", false));
   add("mcpResult", "mcp:isError", mcpDispatchResult("tool failed", true));
   add("mcpResult", "mcp:object", mcpDispatchResult({ k: "v" }, false));
+  // EX3: validate the McpImageContent variant ({image:{data:<base64>,mimeType}}) serializes through the REAL
+  // proto at startup, so a wrong shape fails fast here (fail-closed) instead of crashing on the first real image.
+  add("mcpResult", "mcp:image", mcpDispatchResult("here is the image", false, [{ data: "iVBORw0KGgo=", mimeType: "image/png" }]));
   // 8) Headless request context (the SDK's first exec on every run).
   add("requestContextResult", "requestContext", headlessRequestContext(null).__ccJson);
   // Validate the always-apply agent.v1.CursorRule proto serializes (independent of TOOL_MANIFEST_MODE), so any

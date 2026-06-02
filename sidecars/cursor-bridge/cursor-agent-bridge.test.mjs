@@ -840,6 +840,23 @@ test("collectToolResultImages gathers tr.images across results (BR9/EX3)", () =>
   assert.deepEqual(collectToolResultImages({}), []);
 });
 
+test("EX3: mcpDispatchResult folds a base64 image as McpImageContent (clean path, proto content oneof)", () => {
+  // The clean path: a base64 tool-result image becomes the content oneof's `image` member (McpImageContent =
+  // {data:bytes, mime_type:string}; protobuf-es decodes the base64 string into the bytes field), placed BEFORE
+  // the text. The serialization self-test (mcp:image) proves this round-trips through the REAL proto fromJson.
+  assert.deepEqual(
+    mcpDispatchResult("here is the image", false, [{ data: "QQ==", mimeType: "image/png" }]),
+    { success: { isError: false, content: [{ image: { data: "QQ==", mimeType: "image/png" } }, { text: { text: "here is the image" } }] } },
+  );
+  // url-form images carry no base64 `data`, so they are NOT McpImageContent — they fall back to the fresh-send.
+  assert.deepEqual(
+    mcpDispatchResult("x", false, [{ url: "https://h/i.png", mimeType: "image/png" }]),
+    { success: { isError: false, content: [{ text: { text: "x" } }] } },
+  );
+  // no images -> the unchanged text-only shape (back-compat).
+  assert.deepEqual(mcpDispatchResult("y", false), { success: { isError: false, content: [{ text: { text: "y" } }] } });
+});
+
 test("isConversationTooLong matches the Cursor error class (BR-PL)", () => {
   assert.equal(isConversationTooLong("ERROR_CONVERSATION_TOO_LONG"), true);
   assert.equal(isConversationTooLong("upstream: error_conversation_too_long (run failed)"), true);
@@ -1120,6 +1137,7 @@ test("BR5/C1: a continuation that answers ALL pending with a live run RESUMES (n
 });
 
 test("BR5/C1: tool-result images are folded into the C1 fresh send", async () => {
+  process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = "0"; // fresh-send FALLBACK (folds BOTH base64 + url images); default-on path delivers base64 via McpImageContent instead
   const id = "br5img";
   const cursorKey = "k-br5img";
   seedSession(id, cursorKey, { seeded: true });
@@ -1134,6 +1152,67 @@ test("BR5/C1: tool-result images are folded into the C1 fresh send", async () =>
   assert.ok(sent && Array.isArray(sent.images), "the C1 send carries images");
   // Both the input.images and the tool-result image survive (order: input images first, then tool-result).
   assert.deepEqual(sent.images, [{ data: "QQ", mimeType: "image/png" }, { url: "https://h/i.png" }]);
+});
+
+test("EX3: a tool-result IMAGE resolving the last pending force-freshes (image can't ride the resume protobuf)", { timeout: 5000 }, async () => {
+  // The warm bug behind "can't read photos from a file": a Read-tool image resolves its pending, so without
+  // forceFreshOnImage the run RESUMES via the text-only Cursor tool-result protobuf and the image is silently
+  // dropped (the model re-reads the file). forceFreshOnImage must instead drive a C1 fresh-send carrying the
+  // image — exactly like forceFreshOnError does for a failed tool. Mirror of the RESUMES test above, but the
+  // sole tool result carries an image (and no userText), so it MUST fresh-send rather than resume.
+  process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = "0"; // test the fresh-send FALLBACK; the default-on clean McpImageContent path is covered by the mcpDispatchResult unit test + the serialization self-test
+  const id = "ex3warm";
+  const cursorKey = "k-ex3warm";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  const { sends } = installFakePlatform(cursorKey, {
+    onSend: (m, cbs) => { try { cbs.onDelta({ update: { type: "text-delta", text: "ok" } }); } catch { /* ignore */ } return Promise.resolve({ id: "r2", status: "finished", wait: () => Promise.resolve({ status: "finished" }), cancel: () => {} }); },
+  });
+  let canceled = false;
+  s.cancel = async () => { canceled = true; s.run = null; };
+  s.run = { id: "live", wait: () => new Promise(() => {}), cancel: async () => {} };
+  const wrap = () => {}; wrap.__reject = () => {};
+  s.newPending("readtool", wrap); s.everEmitted.add("readtool"); s.delivered.add("readtool");
+  const res = makeRes();
+  await drainTurn(makeReq(), res, {
+    sessionId: id,
+    input: { type: "tool_results", results: [{ toolCallId: "readtool", content: "", images: [{ data: "IMG", mimeType: "image/png" }] }] },
+  }, cursorKey);
+  assert.equal(sends.length, 1, "a tool-result image must drive a fresh send, not a text-only resume that drops it");
+  const sent = sends[0].msg;
+  assert.ok(sent && Array.isArray(sent.images), "the fresh send carries the image");
+  assert.deepEqual(sent.images, [{ data: "IMG", mimeType: "image/png" }]);
+  assert.equal(canceled, true, "the resuming run is cancelled so the image can be delivered via a fresh send");
+});
+
+test("EX3: an image in a PARTIAL batch is stashed and folded when the batch completes (no mid-batch cancel)", { timeout: 5000 }, async () => {
+  // The partial case: the model called TWO tools; the client answers the image-bearing one FIRST (the other is
+  // still running). Force-freshing now would cancel the still-pending tool's work, so instead the image is
+  // stashed and folded only when the batch COMPLETES (the last pending resolves and the run would resume).
+  process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = "0"; // fresh-send FALLBACK path (the partial-batch stash); base64 images otherwise ride McpImageContent
+  const id = "ex3partial";
+  const cursorKey = "k-ex3partial";
+  const s = seedSession(id, cursorKey, { seeded: true });
+  const { sends } = installFakePlatform(cursorKey, {
+    onSend: (m, cbs) => { try { cbs.onDelta({ update: { type: "text-delta", text: "ok" } }); } catch { /* ignore */ } return Promise.resolve({ id: "r", status: "finished", wait: () => Promise.resolve({ status: "finished" }), cancel: () => {} }); },
+  });
+  let canceled = false;
+  s.cancel = async () => { canceled = true; s.run = null; };
+  s.run = { id: "live", wait: () => new Promise(() => {}), cancel: async () => {} };
+  const noop = () => {}; noop.__reject = () => {};
+  s.newPending("img-tool", noop); s.everEmitted.add("img-tool"); s.delivered.add("img-tool");
+  s.newPending("other-tool", noop); s.everEmitted.add("other-tool"); s.delivered.add("other-tool");
+
+  // Batch 1: answer ONLY the image tool; other-tool stays pending -> PARTIAL -> stash, do not fresh-send/cancel.
+  await drainTurn(makeReq(), makeRes(), { sessionId: id, input: { type: "tool_results", results: [{ toolCallId: "img-tool", content: "", images: [{ data: "IMG", mimeType: "image/png" }] }] } }, cursorKey);
+  assert.equal(sends.length, 0, "a partial batch must NOT fresh-send (it would cancel the still-pending tool)");
+  assert.equal(canceled, false, "the run must NOT be cancelled mid-batch");
+  assert.deepEqual(s.stashedToolResultImages, [{ data: "IMG", mimeType: "image/png" }], "the partial-batch image is stashed");
+
+  // Batch 2: answer the last pending (text). Batch is now COMPLETE -> the stashed image is folded via fresh send.
+  await drainTurn(makeReq(), makeRes(), { sessionId: id, input: { type: "tool_results", results: [{ toolCallId: "other-tool", content: "done" }] } }, cursorKey);
+  assert.equal(sends.length, 1, "completing the batch folds the stashed image via a fresh send");
+  assert.deepEqual(sends[0].msg.images, [{ data: "IMG", mimeType: "image/png" }], "the stashed image is delivered on completion");
+  assert.deepEqual(s.stashedToolResultImages, [], "the stash is cleared after folding");
 });
 
 test("BR6/C3: a changed system on a continuation is applied to the C1 send + seededSystem updated", async () => {
