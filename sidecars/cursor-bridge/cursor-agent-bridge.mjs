@@ -2673,15 +2673,23 @@ async function handleTurn(req, res, body, cursorKey) {
     // replays the conversation as a fresh user turn (the orphaned result is already visible in that replayed
     // history, so no context is lost). A continuation WITH user payload is left alone: runTurn's C1 path
     // fresh-sends it and recovers on its own.
-    // Scope: an IDLE session only — no live run, nothing pending, no concurrent stream. A LIVE session that
-    // receives a foreign id is a genuine desync that must still surface as an "unknown tool_call_id" error
-    // (C03/C04/M32: never a silent misroute or false success); only a fully-idle session with a wholly-foreign
-    // batch is the orphan-by-dead-run case where reseeding is the correct (and only) recovery.
-    if (session.run === null && !session.activeRes && session.pending.size === 0) {
+    // Scope: ANY non-streaming session (activeRes unset) — idle, OR a paused run with its own outstanding
+    // pending, OR a session whose owning run just died and whose ownership the Go executor already forgot. For a
+    // wholly-foreign no-user-payload batch ONLY, that batch can never be resolved here (allToolResultsForeign is
+    // non-mutating and returns false the moment ANY id is pending/delivered/ever-emitted), so the sole useful
+    // action is reseed-recovery (410); the foreign id is never resolved into a pending. An ACTIVELY-STREAMING
+    // session (activeRes set) still surfaces a foreign id as an "unknown tool_call_id" error (C04: never reseed
+    // mid-stream, never a silent misroute or false success). The old full-idle gate (pending.size===0) excluded
+    // the paused / own-pending variant this bug produces under dynamic-workflow fan-out; (not activeRes) includes
+    // it while still excluding the live stream. Safe because routing is CONTENT-derived (deriveComposerSessionID
+    // over the continuation's own head/opener), so the orphan re-derives to its OWN just-died session id (lease
+    // already released + ownership forgotten at the error stop, run ended/paused, activeRes null) or a fresh
+    // reseed fork — never a sibling subagent's live stream.
+    if (!session.activeRes) {
       const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
       const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || collectToolResultImages(input).length > 0;
       if (!hasUserText && !hasUserImages && session.allToolResultsForeign(input.results)) {
-        dbg("tool_results ALL-FOREIGN on idle session + no user payload -> 410 reseed (orphaned: owning run died, ownership lost)",
+        dbg("tool_results ALL-FOREIGN on non-streaming session + no user payload -> 410 reseed (orphaned: owning run died, ownership lost)",
           "session=" + sessionId, "ids=" + safeJson((input.results || []).map((r) => r && r.toolCallId)));
         fail(410, "orphaned tool_call_id: none of these results were issued by this session (the owning run has ended); the continuation must be re-seeded");
         return;

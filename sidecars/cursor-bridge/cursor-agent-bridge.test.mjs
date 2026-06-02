@@ -921,10 +921,11 @@ function makeDeferred() {
   return { promise, resolve };
 }
 
-test("C03: a mismatched NON-idless id with one pending is NOT silently resolved — it surfaces as unknown (no false success)", async () => {
-  // C03 removed the unconditional pending.size===1 fallback. With C02 (Gemini now emits real functionCall.id),
-  // a foreign/mismatched id with a nonempty toolCallId must be matched STRICTLY: it is unknown -> error turn,
-  // NOT silently fed into the lone pending (which was the silent-data-corruption risk).
+test("C03: a mismatched NON-idless id with one pending is NEVER fed into the lone pending — wholly-foreign 410-reseeds (no false success)", async () => {
+  // C03 removed the unconditional pending.size===1 fallback. A foreign/mismatched id with a nonempty toolCallId
+  // must be matched STRICTLY and NEVER silently fed into the lone pending (the silent-data-corruption risk). On a
+  // NON-streaming session a wholly-foreign no-payload batch now 410-reseeds (orphan recovery) rather than
+  // erroring — still never resolving the foreign id into the pending. (An active stream still errors: see C04.)
   const id = "c03-mismatch";
   const cursorKey = "k-c03";
   const s = seedSession(id, cursorKey, { seeded: true });
@@ -935,8 +936,8 @@ test("C03: a mismatched NON-idless id with one pending is NOT silently resolved 
   const res = makeRes();
   await drainTurn(makeReq(), res, { sessionId: id, input: { type: "tool_results", results: [{ toolCallId: "foreign-mismatched-id", content: "STALE" }] } }, cursorKey);
   assert.equal(got.content, undefined, "the lone pending must NOT be resolved by a foreign id (C03 fallback removed)");
-  assert.match(res.sse, /"stop_reason":"error"/, "a foreign id is surfaced as an error, not a clean success");
-  assert.match(res.sse, /unknown tool_call_id foreign-mismatched-id/);
+  assert.equal(res.status, 410, "a non-streaming session + wholly-foreign batch 410-reseeds (recovery), never a clean success");
+  assert.match(res.sse, /orphaned tool_call_id/, "the 410 names the orphan");
   s.rejectAllPending("test cleanup"); // clear the dangling pending's watchdog timer so the event loop drains
   sessions.delete(id);
 });
@@ -978,19 +979,22 @@ test("BR1/orphan: an IDLE session with a wholly-foreign batch (no payload) 410s 
   assert.doesNotMatch(res.sse, /"stop_reason":"end_turn"/, "never a clean/false success that strands the tool work");
 });
 
-test("orphan guard: idle+foreign 410s, but a LIVE session (pending) or a benign re-ack is left to the strict matcher", async () => {
-  // Pins the idle-vs-live boundary the 410 reseed guard depends on (allToolResultsForeign + idle gates).
+test("orphan guard: any NON-streaming session + wholly-foreign batch 410-reseeds (incl. own pending); active stream + benign re-ack do not", async () => {
+  // Pins the boundary the 410 reseed guard depends on: (not activeRes) + wholly-foreign (allToolResultsForeign).
   const cursorKey = "k-orphan-boundary";
   installFakePlatform(cursorKey, null);
-  // (a) LIVE session (has a pending) + foreign id -> NOT 410: a genuine desync still surfaces as unknown.
-  const live = seedSession("orphan-live", cursorKey, { seeded: true });
-  const w = (c) => { void c; }; w.__reject = () => {};
-  live.newPending("mine", w); live.everEmitted.add("mine"); live.delivered.add("mine");
-  const resLive = makeRes();
-  await drainTurn(makeReq(), resLive, { sessionId: "orphan-live", input: { type: "tool_results", results: [{ toolCallId: "foreign", content: "x" }] } }, cursorKey);
-  assert.notEqual(resLive.status, 410, "a live session (pending) must NOT 410 — the desync is surfaced, not reseeded");
-  assert.match(resLive.sse, /unknown tool_call_id foreign/);
-  live.rejectAllPending("test cleanup"); sessions.delete("orphan-live");
+  // (a) NON-streaming session with its OWN unrelated pending + a wholly-foreign batch -> 410 reseed (the variant
+  // the old full-idle gate missed under workflow fan-out). The foreign id is NEVER resolved into the pending.
+  const paused = seedSession("orphan-paused", cursorKey, { seeded: true });
+  let mineResolved = false;
+  const w = (c) => { void c; mineResolved = true; }; w.__reject = () => {};
+  paused.newPending("mine", w); paused.everEmitted.add("mine"); paused.delivered.add("mine");
+  const resPaused = makeRes();
+  await drainTurn(makeReq(), resPaused, { sessionId: "orphan-paused", input: { type: "tool_results", results: [{ toolCallId: "foreign", content: "x" }] } }, cursorKey);
+  assert.equal(resPaused.status, 410, "a non-streaming session with its own pending still 410-reseeds on a wholly-foreign batch");
+  assert.match(resPaused.sse, /orphaned tool_call_id/);
+  assert.equal(mineResolved, false, "the foreign id is NEVER resolved into this session's own pending");
+  paused.rejectAllPending("test cleanup"); sessions.delete("orphan-paused");
   // (b) IDLE session + a benign already-emitted id -> NOT 410: a re-ack of resolved work acks cleanly.
   const idle = seedSession("orphan-reack", cursorKey, { seeded: true });
   idle.everEmitted.add("seen");
@@ -1006,6 +1010,30 @@ test("orphan guard: idle+foreign 410s, but a LIVE session (pending) or a benign 
   assert.equal(probe.allToolResultsForeign([{ toolCallId: "a" }, { toolCallId: "known" }]), false, "a known id makes it non-foreign");
   assert.equal(probe.allToolResultsForeign([]), false, "empty batch is not foreign");
   sessions.delete("orphan-probe");
+  // (d) ACTIVE STREAM (activeRes set) + foreign id -> NOT 410: a live stream still surfaces "unknown tool_call_id"
+  // (C04 guarantee; the (not activeRes) guard MUST exclude it — never reseed mid-stream).
+  const streaming = seedSession("orphan-streaming", cursorKey, { seeded: true });
+  streaming.activeRes = { write(line) { this._sse = (this._sse || "") + line; return true; }, _sse: "" };
+  const resStream = makeRes();
+  await drainTurn(makeReq(), resStream, { sessionId: "orphan-streaming", input: { type: "tool_results", results: [{ toolCallId: "foreign-x", content: "y" }] } }, cursorKey);
+  assert.notEqual(resStream.status, 410, "an ACTIVE stream must NOT 410 — it surfaces the unknown id (C04)");
+  assert.match(resStream.sse, /unknown tool_call_id foreign-x/);
+  sessions.delete("orphan-streaming");
+});
+
+test("orphan guard: a repeated retry of the same wholly-foreign batch keeps 410-reseeding (idempotent, no loop)", async () => {
+  // The client retries the orphaned result; every retry on a non-streaming session must yield the SAME 410-reseed
+  // signal — never oscillate into an error turn or resolve anything. Pins idempotency under retry.
+  const id = "orphan-idem"; const cursorKey = "k-orphan-idem";
+  seedSession(id, cursorKey, { seeded: true });
+  installFakePlatform(cursorKey, null);
+  for (let i = 0; i < 3; i++) {
+    const res = makeRes();
+    await drainTurn(makeReq(), res, { sessionId: id, input: { type: "tool_results", results: [{ toolCallId: "ghost", content: "x" }] } }, cursorKey);
+    assert.equal(res.status, 410, "retry #" + i + " still 410-reseeds");
+    assert.match(res.sse, /orphaned tool_call_id/);
+  }
+  sessions.delete(id);
 });
 
 test("BR1: a watchdog-reaped / already-emitted id is benign (no error, no false success masking)", async () => {
@@ -1928,10 +1956,11 @@ test("H12: a COLD restart with the SAME fingerprint as durable does NOT force a 
   sessions.delete(id);
 });
 
-test("M32 (bridge side): a foreign id from another session is surfaced as unknown (no silent cross-session misroute)", async () => {
+test("M32 (bridge side): a foreign id from another session is NEVER consumed against this session's pending — wholly-foreign 410-reseeds", async () => {
   // Cross-session routing is the executor's job (lookupSessionByToolResults). The bridge's contribution: it
-  // resolves ONLY ids this session issued; a foreign id (e.g. belonging to a different session that got routed
-  // here) lands in `unknown` -> error turn, never silently consumed against this session's pending.
+  // resolves ONLY ids this session issued; a foreign id (a different session's, mis-routed here) is NEVER
+  // silently consumed against this session's pending. On a NON-streaming session a wholly-foreign no-payload
+  // batch now 410-reseeds (orphan recovery) instead of erroring — still never resolving it into the pending.
   const id = "m32";
   const cursorKey = "k-m32";
   const s = seedSession(id, cursorKey, { seeded: true });
@@ -1942,8 +1971,8 @@ test("M32 (bridge side): a foreign id from another session is surfaced as unknow
   const res = makeRes();
   await drainTurn(makeReq(), res, { sessionId: id, input: { type: "tool_results", results: [{ toolCallId: "other-session-id", content: "z" }] } }, cursorKey);
   assert.equal(got.mine, undefined, "a foreign id must NOT resolve this session's pending");
-  assert.match(res.sse, /"stop_reason":"error"/, "a foreign id is surfaced as unknown, not silently misrouted");
-  assert.match(res.sse, /unknown tool_call_id other-session-id/);
+  assert.equal(res.status, 410, "a non-streaming session + wholly-foreign batch 410-reseeds (recovery), not a silent misroute");
+  assert.match(res.sse, /orphaned tool_call_id/, "the 410 names the orphan");
   s.rejectAllPending("test cleanup");
   sessions.delete(id);
 });
