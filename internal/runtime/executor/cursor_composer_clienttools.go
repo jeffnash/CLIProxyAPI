@@ -32,6 +32,7 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // Cursor Composer Client-Tools is the DEFAULT, ToS-safe Cursor routing: requests go to the
@@ -3514,6 +3515,42 @@ func composerPromptChars(oai []byte) int {
 	return total
 }
 
+// composerSetMessageStartInputTokens rewrites usage.input_tokens in a translated Anthropic `message_start` SSE
+// event to the composer prompt-token estimate. Claude Code's AUTO-COMPACT reads message.usage.input_tokens off
+// the assistant turn (verified in the CC binary: `autocompact: tokens = input_tokens + cache_* + output_tokens`).
+// The openai->claude translator hard-codes that field to 0, and a composer turn carries no upstream usage — so
+// without this CC sees 0 tokens used and NEVER auto-compacts a composer session, while every native Claude model
+// (which gets the real value in its own message_start) compacts normally. No-op on any chunk that is not a
+// message_start, or when no estimate is available.
+func composerSetMessageStartInputTokens(chunk []byte, inputTokens int) []byte {
+	if inputTokens <= 0 || !bytes.Contains(chunk, []byte(`"type":"message_start"`)) {
+		return chunk
+	}
+	idx := bytes.Index(chunk, []byte("data: "))
+	if idx < 0 {
+		return chunk
+	}
+	start := idx + len("data: ")
+	rel := bytes.IndexByte(chunk[start:], '\n')
+	if rel < 0 {
+		return chunk
+	}
+	end := start + rel
+	payload := chunk[start:end]
+	if !gjson.GetBytes(payload, "message.usage").Exists() {
+		return chunk
+	}
+	patched, err := sjson.SetBytes(payload, "message.usage.input_tokens", inputTokens)
+	if err != nil {
+		return chunk
+	}
+	out := make([]byte, 0, len(chunk)-len(payload)+len(patched))
+	out = append(out, chunk[:start]...)
+	out = append(out, patched...)
+	out = append(out, chunk[end:]...)
+	return out
+}
+
 // composerUsageChunk builds an OpenAI streaming usage frame (empty choices + a usage object) so the per-schema
 // translator forwards token usage to the client (e.g. Anthropic message_delta.usage). It carries the composer
 // usage ESTIMATE, since the bridge / @cursor/sdk provide none.
@@ -3817,10 +3854,13 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 			composerApplyLeaseStop(tenant, sessionID, leaseStop, leaseOwner, ctx)
 		}()
 
+		// CC's auto-compact reads message.usage.input_tokens; the openai->claude translator hard-codes it to 0, so
+		// inject the prompt estimate into message_start or CC never auto-compacts a composer session, however full.
+		composerInputEstimate := composerEstimateTokens(promptChars)
 		emit := func(srcChunks [][]byte) bool {
 			for i := range srcChunks {
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: srcChunks[i]}:
+				case out <- cliproxyexecutor.StreamChunk{Payload: composerSetMessageStartInputTokens(srcChunks[i], composerInputEstimate)}:
 				case <-ctx.Done():
 					return false
 				}
