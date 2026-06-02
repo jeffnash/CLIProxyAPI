@@ -3504,13 +3504,20 @@ func composerEstimateTokens(chars int) int {
 	return (chars + 3) / 4
 }
 
-// composerPromptChars sums the visible text length of the inbound messages (the estimate input for prompt
-// tokens), reusing the same per-message text extraction the lineage head uses so every role/content shape is
-// counted uniformly.
+// composerPromptChars estimates the size of the FULL inbound conversation (the estimate input for prompt tokens —
+// what Claude Code's auto-compact reads back via message_start.usage.input_tokens). It sums each message's visible
+// text via cursorMessageText (shared VERBATIM with the lineage head digest, so it must not change) PLUS assistant
+// tool-call ARGUMENTS, which are not visible text but ARE a large part of a code-heavy conversation (patches, file
+// writes, shell commands) — without them the estimate badly under-counts and auto-compact fires far too late. It
+// counts the inbound conversation, NOT the proxy's history-bounded replay (auto-compact must track what CC holds,
+// not what we forward downstream). Image base64 is deliberately not counted as prompt text.
 func composerPromptChars(oai []byte) int {
 	total := 0
 	for _, m := range gjson.GetBytes(oai, "messages").Array() {
 		total += len(cursorMessageText(m))
+		for _, tc := range m.Get("tool_calls").Array() {
+			total += len(tc.Get("function.name").String()) + len(tc.Get("function.arguments").String())
+		}
 	}
 	return total
 }

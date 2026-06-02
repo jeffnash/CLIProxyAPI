@@ -2,6 +2,8 @@ package executor
 
 import (
 	"bytes"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -57,5 +59,40 @@ func TestComposerSetMessageStartInputTokens(t *testing.T) {
 	mdelta := []byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"output_tokens\":5}}\n\n")
 	if !bytes.Equal(composerSetMessageStartInputTokens(mdelta, 999), mdelta) {
 		t.Fatal("message_delta must be returned unchanged")
+	}
+}
+
+// TestComposerPromptCharsCountsToolCallArgs pins that the prompt estimate (which drives CC's auto-compact via
+// message_start.input_tokens) counts assistant tool-call ARGUMENTS — the bulk of a code-heavy turn — not just
+// visible message text. Without it the estimate badly under-counts and auto-compact fires far too late.
+func TestComposerPromptCharsCountsToolCallArgs(t *testing.T) {
+	largeArgs := strings.Repeat("A", 8000)
+	oai, err := json.Marshal(map[string]any{
+		"messages": []map[string]any{
+			{"role": "user", "content": "patch it"},
+			{"role": "assistant", "content": "ok", "tool_calls": []map[string]any{{
+				"id": "tc1", "type": "function",
+				"function": map[string]any{"name": "ApplyPatch", "arguments": largeArgs},
+			}}},
+			{"role": "tool", "tool_call_id": "tc1", "content": "patched"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := composerPromptChars(oai)
+	if got < len(largeArgs) {
+		t.Fatalf("composerPromptChars=%d must include the tool-call arguments (>= %d)", got, len(largeArgs))
+	}
+	// Visible-text-only accounting would be ~ len("patch it")+len("ok")+len("patched") << 8000.
+	visible := len("patch it") + len("ok") + len("patched")
+	if got <= visible+len(largeArgs)/2 {
+		t.Fatalf("composerPromptChars=%d still looks like visible-text-only (visible=%d args=%d)", got, visible, len(largeArgs))
+	}
+	// cursorMessageText (shared with the lineage digest) must remain text-only — assert the args are NOT in it.
+	for _, m := range gjson.GetBytes(oai, "messages").Array() {
+		if strings.Contains(cursorMessageText(m), "AAAA") {
+			t.Fatal("cursorMessageText must stay visible-text-only (tool-call args counted separately, not via it)")
+		}
 	}
 }
