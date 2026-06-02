@@ -1952,43 +1952,6 @@ function mcpServerKeyForTool(name, grouping = MCP_GROUPING) {
 // mcpToolsForServer returns the slice of the session's advertised tools that belongs to serverKey under the
 // active grouping. For grouping "one" (serverKey "cc" / empty) it returns ALL advertised tools. Recomputed
 // per request (never cached) because session.advertise can change per turn. Each entry is shaped for
-// ── Tool-advertisement TOKEN-DIET (experiment; default OFF) ─────────────────────────────────────────────────
-// composer's upstream context holds every advertised tool's {description, inputSchema}. With many MCP tools (e.g.
-// chrome-devtools) that FIXED overhead swallows a large share of the window, leaving little room for the
-// conversation — runs then hit composer's real limit ("conversation too long"), die, and orphan their tool-calls.
-// These knobs shrink ONLY the ADVERTISED copy (tools/list + mcpState, both built via mcpToolsForServer);
-// session.advertise — used for arg coercion / tool gating — keeps the full schema. Default OFF: no behavior change
-// until explicitly toggled. To measure the win set CURSOR_COMPOSER_DEBUG=1 and read the "ADVERTISE size" line.
-const TOOL_DESC_MAX = envInt("CURSOR_COMPOSER_TOOL_DESC_MAX", 0, { min: 0 }); // cap a tool's BASE description (0 = no cap)
-const SCHEMA_COMPACT = process.env.CURSOR_COMPOSER_SCHEMA_COMPACT === "1" || process.env.CURSOR_COMPOSER_SCHEMA_COMPACT === "true";
-// Token-heavy ANNOTATION fields stripped from the advertised inputSchema when SCHEMA_COMPACT is on. STRUCTURE
-// (type/properties/required/items/enum/anyOf/min/max…) is preserved so the model still knows each arg's shape.
-const SCHEMA_COMPACT_DROP = new Set(["description", "examples", "example", "default", "title", "$comment", "markdownDescription", "deprecated", "readOnly", "writeOnly"]);
-
-// compactToolSchema returns a NEW schema with annotation fields stripped (never mutates the input). `enabled` is a
-// param (not just the const) so tests can exercise both states without reloading the module.
-function compactToolSchema(schema, enabled = SCHEMA_COMPACT) {
-  if (!enabled || !schema || typeof schema !== "object") return schema;
-  const walk = (node) => {
-    if (Array.isArray(node)) return node.map(walk);
-    if (!node || typeof node !== "object") return node;
-    const out = {};
-    for (const k of Object.keys(node)) {
-      if (SCHEMA_COMPACT_DROP.has(k)) continue;
-      out[k] = walk(node[k]);
-    }
-    return out;
-  };
-  try { return walk(schema); } catch { return schema; }
-}
-
-// capToolDescription truncates a tool's BASE description to `max` chars (0 = no cap). Our own per-tool guidance
-// (TOOL_USAGE_*) is appended AFTER, in augmentToolDescription, and is never capped.
-function capToolDescription(desc, max = TOOL_DESC_MAX) {
-  if (!max || typeof desc !== "string" || desc.length <= max) return desc;
-  return desc.slice(0, max - 1).trimEnd() + "…";
-}
-
 // tools/list: {name, description, inputSchema} with a valid object inputSchema default.
 function mcpToolsForServer(session, serverKey, grouping = MCP_GROUPING) {
   // ADD-40: tools/list during a live run reflects the turn-scoped effective set (tool_choice-gated), so a
@@ -1996,20 +1959,15 @@ function mcpToolsForServer(session, serverKey, grouping = MCP_GROUPING) {
   const adv = (session && session.advertiseForGating && session.advertiseForGating()) || (session && session.advertise) || [];
   const all = grouping === "one" || !serverKey || serverKey === "cc";
   const out = [];
-  let rawBytes = 0, sentBytes = 0; // token-diet measurement (debug only)
   for (const t of adv) {
     const name = t.toolName || t.name;
     if (!name) continue;
     if (!all && mcpServerKeyForTool(name, grouping) !== serverKey) continue;
-    const rawSchema = t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : { type: "object" };
-    const schema = compactToolSchema(rawSchema);
+    const schema = t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : { type: "object" };
     // Inject a schema-derived argument contract (+ any per-tool extra) so the model calls each tool with its exact
     // arg shape and never conflates tools. ONLY in what composer reads here; session.advertise stays untouched.
-    const entry = { name, description: augmentToolDescription(name, capToolDescription(t.description || ""), schema), inputSchema: schema };
-    if (COMPOSER_DEBUG) { rawBytes += Buffer.byteLength(safeJson({ name, description: t.description || "", inputSchema: rawSchema })); sentBytes += Buffer.byteLength(safeJson(entry)); }
-    out.push(entry);
+    out.push({ name, description: augmentToolDescription(name, t.description || "", schema), inputSchema: schema });
   }
-  if (COMPOSER_DEBUG && out.length) dbg("mcpToolsForServer ADVERTISE size", "tools=" + out.length, "rawBytes=" + rawBytes, "sentBytes=" + sentBytes, "deltaVsRaw=" + (sentBytes - rawBytes), "schemaCompact=" + SCHEMA_COMPACT, "descMax=" + TOOL_DESC_MAX);
   return out;
 }
 
@@ -3635,5 +3593,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, compactToolSchema, capToolDescription };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }
