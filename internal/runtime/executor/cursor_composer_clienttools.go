@@ -2374,6 +2374,11 @@ func composerImagePlaceholder(m gjson.Result) string {
 // and was invalid, rather than silently pretending the turn had no image (which would mislead the model).
 const composerImageInvalidPlaceholder = "[an image attachment was provided but could not be processed (invalid or unsupported); it was not included]"
 
+// composerReseedImageDirective is appended to a lost-continuation reseed that carries tool-result image(s)
+// (EX3). The reseed replays the tool-call request as history with the tool still advertised, so without this
+// the model re-calls the tool to fetch the file instead of reading the image already attached to the reseed.
+const composerReseedImageDirective = "The image(s) referenced in the conversation above are attached directly to this message — read them here. Do NOT call a tool again to fetch them."
+
 // messageHasImageParts reports whether a message's content array carries ANY image part — by content-part
 // type ("image"/"input_image"/"image_url") or by a recognized image field (image_url / source). It detects
 // the ORIGINAL intent regardless of whether the part is well-formed, so ADD-56 can tell an image-only turn
@@ -3464,9 +3469,36 @@ func composerReseedLostContinuation(tenant, apiKey string, oai []byte, opts clip
 	if t, ok := inp["userText"].(string); ok && t != "" {
 		seed["text"] = t
 	}
-	for _, k := range []string{"system", "history", "historyFingerprint", "images"} {
+	for _, k := range []string{"system", "history", "historyFingerprint"} {
 		if v, ok := inp[k]; ok {
 			seed[k] = v
+		}
+	}
+	// EX3 (reseed): a Read-tool/screenshot image lives in inp["results"][].images (composerToolResultEntry),
+	// NOT inp["images"] (which only carries trailing role:user images via trailingContinuationImages). The
+	// reseed drives a fresh type:"user" turn, whose images come solely from seed["images"] — so gather BOTH,
+	// else the image is silently dropped on a lost-continuation reseed and the model re-reads the same file.
+	var seedImages []map[string]any
+	if v, ok := inp["images"].([]map[string]any); ok {
+		seedImages = append(seedImages, v...)
+	}
+	if results, ok := inp["results"].([]map[string]any); ok {
+		for _, r := range results {
+			if imgs, ok := r["images"].([]map[string]any); ok {
+				seedImages = append(seedImages, imgs...)
+			}
+		}
+	}
+	if len(seedImages) > 0 {
+		seed["images"] = seedImages
+		// The reseed replays "read the file" as history WITH the tool still advertised, so the model would
+		// re-call the tool instead of reading the image already attached here (the warm twin avoids this via
+		// its resumed durable context). Append an explicit directive — placed last, so it is the freshest
+		// instruction — telling the model the image IS attached and not to re-fetch it.
+		if t, _ := seed["text"].(string); strings.TrimSpace(t) == "" {
+			seed["text"] = composerReseedImageDirective
+		} else {
+			seed["text"] = t + "\n\n" + composerReseedImageDirective
 		}
 	}
 	body := composerTurnBody(reseedSid, model, seed, advertise, toolChoice, extractComposerClientEnv(opts), constraints)
