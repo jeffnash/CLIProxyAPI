@@ -16,8 +16,6 @@ import {
   augmentToolDescription,
   augmentWorkflowResultOnFailure,
   augmentBackgroundLaunchResult,
-  compactToolSchema,
-  capToolDescription,
   snapWorkflowAgentTypes,
   appendRulesReminder,
   forcedToolUnavailable,
@@ -288,40 +286,6 @@ test("augmentWorkflowResultOnFailure appends a targeted fix on Workflow failures
   // fail-safe: non-string content + errors never throw, and an unrecognized failure is left alone.
   assert.equal(augmentWorkflowResultOnFailure(null, false), null);
   assert.equal(augmentWorkflowResultOnFailure("some other neutral output", false), "some other neutral output");
-});
-
-test("token-diet: compactToolSchema strips annotations but keeps structure (no mutation); capToolDescription caps length", () => {
-  const schema = {
-    type: "object",
-    description: "a verbose tool",
-    properties: {
-      url: { type: "string", description: "the url to navigate to", examples: ["http://x"], default: "" },
-      n: { type: "integer", minimum: 1, maximum: 9, title: "Count" },
-      mode: { type: "string", enum: ["a", "b"], description: "pick one" },
-    },
-    required: ["url"],
-  };
-  // disabled -> returned unchanged
-  assert.deepEqual(compactToolSchema(schema, false), schema);
-  // enabled -> annotation fields gone, STRUCTURE preserved
-  const c = compactToolSchema(schema, true);
-  assert.equal(c.description, undefined);
-  assert.equal(c.properties.url.description, undefined);
-  assert.equal(c.properties.url.examples, undefined);
-  assert.equal(c.properties.url.default, undefined);
-  assert.equal(c.properties.n.title, undefined);
-  assert.equal(c.properties.url.type, "string");        // type kept
-  assert.equal(c.properties.n.minimum, 1);              // constraints kept
-  assert.equal(c.properties.n.maximum, 9);
-  assert.deepEqual(c.properties.mode.enum, ["a", "b"]); // enum kept (semantically load-bearing)
-  assert.deepEqual(c.required, ["url"]);                // required kept
-  // input is NOT mutated
-  assert.equal(schema.properties.url.description, "the url to navigate to");
-  // capToolDescription
-  assert.equal(capToolDescription("short", 100), "short");
-  assert.equal(capToolDescription("x".repeat(50), 0), "x".repeat(50), "0 = no cap");
-  const capped = capToolDescription("y".repeat(50), 10);
-  assert.ok(capped.length <= 10 && capped.endsWith("…"), "capped + ellipsis");
 });
 
 test("augmentBackgroundLaunchResult: a 'running in background' result gets a live WAIT interrupt; real results pass through", () => {
