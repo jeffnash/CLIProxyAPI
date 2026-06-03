@@ -3204,12 +3204,30 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       try {
         session.run = await agent.send(msg, streamCallbacks(session, ep));
       } catch (sendErr) {
-        // H11: the send failed — roll the seed flags back to their pre-send values so a retry on this same
-        // in-memory session re-prepends the system + history prelude (the first send never actually landed).
-        session.seeded = seededBefore;
-        session.seededSystem = seededSystemBefore;
-        dbg("runTurn agent.send THREW (rolled back seeded)", "session=" + session.id, "seeded->" + session.seeded, (sendErr && sendErr.stack) || (sendErr && sendErr.message) || String(sendErr));
-        throw sendErr;
+        // ADD-115: a RESUMED durable agent can be wedged on a PRIOR run that died abnormally (e.g. a
+        // mid-tool-call drop + bridge restart): the SDK refuses the new send with "already has active run".
+        // Expire that stuck run via SendOptions.local.force and retry ONCE so the conversation recovers IN PLACE
+        // (durable context intact) instead of erroring out / forcing a context-light fork+reseed. Scoped to that
+        // one error; any other send failure rolls the seed flags back (H11) and propagates unchanged.
+        const stuckRun = /already has (an )?active run|active run\b/i.test((sendErr && sendErr.message) || "");
+        if (stuckRun) {
+          try {
+            dbg("runTurn agent.send stuck on a prior run -> retry with local.force=true", "session=" + session.id, (sendErr && sendErr.message) || String(sendErr));
+            session.run = await agent.send(msg, { ...streamCallbacks(session, ep), local: { force: true } });
+          } catch (forceErr) {
+            session.seeded = seededBefore;
+            session.seededSystem = seededSystemBefore;
+            dbg("runTurn force-retry THREW (rolled back seeded)", "session=" + session.id, (forceErr && forceErr.stack) || (forceErr && forceErr.message) || String(forceErr));
+            throw forceErr;
+          }
+        } else {
+          // H11: the send failed — roll the seed flags back to their pre-send values so a retry on this same
+          // in-memory session re-prepends the system + history prelude (the first send never actually landed).
+          session.seeded = seededBefore;
+          session.seededSystem = seededSystemBefore;
+          dbg("runTurn agent.send THREW (rolled back seeded)", "session=" + session.id, "seeded->" + session.seeded, (sendErr && sendErr.stack) || (sendErr && sendErr.message) || String(sendErr));
+          throw sendErr;
+        }
       } finally {
         session.advertise = savedAdvertise;
       }
