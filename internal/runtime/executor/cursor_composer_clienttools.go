@@ -2512,17 +2512,22 @@ type composerInvalidRequestError struct{ msg string }
 func (e *composerInvalidRequestError) Error() string   { return e.msg }
 func (e *composerInvalidRequestError) StatusCode() int { return http.StatusBadRequest }
 
-// composerRejectStoreFalse returns a typed 400 when the (translated) request explicitly set store:false. Cursor
-// Composer persists/resumes durable agent state by a stable session id; there is no honest ephemeral no-store
-// mode (the bridge's stateRoot/resumeAgent are inherently durable), so silently persisting despite store:false
-// would violate the caller's no-store contract (ADD-94 / Comment 4) — reject BEFORE any durable state is
-// created rather than fake-acknowledging it. The Responses translator surfaces store:false as a top-level body
-// field (C-ADD94-STORE); store:true / absent is the durable default and needs no handling.
-func composerRejectStoreFalse(oai []byte) error {
-	if v := gjson.GetBytes(oai, "store"); v.Exists() && !v.Bool() {
-		return &composerInvalidRequestError{msg: "cursor composer: store:false is not supported — Cursor Composer requires durable agent state; omit store or set store:true"}
+// composerForceStoreTrue coerces the (translated) request's `store` field to true. Cursor Composer is an
+// inherently DURABLE agent — it persists/resumes state via resumeAgent on a stable session id, so there is no
+// ephemeral no-store mode. Rather than 400-reject a client that defaults to store:false (e.g. the
+// pi/openai-completions client), OVERRIDE store to true so the request proceeds on the durable path it would
+// take anyway. (Supersedes the ADD-94 reject: a client's store:false DEFAULT must not block composer. The flag
+// is moot for the bridge body, which never carries it; normalizing it just keeps the request internally
+// consistent.) store:true / absent are left as-is (already durable).
+func composerForceStoreTrue(oai []byte) []byte {
+	if v := gjson.GetBytes(oai, "store"); v.Exists() && v.Bool() {
+		return oai
 	}
-	return nil
+	out, err := sjson.SetBytes(oai, "store", true)
+	if err != nil {
+		return oai // malformed body — proceed; store is moot for the durable bridge path
+	}
+	return out
 }
 
 // lastUserTurnImageOnlyInvalid reports whether the request's LAST user message had image part(s), produced no
@@ -3817,9 +3822,7 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	turn.oai = sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
-	if errStore := composerRejectStoreFalse(turn.oai); errStore != nil {
-		return turn, errStore
-	}
+	turn.oai = composerForceStoreTrue(turn.oai) // Cursor Composer is always durable; override store:false -> true
 	turn.tenant = composerTenant(auth, opts)
 	turn.contHint = composerContinuationHintFor(turn.tenant, turn.oai)
 	if lastUserTurnImageOnlyInvalid(gjson.GetBytes(turn.oai, "messages").Array(), turn.contHint) {
