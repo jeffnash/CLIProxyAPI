@@ -3859,7 +3859,26 @@ func (e *CursorExecutor) composerAgentTurnDial(
 	}
 	if httpResp.StatusCode == composerBridgeStatusGone {
 		if rsid, rbody, ok := composerReseedLostContinuation(tenant, apiKey, oai, opts, contHint, model, advertise, toolChoice, constraints); ok {
-			if newOwner, claimed := composerInflight.claim(tenant, rsid); claimed {
+			if rsid == *sessionID {
+				// ADD-116 resume-base-in-place: the reseed targets the SAME session we are already on (resume the
+				// alive durable base). composerInflight.claim here would FAIL whenever this turn still holds that
+				// session's lease (claimed==false), SILENTLY SKIPPING the recovery and surfacing the 410 to the
+				// client (the regression the real-claude e2e caught). Reuse the session + its existing lease as-is;
+				// just swap in the fresh seed and re-POST. (Before ADD-116 the reseed always forked to a NEW sid, so
+				// rsid never equalled *sessionID here and the plain claim was always correct.)
+				_, _ = io.Copy(io.Discard, io.LimitReader(httpResp.Body, composerBridgeMaxErrorBodyBytes))
+				_ = httpResp.Body.Close()
+				*body = rbody
+				if stream {
+					log.Warnf("[composer %s] STREAM reseed-on-410: resume base in place -> sid=%s", responseID, *sessionID)
+				} else {
+					log.Warnf("[composer %s] reseed-on-410: resume base in place -> sid=%s", responseID, *sessionID)
+				}
+				httpResp, err = e.postAgentTurn(ctx, auth, apiKey, *body)
+				if err != nil {
+					return nil, err
+				}
+			} else if newOwner, claimed := composerInflight.claim(tenant, rsid); claimed {
 				_, _ = io.Copy(io.Discard, io.LimitReader(httpResp.Body, composerBridgeMaxErrorBodyBytes))
 				_ = httpResp.Body.Close()
 				composerInflight.release(tenant, *sessionID, *leaseOwner)
