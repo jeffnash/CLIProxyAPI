@@ -2575,22 +2575,18 @@ func TestComment5_HintedContinuationNotRejectedAsImageOnly(t *testing.T) {
 	}
 }
 
-func TestADD94_StoreFalseRejectedAsTyped400(t *testing.T) {
-	// store:false must be rejected with a typed 4xx BEFORE any durable Cursor state is created — never silently
-	// persisted (ADD-94 / Comment 4). The Responses translator surfaces store:false onto the normalized body.
-	err := composerRejectStoreFalse([]byte(`{"model":"composer-2.5","messages":[],"store":false}`))
-	if err == nil {
-		t.Fatal("ADD-94: store:false must be rejected, not silently persisted")
-	}
-	sc, ok := err.(interface{ StatusCode() int })
-	if !ok || sc.StatusCode() != http.StatusBadRequest {
-		t.Fatalf("ADD-94: store:false must reject as a typed %d, got %v", http.StatusBadRequest, err)
-	}
-	// store:true and absent are the durable default — accepted (no reject).
-	if errTrue := composerRejectStoreFalse([]byte(`{"store":true}`)); errTrue != nil {
-		t.Fatalf("ADD-94: store:true must be accepted, got %v", errTrue)
-	}
-	if errAbsent := composerRejectStoreFalse([]byte(`{"model":"composer-2.5"}`)); errAbsent != nil {
-		t.Fatalf("ADD-94: absent store must be accepted, got %v", errAbsent)
+func TestComposerForceStoreTrue_OverridesStoreFalse(t *testing.T) {
+	// Cursor Composer is inherently durable, so a client's store:false DEFAULT (e.g. pi/openai-completions) is
+	// OVERRIDDEN to true rather than 400-rejected (supersedes ADD-94). store:true/absent normalize to true too,
+	// so the request is internally consistent on the durable path.
+	for _, in := range []string{
+		`{"model":"composer-2.5","messages":[],"store":false}`,
+		`{"store":true}`,
+		`{"model":"composer-2.5"}`,
+	} {
+		out := composerForceStoreTrue([]byte(in))
+		if v := gjson.GetBytes(out, "store"); !v.Exists() || !v.Bool() {
+			t.Fatalf("store must be coerced to true (in=%s out=%s)", in, out)
+		}
 	}
 }
