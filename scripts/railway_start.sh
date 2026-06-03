@@ -587,6 +587,13 @@ fi
 if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR_AGENT_BRIDGE_TOKEN:-}" ) ]]; then
   CURSOR_BRIDGE_DIR="${ROOT_DIR}/sidecars/cursor-bridge"
   CURSOR_AGENT_BRIDGE_PORT="${CURSOR_AGENT_BRIDGE_PORT:-9798}"
+  # The SDK's DURABLE agent/run state (sqlite checkpoint + event stores) MUST live on a persistent path or every
+  # restart wipes all durable agents and the next turn of each live conversation falls back to a full history
+  # reseed. Prefer an attached Railway volume (RAILWAY_VOLUME_MOUNT_PATH) over the ephemeral container fs; an
+  # explicit CURSOR_AGENT_STATE_ROOT still wins. (The bridge applies the same precedence as a defensive default.)
+  if [[ -z "${CURSOR_AGENT_STATE_ROOT:-}" && -n "${RAILWAY_VOLUME_MOUNT_PATH:-}" ]]; then
+    CURSOR_AGENT_STATE_ROOT="${RAILWAY_VOLUME_MOUNT_PATH}/.cursor-agent-store"
+  fi
   CURSOR_AGENT_STATE_ROOT="${CURSOR_AGENT_STATE_ROOT:-${ROOT_DIR}/.cursor-agent-store}"
   if [[ -d "${CURSOR_BRIDGE_DIR}" ]]; then
     ensure_node
