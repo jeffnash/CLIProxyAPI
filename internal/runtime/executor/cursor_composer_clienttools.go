@@ -1351,6 +1351,93 @@ func (s *composerLineageStore) reseedLostFork(tenant, baseSid, headDigest, opene
 	return forkSid
 }
 
+// hasLiveForkSibling reports whether ANY co-resident lineage under baseSid OTHER THAN the base itself
+// (sid != baseSid, i.e. a concurrency/content fork) is currently LIVE (holds a logical-run lease or owns a
+// pending tool). It is the safety gate for collapsing a lost continuation onto baseSid: a live sibling must
+// never be collapsed (that would mis-route into a parallel sub-agent's run). Fork sids are collected under the
+// lineage lock, then liveness is checked WITHOUT it (composerSessionIsLive takes the inflight/ownership locks)
+// to avoid any lineage->inflight lock-order coupling.
+func (s *composerLineageStore) hasLiveForkSibling(tenant, baseSid string) bool {
+	if tenant == "" || baseSid == "" {
+		return false
+	}
+	to := s.tenantLineageFor(tenant)
+	prefix := baseSid + "\x00"
+	to.mu.Lock()
+	s.expireLocked(to)
+	sids := make([]string, 0, 4)
+	for _, k := range to.order {
+		e := to.byBaseHead[k]
+		if e == nil || e.sid == "" || e.sid == baseSid || !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		sids = append(sids, e.sid)
+	}
+	to.mu.Unlock()
+	for _, sid := range sids {
+		if composerSessionIsLive(tenant, sid) {
+			return true
+		}
+	}
+	return false
+}
+
+// baseOpenerFP returns the opener fingerprint recorded for the BASE lineage (the sid == baseSid entry), or ""
+// when the base lineage was never recorded / has aged out. Used to require a POSITIVE base-lineage match before
+// resuming the base on a lost continuation.
+func (s *composerLineageStore) baseOpenerFP(tenant, baseSid string) string {
+	if tenant == "" || baseSid == "" {
+		return ""
+	}
+	to := s.tenantLineageFor(tenant)
+	to.mu.Lock()
+	defer to.mu.Unlock()
+	s.expireLocked(to)
+	prefix := baseSid + "\x00"
+	for _, k := range to.order {
+		e := to.byBaseHead[k]
+		if e != nil && e.sid == baseSid && e.openerFP != "" && strings.HasPrefix(k, prefix) {
+			return e.openerFP
+		}
+	}
+	return ""
+}
+
+// composerLostContinuationMayResumeBase decides whether a lost continuation (ownership + opener-bridge miss,
+// full-replay) may RESUME the alive durable base agent instead of forking to a fresh one (reseedLostFork). It is
+// intentionally CONSERVATIVE — true only when provably safe:
+//  1. a concrete continuation opener is present, AND
+//  2. NO live fork sibling shares this base (never collapse a parallel sub-agent's live run), AND
+//  3. the continuation's opener POSITIVELY matches the RECORDED base-lineage opener (proves base traffic, not a
+//     divergent content-fork; a fully-wiped base with no recorded opener stays conservative and forks).
+//
+// The bridge is the ultimate backstop: a wrong route can NEVER deliver a result into another session's pending
+// call (foreign tool ids surface as 410, never resolved into a sibling's pending), so the worst case degrades to
+// today's fork+reseed rather than a mis-route. Enabled by the bridge's local.force resume recovery (a base
+// wedged on a dead run is now cleared instead of erroring) — which did not exist when reseedLostFork was the
+// only safe option.
+func composerLostContinuationMayResumeBase(tenant, baseSid, contOpenerFP string) bool {
+	if baseSid == "" || contOpenerFP == "" {
+		return false
+	}
+	if composerLineage.hasLiveForkSibling(tenant, baseSid) {
+		return false
+	}
+	baseOpener := composerLineage.baseOpenerFP(tenant, baseSid)
+	return baseOpener != "" && baseOpener == contOpenerFP
+}
+
+// composerLostContinuationSessionID is the SINGLE source of truth for routing a full-replay lost continuation:
+// resume the alive durable base (resumedBase=true) when composerLostContinuationMayResumeBase allows it, else
+// fork to a fresh fork-namespaced id (reseedLostFork). Both deriveComposerSessionID and
+// composerReseedLostContinuation MUST call this so the derive-side route and the 410-reseed route never diverge.
+func composerLostContinuationSessionID(tenant, baseSid, headDigest, openerFP string) (sid string, resumedBase bool) {
+	if composerLostContinuationMayResumeBase(tenant, baseSid, openerFP) {
+		return baseSid, true
+	}
+	return composerLineage.reseedLostFork(tenant, baseSid, headDigest, openerFP), false
+}
+
 // forget drops every lineage routing to sid for a tenant (terminal-stop release). Best-effort cleanup; the
 // TTL+LRU age entries out regardless, so this is an optimization, not correctness-critical.
 func (s *composerLineageStore) forget(tenant, sid string) {
@@ -1908,8 +1995,12 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 				return sid, nil
 			}
 			if composerContinuationCarriesOpener(contMsgs) {
-				sid := composerLineage.reseedLostFork(tenant, baseSid, headDigest, openerFP)
-				composerDebugf("[composer] deriveSessionID BRANCH=continuation(reseed lost fork, no collapse) convID=%q -> sessionID=%s", id, sid)
+				sid, resumedBase := composerLostContinuationSessionID(tenant, baseSid, headDigest, openerFP)
+				if resumedBase {
+					composerDebugf("[composer] deriveSessionID BRANCH=continuation(resume base, no live fork sibling) convID=%q -> sessionID=%s", id, sid)
+				} else {
+					composerDebugf("[composer] deriveSessionID BRANCH=continuation(reseed lost fork, no collapse) convID=%q -> sessionID=%s", id, sid)
+				}
 				return sid, nil
 			}
 			composerDebugf("[composer] deriveSessionID BRANCH=continuation(stable fallback, thin) convID=%q -> sessionID=%s", id, baseSid)
@@ -3466,7 +3557,12 @@ func composerReseedLostContinuation(tenant, apiKey string, oai []byte, opts clip
 		baseSid := composerStableBaseSessionID(tenant, apiKey, id)
 		headDigest := lineageHeadDigest(tenant, composerHistoryFingerprint(contMsgs), contMsgs)
 		openerFP := lineageOpenerFingerprint(contMsgs)
-		reseedSid = composerLineage.reseedLostFork(tenant, baseSid, headDigest, openerFP)
+		// Route via the SAME decision as deriveComposerSessionID: resume the alive durable base (context intact,
+		// recovered via the bridge's local.force) when safe, else fork (reseedLostFork). The seed below still
+		// carries the bounded history as a SAFETY NET — the bridge skips re-prepend when baseSid actually resumes
+		// (seeded=true) and uses it only if baseSid must be created fresh, so routing to baseSid never loses
+		// context either way.
+		reseedSid, _ = composerLostContinuationSessionID(tenant, baseSid, headDigest, openerFP)
 	} else {
 		reseedSid = mintComposerSessionID()
 	}
