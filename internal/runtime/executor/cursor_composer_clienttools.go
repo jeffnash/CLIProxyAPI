@@ -157,6 +157,12 @@ func (e *composerBridgeStatusError) Error() string {
 		return fmt.Sprintf("cursor composer: the tool-call this result answers is no longer active on the bridge "+
 			"(session lost to a restart or eviction); re-seed/restart the turn rather than retrying (correlation %s)", e.correlation)
 	}
+	if e.status == http.StatusTooManyRequests {
+		// 429: upstream rate-limit (Cursor HTTP/2 ENHANCE_YOUR_CALM, recycled connection + backoff) or proxy
+		// capacity. Tell the client to back off — rapid retries re-trip the limit and prolong the outage.
+		return fmt.Sprintf("cursor composer: upstream is rate-limiting this account or the proxy is at capacity; "+
+			"back off and retry in a few seconds — rapid retries make it worse (correlation %s)", e.correlation)
+	}
 	return fmt.Sprintf("cursor composer: bridge /agent/turn failed with status %d (correlation %s)", e.status, e.correlation)
 }
 

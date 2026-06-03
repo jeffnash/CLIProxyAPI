@@ -29,6 +29,16 @@ import {
   headlessRequestContext,
   headlessMcpState,
   Session,
+  sessionForClosedInputStream,
+  isUpstreamRateLimit,
+  recyclePlatform,
+  tripBreaker,
+  breakerOpen,
+  breakerRetryAfterMs,
+  closeBreaker,
+  breakerBackoffMs,
+  soleStreamingSession,
+  rateLimitedKeyToRecycle,
   ccToolId,
   authorizeRequestWith,
   platformHasSession,
@@ -435,6 +445,95 @@ test("ccToolId sanitizes to the Claude charset and uses full-uuid fallback (M2/L
   const a = ccToolId({}), b = ccToolId(undefined);
   assert.match(a, /^tc_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   assert.notEqual(a, b); // unique per call
+});
+
+test("sessionForClosedInputStream: attributes a WriteIterableClosedError to the lone streaming run, refuses to guess otherwise", () => {
+  const streaming = (id) => ({ id, run: {}, activeRes: {}, done: false });
+  const idle = (id) => ({ id, run: null, activeRes: null, done: false }); // paused/idle: not a candidate
+  const closedErr = () => { const e = new Error("WritableIterable is closed"); e.name = "WriteIterableClosedError"; return e; };
+
+  // exactly one streaming session -> attributed (idle sessions are ignored)
+  const one = new Map([["a", streaming("a")], ["b", idle("b")]]);
+  assert.equal(sessionForClosedInputStream(closedErr(), one)?.id, "a");
+  // matched by message substring even when the error name is absent
+  assert.equal(sessionForClosedInputStream(new Error("write failed: WritableIterable is closed"), one)?.id, "a");
+
+  // 2+ streaming -> no safe attribution (would risk killing a healthy concurrent turn)
+  assert.equal(sessionForClosedInputStream(closedErr(), new Map([["a", streaming("a")], ["c", streaming("c")]])), null);
+  // 0 streaming -> null
+  assert.equal(sessionForClosedInputStream(closedErr(), new Map([["b", idle("b")]])), null);
+  // a done session is never a candidate
+  assert.equal(sessionForClosedInputStream(closedErr(), new Map([["d", { id: "d", run: {}, activeRes: {}, done: true }]])), null);
+  // an unrelated rejection -> null even with a lone streaming session
+  assert.equal(sessionForClosedInputStream(new Error("some other failure"), one), null);
+});
+
+test("isUpstreamRateLimit: matches ENHANCE_YOUR_CALM / RESOURCE_EXHAUSTED / connect code, rejects unrelated", () => {
+  assert.equal(isUpstreamRateLimit(new Error("[internal] Stream closed with error code NGHTTP2_ENHANCE_YOUR_CALM")), true);
+  assert.equal(isUpstreamRateLimit({ code: "resource_exhausted", message: "x" }), true);
+  assert.equal(isUpstreamRateLimit(new Error("RESOURCE_EXHAUSTED: too many")), true);
+  assert.equal(isUpstreamRateLimit(new Error("rate limited, slow down")), true);
+  assert.equal(isUpstreamRateLimit("plain ENHANCE_YOUR_CALM string"), true);
+  // not a rate-limit: the input-stream-closed drop (handled by the teardown path) and unrelated errors
+  assert.equal(isUpstreamRateLimit(new Error("WritableIterable is closed")), false);
+  assert.equal(isUpstreamRateLimit(new Error("some other failure")), false);
+  assert.equal(isUpstreamRateLimit(null), false);
+});
+
+test("rate-limit circuit breaker: trips open, grows backoff (capped), reports retry-after, closes on success", () => {
+  const h = "testkey_breaker_1";
+  closeBreaker(h); // clean slate
+  const t0 = 1_000_000;
+  assert.equal(breakerOpen(h, t0), false);                          // closed initially
+
+  const e1 = tripBreaker(h, t0);
+  assert.equal(e1.fails, 1);
+  assert.equal(breakerOpen(h, t0), true);                           // open right after a trip
+  assert.ok(breakerRetryAfterMs(h, t0) > 0);
+  assert.equal(breakerOpen(h, t0 + breakerBackoffMs(1)), false);    // closed once the window elapses
+
+  const e2 = tripBreaker(h, t0);
+  assert.equal(e2.fails, 2);
+  assert.ok(breakerBackoffMs(2) > breakerBackoffMs(1));             // exponential growth
+  assert.ok(breakerBackoffMs(99) <= breakerBackoffMs(100));         // monotone non-decreasing
+  assert.equal(breakerBackoffMs(100), breakerBackoffMs(101));       // capped
+
+  assert.equal(closeBreaker(h), true);                              // closing clears all state
+  assert.equal(breakerOpen(h, t0), false);
+  assert.equal(breakerRetryAfterMs(h, t0), 0);
+});
+
+test("recyclePlatform evicts a cached platform; no-op for an unknown key", () => {
+  const h = "testkey_recycle_1";
+  platforms.set(h, { promise: Promise.resolve({}), stateRoot: "/tmp/x", lastUsed: 0, fp: "fp" });
+  assert.equal(recyclePlatform(h), true);
+  assert.equal(platforms.has(h), false);
+  assert.equal(recyclePlatform("nope_unknown_key"), false);
+});
+
+test("soleStreamingSession: exactly one in-flight streaming run, else null", () => {
+  const streaming = (id) => ({ id, run: {}, activeRes: {}, done: false });
+  assert.equal(soleStreamingSession(new Map([["a", streaming("a")], ["b", { run: null, activeRes: null, done: false }]]))?.id, "a");
+  assert.equal(soleStreamingSession(new Map([["a", streaming("a")], ["c", streaming("c")]])), null);
+  assert.equal(soleStreamingSession(new Map()), null);
+});
+
+test("rateLimitedKeyToRecycle: sole platform unambiguous; else lone streaming session; else null", () => {
+  // single-tenant (one platform) -> that key, unambiguous
+  assert.equal(rateLimitedKeyToRecycle(new Map(), new Map([["k1", {}]])), "k1");
+  // multi-tenant + exactly one streaming session -> that session's key hash
+  const multi = new Map([["k1", {}], ["k2", {}]]);
+  const sess = new Map([
+    ["s", { id: "s", cursorKey: "rawkeyA", run: {}, activeRes: {}, done: false }],
+    ["i", { id: "i", cursorKey: "rawkeyB", run: null, activeRes: null, done: false }],
+  ]);
+  assert.equal(rateLimitedKeyToRecycle(sess, multi), keyHash("rawkeyA"));
+  // multi-tenant + 2+ streaming -> ambiguous -> null (never recycle the wrong tenant)
+  const twoStreaming = new Map([
+    ["a", { cursorKey: "A", run: {}, activeRes: {}, done: false }],
+    ["b", { cursorKey: "B", run: {}, activeRes: {}, done: false }],
+  ]);
+  assert.equal(rateLimitedKeyToRecycle(twoStreaming, multi), null);
 });
 
 test("Session pending bookkeeping: resolve a subset leaves the rest pending (basis of the partial-batch fix)", () => {
