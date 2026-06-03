@@ -72,7 +72,16 @@ const PORT = envInt("CURSOR_AGENT_BRIDGE_PORT", 9798, { min: 1, max: 65535 });
 const BRIDGE_HOST = (process.env.CURSOR_AGENT_BRIDGE_HOST || "127.0.0.1").trim() || "127.0.0.1";
 const ALLOW_INSECURE_BIND = process.env.CURSOR_AGENT_ALLOW_INSECURE_BIND === "1" || process.env.CURSOR_AGENT_ALLOW_INSECURE_BIND === "true";
 const API_KEY = process.env.CURSOR_API_KEY || "";
-const STATE_ROOT = process.env.CURSOR_AGENT_STATE_ROOT || path.join(process.cwd(), ".cursor-agent-store");
+// STATE_ROOT holds the SDK's DURABLE agent/run state (sqlite checkpoint + event stores). It MUST live on a
+// PERSISTENT path: on an ephemeral container fs every restart wipes all durable agents, so the next turn of
+// every live conversation can't resume its agent and falls back to a full history reseed (the reseed-storm
+// incidents). Precedence: explicit CURSOR_AGENT_STATE_ROOT > a subdir of the Railway persistent volume
+// (RAILWAY_VOLUME_MOUNT_PATH, set automatically when a volume is attached) > cwd (dev default). A durable run
+// is re-attachable across a process restart via platform.getRun(runId) ONLY when this path survives the restart.
+const STATE_ROOT = process.env.CURSOR_AGENT_STATE_ROOT
+  || (process.env.RAILWAY_VOLUME_MOUNT_PATH
+    ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, ".cursor-agent-store")
+    : path.join(process.cwd(), ".cursor-agent-store"));
 const EMPTY_CWD = path.join(STATE_ROOT, ".empty");
 // PENDING_TIMEOUT_MS / SESSION_TTL_MS must be POSITIVE (a 0 watchdog would reap a tool the instant it is
 // emitted; a 0 TTL would evict a session immediately) — floor them at 1ms via min:1.
