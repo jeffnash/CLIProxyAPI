@@ -988,6 +988,87 @@ function platformCapHasRoomForNew(cursorKey) {
   return platforms.size < MAX_PLATFORMS;
 }
 
+// ---- Upstream rate-limit hardening (NGHTTP2_ENHANCE_YOUR_CALM) ----
+// When Cursor's HTTP/2 gateway flood-protects an account it RST_STREAMs with NGHTTP2_ENHANCE_YOUR_CALM. The SDK
+// holds ONE persistent HTTP/2 connection per platform (the getPlatform cache), so once that connection is
+// flagged EVERY reused stream on it fails the same way until the connection is recycled — and getPlatform only
+// evicts a REJECTED create (ADD-61), never a successfully-created platform whose connection later got poisoned.
+// These helpers close that gap: classify the signal, recycle the poisoned connection, and run a per-key circuit
+// breaker so client retries back off instead of immediately re-poisoning the freshly-dialed connection.
+
+// isUpstreamRateLimit detects Cursor's HTTP/2 flood/rate-limit signal and adjacent transport codes. The error
+// arrives as a @connectrpc ConnectError whose message carries the nghttp2 code. Exported for tests.
+function isUpstreamRateLimit(reason) {
+  if (!reason) return false;
+  if (reason.code === "resource_exhausted") return true;
+  const msg = (reason.message != null ? String(reason.message) : (typeof reason === "string" ? reason : ""));
+  return /ENHANCE_YOUR_CALM|RESOURCE_EXHAUSTED|too many requests|rate.?limit/i.test(msg);
+}
+
+// recyclePlatform evicts + disposes the cached platform (and its poisoned HTTP/2 connection) for a key hash so
+// the NEXT turn dials a FRESH connection with a clean stream budget. Best-effort dispose (fire-and-forget).
+function recyclePlatform(h) {
+  const entry = platforms.get(h);
+  if (!entry) return false;
+  platforms.delete(h);
+  void disposePlatform(entry);
+  return true;
+}
+
+// Per-key circuit breaker for upstream rate-limiting. While OPEN (now < openUntil) handleTurn fast-fails NEW
+// runs for that key with a clear 429 so the client backs off; the window grows exponentially (capped) per
+// consecutive trip. A successful run closes it (closeBreaker in onRunComplete). This is an IN-PROCESS,
+// PRE-CONNECT rate guard (it bounds how often we re-dial) — NOT a timeout on an established upstream stream, so
+// it stays in the allowed class alongside the abandonment guards in AGENTS.md.
+const CURSOR_RATELIMIT_BASE_MS = envInt("CURSOR_COMPOSER_RATELIMIT_BASE_MS", 4000, { min: 100 });
+const CURSOR_RATELIMIT_MAX_MS = envInt("CURSOR_COMPOSER_RATELIMIT_MAX_MS", 60000, { min: 1000 });
+const upstreamBreaker = new Map(); // keyHash -> { fails, openUntil }
+
+function breakerBackoffMs(fails) {
+  const f = Math.max(1, fails);
+  return Math.min(CURSOR_RATELIMIT_MAX_MS, CURSOR_RATELIMIT_BASE_MS * Math.pow(2, f - 1));
+}
+function tripBreaker(h, now = nowMs()) {
+  const e = upstreamBreaker.get(h) || { fails: 0, openUntil: 0 };
+  e.fails += 1;
+  e.openUntil = now + breakerBackoffMs(e.fails);
+  upstreamBreaker.set(h, e);
+  return e;
+}
+function breakerOpen(h, now = nowMs()) {
+  const e = upstreamBreaker.get(h);
+  return !!(e && now < e.openUntil);
+}
+function breakerRetryAfterMs(h, now = nowMs()) {
+  const e = upstreamBreaker.get(h);
+  return e ? Math.max(0, e.openUntil - now) : 0;
+}
+function closeBreaker(h) {
+  return upstreamBreaker.delete(h);
+}
+
+// soleStreamingSession returns the ONE session with an in-flight streaming run (run set, activeRes open, not
+// done), or null when 0 or 2+ qualify — used to safely attribute a floating rejection that carries no session
+// handle. Shared by the input-stream-closed teardown and the rate-limit attribution.
+function soleStreamingSession(sessionsMap) {
+  if (!sessionsMap || typeof sessionsMap.values !== "function") return null;
+  let victim = null;
+  for (const s of sessionsMap.values()) {
+    if (s && s.run && s.activeRes && !s.done) { if (victim) return null; victim = s; }
+  }
+  return victim;
+}
+
+// rateLimitedKeyToRecycle picks the key hash whose connection to recycle on an ENHANCE_YOUR_CALM rejection that
+// carries no key. Single-tenant (the common case) — exactly one platform — is unambiguous. Otherwise attribute
+// via the lone in-flight session; if still ambiguous (2+ tenants mid-run), return null (log-only) rather than
+// recycle the wrong tenant's healthy connection.
+function rateLimitedKeyToRecycle(sessionsMap, platformsMap) {
+  if (platformsMap && platformsMap.size === 1) return [...platformsMap.keys()][0];
+  const s = soleStreamingSession(sessionsMap);
+  return s ? keyHash(s.cursorKey) : null;
+}
+
 class Session {
   constructor(id, cursorKey) {
     this.id = id;
@@ -1652,6 +1733,8 @@ class Session {
     const producedOutput = !!this.streamedText || this.reasonedThisRun || !!fullResult
       || this.delivered.size > 0 || this.undelivered.length > 0 || this.pendingDeltas.length > 0 || hasUsage;
     const stopReason = finished && producedOutput ? "end_turn" : "error";
+    // A successful run proves the upstream connection is healthy -> close any rate-limit breaker for this key.
+    if (stopReason === "end_turn") closeBreaker(keyHash(this.cursorKey));
     const turnError = finished
       ? (producedOutput ? (res && res.error) : "composer run finished with no output (empty turn)")
       : ((res && res.error) || "composer run did not finish");
@@ -2710,6 +2793,19 @@ async function handleTurn(req, res, body, cursorKey) {
   // Validate BEFORE opening the SSE so we can return a real HTTP status.
   if (!sessionId) { fail(400, "sessionId is required"); return; }
 
+  // Upstream rate-limit circuit breaker: while OPEN for this key, fast-fail NEW runs with a clear 429 so client
+  // retries back off instead of re-poisoning the freshly-recycled HTTP/2 connection. tool_results continuations
+  // are NOT gated — they complete a paused run, and blocking one would strand it until the abandonment watchdog.
+  // HALF-OPEN after the window: the next new-user turn probes and closeBreaker (onRunComplete) clears it on success.
+  if (input.type !== "tool_results") {
+    const kh = keyHash(cursorKey);
+    if (breakerOpen(kh)) {
+      const waitS = Math.ceil(breakerRetryAfterMs(kh) / 1000);
+      fail(429, `upstream is rate-limiting this account (Cursor HTTP/2 ENHANCE_YOUR_CALM); the proxy recycled the connection and is backing off — retry in ~${waitS}s and avoid rapid retries (they re-trip the limit)`);
+      return;
+    }
+  }
+
   // Enforced response constraints + tool_choice carried from the Go executor (Comment 3). Applied as
   // model instructions and tool-advertisement gating on the user turn. unsupportedHardGuarantees (H20/H21/
   // ADD-72/ADD-84) is the executor's advisory list of constraints the composer path cannot hard-enforce; it is
@@ -3496,7 +3592,49 @@ process.on("SIGINT", shutdown);
 process.on("uncaughtException", (err, origin) => {
   try { console.error("[cursor-agent-bridge] FATAL uncaughtException (process kept alive) origin=" + origin + ":", (err && err.stack) ? err.stack : err); } catch { /* a logger throw must never re-crash the handler */ }
 });
+// sessionForClosedInputStream attributes a FLOATING WriteIterableClosedError to the one session it can SAFELY
+// blame. The error means a run's INPUT pipe (the SDK's WritableIterable — the channel agent.send writes into)
+// was torn down by an upstream Cursor stream drop and a late write then hit it; it surfaces as an
+// unhandledRejection instead of rejecting run.wait()->onRunError, so the dead run would otherwise linger (the
+// client sees a silent "socket closed", pendings stay stranded until PENDING_TIMEOUT, and the session looks
+// busy). The reason carries NO run/session handle, so attribute ONLY when EXACTLY ONE session has an in-flight
+// STREAMING run (run set, activeRes open, not done) — the unambiguous common case (a single CC user runs one
+// turn at a time). 0 or 2+ candidates -> null (refuse to guess; blaming the wrong one would kill a healthy
+// concurrent turn — same safe degradation as before). Exported for tests.
+function sessionForClosedInputStream(reason, sessionsMap) {
+  const closed = reason && (reason.name === "WriteIterableClosedError" ||
+    /WritableIterable is closed/i.test((reason && reason.message) || ""));
+  return closed ? soleStreamingSession(sessionsMap) : null;
+}
+
 process.on("unhandledRejection", (reason) => {
+  try {
+    const victim = sessionForClosedInputStream(reason, sessions);
+    if (victim) {
+      // Convert the leaked input-pipe closure into a clean run teardown: the in-flight turn ends with a typed
+      // error (not a silent socket close), pendings reject at once (not stranded until PENDING_TIMEOUT), and
+      // the session is freed so the next turn routes against clean state. onRunError is idempotent on `done`,
+      // so a racing real onRunComplete/onRunError cannot double-tear-down.
+      console.error("[cursor-agent-bridge] run input stream closed mid-turn (upstream Cursor drop) -> clean teardown session=" + victim.id + ":", (reason && reason.message) || reason);
+      try { victim.onRunError(new Error("upstream Cursor stream closed mid-run; the turn was interrupted")); } catch { /* never throw from the handler */ }
+      return;
+    }
+    if (isUpstreamRateLimit(reason)) {
+      // Cursor flood-protected the account (NGHTTP2_ENHANCE_YOUR_CALM): the cached HTTP/2 connection is now
+      // poisoned and every reused stream on it fails until it is recycled. Drop + dispose the poisoned platform
+      // so the next turn dials fresh, and OPEN the per-key breaker so client retries back off instead of
+      // immediately re-poisoning the new connection.
+      const kh = rateLimitedKeyToRecycle(sessions, platforms);
+      if (kh) {
+        recyclePlatform(kh);
+        const e = tripBreaker(kh);
+        console.error("[cursor-agent-bridge] upstream rate-limit (ENHANCE_YOUR_CALM) -> recycled connection + breaker OPEN key=" + kh + " fails=" + e.fails + " ~" + Math.ceil(breakerRetryAfterMs(kh) / 1000) + "s:", (reason && reason.message) || reason);
+      } else {
+        console.error("[cursor-agent-bridge] upstream rate-limit (ENHANCE_YOUR_CALM) but could not safely attribute a key (multi-tenant) -> log only:", (reason && reason.message) || reason);
+      }
+      return;
+    }
+  } catch { /* never throw from the handler */ }
   try { console.error("[cursor-agent-bridge] unhandledRejection (process kept alive):", (reason && reason.stack) ? reason.stack : reason); } catch { /* never throw from the handler */ }
 });
 
@@ -3725,5 +3863,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, sessionForClosedInputStream, isUpstreamRateLimit, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }
