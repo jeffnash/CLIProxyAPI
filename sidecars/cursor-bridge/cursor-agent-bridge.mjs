@@ -2705,6 +2705,15 @@ const TOOL_USAGE_PROMINENT = {
     "                 So a 2nd/3rd step's agents do NOT pile into the 1st step. List EVERY step in meta.phases:[{title:'probe'},{title:'synthesize'}] with titles matching your phase() calls.\n" +
     "IF A WORKFLOW CALL ERRORS: it is a SMALL mechanical fix (one of the above) — CORRECT the `script` and RE-INVOKE `Workflow`. NEVER abandon the workflow to do the task inline / yourself / with the Task tool just because the script errored.\n" +
     "WHILE A WORKFLOW RUNS: do NOT busy-poll it with `sleep`/`stat`/`tail` loops — you are AUTO-NOTIFIED the moment it completes (use `/workflows` for live progress). Burning turns on poll loops makes you UNRESPONSIVE: a new user message must be answered RIGHT AWAY, not after the loop. If the user asks something while a workflow runs, STOP polling and reply.\n" +
+    "SKELETON — the WHOLE shape, copy and adapt (every line matters; this is the imperative model above):\n" +
+    "  export const meta = { name: 'task', description: 'what it does', phases: [{ title: 'probe' }, { title: 'synthesize' }] }\n" +
+    "  const CTX = 'TASK: <the goal>.  SCOPE: <in/out>.  OUTPUT: <what each lane returns>.'\n" +
+    "  const UNITS = ['partA', 'partB', 'partC']            // the INDEPENDENT pieces to fan out — one lane each (>= any N the user named)\n" +
+    "  phase('probe')\n" +
+    "  const results = await parallel(UNITS.map((u) => () => agent(CTX + '\\nLANE: ' + u + '\\nDo the work for THIS piece and report.', { agentType: 'general-purpose' })))\n" +
+    "  phase('synthesize')\n" +
+    "  return await agent(CTX + '\\nMerge these lane results into the final answer: ' + JSON.stringify(results), { agentType: 'general-purpose' })\n" +
+    "(Add a `schema` per lane + a verify phase for audits — see the full example below.)\n" +
     "Copy the ✅ RIGHT forms exactly. Full rules and a complete runnable example follow below.\n" +
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
 };
