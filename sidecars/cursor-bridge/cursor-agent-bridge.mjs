@@ -2547,7 +2547,7 @@ const TOOL_USAGE_EXTRAS = {
     "2. Use `export` EXACTLY ONCE — only for meta. Everything AFTER meta is the BODY; the runtime wraps it in an async function and runs it for you. So NEVER write `export` again (no `export function`, no `export default`, no exported helpers) and do NOT wrap the body in `async function` or an IIFE yourself — a second `export` or a self-wrap throws 'Unexpected keyword export' and the workflow never launches. Use `await` directly in the body.\n" +
     "3. `phase('title')` takes ONLY a string title and runs NO callback. NEVER `phase('name', () => {...})` or `phase('name', async () => {...})` — the callback is never called, so NO agents spawn (a 0-agent empty workflow). Call `phase('name')` on its own to label a section, then write the `agent()`/`parallel()` calls DIRECTLY in the body.\n" +
     "4. `agent()` is POSITIONAL: `agent(promptString, { label, schema, model, agentType })` — the prompt STRING is the FIRST arg. NEVER `agent({ description, prompt, subagent_type })` (that single-object shape is the `Agent` TOOL's, not this function's — it makes the agent's prompt `[object Object]`). If you set `agentType`, copy an EXACT registered agent name verbatim, case-sensitive (e.g. 'general-purpose', 'Explore', 'Plan'); 'explore' or 'generalPurpose' are rejected as 'agent type not found'.\n" +
-    "5. `parallel()`/`pipeline()` take an array of THUNKS: `parallel([() => agent(...), () => agent(...)])` — never bare `agent(...)` (a promise).\n" +
+    "5. `parallel()`/`pipeline()` take ONE array of THUNKS: `parallel([() => agent(...), () => agent(...)])`, or from a list `parallel(UNITS.map((u) => () => agent(...)))` — the INNER `() =>` is REQUIRED. NEVER bare `agent(...)` (a promise), NEVER `.map((u) => agent(...))` (returns promises — add the `() =>`), NEVER separate args (pass one array). On a `parallel`/`pipeline` error, FIX the thunks and RE-INVOKE Workflow — do not fall back to doing the task yourself.\n" +
     "6. No markdown fences. COPY THIS SHAPE EXACTLY (swap in YOUR derived seams + schema fields) — it does the four moves above: derives the SEAMS (UNITS), gives each lane a STRUCTURED-OUTPUT `schema`, adversarially VERIFIES every finding (default-refuted) and keeps only survivors, and threads the confirmed set into the synthesis. It also avoids every pitfall (one `export`; each `phase('x')` is a bare label; `parallel` gets `() =>` thunks; every `agent` is positional):\n" +
     "export const meta = { name: 'audit', description: 'Probe seams, adversarially verify, synthesize', phases: [{ title: 'probe' }, { title: 'verify' }, { title: 'synthesize' }] }\n" +
     "const CTX = 'TASK: audit THIS subsystem. SCOPE: <dirs in/out>. GOAL: bugs, races, security. METHOD: read, grep, targeted tests. OUTPUT: schema only. BAR: file:line + trigger + severity per finding.'\n" +
@@ -2605,14 +2605,16 @@ function augmentWorkflowResultOnFailure(content, isError) {
     const text = typeof content === "string" ? content : safeJson(content);
     const t = (text || "").toLowerCase();
     let reason;
-    if (isError || t.includes("unexpected keyword") || t.includes("syntax error") || t.includes("not launched")) {
+    if (t.includes("is not a function") || t.includes("not iterable") || ((t.includes("parallel") || t.includes("pipeline")) && (t.includes("error") || t.includes("thunk") || t.includes("function")))) {
+      reason = "`parallel()`/`pipeline()` got the WRONG argument — each takes ONE ARRAY of THUNKS (zero-arg functions): `parallel([() => agent('a',{…}), () => agent('b',{…})])`, and from a list `parallel(UNITS.map((u) => () => agent(…)))` — the INNER `() =>` is REQUIRED. NEVER pass bare `agent(...)` (those are promises, not functions), NEVER spread them as separate args (`parallel(()=>…, ()=>…)`), and NEVER `.map((u) => agent(…))` (that returns promises — you MUST add the `() =>`: `.map((u) => () => agent(…))`)";
+    } else if (isError || t.includes("unexpected keyword") || t.includes("syntax error") || t.includes("not launched")) {
       reason = "the script had a SYNTAX error — usually `export` used a SECOND time, or the body wrapped in a function: the runtime already wraps the body in an async function, so use `export` ONLY for `meta` and `await` directly";
     } else if (t.includes("0 agent") || t.replace(/\s/g, "").includes('agentcount":0') || /completed in 0s\b/.test(t)) {
       reason = "it spawned 0 AGENTS — almost always `phase('x', () => {...})`: `phase()` takes ONLY a title and runs NO callback, so the agent()/parallel() calls must be DIRECTLY in the body";
     } else {
       return content; // not a recognized failure -> leave the real result untouched
     }
-    return text + "\n\n[BRIDGE] Your Workflow call FAILED — " + reason + ". Re-run the `Workflow` tool with a corrected `script` following these rules EXACTLY:\n\n" + TOOL_USAGE_EXTRAS.Workflow;
+    return text + "\n\n[BRIDGE] Your Workflow call FAILED — " + reason + ".\nYou MUST FIX the `script` and RE-INVOKE the `Workflow` tool NOW. Do NOT abandon the workflow to do the task yourself / inline / with the Task tool — this is a SMALL mechanical script correction, not a reason to give up on the workflow. Keep your phases, lanes, and schema; just apply the one fix and re-run `Workflow` with the corrected `script`, following these rules EXACTLY:\n\n" + TOOL_USAGE_EXTRAS.Workflow;
   } catch {
     return content;
   }
@@ -2686,13 +2688,22 @@ const TOOL_USAGE_PROMINENT = {
     "      ✅ RIGHT:  agent('Audit the auth code for bugs', { agentType: 'general-purpose' })\n" +
     "      ❌ WRONG:  agent({ description: '…', prompt: '…', subagent_type: '…' })\n" +
     "                 An OBJECT first arg makes the prompt literally '[object Object]' and the agent does nothing.\n" +
-    "(2) `parallel()` / `pipeline()` take THUNKS — wrap each call as `() => agent(...)`:\n" +
+    "(2) `parallel()` / `pipeline()` take ONE ARRAY of THUNKS — wrap each call as `() => agent(...)`:\n" +
     "      ✅ RIGHT:  await parallel([ () => agent('a', { agentType: 'general-purpose' }), () => agent('b', { agentType: 'general-purpose' }) ])\n" +
-    "      ❌ WRONG:  await parallel([ agent('a', {…}), agent('b', {…}) ])\n" +
-    "                 Bare calls are PROMISES, not functions; the run errors immediately.\n" +
+    "      ✅ RIGHT:  await parallel(UNITS.map((u) => () => agent(lanePrompt(u), { schema: FIND })))   // from a list: note the INNER () =>\n" +
+    "      ❌ WRONG:  await parallel([ agent('a', {…}), agent('b', {…}) ])                            // promises, not functions\n" +
+    "      ❌ WRONG:  await parallel(UNITS.map((u) => agent(lanePrompt(u), {…})))                     // .map returns promises — add the () =>\n" +
+    "      ❌ WRONG:  await parallel(() => agent('a'), () => agent('b'))                              // pass ONE array, not separate args\n" +
+    "                 A thunk is a ZERO-ARG function `() => agent(...)`; bare `agent(...)` is a promise and errors immediately.\n" +
     "(3) Subagents do NOT see your chat — put the brief IN the script:\n" +
     "      ✅ RIGHT:  const CTX='TASK:…'; function lanePrompt(u){ return CTX+'\\nLANE:'+u+'\\nSteps:…' }; agent(lanePrompt('auth'), { schema:FIND })\n" +
     "      ❌ WRONG:  agent('Audit auth')   // blind one-liner — subagent has no context\n" +
+    "(4) Each STEP needs its OWN `phase('title')` placed BEFORE that step's agents — every agent attaches to the MOST RECENT `phase()`:\n" +
+    "      ✅ RIGHT:  phase('probe'); await parallel([...]); phase('synthesize'); await agent('Synthesize the findings…', { agentType: 'general-purpose' })\n" +
+    "      ❌ WRONG:  phase('probe'); await parallel([...]); await agent('Synthesize…')   // the synth agent lands inside 'probe' — call phase('synthesize') FIRST\n" +
+    "                 So a 2nd/3rd step's agents do NOT pile into the 1st step. List EVERY step in meta.phases:[{title:'probe'},{title:'synthesize'}] with titles matching your phase() calls.\n" +
+    "IF A WORKFLOW CALL ERRORS: it is a SMALL mechanical fix (one of the above) — CORRECT the `script` and RE-INVOKE `Workflow`. NEVER abandon the workflow to do the task inline / yourself / with the Task tool just because the script errored.\n" +
+    "WHILE A WORKFLOW RUNS: do NOT busy-poll it with `sleep`/`stat`/`tail` loops — you are AUTO-NOTIFIED the moment it completes (use `/workflows` for live progress). Burning turns on poll loops makes you UNRESPONSIVE: a new user message must be answered RIGHT AWAY, not after the loop. If the user asks something while a workflow runs, STOP polling and reply.\n" +
     "Copy the ✅ RIGHT forms exactly. Full rules and a complete runnable example follow below.\n" +
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
 };
