@@ -3634,9 +3634,20 @@ if (evictTimer.unref) evictTimer.unref();
 
 // ---- graceful shutdown: stop accepting, settle/cancel sessions, close stores ----
 let shuttingDown = false;
+// CURSOR_AGENT_DRAIN_MS: on SIGTERM/SIGINT (a redeploy), stop accepting NEW turns (server.close) and let any
+// IN-FLIGHT runs finish for up to this BOUND before force-cancelling — so a restart does not kill a turn that was
+// about to finish (the orphaned-tool_call_id / lost-continuation class). BOUNDED so a redeploy waits AT MOST this
+// long, never indefinitely (set 0 to restore the old immediate-cancel behavior). Kept under a typical container
+// SIGTERM grace window so the platform never SIGKILLs us first.
+const DRAIN_MS = envInt("CURSOR_AGENT_DRAIN_MS", 20000, { min: 0 });
 async function shutdown() {
   if (shuttingDown) return; shuttingDown = true;
-  try { server.close(); } catch {}
+  try { server.close(); } catch {} // refuse NEW connections; in-flight ones keep streaming
+  if (DRAIN_MS > 0) {
+    const deadline = nowMs() + DRAIN_MS;
+    const anyLive = () => { for (const [, s] of sessions) { if (s && s.run && !s.done) return true; } return false; };
+    try { while (anyLive() && nowMs() < deadline) { await new Promise((r) => setTimeout(r, 250)); } } catch {}
+  }
   for (const [, s] of sessions) { try { await s.cancel(); } catch {} }
   sessions.clear();
   for (const [, entry] of platforms) { try { await disposePlatform(entry); } catch {} }
