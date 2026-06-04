@@ -1205,13 +1205,16 @@ func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
 			t.Fatalf("body %s: same conv id + same opener must be stable (%s vs %s)", k, s1, s2)
 		}
 	}
-	// H16: a bare previous_response_id with NO recorded mapping must NOT be a stable conv-id hash — it mints a
-	// fresh session (graceful fallback). Two such calls therefore differ (proving it left stableConversationID).
-	prevOpts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"unmapped-prev"}`)}
-	p1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), prevOpts)
-	p2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), prevOpts)
-	if p1 == p2 {
-		t.Fatalf("H16: an unmapped previous_response_id must NOT be hashed as a stable conv id (must mint fresh): %s == %s", p1, p2)
+	// H16: previous_response_id is NOT a stable conv-id hash (it changes every turn). When UNMAPPED, the turn
+	// falls through past stableConversationID to CLIENT-AGNOSTIC content keying (the turn-stable opener), so two
+	// turns that share an opener but carry DIFFERENT previous_response_id values resolve to the SAME session —
+	// proving the (unstable) response id never entered the key.
+	p1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"),
+		cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"unmapped-prev-1"}`)})
+	p2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"),
+		cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"unmapped-prev-2"}`)})
+	if p1 != p2 {
+		t.Fatalf("H16: an unmapped previous_response_id must NOT enter the key — same opener must key the same regardless of response id: %s != %s", p1, p2)
 	}
 	// Distinct conv ids (here via Session_id) must differ.
 	a, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), optsWithHeaders(map[string]string{"Session_id": "A"}))

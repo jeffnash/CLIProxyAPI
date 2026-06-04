@@ -1676,6 +1676,26 @@ func lineageOpenerFingerprint(messages []gjson.Result) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
+// composerContentConvKey derives a CLIENT-AGNOSTIC, turn-stable conversation key for a turn that carries no
+// EXPLICIT client conversation id (no conv/session/thread header, no metadata.user_id, no conversation_id).
+// Both the OpenAI chat and Anthropic messages APIs are STATELESS — the client resends the full transcript
+// every turn — so the conversation OPENER (the first user message) is byte-identical on every turn, including
+// new-user follow-ups (the first user message never changes as history grows). lineageOpenerFingerprint
+// hashes ONLY that first non-system message, so a volatile system prompt (timestamps/cwd/git status) never
+// breaks turn stability. This is the built-in equivalent of the Anthropic path's metadata.user_id for clients
+// that send no id (e.g. opendesign, raw OpenAI/SDK callers, simple UIs). The result is namespaced so it can
+// never alias a real client conversation id, and "" when there is no opener at all. Unlike the ADD-78
+// prompt_cache_key (a coarse key SHARED across separate tasks), the opener IS the task, so distinct tasks key
+// distinctly; the lineage head-digest still SPLITS two conversations that share an opener once their histories
+// diverge, and deriveComposerSessionIDLive forks concurrent same-opener turns — so the only residual cost is a
+// brief turn-1 overlap for two conversations whose FIRST user message is byte-identical.
+func composerContentConvKey(messages []gjson.Result) string {
+	if fp := lineageOpenerFingerprint(messages); fp != "" {
+		return "openerfp:" + fp
+	}
+	return ""
+}
+
 // composerContinuationCarriesOpener reports whether a continuation REPLAYS the conversation from the top — its
 // first non-system message is a USER message (a full-replay continuation that carries the opener + history).
 // Such a turn can be RE-SEEDED from its own replayed history, so on full state loss it is reseeded to a
@@ -2048,12 +2068,27 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 		composerDebugf("[composer] deriveSessionID BRANCH=stable convID=%q -> sessionID=%s (baseSid=%s)", id, sid, baseSid)
 		return sid, nil
 	}
-	// New user turn with no stable id (a stateless client — curl/SDK/simple UI). Mint a FRESH RANDOM session
-	// id: it can never collide with another conversation (unlike a content hash), so this is safe for the
-	// default Cursor Composer Client-Tools path; a stateless multi-turn client keeps context via history re-seeding (not durable
-	// resume). Continuations still resolve because we record each emitted tool_call_id -> session.
+	// New user turn with no EXPLICIT client conversation id. CLIENT-AGNOSTIC KEYING: rather than mint a fresh
+	// random session every turn — which loses durable continuity for any client that is not Claude Code
+	// (opendesign, raw OpenAI/SDK, simple UIs) and degrades to lossy history re-seeding — derive the key from the
+	// turn-stable conversation opener (composerContentConvKey). The SAME lineage machinery as the explicit-id
+	// BRANCH=stable path then resolves ONE durable session across all of this conversation's turns and tool loops
+	// (the opener is byte-identical on every replayed turn, and the head-digest splits divergent conversations
+	// that happen to share an opener). composerContentConvKey returns "" only when there is no opener at all,
+	// where a fresh mint remains the floor — and a continuation still re-seeds from its own replayed history, so a
+	// routine turn never errors.
+	messages := gjson.GetBytes(oai, "messages").Array()
+	if convKey := composerContentConvKey(messages); convKey != "" {
+		baseSid := composerStableBaseSessionID(tenant, apiKey, convKey)
+		fp16 := composerHistoryFingerprint(messages)
+		headDigest := lineageHeadDigest(tenant, fp16, messages)
+		openerFP := lineageOpenerFingerprint(messages)
+		sid := composerLineage.resolveStableSession(tenant, baseSid, headDigest, openerFP)
+		composerDebugf("[composer] deriveSessionID BRANCH=content-key(client-agnostic opener) -> sessionID=%s (baseSid=%s)", sid, baseSid)
+		return sid, nil
+	}
 	sid := mintComposerSessionID()
-	composerDebugf("[composer] deriveSessionID BRANCH=mint(stateless new user turn) -> sessionID=%s", sid)
+	composerDebugf("[composer] deriveSessionID BRANCH=mint(no opener) -> sessionID=%s", sid)
 	return sid, nil
 }
 
@@ -2096,14 +2131,21 @@ func deriveComposerSessionIDLive(auth *cliproxyauth.Auth, apiKey string, oai []b
 			return finalSid, owner, nil
 		}
 	}
-	id := stableConversationID(opts)
-	if id == "" {
-		return sid, 0, nil // stateless mint: unique by construction, cannot collide
-	}
-	// Branch-4 new-user stable turn: claim its session or fork onto a free sibling. baseSid+headDigest match
-	// what deriveComposerSessionID just used, so the fork slots off the lineage entry it recorded.
-	baseSid := composerStableBaseSessionID(tenant, apiKey, id)
+	// Branch-4 new-user turn: claim its session or fork onto a free sibling. The base session id derives from
+	// the EXPLICIT client conversation id when present, else the CLIENT-AGNOSTIC content key (the conversation
+	// opener) — kept in LOCKSTEP with deriveComposerSessionID so the fork slots off the same lineage entry it
+	// just recorded. A truly openerless no-id turn keeps the stateless-mint shortcut (unique by construction).
 	messages := gjson.GetBytes(oai, "messages").Array()
+	id := stableConversationID(opts)
+	var baseSid string
+	if id != "" {
+		baseSid = composerStableBaseSessionID(tenant, apiKey, id)
+	} else if convKey := composerContentConvKey(messages); convKey != "" {
+		baseSid = composerStableBaseSessionID(tenant, apiKey, convKey)
+	}
+	if baseSid == "" {
+		return sid, 0, nil // stateless mint with no opener: unique by construction, cannot collide
+	}
 	headDigest := lineageHeadDigestFromMessages(tenant, messages)
 	finalSid, owner := composerAcquireOrFork(tenant, sid, baseSid, headDigest)
 	if finalSid != sid {
