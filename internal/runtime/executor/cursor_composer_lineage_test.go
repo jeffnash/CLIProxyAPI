@@ -962,3 +962,74 @@ func TestConcurrencyForkPreviousResponseIDResume(t *testing.T) {
 	composerInflight.release(tenant, a, ownerC)
 	composerInflight.release(tenant, b, ownerB)
 }
+
+// ---------------------------------------------------------------------------
+// CLIENT-AGNOSTIC content keying — a client that sends NO explicit conversation id (opendesign, raw
+// OpenAI/SDK callers, simple UIs) must still get ONE durable session across all of a conversation's turns,
+// keyed off the turn-stable conversation opener (composerContentConvKey) instead of minting fresh every turn.
+// This is the built-in equivalent of the Anthropic path's metadata.user_id for non-Claude-Code clients.
+// ---------------------------------------------------------------------------
+
+// A no-conv-id conversation (stateless replaying client) must keep ONE durable session across a new-user
+// follow-up: the full transcript is replayed every turn, so the opener is byte-identical and resolves to the
+// same session — NOT a fresh mint (the regression that made opendesign "not continue turns").
+func TestContentKey_NoConvIDDurableAcrossTurns(t *testing.T) {
+	auth := authL("tck-dur")
+	noID := cliproxyexecutor.Options{} // no header, no metadata.user_id, no conversation_id
+	t1 := lineagePayload(true, lineageMsg{"user", "implement the OAuth device flow"})
+	s1, err := deriveComposerSessionID(auth, "ckey", t1, noID)
+	if err != nil {
+		t.Fatalf("turn 1 derive: %v", err)
+	}
+	if !strings.HasPrefix(s1, "sess_") {
+		t.Fatalf("content-keyed session must be a real sess_ id, got %q", s1)
+	}
+	// New-user follow-up: same opener replayed at the head + new tail. Must resolve to the SAME session.
+	t2 := lineagePayload(true,
+		lineageMsg{"user", "implement the OAuth device flow"},
+		lineageMsg{"assistant", "done — added the device_code grant"},
+		lineageMsg{"user", "now add token refresh"})
+	s2, err := deriveComposerSessionID(auth, "ckey", t2, noID)
+	if err != nil {
+		t.Fatalf("turn 2 derive: %v", err)
+	}
+	if s1 != s2 {
+		t.Fatalf("a no-conv-id conversation must keep ONE durable session across turns (opener-keyed); got s1=%q s2=%q", s1, s2)
+	}
+}
+
+// Two no-conv-id conversations with DISTINCT openers must NOT collapse onto one session (distinct tasks key
+// distinctly — the opener IS the task, unlike the ADD-78 shared prompt_cache_key).
+func TestContentKey_DistinctOpenersDistinctSessions(t *testing.T) {
+	auth := authL("tck-dist")
+	noID := cliproxyexecutor.Options{}
+	a := lineagePayload(true, lineageMsg{"user", "refactor the billing module"})
+	b := lineagePayload(true, lineageMsg{"user", "write release notes for v2"})
+	sa, _ := deriveComposerSessionID(auth, "ckey", a, noID)
+	sb, _ := deriveComposerSessionID(auth, "ckey", b, noID)
+	if sa == sb {
+		t.Fatalf("distinct openers must NOT collapse onto one session (sa=%q sb=%q)", sa, sb)
+	}
+}
+
+// A CONCURRENT same-opener turn (no conv id) must FORK onto a distinct sibling via the live executor's
+// isolation invariant rather than collide on the busy content-keyed session.
+func TestContentKey_LiveForkOnConcurrentSameOpener(t *testing.T) {
+	auth := authL("tck-fork")
+	noID := cliproxyexecutor.Options{}
+	tenant := composerTenant(auth, noID)
+	p := lineagePayload(true, lineageMsg{"user", "same opener concurrent run"})
+	s1, owner1, err := deriveComposerSessionIDLive(auth, "ckey", p, noID)
+	if err != nil {
+		t.Fatalf("live derive 1: %v", err)
+	}
+	defer composerInflight.release(tenant, s1, owner1)
+	s2, owner2, err := deriveComposerSessionIDLive(auth, "ckey", p, noID)
+	if err != nil {
+		t.Fatalf("live derive 2: %v", err)
+	}
+	defer composerInflight.release(tenant, s2, owner2)
+	if s2 == s1 {
+		t.Fatalf("a concurrent same-opener turn must fork onto a distinct sibling, got the same session %q", s1)
+	}
+}
