@@ -2751,6 +2751,22 @@ function augmentUnderspecifiedToolSchema(name, schema) {
     const branches = [];
     if (hasScript) branches.push({ required: ["script"] });
     if (hasScriptPath) branches.push({ required: ["scriptPath"] });
+    // Bind the highest-signal script-shape rules to the `script` ARG ITSELF — composer reads a property's
+    // description at the moment it constructs that value, so the rules land right where the mistakes happen
+    // (a concise mirror of the full guidance in the tool description). Prepended to CC's own script description.
+    if (hasScript && schema.properties.script && typeof schema.properties.script === "object") {
+      const RULES =
+        "INLINE JS WORKFLOW — a PLAIN imperative async body, NOT a declarative/phased framework. " +
+        "`export const meta = { name, description, phases: [{ title }] }` FIRST (the ONLY `export`), then top-level `await`; pass data between steps with normal `const` variables. " +
+        "`phase('title')` and `meta.phases` are PROGRESS LABELS ONLY — no callback, no `{prev}` injection, no execution graph. " +
+        "`agent('prompt string', { agentType })` is POSITIONAL (the string is the FIRST arg, never an object). " +
+        "`parallel()`/`pipeline()` take ONE ARRAY of THUNKS: `parallel(UNITS.map((u) => () => agent(...)))` — the INNER `() =>` is REQUIRED, never bare `agent(...)`. " +
+        "On any error, FIX the script and RE-INVOKE Workflow — do not abandon it to do the task inline. " +
+        "EXAMPLE: `export const meta={name:'t',description:'d',phases:[{title:'probe'},{title:'synthesize'}]}; const r=await parallel(UNITS.map((u)=>()=>agent('do '+u,{agentType:'general-purpose'}))); return await agent('merge: '+JSON.stringify(r),{agentType:'general-purpose'})`";
+      const ccDesc = typeof schema.properties.script.description === "string" && schema.properties.script.description ? "\n\n" + schema.properties.script.description : "";
+      const script = { ...schema.properties.script, description: RULES + ccDesc };
+      return { ...schema, anyOf: branches, properties: { ...schema.properties, script } };
+    }
     return { ...schema, anyOf: branches };
   } catch { return schema; }
 }
