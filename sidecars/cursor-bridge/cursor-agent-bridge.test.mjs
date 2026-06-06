@@ -31,6 +31,7 @@ import {
   Session,
   sessionForClosedInputStream,
   isUpstreamRateLimit,
+  isUpstreamUnauthenticated,
   recyclePlatform,
   tripBreaker,
   breakerOpen,
@@ -478,6 +479,20 @@ test("isUpstreamRateLimit: matches ENHANCE_YOUR_CALM / RESOURCE_EXHAUSTED / conn
   assert.equal(isUpstreamRateLimit(new Error("WritableIterable is closed")), false);
   assert.equal(isUpstreamRateLimit(new Error("some other failure")), false);
   assert.equal(isUpstreamRateLimit(null), false);
+});
+
+test("isUpstreamUnauthenticated: matches ConnectError [unauthenticated]/unauthorized, rejects unrelated", () => {
+  // The exact shape Cursor returns on the gRPC stream trailer (observed in prod, surfaced as unhandledRejection).
+  assert.equal(isUpstreamUnauthenticated(new Error("[unauthenticated] Error")), true);
+  assert.equal(isUpstreamUnauthenticated({ code: "unauthenticated", message: "x" }), true);
+  assert.equal(isUpstreamUnauthenticated({ code: "unauthorized", message: "x" }), true);
+  assert.equal(isUpstreamUnauthenticated(new Error("request was unauthorized")), true);
+  assert.equal(isUpstreamUnauthenticated("plain unauthenticated string"), true);
+  // not an auth poison: rate-limit, input-stream-closed drop, unrelated, and null all fall through
+  assert.equal(isUpstreamUnauthenticated(new Error("NGHTTP2_ENHANCE_YOUR_CALM")), false);
+  assert.equal(isUpstreamUnauthenticated(new Error("WritableIterable is closed")), false);
+  assert.equal(isUpstreamUnauthenticated(new Error("some other failure")), false);
+  assert.equal(isUpstreamUnauthenticated(null), false);
 });
 
 test("rate-limit circuit breaker: trips open, grows backoff (capped), reports retry-after, closes on success", () => {
