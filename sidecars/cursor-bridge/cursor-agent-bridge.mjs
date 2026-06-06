@@ -1014,6 +1014,20 @@ function isUpstreamRateLimit(reason) {
   return /ENHANCE_YOUR_CALM|RESOURCE_EXHAUSTED|too many requests|rate.?limit/i.test(msg);
 }
 
+// isUpstreamUnauthenticated detects Cursor rejecting the bridge's auth on the cached connection. The crsr_ key
+// mints a session token; when it goes stale/invalid mid-connection Cursor RST_STREAMs the run with a @connectrpc
+// [unauthenticated] ConnectError on the stream trailer. Like the rate-limit poison, the failure is bound to the
+// ONE persistent HTTP/2 connection (the getPlatform cache), so EVERY reused stream on it then fails the same way
+// until the platform is recycled and re-dialed — which re-mints auth. getPlatform only evicts a REJECTED create,
+// never a live-but-poisoned one, so without this the connection wedges every turn into a 500 until restart.
+// Exported for tests.
+function isUpstreamUnauthenticated(reason) {
+  if (!reason) return false;
+  if (reason.code === "unauthenticated" || reason.code === "unauthorized") return true;
+  const msg = (reason.message != null ? String(reason.message) : (typeof reason === "string" ? reason : ""));
+  return /\bunauthenticated\b|\bunauthorized\b/i.test(msg);
+}
+
 // recyclePlatform evicts + disposes the cached platform (and its poisoned HTTP/2 connection) for a key hash so
 // the NEXT turn dials a FRESH connection with a clean stream budget. Best-effort dispose (fire-and-forget).
 function recyclePlatform(h) {
@@ -3694,18 +3708,23 @@ process.on("unhandledRejection", (reason) => {
       try { victim.onRunError(new Error("upstream Cursor stream closed mid-run; the turn was interrupted")); } catch { /* never throw from the handler */ }
       return;
     }
-    if (isUpstreamRateLimit(reason)) {
-      // Cursor flood-protected the account (NGHTTP2_ENHANCE_YOUR_CALM): the cached HTTP/2 connection is now
-      // poisoned and every reused stream on it fails until it is recycled. Drop + dispose the poisoned platform
-      // so the next turn dials fresh, and OPEN the per-key breaker so client retries back off instead of
-      // immediately re-poisoning the new connection.
+    // Both a rate-limit flood (NGHTTP2_ENHANCE_YOUR_CALM) and an auth rejection ([unauthenticated], the session
+    // token went stale/invalid mid-connection) POISON the ONE cached HTTP/2 connection: every reused stream on it
+    // then keeps failing the same way until the platform is recycled, and getPlatform only evicts a REJECTED
+    // create — never a live-but-poisoned one. Same recovery for both: drop + dispose the poisoned platform so the
+    // NEXT turn dials a FRESH connection (which also re-mints auth), and OPEN the per-key breaker so client
+    // retries back off (exponential) instead of immediately re-poisoning it. A successful run closes the breaker.
+    const poison = isUpstreamRateLimit(reason) ? "rate-limit (ENHANCE_YOUR_CALM)"
+      : isUpstreamUnauthenticated(reason) ? "auth rejected (unauthenticated)"
+        : null;
+    if (poison) {
       const kh = rateLimitedKeyToRecycle(sessions, platforms);
       if (kh) {
         recyclePlatform(kh);
         const e = tripBreaker(kh);
-        console.error("[cursor-agent-bridge] upstream rate-limit (ENHANCE_YOUR_CALM) -> recycled connection + breaker OPEN key=" + kh + " fails=" + e.fails + " ~" + Math.ceil(breakerRetryAfterMs(kh) / 1000) + "s:", (reason && reason.message) || reason);
+        console.error("[cursor-agent-bridge] upstream " + poison + " -> recycled connection (force re-auth/re-dial) + breaker OPEN key=" + kh + " fails=" + e.fails + " ~" + Math.ceil(breakerRetryAfterMs(kh) / 1000) + "s:", (reason && reason.message) || reason);
       } else {
-        console.error("[cursor-agent-bridge] upstream rate-limit (ENHANCE_YOUR_CALM) but could not safely attribute a key (multi-tenant) -> log only:", (reason && reason.message) || reason);
+        console.error("[cursor-agent-bridge] upstream " + poison + " but could not safely attribute a key (multi-tenant) -> log only:", (reason && reason.message) || reason);
       }
       return;
     }
@@ -3938,5 +3957,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, sessionForClosedInputStream, isUpstreamRateLimit, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }
