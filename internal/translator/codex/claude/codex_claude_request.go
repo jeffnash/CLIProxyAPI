@@ -8,6 +8,7 @@ package claude
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -251,6 +252,8 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 
 	}
 
+	template = repairCodexClaudeOrphanToolOutputs(template)
+
 	// Convert tools declarations to the expected format for the Codex API.
 	toolsResult := rootResult.Get("tools")
 	if toolsResult.IsArray() {
@@ -349,6 +352,59 @@ func shortenCodexCallIDIfNeeded(id string) string {
 		return suffix[len(suffix)-limit:]
 	}
 	return id[:prefixLen] + suffix
+}
+
+func repairCodexClaudeOrphanToolOutputs(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body
+	}
+
+	var items []json.RawMessage
+	if err := json.Unmarshal([]byte(input.Raw), &items); err != nil {
+		return body
+	}
+
+	changed := false
+	seenCalls := make(map[string]struct{}, len(items))
+	repaired := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		itemType := strings.TrimSpace(gjson.GetBytes(item, "type").String())
+		switch itemType {
+		case "function_call":
+			if callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String()); callID != "" {
+				seenCalls[callID] = struct{}{}
+			}
+			repaired = append(repaired, item)
+		case "function_call_output":
+			callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
+			if callID != "" {
+				if _, ok := seenCalls[callID]; !ok {
+					if cached, found := cachedCodexClaudeToolCall(callID); found {
+						repaired = append(repaired, cached)
+						seenCalls[callID] = struct{}{}
+						changed = true
+					}
+				}
+			}
+			repaired = append(repaired, item)
+		default:
+			repaired = append(repaired, item)
+		}
+	}
+
+	if !changed {
+		return body
+	}
+	raw, err := json.Marshal(repaired)
+	if err != nil {
+		return body
+	}
+	updated, err := sjson.SetRawBytes(body, "input", raw)
+	if err != nil {
+		return body
+	}
+	return updated
 }
 
 func isClaudeWebSearchToolType(toolType string) bool {

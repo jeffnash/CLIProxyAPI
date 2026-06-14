@@ -572,6 +572,77 @@ func TestConvertCodexResponseToClaude_ShortensLongToolUseIDs(t *testing.T) {
 	})
 }
 
+func TestConvertCodexResponseToClaude_CachesStreamToolCallByClaudeVisibleID(t *testing.T) {
+	resetCodexClaudeToolCallCacheForTest()
+	t.Cleanup(resetCodexClaudeToolCallCacheForTest)
+
+	longCallID := "call_" + strings.Repeat("b", 70)
+	if len(longCallID) <= 64 {
+		t.Fatalf("test setup error: longCallID length = %d, want > 64", len(longCallID))
+	}
+
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"lookup","input_schema":{"type":"object","properties":{}}}]}`)
+	var param any
+
+	outputs := ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, []byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"`+longCallID+`","name":"lookup","arguments":{"query":"repo status"}}}`), &param)
+
+	toolID := ""
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			if data.Get("type").String() == "content_block_start" && data.Get("content_block.type").String() == "tool_use" {
+				toolID = data.Get("content_block.id").String()
+			}
+		}
+	}
+	if toolID == "" {
+		t.Fatalf("missing stream tool_use block. Outputs=%q", outputs)
+	}
+	if len(toolID) > 64 || toolID == longCallID {
+		t.Fatalf("tool ID was not shortened for Claude visibility: %q", toolID)
+	}
+
+	request := []byte(`{
+		"model":"claude-3-opus",
+		"messages":[
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"` + toolID + `","content":"ok"}
+			]}
+		]
+	}`)
+
+	result := ConvertClaudeRequestToCodex("test-model", request, false)
+	inputs := gjson.GetBytes(result, "input").Array()
+
+	var outputIndex = -1
+	for i, item := range inputs {
+		if item.Get("type").String() == "function_call_output" && item.Get("call_id").String() == toolID {
+			outputIndex = i
+			break
+		}
+	}
+	if outputIndex <= 0 {
+		t.Fatalf("missing cached function_call before orphan tool result. Output: %s", string(result))
+	}
+	repairedCall := inputs[outputIndex-1]
+	if got := repairedCall.Get("type").String(); got != "function_call" {
+		t.Fatalf("previous input type = %q, want function_call. Output: %s", got, string(result))
+	}
+	if got := repairedCall.Get("call_id").String(); got != toolID {
+		t.Fatalf("repaired call_id = %q, want %q. Output: %s", got, toolID, string(result))
+	}
+	if got := repairedCall.Get("name").String(); got != "lookup" {
+		t.Fatalf("repaired tool name = %q, want lookup. Output: %s", got, string(result))
+	}
+	if got := repairedCall.Get("arguments.query").String(); got != "repo status" {
+		t.Fatalf("repaired arguments.query = %q, want repo status. Output: %s", got, string(result))
+	}
+}
+
 func TestConvertCodexResponseToClaude_StreamStopReasonMapping(t *testing.T) {
 	tests := []struct {
 		name       string
