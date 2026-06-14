@@ -32,6 +32,10 @@ type ConvertCodexResponseToClaudeParams struct {
 	ThinkingStopPending       bool
 	ThinkingSignature         string
 	ThinkingSummarySeen       bool
+	ToolBlockIndexes          map[string]int
+	ToolArgumentDeltaSeen     map[int]bool
+	CurrentToolBlockIndex     int
+	HasCurrentToolBlock       bool
 }
 
 // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
@@ -144,8 +148,9 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			params.HasReceivedArgumentsDelta = false
 			callID := shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(itemResult.Get("call_id").String()))
 			rememberCodexClaudeToolCall(callID, itemResult)
+			blockIndex := params.startCodexToolBlock(rootResult, itemResult)
 			template = []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
-			template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+			template, _ = sjson.SetBytes(template, "index", blockIndex)
 			template, _ = sjson.SetBytes(template, "content_block.id", callID)
 			{
 				name := itemResult.Get("name").String()
@@ -159,7 +164,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 			output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
 
 			template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-			template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+			template, _ = sjson.SetBytes(template, "index", blockIndex)
 
 			output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 		case "reasoning":
@@ -215,9 +220,10 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		case "function_call":
 			callID := shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(itemResult.Get("call_id").String()))
 			rememberCodexClaudeToolCall(callID, itemResult)
+			blockIndex := params.codexToolBlockIndex(rootResult, itemResult)
 			template = []byte(`{"type":"content_block_stop","index":0}`)
-			template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
-			params.BlockIndex++
+			template, _ = sjson.SetBytes(template, "index", blockIndex)
+			params.finishCodexToolBlock(rootResult, itemResult, blockIndex)
 
 			output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
 		case "reasoning":
@@ -234,16 +240,19 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		}
 	case "response.function_call_arguments.delta":
 		params.HasReceivedArgumentsDelta = true
+		blockIndex := params.codexToolBlockIndex(rootResult, gjson.Result{})
+		params.markCodexToolArgumentsDelta(blockIndex)
 		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+		template, _ = sjson.SetBytes(template, "index", blockIndex)
 		template, _ = sjson.SetBytes(template, "delta.partial_json", rootResult.Get("delta").String())
 
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 	case "response.function_call_arguments.done":
-		if !params.HasReceivedArgumentsDelta {
+		blockIndex := params.codexToolBlockIndex(rootResult, gjson.Result{})
+		if !params.codexToolArgumentsDeltaSeen(blockIndex) {
 			if args := rootResult.Get("arguments").String(); args != "" {
 				template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-				template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+				template, _ = sjson.SetBytes(template, "index", blockIndex)
 				template, _ = sjson.SetBytes(template, "delta.partial_json", args)
 
 				output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
@@ -252,6 +261,86 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	}
 
 	return [][]byte{output}
+}
+
+func (params *ConvertCodexResponseToClaudeParams) startCodexToolBlock(rootResult, itemResult gjson.Result) int {
+	params.ensureCodexToolBlockState()
+	blockIndex := params.BlockIndex
+	params.BlockIndex++
+	params.CurrentToolBlockIndex = blockIndex
+	params.HasCurrentToolBlock = true
+	for _, key := range codexToolStreamKeys(rootResult, itemResult) {
+		params.ToolBlockIndexes[key] = blockIndex
+	}
+	return blockIndex
+}
+
+func (params *ConvertCodexResponseToClaudeParams) codexToolBlockIndex(rootResult, itemResult gjson.Result) int {
+	params.ensureCodexToolBlockState()
+	for _, key := range codexToolStreamKeys(rootResult, itemResult) {
+		if blockIndex, ok := params.ToolBlockIndexes[key]; ok {
+			return blockIndex
+		}
+	}
+	if params.HasCurrentToolBlock {
+		return params.CurrentToolBlockIndex
+	}
+	return params.BlockIndex
+}
+
+func (params *ConvertCodexResponseToClaudeParams) markCodexToolArgumentsDelta(blockIndex int) {
+	params.ensureCodexToolBlockState()
+	params.ToolArgumentDeltaSeen[blockIndex] = true
+}
+
+func (params *ConvertCodexResponseToClaudeParams) codexToolArgumentsDeltaSeen(blockIndex int) bool {
+	params.ensureCodexToolBlockState()
+	return params.ToolArgumentDeltaSeen[blockIndex]
+}
+
+func (params *ConvertCodexResponseToClaudeParams) finishCodexToolBlock(rootResult, itemResult gjson.Result, blockIndex int) {
+	params.ensureCodexToolBlockState()
+	for _, key := range codexToolStreamKeys(rootResult, itemResult) {
+		delete(params.ToolBlockIndexes, key)
+	}
+	delete(params.ToolArgumentDeltaSeen, blockIndex)
+	if params.HasCurrentToolBlock && params.CurrentToolBlockIndex == blockIndex {
+		params.HasCurrentToolBlock = false
+	}
+}
+
+func (params *ConvertCodexResponseToClaudeParams) ensureCodexToolBlockState() {
+	if params.ToolBlockIndexes == nil {
+		params.ToolBlockIndexes = make(map[string]int)
+	}
+	if params.ToolArgumentDeltaSeen == nil {
+		params.ToolArgumentDeltaSeen = make(map[int]bool)
+	}
+}
+
+func codexToolStreamKeys(rootResult, itemResult gjson.Result) []string {
+	seen := make(map[string]struct{})
+	keys := make([]string, 0, 4)
+	addKey := func(prefix, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		key := prefix + ":" + value
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+
+	addKey("item_id", rootResult.Get("item_id").String())
+	addKey("item_id", itemResult.Get("id").String())
+	addKey("call_id", itemResult.Get("call_id").String())
+	if outputIndex := rootResult.Get("output_index"); outputIndex.Exists() {
+		addKey("output_index", outputIndex.Raw)
+	}
+	return keys
 }
 
 func codexStreamErrorToClaudeError(rootResult gjson.Result) []byte {

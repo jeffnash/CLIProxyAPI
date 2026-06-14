@@ -643,6 +643,61 @@ func TestConvertCodexResponseToClaude_CachesStreamToolCallByClaudeVisibleID(t *t
 	}
 }
 
+func TestConvertCodexResponseToClaude_ParallelToolCallsKeepDistinctContentBlockIndexes(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read"}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":"{\"file_path\":\"AGENTS.md\"}"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"AGENTS.md\"}"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.done","output_index":1,"item_id":"fc_2","arguments":"{\"file_path\":\"go.mod\"}"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"Read","arguments":"{\"file_path\":\"go.mod\"}"}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	}
+
+	var startIndexes []int
+	var stopIndexes []int
+	argDeltas := map[int]string{}
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			switch data.Get("type").String() {
+			case "content_block_start":
+				if data.Get("content_block.type").String() == "tool_use" {
+					startIndexes = append(startIndexes, int(data.Get("index").Int()))
+				}
+			case "content_block_delta":
+				if data.Get("delta.type").String() == "input_json_delta" {
+					if partial := data.Get("delta.partial_json").String(); partial != "" {
+						argDeltas[int(data.Get("index").Int())] = partial
+					}
+				}
+			case "content_block_stop":
+				stopIndexes = append(stopIndexes, int(data.Get("index").Int()))
+			}
+		}
+	}
+
+	assertIntSliceEqual(t, "tool_use start indexes", startIndexes, []int{0, 1}, outputs)
+	assertIntSliceEqual(t, "tool_use stop indexes", stopIndexes, []int{0, 1}, outputs)
+	if got := argDeltas[0]; !strings.Contains(got, "AGENTS.md") {
+		t.Fatalf("arguments for block 0 = %q, want AGENTS.md. Outputs=%q", got, outputs)
+	}
+	if got := argDeltas[1]; !strings.Contains(got, "go.mod") {
+		t.Fatalf("arguments for block 1 = %q, want go.mod. Outputs=%q", got, outputs)
+	}
+}
+
 func TestConvertCodexResponseToClaude_StreamStopReasonMapping(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -860,4 +915,16 @@ func firstClaudeStreamPayloadForEvent(output, event string) (gjson.Result, bool)
 		return gjson.Parse(strings.TrimPrefix(line, "data: ")), true
 	}
 	return gjson.Result{}, false
+}
+
+func assertIntSliceEqual(t *testing.T, label string, got, want []int, outputs [][]byte) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s = %v, want %v. Outputs=%q", label, got, want, outputs)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("%s = %v, want %v. Outputs=%q", label, got, want, outputs)
+		}
+	}
 }
