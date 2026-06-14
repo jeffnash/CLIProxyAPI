@@ -198,6 +198,78 @@ func TestConvertClaudeRequestToCodex_ShortenLongToolUseIDs(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToCodex_RepairsCachedOrphanToolResult(t *testing.T) {
+	resetCodexClaudeToolCallCacheForTest()
+	t.Cleanup(resetCodexClaudeToolCallCacheForTest)
+
+	callID := "toolu_cached_parallel_read"
+	rememberCodexClaudeToolCall(callID, gjson.Parse(`{
+		"type":"function_call",
+		"call_id":"provider_call_id",
+		"name":"Read",
+		"arguments":{"file_path":"AGENTS.md"}
+	}`))
+
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{"role": "user", "content": [
+				{"type":"tool_result","tool_use_id":"` + callID + `","content":"ok"}
+			]}
+		]
+	}`
+
+	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
+	inputs := gjson.GetBytes(result, "input").Array()
+
+	var outputIndex = -1
+	for i, item := range inputs {
+		if item.Get("type").String() == "function_call_output" && item.Get("call_id").String() == callID {
+			outputIndex = i
+			break
+		}
+	}
+
+	if outputIndex <= 0 {
+		t.Fatalf("missing repaired function_call before orphan tool output. Output: %s", string(result))
+	}
+	repairedCall := inputs[outputIndex-1]
+	if got := repairedCall.Get("type").String(); got != "function_call" {
+		t.Fatalf("previous input type = %q, want function_call. Output: %s", got, string(result))
+	}
+	if got := repairedCall.Get("call_id").String(); got != callID {
+		t.Fatalf("repaired call_id = %q, want %q. Output: %s", got, callID, string(result))
+	}
+	if got := repairedCall.Get("name").String(); got != "Read" {
+		t.Fatalf("repaired tool name = %q, want Read. Output: %s", got, string(result))
+	}
+	if got := repairedCall.Get("arguments.file_path").String(); got != "AGENTS.md" {
+		t.Fatalf("repaired arguments.file_path = %q, want AGENTS.md. Output: %s", got, string(result))
+	}
+}
+
+func TestConvertClaudeRequestToCodex_DoesNotRepairUnknownOrphanToolResult(t *testing.T) {
+	resetCodexClaudeToolCallCacheForTest()
+	t.Cleanup(resetCodexClaudeToolCallCacheForTest)
+
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{"role": "user", "content": [
+				{"type":"tool_result","tool_use_id":"toolu_unknown_parallel_read","content":"ok"}
+			]}
+		]
+	}`
+
+	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
+	if got := countRequestInputItemsByType(result, "function_call"); got != 0 {
+		t.Fatalf("got %d repaired function_call items, want 0. Output: %s", got, string(result))
+	}
+	if got := countRequestInputItemsByType(result, "function_call_output"); got != 1 {
+		t.Fatalf("got %d function_call_output items, want 1. Output: %s", got, string(result))
+	}
+}
+
 func TestConvertClaudeRequestToCodex_ToolChoiceModeMapping(t *testing.T) {
 	tests := []struct {
 		name                string

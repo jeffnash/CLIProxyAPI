@@ -690,24 +690,13 @@ func TestCodexExecutorReasoningReplayCacheReplaysFunctionCallForClaudeToolResult
 		t.Fatalf("upstream request count = %d, want 2", len(bodies))
 	}
 	secondBody := bodies[1]
-	if got := gjson.GetBytes(secondBody, "input.0.type").String(); got != "message" {
-		t.Fatalf("input.0.type = %q, want initial user message; body=%s", got, string(secondBody))
+	if got := countCodexRequestInputItemsByType(secondBody, "reasoning"); got != 1 {
+		t.Fatalf("reasoning item count = %d, want 1; body=%s", got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.1.type").String(); got != "reasoning" {
-		t.Fatalf("input.1.type = %q, want cached reasoning; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, `input.#(role=="user").content.0.text`).String(); got != "call lookup" {
+		t.Fatalf("initial user message = %q, want call lookup; body=%s", got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.2.type").String(); got != "function_call" {
-		t.Fatalf("input.2.type = %q, want cached function_call; body=%s", got, string(secondBody))
-	}
-	if got := gjson.GetBytes(secondBody, "input.2.call_id").String(); got != "call_1" {
-		t.Fatalf("input.2.call_id = %q, want call_1; body=%s", got, string(secondBody))
-	}
-	if got := gjson.GetBytes(secondBody, "input.3.type").String(); got != "function_call_output" {
-		t.Fatalf("input.3.type = %q, want function_call_output after cached call; body=%s", got, string(secondBody))
-	}
-	if got := gjson.GetBytes(secondBody, "input.3.call_id").String(); got != "call_1" {
-		t.Fatalf("input.3.call_id = %q, want call_1; body=%s", got, string(secondBody))
-	}
+	assertCodexRequestFunctionCallBeforeOutput(t, secondBody, "call_1")
 }
 
 func TestCodexExecutorReasoningReplayCacheDropsFunctionCallWithoutMatchingOutput(t *testing.T) {
@@ -830,22 +819,44 @@ func TestCodexExecutorReasoningReplayCacheMatchesShortenedClaudeToolResultCallID
 		t.Fatalf("upstream request count = %d, want 2", len(bodies))
 	}
 	secondBody := bodies[1]
-	if got := gjson.GetBytes(secondBody, "input.0.type").String(); got != "message" {
-		t.Fatalf("input.0.type = %q, want initial user message; body=%s", got, string(secondBody))
+	if got := countCodexRequestInputItemsByType(secondBody, "reasoning"); got != 1 {
+		t.Fatalf("reasoning item count = %d, want 1; body=%s", got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.1.type").String(); got != "reasoning" {
-		t.Fatalf("input.1.type = %q, want cached reasoning; body=%s", got, string(secondBody))
+	if got := gjson.GetBytes(secondBody, `input.#(role=="user").content.0.text`).String(); got != "call lookup" {
+		t.Fatalf("initial user message = %q, want call lookup; body=%s", got, string(secondBody))
 	}
-	if got := gjson.GetBytes(secondBody, "input.2.type").String(); got != "function_call" {
-		t.Fatalf("input.2.type = %q, want cached function_call; body=%s", got, string(secondBody))
+	assertCodexRequestFunctionCallBeforeOutput(t, secondBody, shortCallID)
+}
+
+func countCodexRequestInputItemsByType(body []byte, itemType string) int {
+	count := 0
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		if item.Get("type").String() == itemType {
+			count++
+		}
 	}
-	if got := gjson.GetBytes(secondBody, "input.2.call_id").String(); got != shortCallID {
-		t.Fatalf("input.2.call_id = %q, want shortened call_id %q; body=%s", got, shortCallID, string(secondBody))
+	return count
+}
+
+func assertCodexRequestFunctionCallBeforeOutput(t *testing.T, body []byte, callID string) {
+	t.Helper()
+
+	inputs := gjson.GetBytes(body, "input").Array()
+	outputIndex := -1
+	for i, item := range inputs {
+		if item.Get("type").String() == "function_call_output" && item.Get("call_id").String() == callID {
+			outputIndex = i
+			break
+		}
 	}
-	if got := gjson.GetBytes(secondBody, "input.3.type").String(); got != "function_call_output" {
-		t.Fatalf("input.3.type = %q, want function_call_output after cached call; body=%s", got, string(secondBody))
+	if outputIndex <= 0 {
+		t.Fatalf("missing function_call_output with preceding item for call_id %q; body=%s", callID, string(body))
 	}
-	if got := gjson.GetBytes(secondBody, "input.3.call_id").String(); got != shortCallID {
-		t.Fatalf("input.3.call_id = %q, want shortened call_id %q; body=%s", got, shortCallID, string(secondBody))
+	call := inputs[outputIndex-1]
+	if got := call.Get("type").String(); got != "function_call" {
+		t.Fatalf("input.%d.type = %q, want function_call before output; body=%s", outputIndex-1, got, string(body))
+	}
+	if got := call.Get("call_id").String(); got != callID {
+		t.Fatalf("preceding function_call call_id = %q, want %q; body=%s", got, callID, string(body))
 	}
 }
