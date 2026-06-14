@@ -238,7 +238,7 @@ func TestXAIExecutorAppliesThinkingSuffix(t *testing.T) {
 	}
 }
 
-func TestXAIExecutorAppliesComposerDashThinkingAlias(t *testing.T) {
+func TestXAIExecutorNormalizesComposerDashThinkingAliasWithoutReasoningEffort(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var errRead error
@@ -275,8 +275,8 @@ func TestXAIExecutorAppliesComposerDashThinkingAlias(t *testing.T) {
 	if got := gjson.GetBytes(gotBody, "model").String(); got != "grok-composer-2.5-fast" {
 		t.Fatalf("model = %q, want grok-composer-2.5-fast; body=%s", got, string(gotBody))
 	}
-	if got := gjson.GetBytes(gotBody, "reasoning.effort").String(); got != "high" {
-		t.Fatalf("reasoning.effort = %q, want high; body=%s", got, string(gotBody))
+	if got := gjson.GetBytes(gotBody, "reasoning").Raw; got != "" {
+		t.Fatalf("reasoning must be stripped for xAI composer; got %s; body=%s", got, string(gotBody))
 	}
 }
 
