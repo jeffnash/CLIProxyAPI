@@ -20,9 +20,19 @@ auths
 logs
 conv
 config.yaml
+.env
+.env.*
+!.env.example
+auths_railway
+auths.zip
+auths.tar.gz
 
 # Development/editor
 bin
+.cache
+.gocache
+.meta-harness
+.pytest_cache
 .vscode
 .claude
 .codex
@@ -39,3 +49,7 @@ bin
 .bmad
 _bmad
 _bmad-output
+debug
+node_modules
+sidecars/cursor-bridge/node_modules
+sidecars/cursor-bridge/.cursor-agent-store
