@@ -38,6 +38,8 @@ type ConvertCodexResponseToClaudeParams struct {
 	ToolArgumentDeltaSeen     map[int]bool
 	CurrentToolBlockIndex     int
 	HasCurrentToolBlock       bool
+	MessageStarted            bool
+	MessageStopped            bool
 }
 
 // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
@@ -73,6 +75,15 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 	rootResult := gjson.ParseBytes(rawJSON)
 	params := (*param).(*ConvertCodexResponseToClaudeParams)
 	tolerateGrokComposerStream := isGrokComposerClaudeStreamRepairModel(modelName)
+
+	// Once the Claude message has been stopped, nothing further is valid: a late content block,
+	// a duplicate message_stop, or a second response.completed would all reference a closed message
+	// and surface as "Content block not found" / a stream error. Drop any trailing events. This is
+	// a no-op for well-behaved streams, which emit nothing after response.completed.
+	if params.MessageStopped {
+		return [][]byte{}
+	}
+
 	if params.ThinkingBlockOpen && params.ThinkingStopPending {
 		switch rootResult.Get("type").String() {
 		case "response.content_part.added", "response.completed", "response.incomplete":
@@ -88,18 +99,29 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 	case "error":
 		output = append(output, codexStreamErrorToClaudeError(rootResult)...)
 	case "response.created":
-		template = []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"claude-opus-4-1-20250805","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`)
-		template, _ = sjson.SetBytes(template, "message.model", rootResult.Get("response.model").String())
-		template, _ = sjson.SetBytes(template, "message.id", rootResult.Get("response.id").String())
+		// Emit message_start once per stream. A second response.created would reset the client's
+		// content-block tracking while our block index keeps climbing, turning every later block
+		// into a "Content block not found". One HTTP stream maps to one Claude message.
+		if !params.MessageStarted {
+			template = []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"claude-opus-4-1-20250805","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`)
+			template, _ = sjson.SetBytes(template, "message.model", rootResult.Get("response.model").String())
+			template, _ = sjson.SetBytes(template, "message.id", rootResult.Get("response.id").String())
+			params.MessageStarted = true
 
-		output = translatorcommon.AppendSSEEventBytes(output, "message_start", template, 2)
+			output = translatorcommon.AppendSSEEventBytes(output, "message_start", template, 2)
+		}
 	case "response.reasoning_summary_part.added":
 		if params.ThinkingBlockOpen && params.ThinkingStopPending {
 			output = append(output, finalizeCodexThinkingBlock(params)...)
 		}
+		// Close any open text block before opening a thinking block so they cannot share an index.
+		output = append(output, finalizeCodexTextBlock(params)...)
 		params.ThinkingSummarySeen = true
 		output = append(output, startCodexThinkingBlock(params)...)
 	case "response.reasoning_summary_text.delta":
+		// Defensively open a thinking block if one is not already open (grok-composer can emit a
+		// summary delta without a preceding summary_part.added). No-op when already open.
+		output = append(output, startCodexThinkingBlock(params)...)
 		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
 		template, _ = sjson.SetBytes(template, "delta.thinking", rootResult.Get("delta").String())
@@ -108,12 +130,15 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 	case "response.reasoning_summary_part.done":
 		params.ThinkingStopPending = true
 	case "response.content_part.added":
-		template = []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
-		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
-		params.TextBlockOpen = true
-
-		output = translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
+		// Open a text block only when one is not already open. grok-composer can emit
+		// response.content_part.added more than once before any delta; reopening would emit a
+		// duplicate content_block_start at the same index. Compliant Codex streams send a single
+		// added per part (separated by a done), so this is a no-op for them.
+		output = append(output, ensureCodexTextBlockOpen(params)...)
 	case "response.output_text.delta":
+		// Ensure a text block is open before the delta. Normally content_part.added already opened
+		// it; this also covers grok-composer emitting a text delta without a preceding added.
+		output = append(output, ensureCodexTextBlockOpen(params)...)
 		params.HasTextDelta = true
 		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
@@ -121,16 +146,25 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 	case "response.content_part.done":
-		template = []byte(`{"type":"content_block_stop","index":0}`)
-		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
-		params.TextBlockOpen = false
-		params.BlockIndex++
+		// Close the text block only when it is actually open. grok-composer can deliver
+		// response.content_part.done late — after function_call items have advanced BlockIndex,
+		// and after a tool start already closed the text block — in which case emitting a stop at
+		// the current BlockIndex targets a block that was never opened. When TextBlockOpen is true
+		// no tool/thinking block has advanced BlockIndex since the text opened, so BlockIndex still
+		// points at the text block. Compliant Codex streams always have it open here (no-op guard).
+		if params.TextBlockOpen {
+			template = []byte(`{"type":"content_block_stop","index":0}`)
+			template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+			params.TextBlockOpen = false
+			params.BlockIndex++
 
-		output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
+			output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
+		}
 	case "response.completed", "response.incomplete":
 		if tolerateGrokComposerStream {
-			// Close any text block grok-composer left open (no response.content_part.done)
-			// before flushing tool blocks so the message ends with every block stopped.
+			// Close every block grok-composer may have left open (it can skip the matching
+			// thinking/text/tool *.done events) so the message ends with all content blocks stopped.
+			output = append(output, finalizeCodexThinkingBlock(params)...)
 			output = append(output, finalizeCodexTextBlock(params)...)
 			output = append(output, finalizeOpenCodexToolBlocks(params)...)
 		}
@@ -147,6 +181,7 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_delta", template, 2)
 		output = translatorcommon.AppendSSEEventBytes(output, "message_stop", []byte(`{"type":"message_stop"}`), 2)
+		params.MessageStopped = true
 	case "response.output_item.added":
 		itemResult := rootResult.Get("item")
 		itemType := itemResult.Get("type").String()
@@ -762,6 +797,23 @@ func finalizeCodexSignatureOnlyThinkingBlock(params *ConvertCodexResponseToClaud
 	output := startCodexThinkingBlock(params)
 	output = append(output, finalizeCodexThinkingBlock(params)...)
 	return output
+}
+
+// ensureCodexTextBlockOpen opens a text content block when one is not already open, closing any
+// open thinking block first so the two cannot share a content index. It is idempotent: when a text
+// block is already open it emits nothing, which keeps repeated response.content_part.added events
+// (grok-composer) from producing duplicate content_block_start events at the same index.
+func ensureCodexTextBlockOpen(params *ConvertCodexResponseToClaudeParams) []byte {
+	if params.TextBlockOpen {
+		return nil
+	}
+
+	output := finalizeCodexThinkingBlock(params)
+	template := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+	template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+	params.TextBlockOpen = true
+
+	return translatorcommon.AppendSSEEventBytes(output, "content_block_start", template, 2)
 }
 
 // finalizeCodexTextBlock closes an open text content block and advances the block index.
