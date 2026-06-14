@@ -481,10 +481,8 @@ type xaiPreparedRequest struct {
 
 func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*xaiPreparedRequest, error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	aliasEffort := ""
-	if aliasBaseModel, effort, ok := resolveXAIReasoningAlias(baseModel); ok {
+	if aliasBaseModel, ok := resolveXAIComposerAlias(baseModel); ok {
 		baseModel = aliasBaseModel
-		aliasEffort = effort
 	}
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -501,9 +499,6 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())
 	if err != nil {
 		return nil, err
-	}
-	if aliasEffort != "" {
-		body, _ = sjson.SetBytes(body, "reasoning.effort", aliasEffort)
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
@@ -672,18 +667,18 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 	return body
 }
 
-func resolveXAIReasoningAlias(model string) (baseModel string, effort string, ok bool) {
+func resolveXAIComposerAlias(model string) (baseModel string, ok bool) {
 	normalized := strings.ToLower(strings.TrimSpace(model))
 	for _, level := range []string{"low", "medium", "high"} {
 		suffix := "-" + level
 		if strings.HasSuffix(normalized, suffix) {
 			base := strings.TrimSuffix(normalized, suffix)
 			if base == "grok-composer-2.5-fast" {
-				return base, level, true
+				return base, true
 			}
 		}
 	}
-	return "", "", false
+	return "", false
 }
 
 func normalizeXAITools(body []byte) []byte {
@@ -926,8 +921,6 @@ func xaiSupportsReasoningEffort(model string) bool {
 	}
 	switch {
 	case strings.HasPrefix(name, "grok-3-mini"):
-		return true
-	case strings.HasPrefix(name, "grok-composer-2.5-fast"):
 		return true
 	case strings.HasPrefix(name, "grok-4.20-multi-agent"):
 		return true
