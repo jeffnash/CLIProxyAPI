@@ -643,6 +643,53 @@ func TestConvertCodexResponseToClaude_CachesStreamToolCallByClaudeVisibleID(t *t
 	}
 }
 
+// TestConvertCodexResponseToClaude_GrokComposerLeadingTextThenToolsKeepsBlocksWellFormed
+// reproduces the real failing grok-composer-2.5-fast stream shape captured from Claude Code
+// transcripts: the model opens a leading text content part (response.content_part.added) and
+// then jumps straight into function_call output items WITHOUT a response.content_part.done.
+//
+// Before the fix the translator reused BlockIndex 0 for the first tool_use (the text part never
+// incremented it and was never closed), so the emitted Claude SSE contained two
+// content_block_start events at index 0 with the text block left open. Claude Code rejects that
+// stream with the synthetic "API Error: Content block not found".
+func TestConvertCodexResponseToClaude_GrokComposerLeadingTextThenToolsKeepsBlocksWellFormed(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}},{"name":"Grep","input_schema":{"type":"object","properties":{"pattern":{"type":"string"}}}}]}`)
+	var param any
+
+	// Faithful capture: created -> leading text part (no content_part.done) -> three function calls -> completed.
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-composer-2.5-fast"}}`),
+		[]byte(`data: {"type":"response.content_part.added","output_index":0,"item_id":"msg_1","part":{"type":"output_text","text":""}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"{\"file_path\":\"AGENTS.md\",\"limit\":150}"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"AGENTS.md\",\"limit\":150}"}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":2,"item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_2","delta":"{\"file_path\":\"go.mod\"}"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":2,"item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"Read","arguments":"{\"file_path\":\"go.mod\"}"}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":3,"item":{"id":"fc_3","type":"function_call","call_id":"call_3","name":"Grep"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":3,"item_id":"fc_3","delta":"{\"pattern\":\"TODO\"}"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":3,"item":{"id":"fc_3","type":"function_call","call_id":"call_3","name":"Grep","arguments":"{\"pattern\":\"TODO\"}"}}`),
+		[]byte(`data: {"type":"response.completed","response":{"id":"resp_1","stop_reason":"tool_calls","usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "grok-composer-2.5-fast-high", originalRequest, nil, chunk, &param)...)
+	}
+
+	assertClaudeStreamContentBlocksWellFormed(t, outputs)
+
+	// Three distinct tool_use blocks must be emitted, none colliding with the text block at index 0.
+	var toolStartIndexes []int
+	for _, ev := range parseClaudeStreamEvents(outputs) {
+		if ev.Get("type").String() == "content_block_start" && ev.Get("content_block.type").String() == "tool_use" {
+			toolStartIndexes = append(toolStartIndexes, int(ev.Get("index").Int()))
+		}
+	}
+	assertIntSliceEqual(t, "tool_use start indexes", toolStartIndexes, []int{1, 2, 3}, outputs)
+}
+
 func TestConvertCodexResponseToClaude_ParallelToolCallsKeepDistinctContentBlockIndexes(t *testing.T) {
 	ctx := context.Background()
 	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]}`)
@@ -1016,6 +1063,60 @@ func assertIntSliceEqual(t *testing.T, label string, got, want []int, outputs []
 	for i := range got {
 		if got[i] != want[i] {
 			t.Fatalf("%s = %v, want %v. Outputs=%q", label, got, want, outputs)
+		}
+	}
+}
+
+// parseClaudeStreamEvents flattens all SSE "data:" payloads emitted across translator calls
+// into parsed gjson results, in order.
+func parseClaudeStreamEvents(outputs [][]byte) []gjson.Result {
+	var events []gjson.Result
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			events = append(events, gjson.Parse(strings.TrimPrefix(line, "data: ")))
+		}
+	}
+	return events
+}
+
+// assertClaudeStreamContentBlocksWellFormed enforces the Claude streaming invariants that Claude
+// Code relies on; a violation is exactly what surfaces client-side as "Content block not found".
+//   - content_block_delta / content_block_stop must reference a currently-open block
+//   - content_block_start must not reuse the index of a still-open block
+//   - message_stop must come after every content block is closed, and nothing may follow it
+func assertClaudeStreamContentBlocksWellFormed(t *testing.T, outputs [][]byte) {
+	t.Helper()
+	openBlocks := make(map[int]string)
+	messageStopped := false
+	for _, ev := range parseClaudeStreamEvents(outputs) {
+		typ := ev.Get("type").String()
+		idx := int(ev.Get("index").Int())
+		switch typ {
+		case "content_block_start":
+			if messageStopped {
+				t.Fatalf("content_block_start index=%d after message_stop. Outputs=%q", idx, outputs)
+			}
+			if existing, ok := openBlocks[idx]; ok {
+				t.Fatalf("content_block_start index=%d reused while block still open (%s). Outputs=%q", idx, existing, outputs)
+			}
+			openBlocks[idx] = ev.Get("content_block.type").String()
+		case "content_block_delta":
+			if _, ok := openBlocks[idx]; !ok {
+				t.Fatalf("content_block_delta for unopened index=%d. Outputs=%q", idx, outputs)
+			}
+		case "content_block_stop":
+			if _, ok := openBlocks[idx]; !ok {
+				t.Fatalf("content_block_stop for unopened index=%d. Outputs=%q", idx, outputs)
+			}
+			delete(openBlocks, idx)
+		case "message_stop":
+			if len(openBlocks) != 0 {
+				t.Fatalf("message_stop with still-open content blocks %v. Outputs=%q", openBlocks, outputs)
+			}
+			messageStopped = true
 		}
 	}
 }
