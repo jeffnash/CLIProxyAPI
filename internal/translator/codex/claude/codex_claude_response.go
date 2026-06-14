@@ -129,6 +129,9 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
 	case "response.completed", "response.incomplete":
 		if tolerateGrokComposerStream {
+			// Close any text block grok-composer left open (no response.content_part.done)
+			// before flushing tool blocks so the message ends with every block stopped.
+			output = append(output, finalizeCodexTextBlock(params)...)
 			output = append(output, finalizeOpenCodexToolBlocks(params)...)
 		}
 		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
@@ -150,6 +153,12 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 		switch itemType {
 		case "function_call":
 			output = append(output, finalizeCodexThinkingBlock(params)...)
+			if tolerateGrokComposerStream {
+				// grok-composer can open a leading text content part and jump straight to
+				// function_call items without a response.content_part.done. Close the open text
+				// block first so the tool block does not reuse its (still-open) content index.
+				output = append(output, finalizeCodexTextBlock(params)...)
+			}
 			params.HasToolCall = true
 			params.HasReceivedArgumentsDelta = false
 			callID := shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(itemResult.Get("call_id").String()))
@@ -753,6 +762,24 @@ func finalizeCodexSignatureOnlyThinkingBlock(params *ConvertCodexResponseToClaud
 	output := startCodexThinkingBlock(params)
 	output = append(output, finalizeCodexThinkingBlock(params)...)
 	return output
+}
+
+// finalizeCodexTextBlock closes an open text content block and advances the block index.
+// response.content_part.added opens a text block at the current index without incrementing
+// it (only response.content_part.done does). When an upstream stream skips content_part.done
+// (grok-composer), the next block would otherwise reuse the open text index; closing it here
+// keeps content block indexes monotonic and the text block properly stopped.
+func finalizeCodexTextBlock(params *ConvertCodexResponseToClaudeParams) []byte {
+	if !params.TextBlockOpen {
+		return nil
+	}
+
+	contentBlockStop := []byte(`{"type":"content_block_stop","index":0}`)
+	contentBlockStop, _ = sjson.SetBytes(contentBlockStop, "index", params.BlockIndex)
+	params.TextBlockOpen = false
+	params.BlockIndex++
+
+	return translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStop, 2)
 }
 
 func finalizeCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams) []byte {
