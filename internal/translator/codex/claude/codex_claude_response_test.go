@@ -690,6 +690,140 @@ func TestConvertCodexResponseToClaude_GrokComposerLeadingTextThenToolsKeepsBlock
 	assertIntSliceEqual(t, "tool_use start indexes", toolStartIndexes, []int{1, 2, 3}, outputs)
 }
 
+// TestConvertCodexResponseToClaude_GrokComposerDuplicateTextPartAndLateContentPartDone reproduces
+// the second real failing grok-composer stream captured live (after the leading-text fix shipped):
+//   - response.content_part.added is emitted twice before any text delta
+//   - response.content_part.done arrives LATE, after function_call items advanced BlockIndex and a
+//     tool start already closed the text block, and the final function_call has no output_item.done
+//
+// Before the fix the duplicate added produced two content_block_start at index 0, and the late done
+// emitted a content_block_stop at the current BlockIndex (a block that was never opened) — exactly
+// the "stop#3 stop#2" / "stop#6 stop#5" tails seen in the captured raw SSE. Both surface client-side
+// as "API Error: Content block not found".
+func TestConvertCodexResponseToClaude_GrokComposerDuplicateTextPartAndLateContentPartDone(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-composer-2.5-fast"}}`),
+		// Duplicate content_part.added before any delta.
+		[]byte(`data: {"type":"response.content_part.added","output_index":0,"item_id":"msg_1","part":{"type":"output_text","text":""}}`),
+		[]byte(`data: {"type":"response.content_part.added","output_index":0,"item_id":"msg_1","part":{"type":"output_text","text":""}}`),
+		[]byte(`data: {"type":"response.output_text.delta","output_index":0,"item_id":"msg_1","delta":"Executing the checklist."}`),
+		// First tool: full lifecycle.
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"{\"path\":\"AGENTS.md\"}"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"path\":\"AGENTS.md\"}"}}`),
+		// Second tool: added + args, but NO output_item.done (closed at completion instead).
+		[]byte(`data: {"type":"response.output_item.added","output_index":2,"item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_2","delta":"{\"path\":\"go.mod\"}"}`),
+		// LATE content_part.done, after BlockIndex already advanced past the text block.
+		[]byte(`data: {"type":"response.content_part.done","output_index":0,"item_id":"msg_1","part":{"type":"output_text","text":"Executing the checklist."}}`),
+		[]byte(`data: {"type":"response.completed","response":{"id":"resp_1","stop_reason":"tool_calls","usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "grok-composer-2.5-fast-high", originalRequest, nil, chunk, &param)...)
+	}
+
+	assertClaudeStreamContentBlocksWellFormed(t, outputs)
+
+	// Exactly one text block (index 0) and two tool_use blocks (indexes 1, 2), each opened once.
+	startsByType := map[string][]int{}
+	for _, ev := range parseClaudeStreamEvents(outputs) {
+		if ev.Get("type").String() == "content_block_start" {
+			bt := ev.Get("content_block.type").String()
+			startsByType[bt] = append(startsByType[bt], int(ev.Get("index").Int()))
+		}
+	}
+	assertIntSliceEqual(t, "text start indexes", startsByType["text"], []int{0}, outputs)
+	assertIntSliceEqual(t, "tool_use start indexes", startsByType["tool_use"], []int{1, 2}, outputs)
+}
+
+// TestConvertCodexResponseToClaude_GrokComposerThinkingThenTextKeepsBlocksWellFormed covers a
+// reasoning summary that is not closed with its own *.done before the text part begins. The text
+// block must not reuse the open thinking block's index.
+func TestConvertCodexResponseToClaude_GrokComposerThinkingThenTextKeepsBlocksWellFormed(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-composer-2.5-fast"}}`),
+		[]byte(`data: {"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"rs_1","part":{"type":"summary_text","text":""}}`),
+		[]byte(`data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","delta":"thinking..."}`),
+		// No reasoning_summary_part.done: text part opens while the thinking block is still open.
+		[]byte(`data: {"type":"response.content_part.added","output_index":0,"item_id":"msg_1","part":{"type":"output_text","text":""}}`),
+		[]byte(`data: {"type":"response.output_text.delta","output_index":0,"item_id":"msg_1","delta":"Done."}`),
+		[]byte(`data: {"type":"response.content_part.done","output_index":0,"item_id":"msg_1","part":{"type":"output_text","text":"Done."}}`),
+		[]byte(`data: {"type":"response.completed","response":{"id":"resp_1","stop_reason":"stop","usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "grok-composer-2.5-fast-high", originalRequest, nil, chunk, &param)...)
+	}
+
+	assertClaudeStreamContentBlocksWellFormed(t, outputs)
+
+	startsByType := map[string][]int{}
+	for _, ev := range parseClaudeStreamEvents(outputs) {
+		if ev.Get("type").String() == "content_block_start" {
+			bt := ev.Get("content_block.type").String()
+			startsByType[bt] = append(startsByType[bt], int(ev.Get("index").Int()))
+		}
+	}
+	assertIntSliceEqual(t, "thinking start indexes", startsByType["thinking"], []int{0}, outputs)
+	assertIntSliceEqual(t, "text start indexes", startsByType["text"], []int{1}, outputs)
+}
+
+// TestConvertCodexResponseToClaude_GrokComposerDuplicateCreatedAndTrailingEvents covers stream-level
+// framing weirdness: a repeated response.created must not emit a second message_start, and any event
+// after response.completed (a late tool item, a duplicate completed) must be dropped rather than
+// emitted after message_stop.
+func TestConvertCodexResponseToClaude_GrokComposerDuplicateCreatedAndTrailingEvents(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-composer-2.5-fast"}}`),
+		[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"grok-composer-2.5-fast"}}`),
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"file_path\":\"AGENTS.md\"}"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"file_path\":\"AGENTS.md\"}"}}`),
+		[]byte(`data: {"type":"response.completed","response":{"id":"resp_1","stop_reason":"tool_calls","usage":{"input_tokens":1,"output_tokens":1}}}`),
+		// Trailing events after completion must be ignored.
+		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"fc_2","type":"function_call","call_id":"call_2","name":"Read"}}`),
+		[]byte(`data: {"type":"response.completed","response":{"id":"resp_1","stop_reason":"tool_calls","usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "grok-composer-2.5-fast-high", originalRequest, nil, chunk, &param)...)
+	}
+
+	assertClaudeStreamContentBlocksWellFormed(t, outputs)
+
+	starts, stops := 0, 0
+	for _, ev := range parseClaudeStreamEvents(outputs) {
+		switch ev.Get("type").String() {
+		case "message_start":
+			starts++
+		case "message_stop":
+			stops++
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("message_start count = %d, want 1. Outputs=%q", starts, outputs)
+	}
+	if stops != 1 {
+		t.Fatalf("message_stop count = %d, want 1. Outputs=%q", stops, outputs)
+	}
+}
+
 func TestConvertCodexResponseToClaude_ParallelToolCallsKeepDistinctContentBlockIndexes(t *testing.T) {
 	ctx := context.Background()
 	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]}`)
