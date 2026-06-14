@@ -2,6 +2,8 @@ package registry
 
 import "strings"
 
+const codex52Created = 1765440000
+const codex53Created = 1770307200
 const codex54Created = 1772668800
 const codex55Created = 1776902400
 
@@ -18,6 +20,38 @@ func GetOpenAIModels() []*ModelInfo {
 
 func forkAdditionalCodexModels() []*ModelInfo {
 	return []*ModelInfo{
+		{
+			ID:                  "gpt-5.2",
+			Object:              "model",
+			Created:             codex52Created,
+			OwnedBy:             "openai",
+			Type:                "openai",
+			DisplayName:         "GPT 5.2",
+			Version:             "gpt-5.2",
+			Description:         "Stable version of GPT 5.2",
+			ContextLength:       400000,
+			MaxCompletionTokens: 128000,
+			SupportedParameters: []string{"tools"},
+			Thinking: &ThinkingSupport{
+				Levels: []string{"none", "low", "medium", "high", "xhigh"},
+			},
+		},
+		{
+			ID:                  "gpt-5.3-codex",
+			Object:              "model",
+			Created:             codex53Created,
+			OwnedBy:             "openai",
+			Type:                "openai",
+			DisplayName:         "GPT 5.3 Codex",
+			Version:             "gpt-5.3",
+			Description:         "Stable version of GPT 5.3 Codex, The best model for coding and agentic tasks across domains.",
+			ContextLength:       400000,
+			MaxCompletionTokens: 128000,
+			SupportedParameters: []string{"tools"},
+			Thinking: &ThinkingSupport{
+				Levels: []string{"low", "medium", "high", "xhigh"},
+			},
+		},
 		{
 			ID:                  "gpt-5.4-mini",
 			Object:              "model",

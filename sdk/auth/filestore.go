@@ -13,11 +13,41 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+// PluginAuthParser parses auth JSON owned by plugin providers.
+type PluginAuthParser interface {
+	ParseAuth(context.Context, pluginapi.AuthParseRequest) (*cliproxyauth.Auth, bool, error)
+}
+
+type pluginAuthParserHolder struct {
+	parser PluginAuthParser
+}
+
+var pluginAuthParserValue atomic.Value
+
+// RegisterPluginAuthParser registers the current plugin auth parser.
+func RegisterPluginAuthParser(parser PluginAuthParser) {
+	pluginAuthParserValue.Store(pluginAuthParserHolder{parser: parser})
+}
+
+func currentPluginAuthParser() PluginAuthParser {
+	value := pluginAuthParserValue.Load()
+	if value == nil {
+		return nil
+	}
+	holder, ok := value.(pluginAuthParserHolder)
+	if !ok {
+		return nil
+	}
+	return holder.parser
+}
 
 // FileTokenStore persists token records and auth metadata using the filesystem as backing storage.
 type FileTokenStore struct {
@@ -188,6 +218,30 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
 	}
 	provider, _ := metadata["type"].(string)
+	provider = strings.TrimSpace(provider)
+	info, errStat := os.Stat(path)
+	if errStat != nil {
+		return nil, fmt.Errorf("stat file: %w", errStat)
+	}
+	if parser := currentPluginAuthParser(); parser != nil {
+		auth, handled, errParse := parser.ParseAuth(context.Background(), pluginapi.AuthParseRequest{
+			Provider: provider,
+			Path:     path,
+			FileName: s.idFor(path, baseDir),
+			RawJSON:  data,
+		})
+		if errParse == nil && handled && auth != nil {
+			auth.CreatedAt = info.ModTime()
+			auth.UpdatedAt = info.ModTime()
+			if auth.Attributes == nil {
+				auth.Attributes = make(map[string]string)
+			}
+			auth.Attributes["path"] = path
+			auth.Attributes["source"] = path
+			cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
+			return auth, nil
+		}
+	}
 	if provider == "" {
 		provider = "unknown"
 	}
@@ -221,9 +275,9 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 			}
 		}
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, fmt.Errorf("stat file: %w", err)
+	info, errStat = os.Stat(path)
+	if errStat != nil {
+		return nil, fmt.Errorf("stat file: %w", errStat)
 	}
 	id := s.idFor(path, baseDir)
 	disabled, _ := metadata["disabled"].(bool)
