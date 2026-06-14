@@ -698,6 +698,97 @@ func TestConvertCodexResponseToClaude_ParallelToolCallsKeepDistinctContentBlockI
 	}
 }
 
+func TestConvertCodexResponseToClaude_GrokComposerSuppressesLateToolEvents(t *testing.T) {
+	ctx := context.Background()
+	originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]}`)
+	var param any
+
+	chunks := [][]byte{
+		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":"{\"path\":\"AGENTS.md\"}"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"path\":\"AGENTS.md\"}"}}`),
+		[]byte(`data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_1","arguments":"{\"path\":\"late.md\"}"}`),
+		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read","arguments":"{\"path\":\"late.md\"}"}}`),
+	}
+
+	var outputs [][]byte
+	for _, chunk := range chunks {
+		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "grok-composer-2.5-fast-high", originalRequest, nil, chunk, &param)...)
+	}
+
+	argDeltas := 0
+	stops := 0
+	for _, out := range outputs {
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			switch data.Get("type").String() {
+			case "content_block_delta":
+				if data.Get("delta.type").String() == "input_json_delta" && data.Get("delta.partial_json").String() != "" {
+					argDeltas++
+				}
+			case "content_block_stop":
+				stops++
+			}
+		}
+	}
+
+	if argDeltas != 1 {
+		t.Fatalf("non-empty argument deltas = %d, want 1. Outputs=%q", argDeltas, outputs)
+	}
+	if stops != 1 {
+		t.Fatalf("tool block stops = %d, want 1. Outputs=%q", stops, outputs)
+	}
+}
+
+func TestConvertCodexResponseToClaude_GrokComposerFinalizesOpenToolBlocksOnlyForScopedModel(t *testing.T) {
+	tests := []struct {
+		name      string
+		model     string
+		wantStops int
+	}{
+		{name: "grok composer fast high finalizes", model: "grok-composer-2.5-fast-high", wantStops: 1},
+		{name: "grok composer fast cli suffix finalizes", model: "grok-composer-2.5-fast-high[1m]", wantStops: 1},
+		{name: "other codex model unchanged", model: "gpt-5-codex", wantStops: 0},
+		{name: "cursor composer unchanged", model: "composer-2.5-fast", wantStops: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			originalRequest := []byte(`{"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]}`)
+			var param any
+			chunks := [][]byte{
+				[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read"}}`),
+				[]byte(`data: {"type":"response.completed","response":{"stop_reason":"tool_calls","usage":{"input_tokens":1,"output_tokens":1}}}`),
+			}
+
+			var outputs [][]byte
+			for _, chunk := range chunks {
+				outputs = append(outputs, ConvertCodexResponseToClaude(ctx, tt.model, originalRequest, nil, chunk, &param)...)
+			}
+
+			stops := 0
+			for _, out := range outputs {
+				for _, line := range strings.Split(string(out), "\n") {
+					if !strings.HasPrefix(line, "data: ") {
+						continue
+					}
+					data := gjson.Parse(strings.TrimPrefix(line, "data: "))
+					if data.Get("type").String() == "content_block_stop" {
+						stops++
+					}
+				}
+			}
+			if stops != tt.wantStops {
+				t.Fatalf("tool block stops = %d, want %d. Outputs=%q", stops, tt.wantStops, outputs)
+			}
+		})
+	}
+}
+
 func TestConvertCodexResponseToClaude_StreamStopReasonMapping(t *testing.T) {
 	tests := []struct {
 		name       string
