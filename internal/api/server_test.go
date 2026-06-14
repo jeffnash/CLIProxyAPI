@@ -13,6 +13,7 @@ import (
 	gin "github.com/gin-gonic/gin"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -21,6 +22,11 @@ import (
 )
 
 func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	return newTestServerWithOptions(t)
+}
+
+func newTestServerWithOptions(t *testing.T, opts ...ServerOption) *Server {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
@@ -46,7 +52,7 @@ func newTestServer(t *testing.T) *Server {
 	accessManager := sdkaccess.NewManager()
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
-	return NewServer(cfg, authManager, accessManager, configPath)
+	return NewServer(cfg, authManager, accessManager, configPath, opts...)
 }
 
 func TestHealthz(t *testing.T) {
@@ -84,6 +90,60 @@ func TestHealthz(t *testing.T) {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
 		}
 	})
+}
+
+func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+
+	server := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:5173")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusUnauthorized, rr.Body.String())
+	}
+	if got := rr.Header().Get("X-CPA-SUPPORT-PLUGIN"); got != pluginhost.SupportPluginHeaderValue() {
+		t.Fatalf("X-CPA-SUPPORT-PLUGIN = %q, want %q", got, pluginhost.SupportPluginHeaderValue())
+	}
+
+	exposedHeaders := make(map[string]struct{})
+	for _, headerName := range strings.Split(rr.Header().Get("Access-Control-Expose-Headers"), ",") {
+		headerName = strings.ToLower(strings.TrimSpace(headerName))
+		if headerName != "" {
+			exposedHeaders[headerName] = struct{}{}
+		}
+	}
+	for _, headerName := range corsExposedResponseHeaders {
+		if _, ok := exposedHeaders[strings.ToLower(headerName)]; !ok {
+			t.Fatalf("Access-Control-Expose-Headers missing %s: %q", headerName, rr.Header().Get("Access-Control-Expose-Headers"))
+		}
+	}
+}
+
+func TestNewServerWithPluginHostInjectsHandlerInterceptors(t *testing.T) {
+	host := pluginhost.New()
+	server := newTestServerWithOptions(t, WithPluginHost(host))
+
+	if server.handlers == nil {
+		t.Fatal("server handlers = nil")
+	}
+	got, ok := server.handlers.PluginHost.(*pluginhost.Host)
+	if !ok || got != host {
+		t.Fatalf("handler plugin host = %#v, want configured host", server.handlers.PluginHost)
+	}
+}
+
+func TestNewServerWithoutPluginHostLeavesHandlerInterceptorsDisabled(t *testing.T) {
+	server := newTestServer(t)
+
+	if server.handlers == nil {
+		t.Fatal("server handlers = nil")
+	}
+	if server.handlers.PluginHost != nil {
+		t.Fatalf("handler plugin host = %#v, want nil", server.handlers.PluginHost)
+	}
 }
 
 func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
@@ -145,6 +205,65 @@ func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
 
 	if remaining := redisqueue.PopOldest(1); len(remaining) != 0 {
 		t.Fatalf("remaining queue = %q, want empty", remaining)
+	}
+}
+
+func TestManagementPluginsRouteRegistered(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+
+	server := newTestServer(t)
+	enabled := true
+	server.cfg.Plugins.Configs = map[string]proxyconfig.PluginInstanceConfig{
+		"sample": {Enabled: &enabled, Priority: 4},
+	}
+	if errWrite := os.WriteFile(server.configFilePath, []byte("{}\n"), 0o600); errWrite != nil {
+		t.Fatalf("failed to write config file: %v", errWrite)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/plugins", nil)
+	req.Header.Set("Authorization", "Bearer test-management-key")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var payload struct {
+		PluginsEnabled bool  `json:"plugins_enabled"`
+		Plugins        []any `json:"plugins"`
+	}
+	if errUnmarshal := json.Unmarshal(rr.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal response: %v body=%s", errUnmarshal, rr.Body.String())
+	}
+	if payload.Plugins == nil {
+		t.Fatalf("plugins field = nil, want array; body=%s", rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v0/management/plugins/sample/config", nil)
+	req.Header.Set("Authorization", "Bearer test-management-key")
+	rr = httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("config status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	var configPayload struct {
+		Enabled  bool `json:"enabled"`
+		Priority int  `json:"priority"`
+	}
+	if errUnmarshal := json.Unmarshal(rr.Body.Bytes(), &configPayload); errUnmarshal != nil {
+		t.Fatalf("unmarshal config response: %v body=%s", errUnmarshal, rr.Body.String())
+	}
+	if !configPayload.Enabled || configPayload.Priority != 4 {
+		t.Fatalf("plugin config = %#v, want enabled true priority 4", configPayload)
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/v0/management/plugins/sample", nil)
+	req.Header.Set("Authorization", "Bearer test-management-key")
+	rr = httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
 	}
 }
 
@@ -269,6 +388,7 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 		{ID: "gpt-image-2", Object: "model", OwnedBy: "openai", Type: "openai"},
 		{ID: "grok-imagine-image", Object: "model", OwnedBy: "xai", Type: "openai"},
 		{ID: "grok-imagine-video", Object: "model", OwnedBy: "xai", Type: "openai"},
+		{ID: "grok-imagine-video-1.5-preview", Object: "model", OwnedBy: "xai", Type: "openai"},
 	})
 	t.Cleanup(func() {
 		modelRegistry.UnregisterClient(clientID)
@@ -355,10 +475,11 @@ func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
 	}
 
 	hiddenModels := map[string]bool{
-		"grok-imagine-image-quality": false,
-		"gpt-image-2":                false,
-		"grok-imagine-image":         false,
-		"grok-imagine-video":         false,
+		"grok-imagine-image-quality":     false,
+		"gpt-image-2":                    false,
+		"grok-imagine-image":             false,
+		"grok-imagine-video":             false,
+		"grok-imagine-video-1.5-preview": false,
 	}
 	for _, model := range resp.Models {
 		slug, _ := model["slug"].(string)

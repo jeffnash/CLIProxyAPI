@@ -172,6 +172,17 @@ func TestOAuthModelAliasChannel_Kimi(t *testing.T) {
 	}
 }
 
+func TestOAuthModelAliasChannel_PluginProvider(t *testing.T) {
+	t.Parallel()
+
+	if got := OAuthModelAliasChannel(" Sample-Provider ", "oauth"); got != "sample-provider" {
+		t.Fatalf("OAuthModelAliasChannel() = %q, want %q", got, "sample-provider")
+	}
+	if got := OAuthModelAliasChannel("sample-provider", "api_key"); got != "" {
+		t.Fatalf("OAuthModelAliasChannel() = %q, want empty channel for API key", got)
+	}
+}
+
 func TestApplyOAuthModelAlias_SuffixPreservation(t *testing.T) {
 	t.Parallel()
 
@@ -188,5 +199,43 @@ func TestApplyOAuthModelAlias_SuffixPreservation(t *testing.T) {
 	resolvedModel := mgr.applyOAuthModelAlias(auth, "gemini-2.5-pro(8192)")
 	if resolvedModel != "gemini-2.5-pro-exp-03-25(8192)" {
 		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "gemini-2.5-pro-exp-03-25(8192)")
+	}
+}
+
+func TestApplyOAuthModelAlias_PluginProvider(t *testing.T) {
+	t.Parallel()
+
+	aliases := map[string][]internalconfig.OAuthModelAlias{
+		"sample-provider": {{Name: "sample-model-latest", Alias: "sample-latest"}},
+	}
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+	mgr.SetOAuthModelAlias(aliases)
+
+	auth := &Auth{ID: "sample-provider-auth", Provider: "sample-provider", Attributes: map[string]string{"auth_kind": "oauth"}}
+
+	resolvedModel := mgr.applyOAuthModelAlias(auth, "sample-latest")
+	if resolvedModel != "sample-model-latest" {
+		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "sample-model-latest")
+	}
+}
+
+func TestApplyOAuthModelAlias_PluginProviderSkipsAPIKey(t *testing.T) {
+	t.Parallel()
+
+	aliases := map[string][]internalconfig.OAuthModelAlias{
+		"sample-provider": {{Name: "sample-model-latest", Alias: "sample-latest"}},
+	}
+
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{})
+	mgr.SetOAuthModelAlias(aliases)
+
+	auth := &Auth{ID: "sample-provider-auth", Provider: "sample-provider", Attributes: map[string]string{"auth_kind": "api_key"}}
+
+	resolvedModel := mgr.applyOAuthModelAlias(auth, "sample-latest")
+	if resolvedModel != "sample-latest" {
+		t.Errorf("applyOAuthModelAlias() model = %q, want %q", resolvedModel, "sample-latest")
 	}
 }

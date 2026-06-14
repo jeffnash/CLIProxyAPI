@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"testing"
 
@@ -265,24 +264,24 @@ func TestSetReasoningEffortByAlias(t *testing.T) {
 	}
 }
 
-func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministic(t *testing.T) {
+func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministicForStructuredSession(t *testing.T) {
 	e := &CodexExecutor{}
 	ctx := context.Background()
 	url := "https://example.com/responses"
 
 	req := cliproxyexecutor.Request{
 		Model:   "gpt-5",
-		Payload: []byte(`{"metadata":{"user_id":"u1"}}`),
+		Payload: []byte(`{"metadata":{"user_id":"{\"device_id\":\"device-a\",\"account_uuid\":\"\",\"session_id\":\"u1\"}"}}`),
 	}
 
 	// Raw JSON doesn't have to be a full upstream payload for this test; we just
 	// care that prompt_cache_key is set deterministically.
 	raw := []byte(`{"model":"gpt-5","input":[],"instructions":""}`)
 
-	key := fmt.Sprintf("%s-%s", req.Model, "u1")
+	key := codexClaudeCodePromptCacheStorageKey(req)
 	helps.DeleteCodexCache(key)
 
-	httpReq1, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
+	httpReq1, _, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, nil, req, req.Payload, raw)
 	if err != nil {
 		t.Fatalf("cacheHelper #1 error: %v", err)
 	}
@@ -304,7 +303,7 @@ func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministic(t *testing.T) {
 	// Simulate a cache miss (e.g., restart/eviction) and ensure the ID is still stable.
 	helps.DeleteCodexCache(key)
 
-	httpReq2, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
+	httpReq2, _, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, nil, req, req.Payload, raw)
 	if err != nil {
 		t.Fatalf("cacheHelper #2 error: %v", err)
 	}

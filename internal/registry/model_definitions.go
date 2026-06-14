@@ -7,10 +7,11 @@ import (
 )
 
 const (
-	codexBuiltinImageModelID      = "gpt-image-2"
-	xaiBuiltinImageModelID        = "grok-imagine-image"
-	xaiBuiltinImageQualityModelID = "grok-imagine-image-quality"
-	xaiBuiltinVideoModelID        = "grok-imagine-video"
+	codexBuiltinImageModelID        = "gpt-image-2"
+	xaiBuiltinImageModelID          = "grok-imagine-image"
+	xaiBuiltinImageQualityModelID   = "grok-imagine-image-quality"
+	xaiBuiltinVideoModelID          = "grok-imagine-video"
+	xaiBuiltinVideo15PreviewModelID = "grok-imagine-video-1.5-preview"
 )
 
 // staticModelsJSON mirrors the top-level structure of models.json.
@@ -97,6 +98,31 @@ func GetAntigravityModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Antigravity)
 }
 
+// AntigravityWebSearchModelFor returns the Antigravity model that should run a
+// native web search request for modelID.
+func AntigravityWebSearchModelFor(modelID string) string {
+	modelID = normalizeAntigravityCapabilityModelID(modelID)
+	if modelID == "" {
+		return ""
+	}
+	for _, model := range GetGlobalRegistry().GetAvailableModelsByProvider("antigravity") {
+		if model == nil {
+			continue
+		}
+		currentModelID := normalizeAntigravityCapabilityModelID(model.ID)
+		if currentModelID == "" {
+			continue
+		}
+		if currentModelID == modelID {
+			if model.SupportsWebSearch {
+				return currentModelID
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
 // GetXAIModels returns the standard xAI Grok model definitions.
 func GetXAIModels() []*ModelInfo {
 	return WithXAIBuiltins(cloneModelInfos(getModels().XAI))
@@ -155,7 +181,40 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
 // not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo())
+	extras := []*ModelInfo{xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo()}
+	extras = append(extras, xaiComposerReasoningAliases()...)
+	return upsertModelInfos(models, extras...)
+}
+
+func xaiComposerReasoningAliases() []*ModelInfo {
+	levels := []string{"low", "medium", "high"}
+	out := make([]*ModelInfo, 0, len(levels))
+	for _, level := range levels {
+		out = append(out, &ModelInfo{
+			ID:                  "grok-composer-2.5-fast-" + level,
+			Object:              "model",
+			Created:             1740960000,
+			OwnedBy:             "xai",
+			Type:                "xai",
+			DisplayName:         "Composer 2.5 Fast " + strings.ToUpper(level[:1]) + level[1:],
+			Name:                "grok-composer-2.5-fast-" + level,
+			Description:         "xAI Composer 2.5 Fast with " + level + " reasoning effort.",
+			ContextLength:       200000,
+			MaxCompletionTokens: 32768,
+			Thinking: &ThinkingSupport{
+				Levels: []string{"low", "medium", "high"},
+			},
+		})
+	}
+	return out
+}
+
+func normalizeAntigravityCapabilityModelID(modelID string) string {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	if open := strings.LastIndex(modelID, "("); open >= 0 && strings.HasSuffix(modelID, ")") {
+		modelID = strings.TrimSpace(modelID[:open])
+	}
+	return modelID
 }
 
 func codexBuiltinImageModelInfo() *ModelInfo {
@@ -206,6 +265,19 @@ func xaiBuiltinVideoModelInfo() *ModelInfo {
 		DisplayName: "Grok Imagine Video",
 		Name:        xaiBuiltinVideoModelID,
 		Description: "xAI Grok video generation model.",
+	}
+}
+
+func xaiBuiltinVideo15PreviewModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinVideo15PreviewModelID,
+		Object:      "model",
+		Created:     1735689600, // 2025-01-01
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Imagine Video 1.5 Preview",
+		Name:        xaiBuiltinVideo15PreviewModelID,
+		Description: "xAI Grok preview video generation model.",
 	}
 }
 
