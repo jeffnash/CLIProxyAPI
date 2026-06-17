@@ -2793,112 +2793,116 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else {
 			if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
-					suspendDisabled := modelSuspendDisabledForAuth(auth)
-					disableCooling := quotaCooldownDisabledForAuth(auth) || suspendDisabled
-					state := ensureModelState(auth, result.Model)
-					state.Unavailable = true
-					state.Status = StatusError
-					state.UpdatedAt = now
-					if result.Error != nil {
-						state.LastError = cloneError(result.Error)
-						state.StatusMessage = result.Error.Message
-						auth.LastError = cloneError(result.Error)
-						auth.StatusMessage = result.Error.Message
-					}
-
-					statusCode := statusCodeFromResult(result.Error)
-					if isModelSupportResultError(result.Error) {
-						if disableCooling {
-							state.NextRetryAfter = time.Time{}
-						} else {
-							next := now.Add(12 * time.Hour)
-							state.NextRetryAfter = next
-							suspendReason = "model_not_supported"
-							shouldSuspendModel = true
-						}
-					} else if isCloudflareChallengeResultError(result.Error) {
-						next, backoffLevel := nextCloudflareCooldown(state.Quota.BackoffLevel, disableCooling, now)
-						state.NextRetryAfter = next
-						state.StatusMessage = "cloudflare challenge"
-						if auth.LastError != nil {
-							auth.StatusMessage = "cloudflare challenge"
-						}
-						state.Quota = QuotaState{
-							Exceeded:      true,
-							Reason:        "cloudflare challenge",
-							NextRecoverAt: next,
-							BackoffLevel:  backoffLevel,
-						}
+					if isTransientStreamDisconnectResultError(result.Error) {
+						auth.UpdatedAt = now
 					} else {
-						switch statusCode {
-						case 401:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "unauthorized"
-								shouldSuspendModel = true
-							}
-						case 402, 403:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "payment_required"
-								shouldSuspendModel = true
-							}
-						case 404:
+						suspendDisabled := modelSuspendDisabledForAuth(auth)
+						disableCooling := quotaCooldownDisabledForAuth(auth) || suspendDisabled
+						state := ensureModelState(auth, result.Model)
+						state.Unavailable = true
+						state.Status = StatusError
+						state.UpdatedAt = now
+						if result.Error != nil {
+							state.LastError = cloneError(result.Error)
+							state.StatusMessage = result.Error.Message
+							auth.LastError = cloneError(result.Error)
+							auth.StatusMessage = result.Error.Message
+						}
+
+						statusCode := statusCodeFromResult(result.Error)
+						if isModelSupportResultError(result.Error) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(12 * time.Hour)
 								state.NextRetryAfter = next
-								suspendReason = "not_found"
+								suspendReason = "model_not_supported"
 								shouldSuspendModel = true
 							}
-						case 429:
-							var next time.Time
-							backoffLevel := state.Quota.BackoffLevel
-							if !disableCooling {
-								if result.RetryAfter != nil {
-									next = now.Add(*result.RetryAfter)
-								} else {
-									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
-									if cooldown > 0 {
-										next = now.Add(cooldown)
-									}
-									backoffLevel = nextLevel
-								}
-							}
+						} else if isCloudflareChallengeResultError(result.Error) {
+							next, backoffLevel := nextCloudflareCooldown(state.Quota.BackoffLevel, disableCooling, now)
 							state.NextRetryAfter = next
+							state.StatusMessage = "cloudflare challenge"
+							if auth.LastError != nil {
+								auth.StatusMessage = "cloudflare challenge"
+							}
 							state.Quota = QuotaState{
 								Exceeded:      true,
-								Reason:        "quota",
+								Reason:        "cloudflare challenge",
 								NextRecoverAt: next,
 								BackoffLevel:  backoffLevel,
 							}
-							if !disableCooling {
-								suspendReason = "quota"
-								shouldSuspendModel = true
-								setModelQuota = true
-							}
-						case 408, 500, 502, 503, 504:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								next := now.Add(1 * time.Minute)
+						} else {
+							switch statusCode {
+							case 401:
+								if disableCooling {
+									state.NextRetryAfter = time.Time{}
+								} else {
+									next := now.Add(30 * time.Minute)
+									state.NextRetryAfter = next
+									suspendReason = "unauthorized"
+									shouldSuspendModel = true
+								}
+							case 402, 403:
+								if disableCooling {
+									state.NextRetryAfter = time.Time{}
+								} else {
+									next := now.Add(30 * time.Minute)
+									state.NextRetryAfter = next
+									suspendReason = "payment_required"
+									shouldSuspendModel = true
+								}
+							case 404:
+								if disableCooling {
+									state.NextRetryAfter = time.Time{}
+								} else {
+									next := now.Add(12 * time.Hour)
+									state.NextRetryAfter = next
+									suspendReason = "not_found"
+									shouldSuspendModel = true
+								}
+							case 429:
+								var next time.Time
+								backoffLevel := state.Quota.BackoffLevel
+								if !disableCooling {
+									if result.RetryAfter != nil {
+										next = now.Add(*result.RetryAfter)
+									} else {
+										cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
+										if cooldown > 0 {
+											next = now.Add(cooldown)
+										}
+										backoffLevel = nextLevel
+									}
+								}
 								state.NextRetryAfter = next
+								state.Quota = QuotaState{
+									Exceeded:      true,
+									Reason:        "quota",
+									NextRecoverAt: next,
+									BackoffLevel:  backoffLevel,
+								}
+								if !disableCooling {
+									suspendReason = "quota"
+									shouldSuspendModel = true
+									setModelQuota = true
+								}
+							case 408, 500, 502, 503, 504:
+								if disableCooling {
+									state.NextRetryAfter = time.Time{}
+								} else {
+									next := now.Add(1 * time.Minute)
+									state.NextRetryAfter = next
+								}
+							default:
+								state.NextRetryAfter = time.Time{}
 							}
-						default:
-							state.NextRetryAfter = time.Time{}
 						}
-					}
 
-					auth.Status = StatusError
-					auth.UpdatedAt = now
-					updateAggregatedAvailability(auth, now)
+						auth.Status = StatusError
+						auth.UpdatedAt = now
+						updateAggregatedAvailability(auth, now)
+					}
 				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
@@ -3249,6 +3253,15 @@ func isCloudflareChallengeResultError(err *Error) bool {
 		return false
 	}
 	return isCloudflareChallengeErrorMessage(err.Message)
+}
+
+func isTransientStreamDisconnectResultError(err *Error) bool {
+	if err == nil || statusCodeFromResult(err) != http.StatusRequestTimeout {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(err.Message))
+	return strings.Contains(lower, "stream disconnected before response.completed") ||
+		strings.Contains(lower, "stream closed before response.completed")
 }
 
 func nextCloudflareCooldown(backoffLevel int, disableCooling bool, now time.Time) (time.Time, int) {
