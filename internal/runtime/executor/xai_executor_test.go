@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -277,6 +278,76 @@ func TestXAIExecutorNormalizesComposerDashThinkingAliasWithoutReasoningEffort(t 
 	}
 	if got := gjson.GetBytes(gotBody, "reasoning").Raw; got != "" {
 		t.Fatalf("reasoning must be stripped for xAI composer; got %s; body=%s", got, string(gotBody))
+	}
+}
+
+func TestXAIExecutorTranslatesClaudeMessagesToResponses(t *testing.T) {
+	var gotGrokConvID string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotGrokConvID = r.Header.Get("x-grok-conv-id")
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-composer-2.5-fast\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "grok-composer-2.5-fast-high",
+		Payload: []byte(`{
+			"model":"grok-composer-2.5-fast-high",
+			"max_tokens":16,
+			"system":"You are concise.",
+			"messages":[{"role":"user","content":"reply ok"}]
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatClaude,
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "grok-composer-2.5-fast" {
+		t.Fatalf("model = %q, want grok-composer-2.5-fast; body=%s", got, string(gotBody))
+	}
+	if !strings.HasPrefix(gotGrokConvID, "xai-") {
+		t.Fatalf("x-grok-conv-id = %q, want generated xai-* session without explicit execution session", gotGrokConvID)
+	}
+	if got := gjson.GetBytes(gotBody, "prompt_cache_key").String(); got != gotGrokConvID {
+		t.Fatalf("prompt_cache_key = %q, want generated session %q; body=%s", got, gotGrokConvID, string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "messages").Exists() {
+		t.Fatalf("raw Claude messages leaked to xAI body: %s", string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "max_tokens").Exists() {
+		t.Fatalf("raw Claude max_tokens leaked to xAI body: %s", string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "metadata.user_id").Exists() {
+		t.Fatalf("process-global Claude translator metadata leaked to xAI body: %s", string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "input.0.role").String(); got != "developer" {
+		t.Fatalf("input.0.role = %q, want developer system carry-through; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "input.1.role").String(); got != "user" {
+		t.Fatalf("input.1.role = %q, want user; body=%s", got, string(gotBody))
+	}
+	if got := gjson.GetBytes(gotBody, "input.1.content.0.text").String(); got != "reply ok" {
+		t.Fatalf("input.1.content.0.text = %q, want reply ok; body=%s", got, string(gotBody))
 	}
 }
 
