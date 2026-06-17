@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -492,8 +493,8 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), stream)
+	originalTranslated := translateXAIResponsesRequest(from, to, baseModel, originalPayload, stream)
+	body := translateXAIResponsesRequest(from, to, baseModel, bytes.Clone(req.Payload), stream)
 
 	var err error
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())
@@ -517,6 +518,9 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 	body = sanitizeXAIResponsesBody(body, baseModel)
 
 	sessionID := xaiExecutionSessionID(req, opts)
+	if sessionID == "" {
+		sessionID = "xai-" + uuid.NewString()
+	}
 	if sessionID != "" {
 		body, _ = sjson.SetBytes(body, "prompt_cache_key", sessionID)
 	}
@@ -530,6 +534,14 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 		body:            body,
 		sessionID:       sessionID,
 	}, nil
+}
+
+func translateXAIResponsesRequest(from, to sdktranslator.Format, baseModel string, payload []byte, stream bool) []byte {
+	if from == sdktranslator.FormatClaude && to == sdktranslator.FormatCodex {
+		chatPayload := sdktranslator.TranslateRequest(from, sdktranslator.FormatOpenAI, baseModel, payload, stream)
+		return sdktranslator.TranslateRequest(sdktranslator.FormatOpenAI, to, baseModel, chatPayload, stream)
+	}
+	return sdktranslator.TranslateRequest(from, to, baseModel, payload, stream)
 }
 
 func (e *XAIExecutor) recordXAIRequest(ctx context.Context, auth *cliproxyauth.Auth, url string, headers http.Header, body []byte) {
