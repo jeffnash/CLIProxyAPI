@@ -873,6 +873,80 @@ func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.
 	}
 }
 
+func TestManager_MarkResult_TransientStreamDisconnectDoesNotCooldownModel(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "xai-auth",
+		Provider: "xai",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "grok-composer-2.5-fast-high"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusRequestTimeout,
+			Message:    "xai stream error: stream disconnected before response.completed",
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if updated.Status == StatusError {
+		t.Fatalf("expected transient stream disconnect to keep auth out of error status")
+	}
+	if updated.LastError != nil {
+		t.Fatalf("expected transient stream disconnect to avoid auth LastError, got %#v", updated.LastError)
+	}
+	if state := updated.ModelStates[model]; state != nil {
+		t.Fatalf("expected transient stream disconnect to avoid model cooldown state, got %#v", state)
+	}
+}
+
+func TestManager_MarkResult_Generic408StillCooldownsModel(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "xai-auth",
+		Provider: "xai",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "grok-composer-2.5-fast-high"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusRequestTimeout,
+			Message:    "upstream request timed out",
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected generic 408 to create model state")
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected generic 408 to set model cooldown")
+	}
+}
+
 func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
