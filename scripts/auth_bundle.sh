@@ -124,7 +124,16 @@ else
   BUNDLE_PATH="${TMP_BUNDLE_PATH}"
 fi
 
-tar -czf "${TMP_TAR_PATH}" -C "${AUTH_SOURCE_DIR}" .
+tar \
+  --exclude='./.auth_bundle_hash' \
+  --exclude='./.restore-backups' \
+  --exclude='./.restore-backups/*' \
+  --exclude='./.preflight-backups' \
+  --exclude='./.preflight-backups/*' \
+  --exclude='./.cursor-agent-store' \
+  --exclude='./.cursor-agent-store/*' \
+  --exclude='./passthru:*' \
+  -czf "${TMP_TAR_PATH}" -C "${AUTH_SOURCE_DIR}" .
 base64 < "${TMP_TAR_PATH}" | tr -d '\n' > "${BUNDLE_PATH}"
 printf '\n' >> "${BUNDLE_PATH}"
 

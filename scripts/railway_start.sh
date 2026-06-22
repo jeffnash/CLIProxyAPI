@@ -138,6 +138,177 @@ AUTH_DIR_PATH="${ROOT_DIR}/${AUTH_DIR_NAME}"
 ZIP_PATH="${ROOT_DIR}/auths.zip"
 TAR_PATH="${ROOT_DIR}/auths.tar.gz"
 OUT_CONFIG_PATH="${ROOT_DIR}/config.yaml"
+BIN_PATH="${ROOT_DIR}/cli-proxy-api"
+FORCE_BUILD="${FORCE_BUILD:-0}"
+LDFLAGS_PKG="github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
+INSTALL_GO="${INSTALL_GO:-1}"
+GO_INSTALL_METHOD="${GO_INSTALL_METHOD:-auto}" # auto|tarball|apt
+GO_TARBALL_VARIANT="${GO_TARBALL_VARIANT:-linux-amd64}" # Railway is typically amd64
+
+go_mod_version() {
+  # Return major.minor from go.mod (e.g. "1.24" even if file says "1.24.0").
+  # Some build steps may rewrite the directive with a patch component.
+  awk '
+    /^go[[:space:]]+[0-9]+\.[0-9]+(\.[0-9]+)?[[:space:]]*$/ {
+      v=$2
+      n=split(v, a, ".")
+      if (n >= 2) print a[1]"."a[2]
+      exit
+    }
+  ' "${ROOT_DIR}/go.mod" 2>/dev/null
+}
+
+go_mod_toolchain_version() {
+  # Return toolchain patch version from go.mod if present (e.g. "1.24.13" from "toolchain go1.24.13").
+  awk '
+    /^toolchain[[:space:]]+go[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$/ {
+      v=$2
+      sub(/^go/, "", v)
+      print v
+      exit
+    }
+  ' "${ROOT_DIR}/go.mod" 2>/dev/null
+}
+
+install_go_tarball() {
+  local want_minor="${1:?}"
+  local want_patch=""
+  # If build tooling wrote a "toolchain goX.Y.Z" line, use that exact patch version.
+  want_patch="${GO_TARBALL_VERSION:-$(go_mod_toolchain_version)}"
+  if [[ -z "${want_patch}" ]]; then
+    # Default to .0 for the requested minor.
+    want_patch="${want_minor}.0"
+  fi
+  local url="https://go.dev/dl/go${want_patch}.${GO_TARBALL_VARIANT}.tar.gz"
+
+  info "Installing Go ${want_patch} from tarball: ${url}"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    err "curl is required to install Go from tarball but was not found"
+    return 1
+  fi
+
+  local tmp="/tmp/go${want_patch}.tar.gz"
+  if ! curl -fsSL "${url}" -o "${tmp}"; then
+    err "failed to download Go tarball: ${url}"
+    return 1
+  fi
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf "${tmp}"
+  rm -f "${tmp}" || true
+  export PATH="/usr/local/go/bin:${PATH}"
+}
+
+ensure_go() {
+  local want_minor
+  want_minor="$(go_mod_version)"
+  if [[ -z "${want_minor}" ]]; then
+    # Fallback if go.mod isn't readable for some reason.
+    want_minor="1.24"
+  fi
+
+  if command -v go >/dev/null 2>&1; then
+    # If Go exists, ensure it's new enough for the go.mod directive.
+    local have_minor
+    have_minor="$(go env GOVERSION 2>/dev/null | sed -nE 's/^go([0-9]+\\.[0-9]+).*/\\1/p')"
+    if [[ -n "${have_minor}" ]]; then
+      if [[ "${have_minor}" == "${want_minor}" ]]; then
+        return 0
+      fi
+      # Compare as floats is dangerous; compare major then minor as ints.
+      local have_major="${have_minor%%.*}"
+      local have_min="${have_minor#*.}"
+      local want_major="${want_minor%%.*}"
+      local want_min="${want_minor#*.}"
+      if [[ "${have_major}" -gt "${want_major}" ]] || { [[ "${have_major}" -eq "${want_major}" ]] && [[ "${have_min}" -ge "${want_min}" ]]; }; then
+        return 0
+      fi
+    fi
+    info "Existing Go toolchain is too old for go.mod (have=${have_minor:-unknown} want=${want_minor}); upgrading"
+  fi
+
+  if [[ "${INSTALL_GO}" == "0" ]]; then
+    err "go is required to build on startup, but was not found on PATH and INSTALL_GO=0"
+    return 1
+  fi
+
+  # Prefer tarball for newer Go versions; Debian/Ubuntu repos tend to lag.
+  if [[ "${GO_INSTALL_METHOD}" == "auto" ]] || [[ "${GO_INSTALL_METHOD}" == "tarball" ]]; then
+    install_go_tarball "${want_minor}" || {
+      if [[ "${GO_INSTALL_METHOD}" == "tarball" ]]; then
+        return 1
+      fi
+      info "Tarball install failed; falling back to apt"
+    }
+  fi
+
+  if ! command -v go >/dev/null 2>&1; then
+    info "Installing Go toolchain via apt (GO_INSTALL_METHOD=${GO_INSTALL_METHOD}, INSTALL_GO=${INSTALL_GO})"
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends golang-go git ca-certificates tar gzip
+      rm -rf /var/lib/apt/lists/* || true
+    elif command -v apt >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt update
+      apt install -y --no-install-recommends golang-go git ca-certificates tar gzip
+    else
+      err "neither apt-get nor apt is available; cannot auto-install Go"
+      return 1
+    fi
+  fi
+
+  if ! command -v go >/dev/null 2>&1; then
+    err "Go installation attempted but 'go' is still not on PATH"
+    return 1
+  fi
+}
+
+ensure_server_binary() {
+  local current_sha build_date stored_sha
+  current_sha="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo "unknown")"
+  build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  if [[ "${FORCE_BUILD}" != "0" ]]; then
+    info "FORCE_BUILD set; rebuilding server binary"
+    rm -f "${BIN_PATH}" "${BIN_PATH}.sha"
+  fi
+
+  stored_sha=""
+  if [[ -f "${BIN_PATH}.sha" ]]; then
+    stored_sha="$(cat "${BIN_PATH}.sha" 2>/dev/null || echo "")"
+  fi
+
+  if [[ -x "${BIN_PATH}" ]] && [[ "${stored_sha}" == "${current_sha}" ]]; then
+    info "Binary is up-to-date for commit ${current_sha}: ${BIN_PATH}"
+    return 0
+  fi
+  if [[ -x "${BIN_PATH}" ]] && [[ "${current_sha}" == "unknown" ]] && [[ -z "${stored_sha}" ]]; then
+    # In some Railpack deployments, `.git` isn't available in the runtime image, so we can't
+    # compute a stable commit SHA. If we already have a binary and no stored SHA, don't
+    # force a rebuild loop (which may require Go at runtime).
+    info "Binary exists but commit SHA is unavailable; skipping rebuild: ${BIN_PATH}"
+    return 0
+  fi
+
+  if [[ -x "${BIN_PATH}" ]] && [[ "${stored_sha}" != "${current_sha}" ]]; then
+    info "Binary is stale (stored=${stored_sha:-none} current=${current_sha}); rebuilding"
+  fi
+
+  ensure_go
+
+  info "Installing Go deps"
+  go mod download
+
+  info "Building server binary (commit: ${current_sha})"
+  go build \
+    -ldflags "-X ${LDFLAGS_PKG}.Commit=${current_sha} -X ${LDFLAGS_PKG}.BuildDate=${build_date}" \
+    -o "${BIN_PATH}" ./cmd/server
+
+  printf '%s' "${current_sha}" > "${BIN_PATH}.sha"
+  info "Build complete; SHA written to ${BIN_PATH}.sha"
+}
 
 ensure_electron
 
@@ -146,11 +317,250 @@ mkdir -p "${AUTH_DIR_PATH}"
 
 # Hash file for detecting changes to auth source (AUTH_BUNDLE or AUTH_ZIP_URL).
 # If the hash matches the stored hash, skip restore to preserve refreshed tokens.
-# If the hash differs (new bundle/URL content) or no hash file exists, restore.
+# If the hash differs (new bundle/URL content) or no hash file exists, merge the
+# new source into the auth dir while preserving newer runtime-refreshed files.
 BUNDLE_HASH_FILE="${AUTH_DIR_PATH}/.auth_bundle_hash"
+AUTH_RESTORE_MODE="${AUTH_RESTORE_MODE:-merge-preserve-newer}"
+AUTH_RESTORE_BACKUP_DIR=""
+AUTH_RESTORE_PREFLIGHT="${AUTH_RESTORE_PREFLIGHT:-1}"
+AUTH_RESTORE_PREFLIGHT_REQUIRED="${AUTH_RESTORE_PREFLIGHT_REQUIRED:-1}"
+AUTH_RESTORE_EXISTING_HEALTH_REPORT=""
+AUTH_RESTORE_INCOMING_HEALTH_REPORT=""
 
 # For AUTH_ZIP_URL, we download once and cache the path to avoid double download.
 CACHED_ZIP_PATH=""
+
+json_scalar_field() {
+  local path="$1"
+  local key="$2"
+  local value=""
+  value=$(sed -nE "s/^[[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "${path}" 2>/dev/null | head -n 1)
+  if [[ -n "${value}" ]]; then
+    printf '%s\n' "${value}"
+    return 0
+  fi
+  sed -nE "s/^[[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "${path}" 2>/dev/null | head -n 1
+}
+
+normalize_auth_timestamp() {
+  local raw="$1"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  if [[ -z "${raw}" ]]; then
+    return 1
+  fi
+
+  if [[ "${raw}" =~ ^[0-9]+$ ]]; then
+    local epoch="${raw}"
+    if (( ${#epoch} > 10 )); then
+      epoch=$((10#${epoch} / 1000))
+    else
+      epoch=$((10#${epoch}))
+    fi
+    date -u -d "@${epoch}" +%Y%m%d%H%M%S 2>/dev/null && return 0
+    return 1
+  fi
+
+  date -u -d "${raw}" +%Y%m%d%H%M%S 2>/dev/null && return 0
+  return 1
+}
+
+auth_file_recency_key() {
+  local path="$1"
+  local key raw normalized
+  for key in \
+    last_refresh lastRefresh last_refreshed_at lastRefreshedAt \
+    refreshed_at refreshedAt updated_at updatedAt \
+    expired expires_at expiresAt expiry; do
+    raw=$(json_scalar_field "${path}" "${key}")
+    if [[ -z "${raw}" ]]; then
+      continue
+    fi
+    if normalized=$(normalize_auth_timestamp "${raw}"); then
+      printf '%s\n' "${normalized}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+has_auth_json_files() {
+  local dir="$1"
+  local first
+  first="$(find "${dir}" -type f -name '*.json' -print -quit 2>/dev/null || true)"
+  [[ -n "${first}" ]]
+}
+
+summarize_auth_health_report() {
+  local report="$1"
+  if [[ ! -s "${report}" ]]; then
+    printf 'valid=0 invalid=0 unknown=0 skipped=0'
+    return 0
+  fi
+  awk -F '\t' '
+    $1 == "valid" { valid++ }
+    $1 == "invalid" { invalid++ }
+    $1 == "unknown" { unknown++ }
+    $1 == "skipped" { skipped++ }
+    END {
+      printf "valid=%d invalid=%d unknown=%d skipped=%d", valid, invalid, unknown, skipped
+    }
+  ' "${report}"
+}
+
+run_auth_health_preflight() {
+  local dir="$1"
+  local label="$2"
+  local report="$3"
+
+  : > "${report}"
+  if [[ "${AUTH_RESTORE_PREFLIGHT}" == "0" ]]; then
+    info "Auth preflight disabled for ${label}"
+    return 0
+  fi
+  if ! has_auth_json_files "${dir}"; then
+    info "Auth preflight skipped for ${label}: no JSON auth files"
+    return 0
+  fi
+
+  ensure_server_binary
+  info "Running auth preflight for ${label}"
+  if "${BIN_PATH}" \
+    --auth-health-check \
+    --auth-health-auth-dir "${dir}" \
+    --auth-health-output "${report}" \
+    --auth-health-timeout "${AUTH_RESTORE_PREFLIGHT_TIMEOUT_SECONDS:-90}" >/dev/null; then
+    info "Auth preflight for ${label}: $(summarize_auth_health_report "${report}")"
+    return 0
+  fi
+
+  if [[ "${AUTH_RESTORE_PREFLIGHT_REQUIRED}" == "0" ]]; then
+    info "Auth preflight failed for ${label}; continuing with non-active merge fallback"
+    : > "${report}"
+    return 0
+  fi
+
+  err "Auth preflight failed for ${label}; refusing to merge auth bundle blindly"
+  exit 1
+}
+
+auth_health_status() {
+  local report="$1"
+  local rel="$2"
+  if [[ -z "${report}" || ! -s "${report}" ]]; then
+    return 0
+  fi
+  awk -F '\t' -v rel="${rel}" '$2 == rel { status = $1 } END { if (status != "") print status }' "${report}"
+}
+
+should_overwrite_auth_file() {
+  local existing="$1"
+  local incoming="$2"
+
+  case "${AUTH_RESTORE_MODE}" in
+    force|replace|overwrite)
+      return 0
+      ;;
+  esac
+
+  local rel incoming_status existing_status
+  rel="${incoming#${AUTH_RESTORE_STAGING_DIR}/}"
+  incoming_status="$(auth_health_status "${AUTH_RESTORE_INCOMING_HEALTH_REPORT}" "${rel}")"
+  if [[ "${incoming_status}" == "invalid" ]]; then
+    return 1
+  fi
+
+  if [[ ! -f "${existing}" ]]; then
+    return 0
+  fi
+
+  existing_status="$(auth_health_status "${AUTH_RESTORE_EXISTING_HEALTH_REPORT}" "${rel}")"
+  if [[ "${existing_status}" == "valid" ]]; then
+    return 1
+  fi
+  if [[ "${incoming_status}" == "valid" ]]; then
+    return 0
+  fi
+  if [[ "${existing_status}" == "unknown" && "${incoming_status}" == "unknown" ]]; then
+    return 1
+  fi
+
+  local existing_key incoming_key
+  existing_key=$(auth_file_recency_key "${existing}" || true)
+  incoming_key=$(auth_file_recency_key "${incoming}" || true)
+
+  # If neither side has a comparable token timestamp, keep the runtime file.
+  if [[ -z "${existing_key}" && -z "${incoming_key}" ]]; then
+    return 1
+  fi
+  # If only the runtime file lacks a timestamp, accept the incoming credential.
+  if [[ -z "${existing_key}" && -n "${incoming_key}" ]]; then
+    return 0
+  fi
+  # If only the incoming file lacks a timestamp, keep the runtime credential.
+  if [[ -n "${existing_key}" && -z "${incoming_key}" ]]; then
+    return 1
+  fi
+  # Preserve runtime credentials on ties. OAuth refresh-token rotation can keep
+  # access-token expiry stable while changing the refresh token itself.
+  [[ "${incoming_key}" > "${existing_key}" ]]
+}
+
+backup_auth_file() {
+  local path="$1"
+  local rel="$2"
+  if [[ ! -f "${path}" ]]; then
+    return 0
+  fi
+  if [[ -z "${AUTH_RESTORE_BACKUP_DIR}" ]]; then
+    AUTH_RESTORE_BACKUP_DIR="${AUTH_DIR_PATH}/.restore-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+  mkdir -p "${AUTH_RESTORE_BACKUP_DIR}/$(dirname "${rel}")"
+  cp -p "${path}" "${AUTH_RESTORE_BACKUP_DIR}/${rel}"
+}
+
+merge_auth_restore_tree() {
+  local source_dir="$1"
+  local copied=0
+  local preserved=0
+  local skipped=0
+  local src rel dest
+
+  while IFS= read -r -d '' src; do
+    rel="${src#${source_dir}/}"
+    case "${rel}" in
+      .auth_bundle_hash|.restore-backups/*|.cursor-agent-store/*|passthru:*)
+        skipped=$((skipped + 1))
+        continue
+        ;;
+      .*|*/.*)
+        skipped=$((skipped + 1))
+        continue
+        ;;
+      *.json)
+        ;;
+      *)
+        skipped=$((skipped + 1))
+        continue
+        ;;
+    esac
+
+    dest="${AUTH_DIR_PATH}/${rel}"
+    mkdir -p "$(dirname "${dest}")"
+    if should_overwrite_auth_file "${dest}" "${src}"; then
+      backup_auth_file "${dest}" "${rel}"
+      cp -p "${src}" "${dest}"
+      copied=$((copied + 1))
+    else
+      preserved=$((preserved + 1))
+    fi
+  done < <(find "${source_dir}" -type f -print0)
+
+  info "Merged auth restore: copied_or_updated=${copied} preserved_runtime=${preserved} skipped=${skipped}"
+  if [[ -n "${AUTH_RESTORE_BACKUP_DIR}" ]]; then
+    info "Backed up overwritten auth files under ${AUTH_RESTORE_BACKUP_DIR}"
+  fi
+}
 
 # compute_source_hash outputs the sha256 hash of the auth source content.
 # For AUTH_BUNDLE: hash the bundle string directly.
@@ -213,16 +623,24 @@ should_restore_bundle() {
 }
 
 if should_restore_bundle; then
-  info "Restoring credentials from AUTH_BUNDLE or AUTH_ZIP_URL"
-  # Clear existing files before restore
-  rm -rf "${AUTH_DIR_PATH:?}"/*
+  info "Restoring credentials from AUTH_BUNDLE or AUTH_ZIP_URL using ${AUTH_RESTORE_MODE}"
+  require_cmd "mktemp"
+  AUTH_RESTORE_STAGING_DIR="$(mktemp -d "${ROOT_DIR}/.auth_restore.XXXXXX")"
+  cleanup_auth_restore_staging() {
+    rm -rf "${AUTH_RESTORE_STAGING_DIR}"
+  }
+  trap cleanup_auth_restore_staging EXIT
+  AUTH_RESTORE_EXISTING_HEALTH_REPORT="${AUTH_DIR_PATH}/.auth_restore_existing_health.tsv"
+  AUTH_RESTORE_INCOMING_HEALTH_REPORT="${AUTH_RESTORE_STAGING_DIR}/.auth_restore_incoming_health.tsv"
+
+  run_auth_health_preflight "${AUTH_DIR_PATH}" "existing Railway volume credentials" "${AUTH_RESTORE_EXISTING_HEALTH_REPORT}"
 
   if [[ -n "${AUTH_BUNDLE:-}" ]]; then
     info "Restoring auths from AUTH_BUNDLE"
     require_cmd "tar"
     require_cmd "base64"
     printf '%s' "${AUTH_BUNDLE}" | tr -d '\r\n' | decode_base64 > "${TAR_PATH}"
-    tar -xzf "${TAR_PATH}" -C "${AUTH_DIR_PATH}"
+    tar -xzf "${TAR_PATH}" -C "${AUTH_RESTORE_STAGING_DIR}"
     rm -f "${TAR_PATH}"
     # Save hash of AUTH_BUNDLE content
     RESTORED_HASH=$(printf '%s' "${AUTH_BUNDLE}" | sha256sum | cut -d' ' -f1)
@@ -247,7 +665,7 @@ if should_restore_bundle; then
 
     info "Unzipping auths"
     if command -v unzip >/dev/null 2>&1; then
-      unzip -q "${ZIP_PATH}" -d "${AUTH_DIR_PATH}"
+      unzip -q "${ZIP_PATH}" -d "${AUTH_RESTORE_STAGING_DIR}"
     else
       echo "Need unzip installed to extract auth files" >&2
       exit 1
@@ -255,6 +673,11 @@ if should_restore_bundle; then
 
     rm -f "${ZIP_PATH}"
   fi
+
+  run_auth_health_preflight "${AUTH_RESTORE_STAGING_DIR}" "incoming auth bundle" "${AUTH_RESTORE_INCOMING_HEALTH_REPORT}"
+  merge_auth_restore_tree "${AUTH_RESTORE_STAGING_DIR}"
+  cleanup_auth_restore_staging
+  trap - EXIT
 
   # Save the source hash so subsequent restarts skip restore (preserving refreshed tokens)
   if [[ -n "${RESTORED_HASH}" ]]; then
@@ -407,174 +830,7 @@ if [[ -n "${COPILOT_BLOCK}" ]]; then
   printf "%b" "${COPILOT_BLOCK}" >>"${OUT_CONFIG_PATH}"
 fi
 
-BIN_PATH="${ROOT_DIR}/cli-proxy-api"
-FORCE_BUILD="${FORCE_BUILD:-0}"
-LDFLAGS_PKG="github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
-INSTALL_GO="${INSTALL_GO:-1}"
-GO_INSTALL_METHOD="${GO_INSTALL_METHOD:-auto}" # auto|tarball|apt
-GO_TARBALL_VARIANT="${GO_TARBALL_VARIANT:-linux-amd64}" # Railway is typically amd64
-
-go_mod_version() {
-  # Return major.minor from go.mod (e.g. "1.24" even if file says "1.24.0").
-  # Some build steps may rewrite the directive with a patch component.
-  awk '
-    /^go[[:space:]]+[0-9]+\.[0-9]+(\.[0-9]+)?[[:space:]]*$/ {
-      v=$2
-      n=split(v, a, ".")
-      if (n >= 2) print a[1]"."a[2]
-      exit
-    }
-  ' "${ROOT_DIR}/go.mod" 2>/dev/null
-}
-
-go_mod_toolchain_version() {
-  # Return toolchain patch version from go.mod if present (e.g. "1.24.13" from "toolchain go1.24.13").
-  awk '
-    /^toolchain[[:space:]]+go[0-9]+\.[0-9]+\.[0-9]+[[:space:]]*$/ {
-      v=$2
-      sub(/^go/, "", v)
-      print v
-      exit
-    }
-  ' "${ROOT_DIR}/go.mod" 2>/dev/null
-}
-
-install_go_tarball() {
-  local want_minor="${1:?}"
-  local want_patch=""
-  # If build tooling wrote a "toolchain goX.Y.Z" line, use that exact patch version.
-  want_patch="${GO_TARBALL_VERSION:-$(go_mod_toolchain_version)}"
-  if [[ -z "${want_patch}" ]]; then
-    # Default to .0 for the requested minor.
-    want_patch="${want_minor}.0"
-  fi
-  local url="https://go.dev/dl/go${want_patch}.${GO_TARBALL_VARIANT}.tar.gz"
-
-  info "Installing Go ${want_patch} from tarball: ${url}"
-
-  if ! command -v curl >/dev/null 2>&1; then
-    err "curl is required to install Go from tarball but was not found"
-    return 1
-  fi
-
-  local tmp="/tmp/go${want_patch}.tar.gz"
-  if ! curl -fsSL "${url}" -o "${tmp}"; then
-    err "failed to download Go tarball: ${url}"
-    return 1
-  fi
-  rm -rf /usr/local/go
-  tar -C /usr/local -xzf "${tmp}"
-  rm -f "${tmp}" || true
-  export PATH="/usr/local/go/bin:${PATH}"
-}
-
-ensure_go() {
-  local want_minor
-  want_minor="$(go_mod_version)"
-  if [[ -z "${want_minor}" ]]; then
-    # Fallback if go.mod isn't readable for some reason.
-    want_minor="1.24"
-  fi
-
-  if command -v go >/dev/null 2>&1; then
-    # If Go exists, ensure it's new enough for the go.mod directive.
-    local have_minor
-    have_minor="$(go env GOVERSION 2>/dev/null | sed -nE 's/^go([0-9]+\\.[0-9]+).*/\\1/p')"
-    if [[ -n "${have_minor}" ]]; then
-      if [[ "${have_minor}" == "${want_minor}" ]]; then
-        return 0
-      fi
-      # Compare as floats is dangerous; compare major then minor as ints.
-      local have_major="${have_minor%%.*}"
-      local have_min="${have_minor#*.}"
-      local want_major="${want_minor%%.*}"
-      local want_min="${want_minor#*.}"
-      if [[ "${have_major}" -gt "${want_major}" ]] || { [[ "${have_major}" -eq "${want_major}" ]] && [[ "${have_min}" -ge "${want_min}" ]]; }; then
-        return 0
-      fi
-    fi
-    info "Existing Go toolchain is too old for go.mod (have=${have_minor:-unknown} want=${want_minor}); upgrading"
-  fi
-
-  if [[ "${INSTALL_GO}" == "0" ]]; then
-    err "go is required to build on startup, but was not found on PATH and INSTALL_GO=0"
-    return 1
-  fi
-
-  # Prefer tarball for newer Go versions; Debian/Ubuntu repos tend to lag.
-  if [[ "${GO_INSTALL_METHOD}" == "auto" ]] || [[ "${GO_INSTALL_METHOD}" == "tarball" ]]; then
-    install_go_tarball "${want_minor}" || {
-      if [[ "${GO_INSTALL_METHOD}" == "tarball" ]]; then
-        return 1
-      fi
-      info "Tarball install failed; falling back to apt"
-    }
-  fi
-
-  if ! command -v go >/dev/null 2>&1; then
-    info "Installing Go toolchain via apt (GO_INSTALL_METHOD=${GO_INSTALL_METHOD}, INSTALL_GO=${INSTALL_GO})"
-    if command -v apt-get >/dev/null 2>&1; then
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y --no-install-recommends golang-go git ca-certificates tar gzip
-      rm -rf /var/lib/apt/lists/* || true
-    elif command -v apt >/dev/null 2>&1; then
-      export DEBIAN_FRONTEND=noninteractive
-      apt update
-      apt install -y --no-install-recommends golang-go git ca-certificates tar gzip
-    else
-      err "neither apt-get nor apt is available; cannot auto-install Go"
-      return 1
-    fi
-  fi
-
-  if ! command -v go >/dev/null 2>&1; then
-    err "Go installation attempted but 'go' is still not on PATH"
-    return 1
-  fi
-}
-
-# Determine current repo SHA for build staleness detection and ldflags embedding.
-CURRENT_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo "unknown")"
-BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-if [[ "${FORCE_BUILD}" != "0" ]]; then
-  info "FORCE_BUILD set; rebuilding server binary"
-  rm -f "${BIN_PATH}" "${BIN_PATH}.sha"
-fi
-
-# Rebuild when the repo SHA changes or the binary is missing.
-STORED_SHA=""
-if [[ -f "${BIN_PATH}.sha" ]]; then
-  STORED_SHA="$(cat "${BIN_PATH}.sha" 2>/dev/null || echo "")"
-fi
-
-if [[ -x "${BIN_PATH}" ]] && [[ "${STORED_SHA}" == "${CURRENT_SHA}" ]]; then
-  info "Binary is up-to-date for commit ${CURRENT_SHA}: ${BIN_PATH}"
-elif [[ -x "${BIN_PATH}" ]] && [[ "${CURRENT_SHA}" == "unknown" ]] && [[ -z "${STORED_SHA}" ]]; then
-  # In some Railpack deployments, `.git` isn't available in the runtime image, so we can't
-  # compute a stable commit SHA. If we already have a binary and no stored SHA, don't
-  # force a rebuild loop (which may require Go at runtime).
-  info "Binary exists but commit SHA is unavailable; skipping rebuild: ${BIN_PATH}"
-else
-  if [[ -x "${BIN_PATH}" ]] && [[ "${STORED_SHA}" != "${CURRENT_SHA}" ]]; then
-    info "Binary is stale (stored=${STORED_SHA:-none} current=${CURRENT_SHA}); rebuilding"
-  fi
-
-  ensure_go
-
-  info "Installing Go deps"
-  go mod download
-
-  info "Building server binary (commit: ${CURRENT_SHA})"
-  go build \
-    -ldflags "-X ${LDFLAGS_PKG}.Commit=${CURRENT_SHA} -X ${LDFLAGS_PKG}.BuildDate=${BUILD_DATE}" \
-    -o "${BIN_PATH}" ./cmd/server
-
-  # Persist the SHA so subsequent restarts skip the rebuild.
-  printf '%s' "${CURRENT_SHA}" > "${BIN_PATH}.sha"
-  info "Build complete; SHA written to ${BIN_PATH}.sha"
-fi
+ensure_server_binary
 
 # Cursor Composer Client-Tools is the default, ToS-safe Cursor path: the patched @cursor/sdk sidecar
 # (cursor-agent-bridge.mjs) owns all Cursor I/O and every tool executes on the

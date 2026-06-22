@@ -111,6 +111,10 @@ func main() {
 	var tuiMode bool
 	var standalone bool
 	var localModel bool
+	var authHealthCheck bool
+	var authHealthAuthDir string
+	var authHealthOutput string
+	var authHealthTimeout int
 
 	// Define command-line flags for different operation modes.
 	flag.BoolVar(&login, "login", false, "Login Google Account")
@@ -141,6 +145,10 @@ func main() {
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
 	flag.BoolVar(&localModel, "local-model", false, "Use embedded model catalog only, skip remote model fetching")
+	flag.BoolVar(&authHealthCheck, "auth-health-check", false, "Validate auth files and write a non-secret health report")
+	flag.StringVar(&authHealthAuthDir, "auth-health-auth-dir", "", "Auth directory to validate for -auth-health-check")
+	flag.StringVar(&authHealthOutput, "auth-health-output", "", "TSV report path for -auth-health-check")
+	flag.IntVar(&authHealthTimeout, "auth-health-timeout", 90, "Per-auth validation timeout in seconds")
 
 	flag.CommandLine.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -547,6 +555,9 @@ func main() {
 	// Set the log level based on the configuration.
 	util.SetLogLevel(cfg)
 
+	if authHealthCheck && strings.TrimSpace(authHealthAuthDir) != "" {
+		cfg.AuthDir = strings.TrimSpace(authHealthAuthDir)
+	}
 	if resolvedAuthDir, errResolveAuthDir := util.ResolveAuthDir(cfg.AuthDir); errResolveAuthDir != nil {
 		log.Errorf("failed to resolve auth directory: %v", errResolveAuthDir)
 		return
@@ -561,7 +572,7 @@ func main() {
 		CallbackPort: oauthCallbackPort,
 	}
 
-	commandMode := vertexImport != "" || login || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || xaiLogin
+	commandMode := vertexImport != "" || login || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || xaiLogin || authHealthCheck
 	cloudConfigMissing := isCloudDeploy && !configFileExists
 	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
 	if shouldStartExampleAPIKeyWarningServer(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode) {
@@ -624,6 +635,14 @@ func main() {
 		cmd.DoKimiLogin(cfg, options)
 	} else if xaiLogin {
 		cmd.DoXAILogin(cfg, options)
+	} else if authHealthCheck {
+		if errHealth := cmd.DoAuthHealthCheck(context.Background(), cfg, cmd.AuthHealthOptions{
+			OutputPath: authHealthOutput,
+			Timeout:    time.Duration(authHealthTimeout) * time.Second,
+		}); errHealth != nil {
+			fmt.Fprintf(os.Stderr, "auth health check failed: %v\n", errHealth)
+			os.Exit(1)
+		}
 	} else {
 		// In cloud deploy mode without config file, just wait for shutdown signals
 		if isCloudDeploy && !configFileExists {

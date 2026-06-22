@@ -8,16 +8,17 @@
 
 `scripts/railway_start.sh` bootstraps a Railway container by:
 
-1. **Smart credential restore**: Checks if auth files should be restored from `AUTH_BUNDLE` or `AUTH_ZIP_URL`:
+1. **Validated credential restore**: Checks if auth files should be restored from `AUTH_BUNDLE` or `AUTH_ZIP_URL`:
    - First run (empty directory): restores from bundle/URL
-   - AUTH_BUNDLE changed (hash mismatch): restores new bundle
+   - AUTH_BUNDLE changed (hash mismatch): validates Railway-volume auth files, validates the incoming bundle in staging, then merges
    - AUTH_BUNDLE unchanged: **skips restore** to preserve refreshed OAuth tokens
-2. Unpacking into a folder at repo root (`auths_railway` by default)
-3. Writing `./config.yaml` with a fixed template, but:
+2. Preserving validated runtime-refreshed auth files on the Railway volume when a new bundle contains stale copies of the same filenames
+3. Unpacking into a folder at repo root (`auths_railway` by default)
+4. Writing `./config.yaml` with a fixed template, but:
    - sets `auth-dir: "./auths_railway"` (or `AUTH_DIR_NAME`)
    - sets `api-keys:` to a single entry from `API_KEY_1`
-4. Ensuring `./cli-proxy-api` exists (builds it with `go mod download` + `go build` if missing, or if `FORCE_BUILD` is set)
-5. Running `./cli-proxy-api --config ./config.yaml`
+5. Ensuring `./cli-proxy-api` exists (builds it with `go mod download` + `go build` if missing, or if `FORCE_BUILD` is set)
+6. Running `./cli-proxy-api --config ./config.yaml`
 
 ## Persistent volume (recommended)
 
@@ -30,7 +31,14 @@ OAuth tokens (Codex, Claude, Gemini, etc.) are refreshed automatically by the se
 3. Set mount path: `/app/auths_railway`
 4. Deploy
 
-The startup script automatically detects existing credentials and skips `AUTH_BUNDLE` restore when tokens are already present (unless you update `AUTH_BUNDLE`, which triggers a re-restore).
+The startup script automatically detects existing credentials and skips `AUTH_BUNDLE` restore when tokens are already present and the bundle hash is unchanged. When you update `AUTH_BUNDLE`, the deploy-time script running inside Railway runs `./cli-proxy-api --auth-health-check` against the existing mounted volume, extracts the bundle to a staging directory, runs the same validation against the staged incoming files, then merges JSON auth files into the mounted volume.
+
+Default merge safety rules:
+
+- Incoming files marked `invalid` by Railway-side validation are not copied.
+- Same-named Railway volume files marked `valid` are preserved, even if the incoming bundle has a newer timestamp.
+- Same-named incoming files marked `valid` can replace an existing file that is not valid.
+- If active validation is inconclusive, the script falls back conservatively to preserving the existing volume file unless older timestamp logic clearly applies.
 
 ## Required env vars
 
@@ -42,6 +50,10 @@ The startup script automatically detects existing credentials and skips `AUTH_BU
 ## Optional env vars
 
 - `AUTH_DIR_NAME` (default `auths_railway`) - folder name created at repo root
+- `AUTH_RESTORE_MODE` (default `merge-preserve-newer`) - credential restore behavior when `AUTH_BUNDLE`/`AUTH_ZIP_URL` changes. The default preserves validated runtime-refreshed JSON auth files already on the volume and rejects incoming files that fail validation. Set to `force`, `replace`, or `overwrite` only when you intentionally want the bundle copy to replace same-named runtime files.
+- `AUTH_RESTORE_PREFLIGHT` (default `1`) - run Railway-side auth validation before merging changed bundles.
+- `AUTH_RESTORE_PREFLIGHT_REQUIRED` (default `1`) - fail startup instead of blindly merging when the validation command itself cannot run.
+- `AUTH_RESTORE_PREFLIGHT_TIMEOUT_SECONDS` (default `90`) - per-auth timeout used by the deploy-time validation command. This only applies to credential validation/refresh, not established model streams.
 - `FORCE_BUILD` (default `0`) - set to `1` (or any non-`0`) to force `go build` even if `./cli-proxy-api` already exists
 - `LOG_LEVEL` (default `info`) - log level for stdout/file logs (`debug`, `info`, `warn`, `error`).
 - `VERBOSE_LOGGING` (default unset) - when truthy, enables debug-level logging and request/response snippet capture (useful on Railway when diagnosing issues).
@@ -101,6 +113,30 @@ YAML-only Copilot header emulation keys (not set by this script):
 
 ## Local auth bundle
 
+For an existing Railway deployment with a persistent auth volume, **do not** build a new bundle directly from stale local files. The Railway volume is the source of truth because OAuth refreshes can rotate refresh tokens at runtime. The deploy-time merge above protects the volume during startup by validating both existing and incoming credentials on Railway; the local helper below is a separate pre-login guard so you do not create the next bundle from stale local files.
+
+Before starting another OAuth login session, pull the current Railway volume auth files, inspect live health, and sync the newest files locally:
+
+```bash
+bash scripts/railway_auth_bundle_prepare.sh --sync-local
+```
+
+Then perform the new provider login, for example:
+
+```bash
+go run ./cmd/server --xai-login --no-browser
+```
+
+After the new local auth file exists, build a merged bundle from Railway-current files plus local additions:
+
+```bash
+bash scripts/railway_auth_bundle_prepare.sh -o /tmp/cliproxy-auth-bundle.txt
+railway variable set AUTH_BUNDLE --stdin --service CLIProxyAPI --environment production < /tmp/cliproxy-auth-bundle.txt
+rm -f /tmp/cliproxy-auth-bundle.txt
+```
+
+`railway_auth_bundle_prepare.sh` uses SSH to inspect `/app/auths_railway`, prints non-secret file metadata, queries `/v0/management/auth-files` when `MANAGEMENT_PASSWORD` is available in the container, scans recent Railway auth log markers, and builds the bundle from a remote-first merge. This gives you a chance to see revoked, reused, or blocked accounts before initiating another OAuth session.
+
 To turn your local `~/.cli-proxy-api` auth files into a single string:
 
 ```bash
@@ -113,7 +149,7 @@ To use a different folder:
 AUTH_BUNDLE="$(AUTH_SOURCE_DIR=/path/to/auths bash scripts/auth_bundle.sh)"
 ```
 
-Set that `AUTH_BUNDLE` value in Railway environment variables. If both `AUTH_BUNDLE` and `AUTH_ZIP_URL` are set, the bundle is used.
+Use direct `auth_bundle.sh` output only for first-time deploys or when your local auth directory is known to be the newest source of truth. The bundler excludes runtime metadata/backups such as `.auth_bundle_hash`, `.restore-backups`, `.preflight-backups`, `.cursor-agent-store`, and generated `passthru:*` files. If both `AUTH_BUNDLE` and `AUTH_ZIP_URL` are set, the bundle is used.
 
 ## Build vs runtime note
 
