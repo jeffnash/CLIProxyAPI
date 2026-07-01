@@ -278,7 +278,7 @@ func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministicForStructuredSession(
 	// care that prompt_cache_key is set deterministically.
 	raw := []byte(`{"model":"gpt-5","input":[],"instructions":""}`)
 
-	key := codexClaudeCodePromptCacheStorageKey(req)
+	key := helps.CodexPromptCacheKey(req.Model, "claude:u1")
 	helps.DeleteCodexCache(key)
 
 	httpReq1, _, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, nil, req, req.Payload, raw)
