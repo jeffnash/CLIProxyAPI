@@ -404,11 +404,6 @@ func APIKeyFromContext(ctx context.Context) string {
 func resolveUsageSource(auth *cliproxyauth.Auth, ctxAPIKey string) string {
 	if auth != nil {
 		provider := strings.TrimSpace(auth.Provider)
-		if strings.EqualFold(provider, "gemini-cli") {
-			if id := strings.TrimSpace(auth.ID); id != "" {
-				return id
-			}
-		}
 		if strings.EqualFold(provider, "vertex") {
 			if auth.Metadata != nil {
 				if projectID, ok := auth.Metadata["project_id"].(string); ok {

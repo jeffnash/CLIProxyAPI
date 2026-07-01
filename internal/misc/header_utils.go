@@ -28,7 +28,7 @@ func geminiCLIOS() string {
 	}
 }
 
-// geminiCLIArch maps Go runtime architecture names to the Node.js-style arch strings used by Gemini CLI.
+// geminiCLIArch maps Go runtime architecture names to Node.js-style architecture strings.
 func geminiCLIArch() string {
 	switch runtime.GOARCH {
 	case "amd64":

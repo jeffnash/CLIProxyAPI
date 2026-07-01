@@ -3,7 +3,6 @@ package management
 import (
 	"archive/zip"
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,11 +19,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
 )
 
 func TestListPluginStoreMergesInstalledStatus(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	pluginsDir := writeManagementPluginFile(t, "sample-provider")
 	h := &Handler{
@@ -83,7 +82,6 @@ func TestListPluginStoreMergesInstalledStatus(t *testing.T) {
 
 func TestListPluginStoreEscapesRegistryStrings(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -149,7 +147,6 @@ func TestListPluginStoreEscapesRegistryStrings(t *testing.T) {
 
 func TestListPluginStoreShowsLatestReleaseVersionAndCaches(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	httpClient := &countingPluginStoreHTTPClient{responses: fakePluginStoreHTTPClient{
 		"https://registry.example/registry.json": registryJSON(t),
@@ -202,7 +199,6 @@ func TestListPluginStoreShowsLatestReleaseVersionAndCaches(t *testing.T) {
 
 func TestListPluginStoreFallsBackToRegistryVersion(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := &Handler{
 		cfg: &config.Config{
@@ -239,9 +235,69 @@ func TestListPluginStoreFallsBackToRegistryVersion(t *testing.T) {
 	}
 }
 
+func TestListPluginStoreIncludesThirdPartySources(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			Plugins: config.PluginsConfig{
+				Enabled:      true,
+				Dir:          t.TempDir(),
+				StoreSources: []string{"https://community.example/registry.json"},
+			},
+		},
+		configFilePath: writeTestConfigFile(t),
+		pluginStoreHTTPClient: fakePluginStoreHTTPClient{
+			pluginstore.DefaultRegistryURL: registryJSON(t),
+			"https://community.example/registry.json": []byte(`{
+				"schema_version": 1,
+				"plugins": [{
+					"id": "third-provider",
+					"name": "Third Provider",
+					"description": "Adds third-party provider support.",
+					"author": "community",
+					"version": "0.3.0",
+					"repository": "https://github.com/community/cliproxy-third-provider-plugin"
+				}]
+			}`),
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/plugin-store", nil)
+
+	h.ListPluginStore(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body pluginStoreListResponse
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &body); errDecode != nil {
+		t.Fatalf("Unmarshal() error = %v; body=%s", errDecode, rec.Body.String())
+	}
+	if len(body.Sources) != 2 {
+		t.Fatalf("sources len = %d, want 2: %#v", len(body.Sources), body.Sources)
+	}
+	if len(body.Plugins) != 2 {
+		t.Fatalf("plugins len = %d, want 2: %#v", len(body.Plugins), body.Plugins)
+	}
+	byID := map[string]pluginStoreListEntry{}
+	for _, entry := range body.Plugins {
+		byID[entry.ID] = entry
+	}
+	if byID["sample-provider"].SourceID != pluginstore.DefaultSourceID {
+		t.Fatalf("official source id = %q, want %q", byID["sample-provider"].SourceID, pluginstore.DefaultSourceID)
+	}
+	third := byID["third-provider"]
+	communitySourceID := pluginstore.SourceID("https://community.example/registry.json")
+	if third.StoreID != communitySourceID+"/third-provider" || third.SourceID != communitySourceID || third.SourceName != "community.example" || third.SourceURL != "https://community.example/registry.json" {
+		t.Fatalf("third-party source fields = %#v", third)
+	}
+}
+
 func TestInstallPluginFromStoreWritesFileAndEnablesConfig(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	pluginsDir := t.TempDir()
 	archiveData := makeManagementPluginStoreZip(t, "sample-provider"+managementPluginExtension(runtime.GOOS), "library-data")
@@ -272,6 +328,7 @@ func TestInstallPluginFromStoreWritesFileAndEnablesConfig(t *testing.T) {
 			"https://downloads.example/checksums.txt":  []byte(hex.EncodeToString(checksum[:]) + "  " + archiveName + "\n"),
 		},
 	}
+	reloads, reloadDone := captureConfigReload(h)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -282,6 +339,11 @@ func TestInstallPluginFromStoreWritesFileAndEnablesConfig(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	cfgSnapshot := waitForAsyncReload(t, reloads)
+	waitForReloadDone(t, reloadDone)
+	if cfgSnapshot == h.cfg {
+		t.Fatalf("reload config = handler config %p, want independent snapshot", h.cfg)
 	}
 	var body pluginInstallResponse
 	if errDecode := json.Unmarshal(rec.Body.Bytes(), &body); errDecode != nil {
@@ -308,18 +370,129 @@ func TestInstallPluginFromStoreWritesFileAndEnablesConfig(t *testing.T) {
 	if item.Enabled == nil || !*item.Enabled {
 		t.Fatalf("plugin enabled = %#v, want true", item.Enabled)
 	}
+	snapshotItem := cfgSnapshot.Plugins.Configs["sample-provider"]
+	if snapshotItem.Enabled == nil || !*snapshotItem.Enabled {
+		t.Fatalf("snapshot plugin enabled = %#v, want true", snapshotItem.Enabled)
+	}
 	if h.cfg.Plugins.Enabled {
 		t.Fatal("global plugins.enabled changed to true")
+	}
+	if cfgSnapshot.Plugins.Enabled {
+		t.Fatal("snapshot global plugins.enabled changed to true")
 	}
 	raw := marshalPluginRaw(t, item)
 	if !strings.Contains(raw, "mode: fast") {
 		t.Fatalf("plugin raw config lost custom field:\n%s", raw)
 	}
+	if raw := marshalPluginRaw(t, snapshotItem); !strings.Contains(raw, "mode: fast") {
+		t.Fatalf("snapshot plugin raw config lost custom field:\n%s", raw)
+	}
+}
+
+func TestInstallPluginFromStoreUsesRequestedThirdPartySource(t *testing.T) {
+	t.Parallel()
+
+	pluginsDir := t.TempDir()
+	archiveData := makeManagementPluginStoreZip(t, "sample-provider"+managementPluginExtension(runtime.GOOS), "third-party-library-data")
+	archiveName := "sample-provider_0.3.0_" + runtime.GOOS + "_" + runtime.GOARCH + ".zip"
+	checksum := sha256.Sum256(archiveData)
+	h := &Handler{
+		cfg: &config.Config{
+			Plugins: config.PluginsConfig{
+				Enabled:      false,
+				Dir:          pluginsDir,
+				StoreSources: []string{"https://community.example/registry.json"},
+			},
+		},
+		configFilePath: writeTestConfigFile(t),
+		pluginStoreHTTPClient: fakePluginStoreHTTPClient{
+			pluginstore.DefaultRegistryURL:            registryJSON(t),
+			"https://community.example/registry.json": thirdPartySampleRegistryJSON(t),
+			"https://api.github.com/repos/community/cliproxy-sample-provider-plugin/releases/latest": []byte(`{
+				"tag_name": "v0.3.0",
+				"assets": [
+					{"name": "` + archiveName + `", "browser_download_url": "https://downloads.example/` + archiveName + `"},
+					{"name": "checksums.txt", "browser_download_url": "https://downloads.example/checksums.txt"}
+				]
+			}`),
+			"https://downloads.example/" + archiveName: archiveData,
+			"https://downloads.example/checksums.txt":  []byte(hex.EncodeToString(checksum[:]) + "  " + archiveName + "\n"),
+		},
+	}
+	reloads, reloadDone := captureConfigReload(h)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "sample-provider"}}
+	communitySourceID := pluginstore.SourceID("https://community.example/registry.json")
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/plugin-store/sample-provider/install?source="+communitySourceID, nil)
+
+	h.InstallPluginFromStore(c)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	cfgSnapshot := waitForAsyncReload(t, reloads)
+	waitForReloadDone(t, reloadDone)
+	if cfgSnapshot == h.cfg {
+		t.Fatalf("reload config = handler config %p, want independent snapshot", h.cfg)
+	}
+	var body pluginInstallResponse
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &body); errDecode != nil {
+		t.Fatalf("Unmarshal() error = %v; body=%s", errDecode, rec.Body.String())
+	}
+	if body.SourceID != communitySourceID || body.Version != "0.3.0" {
+		t.Fatalf("install response = %#v, want community source version 0.3.0", body)
+	}
+	targetPath := filepath.Join(pluginsDir, runtime.GOOS, runtime.GOARCH, "sample-provider"+managementPluginExtension(runtime.GOOS))
+	data, errRead := os.ReadFile(targetPath)
+	if errRead != nil {
+		t.Fatalf("ReadFile(%s) error = %v", targetPath, errRead)
+	}
+	if string(data) != "third-party-library-data" {
+		t.Fatalf("installed file = %q, want third-party-library-data", data)
+	}
+	snapshotItem := cfgSnapshot.Plugins.Configs["sample-provider"]
+	if snapshotItem.Enabled == nil || !*snapshotItem.Enabled {
+		t.Fatalf("snapshot plugin enabled = %#v, want true", snapshotItem.Enabled)
+	}
+}
+
+func TestInstallPluginFromStoreRequiresSourceForDuplicateIDs(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			Plugins: config.PluginsConfig{
+				Enabled:      false,
+				Dir:          t.TempDir(),
+				StoreSources: []string{"https://community.example/registry.json"},
+			},
+		},
+		configFilePath: writeTestConfigFile(t),
+		pluginStoreHTTPClient: fakePluginStoreHTTPClient{
+			pluginstore.DefaultRegistryURL:            registryJSON(t),
+			"https://community.example/registry.json": thirdPartySampleRegistryJSON(t),
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "sample-provider"}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/v0/management/plugin-store/sample-provider/install", nil)
+
+	h.InstallPluginFromStore(c)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "plugin_store_source_required") {
+		t.Fatalf("body = %s, want source required error", rec.Body.String())
+	}
 }
 
 func TestInstallPluginFromStoreOverwritesFilePreservesConfigAndReloads(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	pluginsDir := t.TempDir()
 	existingPath := filepath.Join(pluginsDir, "sample-provider"+managementPluginExtension(runtime.GOOS))
@@ -354,13 +527,7 @@ func TestInstallPluginFromStoreOverwritesFilePreservesConfigAndReloads(t *testin
 			"https://downloads.example/checksums.txt":  []byte(hex.EncodeToString(checksum[:]) + "  " + archiveName + "\n"),
 		},
 	}
-	reloads := 0
-	h.SetConfigReloadHook(func(_ context.Context, cfg *config.Config) {
-		reloads++
-		if cfg != h.cfg {
-			t.Fatalf("reload config = %p, want handler config %p", cfg, h.cfg)
-		}
-	})
+	reloads, reloadDone := captureConfigReload(h)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -372,8 +539,10 @@ func TestInstallPluginFromStoreOverwritesFilePreservesConfigAndReloads(t *testin
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if reloads != 1 {
-		t.Fatalf("reloads = %d, want 1", reloads)
+	cfgSnapshot := waitForAsyncReload(t, reloads)
+	waitForReloadDone(t, reloadDone)
+	if cfgSnapshot == h.cfg {
+		t.Fatalf("reload config = handler config %p, want independent snapshot", h.cfg)
 	}
 	data, errRead := os.ReadFile(existingPath)
 	if errRead != nil {
@@ -386,12 +555,22 @@ func TestInstallPluginFromStoreOverwritesFilePreservesConfigAndReloads(t *testin
 	if item.Enabled == nil || !*item.Enabled {
 		t.Fatalf("plugin enabled = %#v, want true", item.Enabled)
 	}
+	snapshotItem := cfgSnapshot.Plugins.Configs["sample-provider"]
+	if snapshotItem.Enabled == nil || !*snapshotItem.Enabled {
+		t.Fatalf("snapshot plugin enabled = %#v, want true", snapshotItem.Enabled)
+	}
 	if item.Priority != 5 {
 		t.Fatalf("plugin priority = %d, want 5", item.Priority)
+	}
+	if snapshotItem.Priority != 5 {
+		t.Fatalf("snapshot plugin priority = %d, want 5", snapshotItem.Priority)
 	}
 	raw := marshalPluginRaw(t, item)
 	if !strings.Contains(raw, "mode: fast") || !strings.Contains(raw, "extra: keep") {
 		t.Fatalf("plugin raw config lost custom fields:\n%s", raw)
+	}
+	if raw := marshalPluginRaw(t, snapshotItem); !strings.Contains(raw, "mode: fast") || !strings.Contains(raw, "extra: keep") {
+		t.Fatalf("snapshot plugin raw config lost custom fields:\n%s", raw)
 	}
 }
 
@@ -496,6 +675,22 @@ func registryJSON(t *testing.T) []byte {
 			"version": "0.1.0",
 			"repository": "https://github.com/author-name/cliproxy-sample-provider-plugin",
 			"tags": ["provider"]
+		}]
+	}`)
+}
+
+func thirdPartySampleRegistryJSON(t *testing.T) []byte {
+	t.Helper()
+
+	return []byte(`{
+		"schema_version": 1,
+		"plugins": [{
+			"id": "sample-provider",
+			"name": "Sample Provider Community Build",
+			"description": "Adds sample provider support from a third-party source.",
+			"author": "community",
+			"version": "0.3.0",
+			"repository": "https://github.com/community/cliproxy-sample-provider-plugin"
 		}]
 	}`)
 }

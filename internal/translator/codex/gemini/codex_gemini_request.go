@@ -105,6 +105,25 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		return string(normalized)
 	}
 
+	getGeminiCallID := func(value gjson.Result) string {
+		if callID := strings.TrimSpace(value.Get("id").String()); callID != "" {
+			return callID
+		}
+		return strings.TrimSpace(value.Get("call_id").String())
+	}
+
+	removePendingCallID := func(ids []string, callID string) []string {
+		if callID == "" {
+			return ids
+		}
+		for idx, pendingID := range ids {
+			if pendingID == callID {
+				return append(ids[:idx], ids[idx+1:]...)
+			}
+		}
+		return ids
+	}
+
 	// Model
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
@@ -181,11 +200,12 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 						argsRaw = normalizeJSONForHash(args.Raw)
 						fn, _ = sjson.SetBytes(fn, "arguments", args.Raw)
 					}
-					// Generate a paired deterministic call_id and enqueue it so the
-					// corresponding functionResponse can pop the earliest id
-					// to preserve ordering when multiple calls are present.
-					id := stableCallID(fmt.Sprintf("call|%s|%s|%d", gjson.GetBytes(fn, "name").String(), argsRaw, callIndex))
-					callIndex++
+					// Reuse gateway-provided IDs when present, otherwise generate one for pairing.
+					id := getGeminiCallID(fc)
+					if id == "" {
+						id = stableCallID(fmt.Sprintf("call|%s|%s|%d", gjson.GetBytes(fn, "name").String(), argsRaw, callIndex))
+						callIndex++
+					}
 					fn, _ = sjson.SetBytes(fn, "call_id", id)
 					pendingCallIDs = append(pendingCallIDs, id)
 					out, _ = sjson.SetRawBytes(out, "input.-1", fn)
@@ -205,7 +225,10 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					// attach the oldest queued call_id to pair the response
 					// with its call. If the queue is empty, generate a new id.
 					var id string
-					if len(pendingCallIDs) > 0 {
+					if customID := getGeminiCallID(fr); customID != "" {
+						id = customID
+						pendingCallIDs = removePendingCallID(pendingCallIDs, id)
+					} else if len(pendingCallIDs) > 0 {
 						id = pendingCallIDs[0]
 						// pop the first element
 						pendingCallIDs = pendingCallIDs[1:]

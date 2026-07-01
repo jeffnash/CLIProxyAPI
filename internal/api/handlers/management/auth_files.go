@@ -33,10 +33,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -62,11 +65,19 @@ type callbackForwarder struct {
 	done     chan struct{}
 }
 
+type codexOAuthService interface {
+	GenerateAuthURL(state string, pkceCodes *codex.PKCECodes) (string, error)
+	ExchangeCodeForTokens(ctx context.Context, code string, pkceCodes *codex.PKCECodes) (*codex.CodexAuthBundle, error)
+	CreateTokenStorage(bundle *codex.CodexAuthBundle) *codex.CodexTokenStorage
+}
+
 var (
 	callbackForwardersMu  sync.Mutex
 	callbackForwarders    = make(map[int]*callbackForwarder)
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
 	errAuthFileNotFound   = errors.New("auth file not found")
+	errPluginVirtualAuth  = errors.New("plugin virtual auth cannot be modified directly; edit or delete the source auth file")
+	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
 )
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -617,9 +628,6 @@ func authProjectID(auth *coreauth.Auth) string {
 		if projectID := strings.TrimSpace(auth.Attributes["project_id"]); projectID != "" {
 			return projectID
 		}
-		if projectID := strings.TrimSpace(auth.Attributes["gemini_virtual_project"]); projectID != "" {
-			return projectID
-		}
 	}
 	return ""
 }
@@ -1037,6 +1045,9 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	targetPath := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	targetID := ""
 	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
+		if !isPluginVirtualSourceDelete(name, targetAuth) {
+			return filepath.Base(name), http.StatusConflict, errPluginVirtualAuth
+		}
 		targetID = strings.TrimSpace(targetAuth.ID)
 		if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
 			targetPath = path
@@ -1056,12 +1067,22 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
-	if targetID != "" {
-		h.removeAuth(ctx, targetID)
-	} else {
-		h.removeAuth(ctx, targetPath)
-	}
+	h.removeAuthsForPath(ctx, targetPath, targetID)
 	return filepath.Base(name), http.StatusOK, nil
+}
+
+func isPluginVirtualSourceDelete(name string, auth *coreauth.Auth) bool {
+	if !coreauth.IsPluginVirtualAuth(auth) {
+		return true
+	}
+	sourcePath := strings.TrimSpace(authAttribute(auth, coreauth.AttributeVirtualSource))
+	if sourcePath == "" {
+		sourcePath = strings.TrimSpace(authAttribute(auth, "path"))
+	}
+	if sourcePath == "" {
+		return false
+	}
+	return strings.EqualFold(filepath.Base(strings.TrimSpace(name)), filepath.Base(sourcePath))
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
@@ -1166,21 +1187,35 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if authID == "" {
 		authID = path
 	}
-	attr := map[string]string{
-		"path":   path,
-		"source": path,
+	auth := (*coreauth.Auth)(nil)
+	if h != nil && h.cfg != nil {
+		sctx := &synthesizer.SynthesisContext{
+			Config:      h.cfg,
+			AuthDir:     h.cfg.AuthDir,
+			Now:         time.Now(),
+			IDGenerator: synthesizer.NewStableIDGenerator(),
+		}
+		if generated := synthesizer.SynthesizeAuthFile(sctx, path, data); len(generated) > 0 && generated[0] != nil {
+			auth = generated[0].Clone()
+		}
 	}
-	auth := &coreauth.Auth{
-		ID:         authID,
-		Provider:   provider,
-		FileName:   filepath.Base(path),
-		Label:      label,
-		Status:     coreauth.StatusActive,
-		Attributes: attr,
-		Metadata:   metadata,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+	if auth == nil {
+		auth = &coreauth.Auth{
+			ID:       authID,
+			Provider: provider,
+			Label:    label,
+			Status:   coreauth.StatusActive,
+			Attributes: map[string]string{
+				"path":   path,
+				"source": path,
+			},
+			Metadata:  metadata,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
 	}
+	auth.ID = authID
+	auth.FileName = filepath.Base(path)
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
@@ -1257,6 +1292,41 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
+	if coreauth.IsPluginVirtualAuth(targetAuth) {
+		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
+		return
+	}
+
+	if coreauth.IsConfigAPIKeyAuth(targetAuth) {
+		h.mu.Lock()
+		handled, errToggle := toggleConfigAPIKeyExcludedAll(h.cfg, targetAuth, *req.Disabled)
+		if errToggle != nil {
+			h.mu.Unlock()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update config api key: %v", errToggle)})
+			return
+		}
+		if !handled {
+			h.mu.Unlock()
+			c.JSON(http.StatusNotFound, gin.H{"error": "config api key entry not found"})
+			return
+		}
+		cfgSnapshot, okSnapshot := h.saveConfigAndSnapshotLocked(c)
+		h.mu.Unlock()
+		if !okSnapshot {
+			return
+		}
+		h.reloadConfigAfterManagementSave(ctx, cfgSnapshot)
+		if h.tokenStore != nil {
+			_ = h.tokenStore.Delete(ctx, targetAuth.ID)
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":           "ok",
+			"disabled":         *req.Disabled,
+			"via":              "config:excluded-models",
+			"excluded_pattern": configAPIKeyDisablePattern,
+		})
+		return
+	}
 
 	// Update disabled state
 	targetAuth.Disabled = *req.Disabled
@@ -1327,6 +1397,10 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if coreauth.IsPluginVirtualAuth(targetAuth) {
+		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
 		return
 	}
 
@@ -1658,6 +1732,53 @@ func (h *Handler) removeAuth(ctx context.Context, id string) {
 	h.authManager.Remove(ctx, authID)
 }
 
+func (h *Handler) removeAuthsForPath(ctx context.Context, path string, fallbackID string) {
+	if h == nil || h.authManager == nil {
+		return
+	}
+	removed := false
+	for _, auth := range h.authManager.List() {
+		if auth == nil {
+			continue
+		}
+		if sameAuthFilePath(authAttribute(auth, "path"), path) || sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), path) {
+			h.removeAuth(ctx, auth.ID)
+			removed = true
+		}
+	}
+	if removed {
+		return
+	}
+	if strings.TrimSpace(fallbackID) != "" {
+		h.removeAuth(ctx, fallbackID)
+		return
+	}
+	h.removeAuth(ctx, path)
+}
+
+func sameAuthFilePath(left, right string) bool {
+	left = cleanAuthFilePath(left)
+	right = cleanAuthFilePath(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func cleanAuthFilePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if abs, errAbs := filepath.Abs(path); errAbs == nil && strings.TrimSpace(abs) != "" {
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("auth path is empty")
@@ -1701,7 +1822,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	}
 	savedPath, errSave := store.Save(ctx, record)
 	if errSave != nil {
-		return "", errSave
+		return savedPath, errSave
 	}
 	if h.postAuthPersistHook != nil {
 		if errHook := h.postAuthPersistHook(ctx, record); errHook != nil {
@@ -1850,266 +1971,6 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Claude services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("anthropic")
-	}()
-
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
-func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
-	ctx := context.Background()
-	ctx = PopulateAuthContext(ctx, c)
-	proxyHTTPClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
-	ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyHTTPClient)
-
-	// Optional project ID from query
-	projectID := c.Query("project_id")
-
-	fmt.Println("Initializing Google authentication...")
-
-	// OAuth2 configuration using exported constants from internal/auth/gemini
-	conf := &oauth2.Config{
-		ClientID:     geminiAuth.ClientID,
-		ClientSecret: geminiAuth.ClientSecret,
-		RedirectURL:  fmt.Sprintf("http://localhost:%d/oauth2callback", geminiAuth.DefaultCallbackPort),
-		Scopes:       geminiAuth.Scopes,
-		Endpoint:     google.Endpoint,
-	}
-
-	// Build authorization URL and return it immediately
-	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
-	authURL := conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
-
-	RegisterOAuthSession(state, "gemini")
-
-	isWebUI := isWebUIRequest(c)
-	var forwarder *callbackForwarder
-	if isWebUI {
-		targetURL, errTarget := h.managementCallbackURL("/google/callback")
-		if errTarget != nil {
-			log.WithError(errTarget).Error("failed to compute gemini callback target")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
-			return
-		}
-		var errStart error
-		if forwarder, errStart = startCallbackForwarder(geminiCallbackPort, "gemini", targetURL); errStart != nil {
-			log.WithError(errStart).Error("failed to start gemini callback forwarder")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
-			return
-		}
-	}
-
-	go func() {
-		if isWebUI {
-			defer stopCallbackForwarderInstance(geminiCallbackPort, forwarder)
-		}
-
-		// Wait for callback file written by server route
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-gemini-%s.oauth", state))
-		fmt.Println("Waiting for authentication callback...")
-		deadline := time.Now().Add(5 * time.Minute)
-		var authCode string
-		for {
-			if !IsOAuthSessionPending(state, "gemini") {
-				return
-			}
-			if time.Now().After(deadline) {
-				log.Error("oauth flow timed out")
-				SetOAuthSessionError(state, "OAuth flow timed out")
-				return
-			}
-			if data, errR := os.ReadFile(waitFile); errR == nil {
-				var m map[string]string
-				_ = json.Unmarshal(data, &m)
-				_ = os.Remove(waitFile)
-				if errStr := m["error"]; errStr != "" {
-					log.Errorf("Authentication failed: %s", errStr)
-					SetOAuthSessionError(state, "Authentication failed")
-					return
-				}
-				authCode = m["code"]
-				if authCode == "" {
-					log.Errorf("Authentication failed: code not found")
-					SetOAuthSessionError(state, "Authentication failed: code not found")
-					return
-				}
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-
-		// Exchange authorization code for token
-		token, err := conf.Exchange(ctx, authCode)
-		if err != nil {
-			log.Errorf("Failed to exchange token: %v", err)
-			SetOAuthSessionError(state, "Failed to exchange token")
-			return
-		}
-
-		requestedProjectID := strings.TrimSpace(projectID)
-
-		// Create token storage (mirrors internal/auth/gemini createTokenStorage)
-		authHTTPClient := conf.Client(ctx, token)
-		req, errNewRequest := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
-		if errNewRequest != nil {
-			log.Errorf("Could not get user info: %v", errNewRequest)
-			SetOAuthSessionError(state, "Could not get user info")
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token.AccessToken))
-
-		resp, errDo := authHTTPClient.Do(req)
-		if errDo != nil {
-			log.Errorf("Failed to execute request: %v", errDo)
-			SetOAuthSessionError(state, "Failed to execute request")
-			return
-		}
-		defer func() {
-			if errClose := resp.Body.Close(); errClose != nil {
-				log.Printf("warn: failed to close response body: %v", errClose)
-			}
-		}()
-
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			log.Errorf("Get user info request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
-			SetOAuthSessionError(state, fmt.Sprintf("Get user info request failed with status %d", resp.StatusCode))
-			return
-		}
-
-		email := gjson.GetBytes(bodyBytes, "email").String()
-		if email != "" {
-			fmt.Printf("Authenticated user email: %s\n", email)
-		} else {
-			fmt.Println("Failed to get user email from token")
-		}
-
-		// Marshal/unmarshal oauth2.Token to generic map and enrich fields
-		var ifToken map[string]any
-		jsonData, _ := json.Marshal(token)
-		if errUnmarshal := json.Unmarshal(jsonData, &ifToken); errUnmarshal != nil {
-			log.Errorf("Failed to unmarshal token: %v", errUnmarshal)
-			SetOAuthSessionError(state, "Failed to unmarshal token")
-			return
-		}
-
-		ifToken["token_uri"] = "https://oauth2.googleapis.com/token"
-		ifToken["client_id"] = geminiAuth.ClientID
-		ifToken["client_secret"] = geminiAuth.ClientSecret
-		ifToken["scopes"] = geminiAuth.Scopes
-		ifToken["universe_domain"] = "googleapis.com"
-
-		ts := geminiAuth.GeminiTokenStorage{
-			Token:     ifToken,
-			ProjectID: requestedProjectID,
-			Email:     email,
-			Auto:      requestedProjectID == "",
-		}
-
-		// Initialize authenticated HTTP client via GeminiAuth to honor proxy settings
-		gemAuth := geminiAuth.NewGeminiAuth()
-		gemClient, errGetClient := gemAuth.GetAuthenticatedClient(ctx, &ts, h.cfg, &geminiAuth.WebLoginOptions{
-			NoBrowser: true,
-		})
-		if errGetClient != nil {
-			log.Errorf("failed to get authenticated client: %v", errGetClient)
-			SetOAuthSessionError(state, "Failed to get authenticated client")
-			return
-		}
-		fmt.Println("Authentication successful.")
-
-		if strings.EqualFold(requestedProjectID, "ALL") {
-			ts.Auto = false
-			projects, errAll := onboardAllGeminiProjects(ctx, gemClient, &ts)
-			if errAll != nil {
-				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errAll)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errAll))
-				return
-			}
-			if errVerify := ensureGeminiProjectsEnabled(ctx, gemClient, projects); errVerify != nil {
-				log.Errorf("Failed to verify Cloud AI API status: %v", errVerify)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errVerify))
-				return
-			}
-			ts.ProjectID = strings.Join(projects, ",")
-			ts.Checked = true
-		} else if strings.EqualFold(requestedProjectID, "GOOGLE_ONE") {
-			ts.Auto = false
-			if errSetup := performGeminiCLISetup(ctx, gemClient, &ts, ""); errSetup != nil {
-				log.Errorf("Google One auto-discovery failed: %v", errSetup)
-				SetOAuthSessionError(state, fmt.Sprintf("Google One auto-discovery failed: %v", errSetup))
-				return
-			}
-			if strings.TrimSpace(ts.ProjectID) == "" {
-				log.Error("Google One auto-discovery returned empty project ID")
-				SetOAuthSessionError(state, "Google One auto-discovery returned empty project ID")
-				return
-			}
-			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
-			if errCheck != nil {
-				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
-				return
-			}
-			ts.Checked = isChecked
-			if !isChecked {
-				log.Error("Cloud AI API is not enabled for the auto-discovered project")
-				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
-				return
-			}
-		} else {
-			if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &ts, requestedProjectID); errEnsure != nil {
-				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errEnsure))
-				return
-			}
-
-			if strings.TrimSpace(ts.ProjectID) == "" {
-				log.Error("Onboarding did not return a project ID")
-				SetOAuthSessionError(state, "Failed to resolve project ID")
-				return
-			}
-
-			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, ts.ProjectID)
-			if errCheck != nil {
-				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
-				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
-				return
-			}
-			ts.Checked = isChecked
-			if !isChecked {
-				log.Error("Cloud AI API is not enabled for the selected project")
-				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", ts.ProjectID))
-				return
-			}
-		}
-
-		recordMetadata := map[string]any{
-			"email":      ts.Email,
-			"project_id": ts.ProjectID,
-			"auto":       ts.Auto,
-			"checked":    ts.Checked,
-		}
-
-		fileName := geminiAuth.CredentialFileName(ts.Email, ts.ProjectID, true)
-		record := &coreauth.Auth{
-			ID:       fileName,
-			Provider: "gemini",
-			FileName: fileName,
-			Storage:  &ts,
-			Metadata: recordMetadata,
-		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			log.Errorf("Failed to save token to file: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to file")
-			return
-		}
-
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("gemini")
-		fmt.Printf("You can now use Gemini CLI services through this CLI; token saved to %s\n", savedPath)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2138,7 +1999,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	}
 
 	// Initialize Codex auth service
-	openaiAuth := codex.NewCodexAuth(h.cfg)
+	openaiAuth := newCodexOAuthService(h.cfg)
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
@@ -2255,7 +2116,6 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Codex services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("codex")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2415,7 +2275,6 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("antigravity")
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
 			fmt.Printf("Using GCP project: %s\n", util.HideAPIKey(projectID))
@@ -2597,9 +2456,259 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 		}
 
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("xai")
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use xAI services through this CLI")
+	}()
+
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+	proxyHTTPClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyHTTPClient)
+
+	projectID := c.Query("project_id")
+
+	fmt.Println("Initializing Google authentication...")
+
+	conf := &oauth2.Config{
+		ClientID:     geminiAuth.ClientID,
+		ClientSecret: geminiAuth.ClientSecret,
+		RedirectURL:  fmt.Sprintf("http://localhost:%d/oauth2callback", geminiAuth.DefaultCallbackPort),
+		Scopes:       geminiAuth.Scopes,
+		Endpoint:     google.Endpoint,
+	}
+
+	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
+	authURL := conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
+
+	RegisterOAuthSession(state, "gemini")
+
+	isWebUI := isWebUIRequest(c)
+	var forwarder *callbackForwarder
+	if isWebUI {
+		targetURL, errTarget := h.managementCallbackURL("/google/callback")
+		if errTarget != nil {
+			log.WithError(errTarget).Error("failed to compute gemini callback target")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
+			return
+		}
+		var errStart error
+		if forwarder, errStart = startCallbackForwarder(geminiCallbackPort, "gemini", targetURL); errStart != nil {
+			log.WithError(errStart).Error("failed to start gemini callback forwarder")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
+			return
+		}
+	}
+
+	go func() {
+		if isWebUI {
+			defer stopCallbackForwarderInstance(geminiCallbackPort, forwarder)
+		}
+
+		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-gemini-%s.oauth", state))
+		fmt.Println("Waiting for authentication callback...")
+		deadline := time.Now().Add(5 * time.Minute)
+		var authCode string
+		for {
+			if !IsOAuthSessionPending(state, "gemini") {
+				return
+			}
+			if time.Now().After(deadline) {
+				log.Error("oauth flow timed out")
+				SetOAuthSessionError(state, "OAuth flow timed out")
+				return
+			}
+			if data, errRead := os.ReadFile(waitFile); errRead == nil {
+				var payload map[string]string
+				_ = json.Unmarshal(data, &payload)
+				_ = os.Remove(waitFile)
+				if errStr := payload["error"]; errStr != "" {
+					log.Errorf("Authentication failed: %s", errStr)
+					SetOAuthSessionError(state, "Authentication failed")
+					return
+				}
+				authCode = payload["code"]
+				if authCode == "" {
+					log.Errorf("Authentication failed: code not found")
+					SetOAuthSessionError(state, "Authentication failed: code not found")
+					return
+				}
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		token, errExchange := conf.Exchange(ctx, authCode)
+		if errExchange != nil {
+			log.Errorf("Failed to exchange token: %v", errExchange)
+			SetOAuthSessionError(state, "Failed to exchange token")
+			return
+		}
+
+		requestedProjectID := strings.TrimSpace(projectID)
+
+		authHTTPClient := conf.Client(ctx, token)
+		req, errNewRequest := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
+		if errNewRequest != nil {
+			log.Errorf("Could not get user info: %v", errNewRequest)
+			SetOAuthSessionError(state, "Could not get user info")
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token.AccessToken))
+
+		resp, errDo := authHTTPClient.Do(req)
+		if errDo != nil {
+			log.Errorf("Failed to execute request: %v", errDo)
+			SetOAuthSessionError(state, "Failed to execute request")
+			return
+		}
+		defer func() {
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Printf("warn: failed to close response body: %v", errClose)
+			}
+		}()
+
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			log.Errorf("Get user info request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+			SetOAuthSessionError(state, fmt.Sprintf("Get user info request failed with status %d", resp.StatusCode))
+			return
+		}
+
+		email := gjson.GetBytes(bodyBytes, "email").String()
+		if email != "" {
+			fmt.Printf("Authenticated user email: %s\n", email)
+		} else {
+			fmt.Println("Failed to get user email from token")
+		}
+
+		var tokenMap map[string]any
+		jsonData, _ := json.Marshal(token)
+		if errUnmarshal := json.Unmarshal(jsonData, &tokenMap); errUnmarshal != nil {
+			log.Errorf("Failed to unmarshal token: %v", errUnmarshal)
+			SetOAuthSessionError(state, "Failed to unmarshal token")
+			return
+		}
+
+		tokenMap["token_uri"] = "https://oauth2.googleapis.com/token"
+		tokenMap["client_id"] = geminiAuth.ClientID
+		tokenMap["client_secret"] = geminiAuth.ClientSecret
+		tokenMap["scopes"] = geminiAuth.Scopes
+		tokenMap["universe_domain"] = "googleapis.com"
+
+		storage := geminiAuth.GeminiTokenStorage{
+			Token:     tokenMap,
+			ProjectID: requestedProjectID,
+			Email:     email,
+			Auto:      requestedProjectID == "",
+		}
+
+		gemAuth := geminiAuth.NewGeminiAuth()
+		gemClient, errGetClient := gemAuth.GetAuthenticatedClient(ctx, &storage, h.cfg, &geminiAuth.WebLoginOptions{
+			NoBrowser: true,
+		})
+		if errGetClient != nil {
+			log.Errorf("failed to get authenticated client: %v", errGetClient)
+			SetOAuthSessionError(state, "Failed to get authenticated client")
+			return
+		}
+		fmt.Println("Authentication successful.")
+
+		if strings.EqualFold(requestedProjectID, "ALL") {
+			storage.Auto = false
+			projects, errAll := onboardAllGeminiProjects(ctx, gemClient, &storage)
+			if errAll != nil {
+				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errAll)
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errAll))
+				return
+			}
+			if errVerify := ensureGeminiProjectsEnabled(ctx, gemClient, projects); errVerify != nil {
+				log.Errorf("Failed to verify Cloud AI API status: %v", errVerify)
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errVerify))
+				return
+			}
+			storage.ProjectID = strings.Join(projects, ",")
+			storage.Checked = true
+		} else if strings.EqualFold(requestedProjectID, "GOOGLE_ONE") {
+			storage.Auto = false
+			if errSetup := performGeminiCLISetup(ctx, gemClient, &storage, ""); errSetup != nil {
+				log.Errorf("Google One auto-discovery failed: %v", errSetup)
+				SetOAuthSessionError(state, fmt.Sprintf("Google One auto-discovery failed: %v", errSetup))
+				return
+			}
+			if strings.TrimSpace(storage.ProjectID) == "" {
+				log.Error("Google One auto-discovery returned empty project ID")
+				SetOAuthSessionError(state, "Google One auto-discovery returned empty project ID")
+				return
+			}
+			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, storage.ProjectID)
+			if errCheck != nil {
+				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
+				return
+			}
+			storage.Checked = isChecked
+			if !isChecked {
+				log.Error("Cloud AI API is not enabled for the auto-discovered project")
+				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", storage.ProjectID))
+				return
+			}
+		} else {
+			if errEnsure := ensureGeminiProjectAndOnboard(ctx, gemClient, &storage, requestedProjectID); errEnsure != nil {
+				log.Errorf("Failed to complete Gemini CLI onboarding: %v", errEnsure)
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to complete Gemini CLI onboarding: %v", errEnsure))
+				return
+			}
+
+			if strings.TrimSpace(storage.ProjectID) == "" {
+				log.Error("Onboarding did not return a project ID")
+				SetOAuthSessionError(state, "Failed to resolve project ID")
+				return
+			}
+
+			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, gemClient, storage.ProjectID)
+			if errCheck != nil {
+				log.Errorf("Failed to verify Cloud AI API status: %v", errCheck)
+				SetOAuthSessionError(state, fmt.Sprintf("Failed to verify Cloud AI API status: %v", errCheck))
+				return
+			}
+			storage.Checked = isChecked
+			if !isChecked {
+				log.Error("Cloud AI API is not enabled for the selected project")
+				SetOAuthSessionError(state, fmt.Sprintf("Cloud AI API not enabled for project %s", storage.ProjectID))
+				return
+			}
+		}
+
+		recordMetadata := map[string]any{
+			"email":      storage.Email,
+			"project_id": storage.ProjectID,
+			"auto":       storage.Auto,
+			"checked":    storage.Checked,
+		}
+
+		fileName := geminiAuth.CredentialFileName(storage.Email, storage.ProjectID, true)
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "gemini",
+			FileName: fileName,
+			Storage:  &storage,
+			Metadata: recordMetadata,
+		}
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save token to file: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save token to file")
+			return
+		}
+
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("gemini")
+		fmt.Printf("You can now use Gemini CLI services through this CLI; token saved to %s\n", savedPath)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -2676,7 +2785,6 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Kimi services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("kimi")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -3242,13 +3350,13 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 				c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
 				return
 			case pluginapi.AuthLoginStatusSuccess:
-				record := host.AuthDataToCoreAuth(resp.Auth, "", "")
-				if record == nil {
+				records := pluginLoginPollAuths(host, resp)
+				if len(records) == 0 {
 					SetOAuthSessionError(state, "Authentication failed")
 					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Authentication failed"})
 					return
 				}
-				if _, errSave := h.saveTokenRecord(ctx, record); errSave != nil {
+				if errSave := h.savePluginLoginRecords(ctx, records); errSave != nil {
 					log.WithError(errSave).WithField("provider", provider).Error("failed to save plugin auth tokens")
 					SetOAuthSessionError(state, "Failed to save authentication tokens")
 					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Failed to save authentication tokens"})
@@ -3562,6 +3670,53 @@ func generateKiroPKCE() (verifier, challenge string, err error) {
 	challenge = base64.RawURLEncoding.EncodeToString(h[:])
 
 	return verifier, challenge, nil
+}
+
+func pluginLoginPollAuths(host *pluginhost.Host, resp pluginapi.AuthLoginPollResponse) []*coreauth.Auth {
+	if host == nil {
+		return nil
+	}
+	authDatas := resp.Auths
+	if len(authDatas) == 0 {
+		authDatas = []pluginapi.AuthData{resp.Auth}
+	}
+	records := make([]*coreauth.Auth, 0, len(authDatas))
+	for _, authData := range authDatas {
+		record := host.AuthDataToCoreAuth(authData, "", "")
+		if record == nil {
+			return nil
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+func (h *Handler) savePluginLoginRecords(ctx context.Context, records []*coreauth.Auth) error {
+	savedPaths := make([]string, 0, len(records))
+	for _, record := range records {
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if strings.TrimSpace(savedPath) != "" {
+			savedPaths = append(savedPaths, savedPath)
+		}
+		if errSave != nil {
+			h.rollbackSavedTokenRecords(ctx, savedPaths)
+			return errSave
+		}
+	}
+	return nil
+}
+
+func (h *Handler) rollbackSavedTokenRecords(ctx context.Context, savedPaths []string) {
+	for i := len(savedPaths) - 1; i >= 0; i-- {
+		path := strings.TrimSpace(savedPaths[i])
+		if path == "" {
+			continue
+		}
+		if errDelete := h.deleteTokenRecord(ctx, path); errDelete != nil {
+			log.WithError(errDelete).WithField("path", path).Warn("failed to roll back plugin auth token")
+		}
+		h.removeAuthsForPath(ctx, path, path)
+	}
 }
 
 // PopulateAuthContext extracts request info and adds it to the context

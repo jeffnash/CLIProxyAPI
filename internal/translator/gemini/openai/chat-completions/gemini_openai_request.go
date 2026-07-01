@@ -230,6 +230,18 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 									p++
 								}
 							}
+						case "video_url":
+							videoURL := item.Get("video_url.url").String()
+							if len(videoURL) > 5 {
+								pieces := strings.SplitN(videoURL[5:], ";", 2)
+								if len(pieces) == 2 && len(pieces[1]) > 7 {
+									mime := pieces[0]
+									data := pieces[1][7:]
+									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mime)
+									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
+									p++
+								}
+							}
 						case "file":
 							filename := item.Get("file.filename").String()
 							fileData := item.Get("file.file_data").String()
@@ -243,6 +255,14 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 								p++
 							} else {
 								log.Warnf("Unknown file name extension '%s' in user message, skip", ext)
+							}
+						case "input_audio":
+							audioData := item.Get("input_audio.data").String()
+							if audioData != "" {
+								mimeType := openAIInputAudioMimeType(item.Get("input_audio.format").String())
+								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mimeType)
+								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", audioData)
+								p++
 							}
 						}
 					}
@@ -328,6 +348,16 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		}
 	}
 
+	// Gemini/Vertex accepts assistant/model turns in history, but some model
+	// surfaces reject requests whose final turn is model-authored prefill.
+	contents := gjson.GetBytes(out, "contents")
+	if contents.Exists() && contents.IsArray() {
+		arr := contents.Array()
+		if len(arr) > 0 && arr[len(arr)-1].Get("role").String() == "model" {
+			out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
+		}
+	}
+
 	// tools -> tools[].functionDeclarations + tools[].googleSearch/codeExecution/urlContext passthrough
 	tools := gjson.GetBytes(rawJSON, "tools")
 	if tools.IsArray() && len(tools.Array()) > 0 {
@@ -379,6 +409,9 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 					fnRawBytes := []byte(fnRaw)
 					fnRawBytes, _ = sjson.SetBytes(fnRawBytes, "name", util.SanitizeFunctionName(fn.Get("name").String()))
 					fnRaw = string(fnRawBytes)
+					if parameters := gjson.Get(fnRaw, "parametersJsonSchema"); parameters.Exists() {
+						fnRaw, _ = sjson.SetRaw(fnRaw, "parametersJsonSchema", util.CleanJSONSchemaForGemini(parameters.Raw))
+					}
 					fnRaw, _ = sjson.Delete(fnRaw, "strict")
 					if !hasFunction {
 						functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", []byte("[]"))
@@ -462,3 +495,26 @@ func openAIToolCallGeminiThoughtSignature(toolCall gjson.Result) string {
 
 // itoa converts int to string without strconv import for few usages.
 func itoa(i int) string { return fmt.Sprintf("%d", i) }
+
+func openAIInputAudioMimeType(audioFormat string) string {
+	switch audioFormat {
+	case "", "wav":
+		return "audio/wav"
+	case "mp3":
+		return "audio/mpeg"
+	case "ogg":
+		return "audio/ogg"
+	case "flac":
+		return "audio/flac"
+	case "aac":
+		return "audio/aac"
+	case "webm":
+		return "audio/webm"
+	case "pcm16":
+		return "audio/pcm"
+	case "g711_ulaw", "g711_alaw":
+		return "audio/basic"
+	default:
+		return "audio/" + audioFormat
+	}
+}

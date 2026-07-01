@@ -145,6 +145,9 @@ func codexTerminalStreamErrShouldHandle(body []byte) bool {
 	if codexTerminalErrorIsContextLength(body) {
 		return true
 	}
+	if isCodexUsageLimitError(body) || isCodexModelCapacityError(body) {
+		return true
+	}
 	code, _, ok := codexStatusErrorClassification(http.StatusBadRequest, body)
 	return ok && code == "thinking_signature_invalid"
 }
@@ -250,23 +253,28 @@ func (s codexReasoningReplayScope) valid() bool {
 }
 
 func applyCodexReasoningReplayCache(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte) ([]byte, codexReasoningReplayScope) {
+	updated, scope, _ := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
+	return updated, scope
+}
+
+func applyCodexReasoningReplayCacheRequired(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte) ([]byte, codexReasoningReplayScope, error) {
 	scope := codexReasoningReplayScopeFromRequest(ctx, from, req, opts, body)
 	if !scope.valid() {
-		return body, scope
+		return body, scope, nil
 	}
-	items, ok := internalcache.GetCodexReasoningReplayItems(scope.modelName, scope.sessionKey)
-	if !ok {
-		return body, scope
+	items, ok, errReplay := internalcache.GetCodexReasoningReplayItemsRequired(ctx, scope.modelName, scope.sessionKey)
+	if errReplay != nil || !ok {
+		return body, scope, errReplay
 	}
 	items = filterCodexReasoningReplayItemsForInput(body, items)
 	if len(items) == 0 {
-		return body, scope
+		return body, scope, nil
 	}
 	updated, ok := insertCodexReasoningReplayItems(body, items)
 	if !ok {
-		return body, scope
+		return body, scope, nil
 	}
-	return updated, scope
+	return updated, scope, nil
 }
 
 func codexReasoningReplayScopeFromRequest(ctx context.Context, from sdktranslator.Format, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, body []byte) codexReasoningReplayScope {
@@ -300,23 +308,25 @@ func codexClaudeCodePromptCacheStorageKey(req cliproxyexecutor.Request) string {
 	if sessionID == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s-claude:%s", req.Model, sessionID)
+	return helps.CodexPromptCacheKey(req.Model, "claude:"+sessionID)
 }
 
-func codexClaudeCodePromptCache(req cliproxyexecutor.Request) (helps.CodexCache, bool) {
+func codexClaudeCodePromptCache(ctx context.Context, req cliproxyexecutor.Request) (helps.CodexCache, bool, error) {
 	key := codexClaudeCodePromptCacheStorageKey(req)
 	if key == "" {
-		return helps.CodexCache{}, false
+		return helps.CodexCache{}, false, nil
 	}
-	if cache, ok := helps.GetCodexCache(key); ok {
-		return cache, true
+	if cache, ok, errCache := helps.GetCodexCacheRequired(ctx, key); errCache != nil || ok {
+		return cache, ok, errCache
 	}
 	cache := helps.CodexCache{
 		ID:     uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+key)).String(),
 		Expire: time.Now().Add(1 * time.Hour),
 	}
-	helps.SetCodexCache(key, cache)
-	return cache, true
+	if errSet := helps.SetCodexCacheRequired(ctx, key, cache); errSet != nil {
+		return helps.CodexCache{}, false, errSet
+	}
+	return cache, true, nil
 }
 
 func extractClaudeCodeSessionIDForCodexReplay(payload []byte) string {
@@ -725,19 +735,20 @@ func cacheCodexReasoningReplayFromCompleted(scope codexReasoningReplayScope, com
 			continue
 		}
 	}
-	if !internalcache.CacheCodexReasoningReplayItems(scope.modelName, scope.sessionKey, items) {
+	if !internalcache.CacheCodexReasoningReplayItemsBestEffort(context.Background(), scope.modelName, scope.sessionKey, items) {
 		internalcache.DeleteCodexReasoningReplayItem(scope.modelName, scope.sessionKey)
 	}
 }
 
-func clearCodexReasoningReplayOnInvalidSignature(scope codexReasoningReplayScope, statusCode int, body []byte) {
+func clearCodexReasoningReplayOnInvalidSignature(ctx context.Context, scope codexReasoningReplayScope, statusCode int, body []byte) error {
 	if !scope.valid() {
-		return
+		return nil
 	}
 	code, _, ok := codexStatusErrorClassification(statusCode, body)
 	if ok && code == "thinking_signature_invalid" {
-		internalcache.DeleteCodexReasoningReplayItem(scope.modelName, scope.sessionKey)
+		return internalcache.DeleteCodexReasoningReplayItemRequired(ctx, scope.modelName, scope.sessionKey)
 	}
+	return nil
 }
 
 // PrepareRequest injects Codex credentials into the outgoing HTTP request.
@@ -848,7 +859,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		body = ensureImageGenerationTool(body, modelForUpstream, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body, replayScope := applyCodexReasoningReplayCache(ctx, from, req, opts, body)
+	body = normalizeCodexParallelToolCallsForTools(body)
+	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
+	if errReplay != nil {
+		return resp, errReplay
+	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -892,7 +907,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
-		clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, b)
+		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, b); errClearReplay != nil {
+			return resp, errClearReplay
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
@@ -918,7 +935,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		eventType := gjson.GetBytes(eventData, "type").String()
 
 		if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
-			clearCodexReasoningReplayOnInvalidSignature(replayScope, streamErr.StatusCode(), terminalBody)
+			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
+				return resp, errClearReplay
+			}
 			err = streamErr
 			return resp, err
 		}
@@ -1037,6 +1056,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		body = ensureImageGenerationTool(body, modelForUpstream, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
+	body = normalizeCodexParallelToolCallsForTools(body)
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
@@ -1167,7 +1187,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		body = ensureImageGenerationTool(body, modelForUpstream, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
-	body, replayScope := applyCodexReasoningReplayCache(ctx, from, req, opts, body)
+	body = normalizeCodexParallelToolCallsForTools(body)
+	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
+	if errReplay != nil {
+		return nil, errReplay
+	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
@@ -1214,7 +1238,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			return nil, readErr
 		}
 		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
-		clearCodexReasoningReplayOnInvalidSignature(replayScope, httpResp.StatusCode, data)
+		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
+			return nil, errClearReplay
+		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		err = newCodexStatusErr(httpResp.StatusCode, data)
@@ -1241,7 +1267,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
 				if streamErr, terminalBody, ok := codexTerminalStreamErr(data); ok {
-					clearCodexReasoningReplayOnInvalidSignature(replayScope, streamErr.StatusCode(), terminalBody)
+					if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody); errClearReplay != nil {
+						helps.RecordAPIResponseError(ctx, e.cfg, errClearReplay)
+						reporter.PublishFailure(ctx, errClearReplay)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: errClearReplay}:
+						case <-ctx.Done():
+						}
+						return
+					}
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 					reporter.PublishFailure(ctx, streamErr)
 					select {
@@ -1642,7 +1676,11 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	var cache helps.CodexCache
 	setConversationID := false
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		if cached, ok := codexClaudeCodePromptCache(req); ok {
+		cached, ok, errCache := codexClaudeCodePromptCache(ctx, req)
+		if errCache != nil {
+			return nil, nil, codexIdentityConfuseState{}, errCache
+		}
+		if ok {
 			cache = cached
 			setConversationID = true
 		}
@@ -1856,7 +1894,7 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	errCode := statusCode
-	if isCodexModelCapacityError(body) {
+	if isCodexModelCapacityError(body) || isCodexUsageLimitError(body) {
 		errCode = http.StatusTooManyRequests
 	}
 	body = classifyCodexStatusError(errCode, body)
@@ -1956,6 +1994,21 @@ func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth
 	return body
 }
 
+func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
+	if !gjson.GetBytes(body, "parallel_tool_calls").Exists() {
+		return body
+	}
+
+	tools := gjson.GetBytes(body, "tools")
+	hasTools := tools.Exists() && tools.IsArray() && len(tools.Array()) > 0
+	if hasTools {
+		return body
+	}
+
+	body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
+	return body
+}
+
 func publishCodexImageToolUsage(ctx context.Context, reporter *helps.UsageReporter, body []byte, completedData []byte) {
 	detail, ok := helps.ParseCodexImageToolUsage(completedData)
 	if !ok {
@@ -1997,6 +2050,28 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 		}
 		if strings.Contains(lower, "selected model is at capacity") ||
 			strings.Contains(lower, "model is at capacity. please try a different model") {
+			return true
+		}
+	}
+	return false
+}
+
+// isCodexUsageLimitError reports whether the error body represents a Codex
+// quota/plan-limit exhaustion (error.type == "usage_limit_reached"). This is the
+// signal Codex emits when a credential's usage quota is depleted, and it carries
+// reset timing (resets_at/resets_in_seconds) parsed by parseCodexRetryAfter.
+// Transient per-minute rate limits (rate_limit_error/rate_limit_exceeded) are
+// intentionally excluded, as they should be retried rather than cooled down.
+func isCodexUsageLimitError(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	candidates := []string{
+		gjson.GetBytes(errorBody, "error.type").String(),
+		gjson.GetBytes(errorBody, "type").String(),
+	}
+	for _, candidate := range candidates {
+		if strings.EqualFold(strings.TrimSpace(candidate), "usage_limit_reached") {
 			return true
 		}
 	}

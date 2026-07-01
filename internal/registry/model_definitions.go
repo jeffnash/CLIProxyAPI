@@ -7,6 +7,7 @@ import (
 )
 
 const (
+	codexBuiltinImage15ModelID      = "gpt-image-1.5"
 	codexBuiltinImageModelID        = "gpt-image-2"
 	xaiBuiltinImageModelID          = "grok-imagine-image"
 	xaiBuiltinImageQualityModelID   = "grok-imagine-image-quality"
@@ -19,7 +20,6 @@ type staticModelsJSON struct {
 	Claude      []*ModelInfo `json:"claude"`
 	Gemini      []*ModelInfo `json:"gemini"`
 	Vertex      []*ModelInfo `json:"vertex"`
-	GeminiCLI   []*ModelInfo `json:"gemini-cli"`
 	AIStudio    []*ModelInfo `json:"aistudio"`
 	CodexFree   []*ModelInfo `json:"codex-free"`
 	CodexTeam   []*ModelInfo `json:"codex-team"`
@@ -46,11 +46,6 @@ func GetGeminiModels() []*ModelInfo {
 // GetGeminiVertexModels returns Gemini model definitions for Vertex AI.
 func GetGeminiVertexModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Vertex)
-}
-
-// GetGeminiCLIModels returns Gemini model definitions for the Gemini CLI.
-func GetGeminiCLIModels() []*ModelInfo {
-	return cloneModelInfos(getModels().GeminiCLI)
 }
 
 // GetAIStudioModels returns model definitions for AI Studio.
@@ -175,7 +170,7 @@ func cursorBuiltinModels() []*ModelInfo {
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, codexBuiltinImageModelInfo())
+	return upsertModelInfos(models, codexBuiltinImage15ModelInfo(), codexBuiltinImageModelInfo())
 }
 
 // WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
@@ -215,6 +210,18 @@ func normalizeAntigravityCapabilityModelID(modelID string) string {
 		modelID = strings.TrimSpace(modelID[:open])
 	}
 	return modelID
+}
+
+func codexBuiltinImage15ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          codexBuiltinImage15ModelID,
+		Object:      "model",
+		Created:     1704067200, // 2024-01-01
+		OwnedBy:     "openai",
+		Type:        "openai",
+		DisplayName: "GPT Image 1.5",
+		Version:     codexBuiltinImage15ModelID,
+	}
 }
 
 func codexBuiltinImageModelInfo() *ModelInfo {
@@ -346,7 +353,6 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - claude
 //   - gemini
 //   - vertex
-//   - gemini-cli
 //   - aistudio
 //   - codex
 //   - kimi
@@ -361,8 +367,6 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetGeminiModels()
 	case "vertex":
 		return GetGeminiVertexModels()
-	case "gemini-cli":
-		return GetGeminiCLIModels()
 	case "aistudio":
 		return GetAIStudioModels()
 	case "codex":
@@ -395,7 +399,6 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		GetClaudeModels(),
 		GetGeminiModels(),
 		GetGeminiVertexModels(),
-		GetGeminiCLIModels(),
 		GetAIStudioModels(),
 		GetCodexFreeModels(),
 		GetCodexTeamModels(),
@@ -406,6 +409,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		GetKimiModels(),
 		GetAntigravityModels(),
 		GetXAIModels(),
+		GetCursorModels(),
 	}
 	for _, models := range allModels {
 		for _, m := range models {

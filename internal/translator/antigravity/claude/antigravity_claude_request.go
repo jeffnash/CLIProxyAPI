@@ -1,11 +1,12 @@
 // Package claude provides request translation functionality for Claude Code API compatibility.
-// This package handles the conversion of Claude Code API requests into Gemini CLI-compatible
+// This package handles the conversion of Claude Code API requests into Antigravity-compatible
 // JSON format, transforming message contents, system instructions, and tool declarations
-// into the format expected by Gemini CLI API clients. It performs JSON data transformation
-// to ensure compatibility between Claude Code API format and Gemini CLI API's expected format.
+// into the format expected by Antigravity API clients. It performs JSON data transformation
+// to ensure compatibility between Claude Code API format and Antigravity API's expected format.
 package claude
 
 import (
+	"context"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
@@ -19,36 +20,56 @@ import (
 )
 
 func resolveThinkingSignature(modelName, thinkingText, rawSignature string) string {
+	signature, errSignature := resolveThinkingSignatureRequired(context.Background(), modelName, thinkingText, rawSignature)
+	if errSignature != nil {
+		return ""
+	}
+	return signature
+}
+
+func resolveThinkingSignatureRequired(ctx context.Context, modelName, thinkingText, rawSignature string) (string, error) {
 	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
 	if targetProvider == sigcompat.SignatureProviderGemini {
-		return resolveProviderCompatibleSignature(targetProvider, rawSignature, sigcompat.SignatureBlockKindGeminiModelPart)
+		return resolveProviderCompatibleSignature(targetProvider, rawSignature, sigcompat.SignatureBlockKindGeminiModelPart), nil
 	}
 	if cache.SignatureCacheEnabled() {
-		return resolveCacheModeSignature(modelName, thinkingText, rawSignature)
+		return resolveCacheModeSignatureRequired(ctx, modelName, thinkingText, rawSignature)
 	}
 	if signature := resolveProviderCompatibleSignature(targetProvider, rawSignature, sigcompat.SignatureBlockKindUnknown); signature != "" {
-		return signature
+		return signature, nil
 	}
-	return resolveBypassModeSignatureForProvider(targetProvider, rawSignature)
+	return resolveBypassModeSignatureForProvider(targetProvider, rawSignature), nil
 }
 
 func resolveCacheModeSignature(modelName, thinkingText, rawSignature string) string {
+	signature, errSignature := resolveCacheModeSignatureRequired(context.Background(), modelName, thinkingText, rawSignature)
+	if errSignature != nil {
+		return ""
+	}
+	return signature
+}
+
+func resolveCacheModeSignatureRequired(ctx context.Context, modelName, thinkingText, rawSignature string) (string, error) {
 	targetProvider := sigcompat.SignatureProviderFromModelName(modelName)
 	if thinkingText != "" {
-		if cachedSig := cache.GetCachedSignature(modelName, thinkingText); cachedSig != "" {
+		cachedSig, errCachedSig := cache.GetCachedSignatureRequired(ctx, modelName, thinkingText)
+		if errCachedSig != nil {
+			return "", errCachedSig
+		}
+		if cachedSig != "" {
 			if targetProvider == sigcompat.SignatureProviderClaude {
 				signature, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(cachedSig)
 				if !ok {
-					return ""
+					return "", nil
 				}
-				return signature
+				return signature, nil
 			}
-			return cachedSig
+			return cachedSig, nil
 		}
 	}
 
 	if rawSignature == "" {
-		return ""
+		return "", nil
 	}
 
 	clientSignature := ""
@@ -62,14 +83,46 @@ func resolveCacheModeSignature(modelName, thinkingText, rawSignature string) str
 		if targetProvider == sigcompat.SignatureProviderClaude {
 			signature, ok := sigcompat.CompatibleAntigravityClaudeThinkingSignature(clientSignature)
 			if !ok {
-				return ""
+				return "", nil
 			}
-			return signature
+			return signature, nil
 		}
-		return clientSignature
+		return clientSignature, nil
 	}
 
-	return ""
+	return "", nil
+}
+
+func RequireCachedThinkingSignatures(ctx context.Context, modelName string, rawJSON []byte) error {
+	if !cache.SignatureCacheEnabled() {
+		return nil
+	}
+	if sigcompat.SignatureProviderFromModelName(modelName) == sigcompat.SignatureProviderGemini {
+		return nil
+	}
+	messagesResult := gjson.GetBytes(rawJSON, "messages")
+	if !messagesResult.IsArray() {
+		return nil
+	}
+	for _, messageResult := range messagesResult.Array() {
+		contentsResult := messageResult.Get("content")
+		if !contentsResult.IsArray() {
+			continue
+		}
+		for _, contentResult := range contentsResult.Array() {
+			if contentResult.Get("type").String() != "thinking" {
+				continue
+			}
+			thinkingText := thinking.GetThinkingText(contentResult)
+			if thinkingText == "" {
+				continue
+			}
+			if _, errSignature := cache.GetCachedSignatureRequired(ctx, modelName, thinkingText); errSignature != nil {
+				return errSignature
+			}
+		}
+	}
+	return nil
 }
 
 func resolveBypassModeSignature(rawSignature string) string {
@@ -235,12 +288,12 @@ func logDroppedAntigravityToolUseSignature(modelName string, messageIndex, conte
 	}).Debug("antigravity claude translator: dropped tool_use signature field")
 }
 
-// ConvertClaudeRequestToAntigravity parses and transforms a Claude Code API request into Gemini CLI API format.
+// ConvertClaudeRequestToAntigravity parses and transforms a Claude Code API request into Antigravity API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
-// from the raw JSON request and returns them in the format expected by the Gemini CLI API.
+// from the raw JSON request and returns them in the format expected by the Antigravity API.
 // The function performs the following transformations:
 // 1. Extracts the model information from the request
-// 2. Restructures the JSON to match Gemini CLI API format
+// 2. Restructures the JSON to match Antigravity API format
 // 3. Converts system instructions to the expected format
 // 4. Maps message contents with proper role transformations
 // 5. Handles tool declarations and tool choices
@@ -252,7 +305,7 @@ func logDroppedAntigravityToolUseSignature(modelName string, messageIndex, conte
 //   - stream: A boolean indicating if the request is for a streaming response (unused in current implementation)
 //
 // Returns:
-//   - []byte: The transformed request data in Gemini CLI API format
+//   - []byte: The transformed request data in Antigravity API format
 func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
 	enableThoughtTranslate := true
 	rawJSON := inputRawJSON
@@ -628,7 +681,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		}
 	}
 
-	// Build output Gemini CLI request JSON
+	// Build output Antigravity request JSON
 	out := []byte(`{"model":"","request":{"contents":[]}}`)
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
