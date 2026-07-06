@@ -536,6 +536,80 @@ func TestP01_Reseed410ThinContinuationStays410(t *testing.T) {
 	}
 }
 
+// P0-1 recovery extension: a THIN continuation that also carries a fresh user instruction is recoverable. The
+// stale tool_results are no longer answerable, but the latest user payload must not force a new Claude session;
+// reframe it as a clean user turn and retry once.
+func TestP01_Reseed410ThinMixedContinuationRecoversUserText(t *testing.T) {
+	var mu sync.Mutex
+	var bodies [][]byte
+	okBody := "data: {\"type\":\"text\",\"delta\":\"answered latest\"}\n\ndata: {\"type\":\"turn_end\",\"stop_reason\":\"stop\"}\n\ndata: [DONE]\n\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, raw)
+		mu.Unlock()
+		if gjson.GetBytes(raw, "input.type").String() == "tool_results" {
+			w.WriteHeader(410)
+			_, _ = w.Write([]byte("unknown or expired session"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(okBody))
+	}))
+	defer srv.Close()
+	e := NewCursorExecutor(&config.Config{})
+	auth := protoAuth(srv.URL)
+	thinMixed := func() cliproxyexecutor.Request {
+		return cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[` +
+			`{"role":"assistant","tool_calls":[{"id":"call_thin_mixed_1","function":{"name":"Read"}}]},` +
+			`{"role":"tool","tool_call_id":"call_thin_mixed_1","content":"stale output"},` +
+			`{"role":"user","content":"write the goal statement now"}],` +
+			`"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)}
+	}
+
+	resp, err := e.executeComposer(context.Background(), auth, "k", thinMixed(), protoOpts("p01-thin-mixed-ns"))
+	if err != nil {
+		t.Fatalf("P0-1: a thin mixed 410 must recover on the non-stream path, got %T %v", err, err)
+	}
+	if resp.Payload == nil {
+		t.Fatalf("P0-1: non-stream thin mixed reseed must produce a response")
+	}
+
+	sr, errS := e.executeComposerStream(context.Background(), auth, "k", thinMixed(), protoOpts("p01-thin-mixed-s"))
+	if errS != nil {
+		t.Fatalf("P0-1: a thin mixed 410 must recover on the stream path, got %T %v", errS, errS)
+	}
+	streamErr, payload := drainStreamErr(sr)
+	if streamErr != nil {
+		t.Fatalf("P0-1: stream thin mixed reseed must not surface a chunk error, got %v", streamErr)
+	}
+	if !strings.Contains(payload, "answered latest") {
+		t.Fatalf("P0-1: stream thin mixed reseed must deliver the recovered turn, got %q", payload)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	sawLostContinuation, sawReseed := false, false
+	for _, raw := range bodies {
+		switch gjson.GetBytes(raw, "input.type").String() {
+		case "tool_results":
+			sawLostContinuation = true
+		case "user":
+			sawReseed = true
+			if gjson.GetBytes(raw, "input.results").Exists() {
+				t.Fatalf("P0-1: thin mixed reseed must DROP stale tool_results, got %s", string(raw))
+			}
+			if got := gjson.GetBytes(raw, "input.text").String(); got != "write the goal statement now" {
+				t.Fatalf("P0-1: thin mixed reseed text = %q", got)
+			}
+		}
+	}
+	if !sawLostContinuation || !sawReseed {
+		t.Fatalf("P0-1: expected a tool_results 410 then a user reseed (lost=%v reseed=%v)", sawLostContinuation, sawReseed)
+	}
+}
+
 // P0-4 (bridge-down typed status) — a TRANSPORT failure dialing the bridge (the sidecar down / refusing
 // connections) must surface as a typed 503 Service Unavailable on BOTH paths (a retryable upstream outage),
 // never an opaque 500, and must produce no response (so no phantom response-session mapping is recorded —

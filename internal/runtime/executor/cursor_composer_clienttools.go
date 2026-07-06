@@ -148,6 +148,7 @@ func composerEventIsBenignTelemetry(eventType string) bool {
 type composerBridgeStatusError struct {
 	status      int
 	correlation string
+	retryAfter  *time.Duration
 }
 
 func (e *composerBridgeStatusError) Error() string {
@@ -169,6 +170,47 @@ func (e *composerBridgeStatusError) Error() string {
 // StatusCode implements cliproxyexecutor.StatusError so the conductor/handler preserve the bridge status
 // to the client (e.g. a 410 stays a 410, a 429 stays a 429) instead of collapsing every non-2xx to 500.
 func (e *composerBridgeStatusError) StatusCode() int { return e.status }
+
+// RetryAfter exposes bridge/local-admission retry hints to the conductor so 429 cooldowns use the provider's
+// actual backoff window instead of a generic quota schedule.
+func (e *composerBridgeStatusError) RetryAfter() *time.Duration { return e.retryAfter }
+
+var composerRetryInPattern = regexp.MustCompile(`(?i)retry\s+in\s+~?\s*(\d+)\s*s`)
+
+func parseComposerRetryAfterHeader(h http.Header, now time.Time) *time.Duration {
+	raw := strings.TrimSpace(h.Get("Retry-After"))
+	if raw == "" {
+		return nil
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil {
+		d := time.Duration(seconds) * time.Second
+		if d < 0 {
+			d = 0
+		}
+		return &d
+	}
+	if t, err := http.ParseTime(raw); err == nil {
+		d := t.Sub(now)
+		if d < 0 {
+			d = 0
+		}
+		return &d
+	}
+	return nil
+}
+
+func parseComposerRetryAfterBody(body []byte) *time.Duration {
+	match := composerRetryInPattern.FindSubmatch(body)
+	if len(match) != 2 {
+		return nil
+	}
+	seconds, err := strconv.Atoi(string(match[1]))
+	if err != nil {
+		return nil
+	}
+	d := time.Duration(seconds) * time.Second
+	return &d
+}
 
 // composerBridgeUnavailableError is a typed executor error for a TRANSPORT failure dialing the bridge's
 // /agent/turn endpoint (connection refused, DNS, TLS, the sidecar process down or restarting) — distinct from a
@@ -3579,22 +3621,26 @@ func composerTurnBody(sessionID, model string, input map[string]any, advertise [
 
 // composerReseedLostContinuation builds a single fresh-seed retry for a tool_results continuation that the
 // bridge reported GONE (410): the session this result answers was lost (ESC-interrupt, bridge restart, or idle
-// eviction). It returns (reseedSid, reseedBody, true) ONLY when the inbound turn is a tool_results continuation
-// that REPLAYS the conversation from the top (composerContinuationCarriesOpener) — so it can be re-seeded from
-// its own replayed history. Otherwise it returns ("", nil, false) and the caller surfaces the typed 410: a thin
-// continuation (no replayed opener) or a non-continuation 410 has no re-seedable context and must NEVER be
-// turned into a fabricated success. The reseed re-frames the turn as a fresh type:"user" seed (mirrors the
-// deriveComposerSessionID lost-fork reseed at the ownership-miss branch): it drops the now-unanswerable
-// tool_results and keeps the replayed history/system/images plus the trailing user instruction as the seed
-// text, so the bridge creates a fresh session, seeds it from history+system, and answers — the lost tool work
-// is re-done, never silently discarded.
+// eviction). It returns (reseedSid, reseedBody, true) when the inbound continuation can safely be reframed as a
+// fresh user turn:
+//   - full replay continuations carry an opener/history, so the lost tool work can be re-done from context;
+//   - thin mixed continuations carry a new user instruction/image, so the stale tool_results can be dropped and
+//     the latest user payload can continue in the same client session without forcing a new Claude session.
+//
+// A pure thin continuation (only stale tool results, no replayed opener and no new user payload) still returns
+// ("", nil, false) and surfaces the typed 410: there is no context to re-seed from and no new user work to
+// answer, so fabricating success would silently discard tool output.
 func composerReseedLostContinuation(tenant, apiKey string, oai []byte, opts cliproxyexecutor.Options, contHint composerContinuationHint, model string, advertise []map[string]any, toolChoice string, constraints map[string]any) (string, []byte, bool) {
 	contMsgs := gjson.GetBytes(oai, "messages").Array()
 	if _, _, isCont := composerToolResultsHinted(contMsgs, contHint); !isCont {
 		return "", nil, false // a new-user-turn 410 is a real error, never reseeded
 	}
-	if !composerContinuationCarriesOpener(contMsgs) {
-		return "", nil, false // thin continuation: no replayed opener to seed from -> surface the 410
+	inp := composerInputHinted(oai, contHint)
+	carriesOpener := composerContinuationCarriesOpener(contMsgs)
+	userText, _ := inp["userText"].(string)
+	userImages, _ := inp["images"].([]map[string]any)
+	if !carriesOpener && strings.TrimSpace(userText) == "" && len(userImages) == 0 {
+		return "", nil, false // pure thin continuation: no replayed opener and no new user payload
 	}
 	// Re-derive the reseed sid exactly as deriveComposerSessionID does on a lost continuation (the ownership-miss
 	// branch): a fork-namespaced id (deterministic with a stable lineage secret, re-resolvable on later turns) when
@@ -3602,21 +3648,24 @@ func composerReseedLostContinuation(tenant, apiKey string, oai []byte, opts clip
 	var reseedSid string
 	if id := stableConversationID(opts); id != "" {
 		baseSid := composerStableBaseSessionID(tenant, apiKey, id)
-		headDigest := lineageHeadDigest(tenant, composerHistoryFingerprint(contMsgs), contMsgs)
-		openerFP := lineageOpenerFingerprint(contMsgs)
-		// Route via the SAME decision as deriveComposerSessionID: resume the alive durable base (context intact,
-		// recovered via the bridge's local.force) when safe, else fork (reseedLostFork). The seed below still
-		// carries the bounded history as a SAFETY NET — the bridge skips re-prepend when baseSid actually resumes
-		// (seeded=true) and uses it only if baseSid must be created fresh, so routing to baseSid never loses
-		// context either way.
-		reseedSid, _ = composerLostContinuationSessionID(tenant, baseSid, headDigest, openerFP)
+		if carriesOpener {
+			headDigest := lineageHeadDigest(tenant, composerHistoryFingerprint(contMsgs), contMsgs)
+			openerFP := lineageOpenerFingerprint(contMsgs)
+			// Route via the SAME decision as deriveComposerSessionID: resume the alive durable base (context intact,
+			// recovered via the bridge's local.force) when safe, else fork (reseedLostFork). The seed below still
+			// carries the bounded history as a SAFETY NET — the bridge skips re-prepend when baseSid actually resumes
+			// (seeded=true) and uses it only if baseSid must be created fresh, so routing to baseSid never loses
+			// context either way.
+			reseedSid, _ = composerLostContinuationSessionID(tenant, baseSid, headDigest, openerFP)
+		} else {
+			reseedSid = baseSid
+		}
 	} else {
 		reseedSid = mintComposerSessionID()
 	}
-	inp := composerInputHinted(oai, contHint)
 	seed := map[string]any{"type": "user", "text": ""}
-	if t, ok := inp["userText"].(string); ok && t != "" {
-		seed["text"] = t
+	if userText != "" {
+		seed["text"] = userText
 	}
 	for _, k := range []string{"system", "history", "historyFingerprint"} {
 		if v, ok := inp[k]; ok {
@@ -3631,10 +3680,13 @@ func composerReseedLostContinuation(tenant, apiKey string, oai []byte, opts clip
 	if v, ok := inp["images"].([]map[string]any); ok {
 		seedImages = append(seedImages, v...)
 	}
-	if results, ok := inp["results"].([]map[string]any); ok {
-		for _, r := range results {
-			if imgs, ok := r["images"].([]map[string]any); ok {
-				seedImages = append(seedImages, imgs...)
+	if carriesOpener {
+		results, ok := inp["results"].([]map[string]any)
+		if ok {
+			for _, r := range results {
+				if imgs, ok := r["images"].([]map[string]any); ok {
+					seedImages = append(seedImages, imgs...)
+				}
 			}
 		}
 	}
@@ -3951,13 +4003,17 @@ func composerValidateAgentTurnPreStream(resp *http.Response, responseID string, 
 		if closeBody {
 			_ = resp.Body.Close()
 		}
+		retryAfter := parseComposerRetryAfterHeader(resp.Header, time.Now())
+		if retryAfter == nil {
+			retryAfter = parseComposerRetryAfterBody(errBody)
+		}
 		corr := composerCorrelationID()
 		if stream {
 			log.Errorf("[composer %s] STREAM bridge NON-2xx corr=%s status=%d body=%s", responseID, corr, resp.StatusCode, sanitizeBridgeBody(errBody))
 		} else {
 			log.Errorf("[composer %s] bridge NON-2xx corr=%s status=%d body=%s", responseID, corr, resp.StatusCode, sanitizeBridgeBody(errBody))
 		}
-		return &composerBridgeStatusError{status: resp.StatusCode, correlation: corr}
+		return &composerBridgeStatusError{status: resp.StatusCode, correlation: corr, retryAfter: retryAfter}
 	}
 	if !composerResponseIsSSE(resp) {
 		ctHdr := resp.Header.Get("Content-Type")
@@ -4603,19 +4659,230 @@ func composerCorrelationID() string {
 	return composerRandHex(8)
 }
 
+type composerAdmissionGate struct {
+	mu     sync.Mutex
+	states map[string]*composerAdmissionState
+	nowFn  func() time.Time
+}
+
+type composerAdmissionState struct {
+	active    int
+	queued    int
+	lastStart time.Time
+}
+
+type composerAdmissionLease struct {
+	g        *composerAdmissionGate
+	key      string
+	released bool
+}
+
+type composerAdmissionError struct {
+	retryAfter time.Duration
+}
+
+func (e *composerAdmissionError) Error() string {
+	return fmt.Sprintf("cursor composer: local admission queue is full; retry in ~%ds", composerRetryAfterSeconds(e.retryAfter))
+}
+
+func (e *composerAdmissionError) StatusCode() int { return http.StatusTooManyRequests }
+
+func (e *composerAdmissionError) RetryAfter() *time.Duration { return &e.retryAfter }
+
+var composerAdmission = newComposerAdmissionGate()
+
+func newComposerAdmissionGate() *composerAdmissionGate {
+	return &composerAdmissionGate{states: make(map[string]*composerAdmissionState), nowFn: time.Now}
+}
+
+func composerEnvInt(name string, def, min int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < min {
+		log.Warnf("[composer] invalid %s=%q; using default %d", name, raw, def)
+		return def
+	}
+	return n
+}
+
+func composerAdmissionConfig() (maxActive int, maxQueue int, minGap time.Duration) {
+	maxActive = composerEnvInt("CURSOR_COMPOSER_ADMISSION_MAX_ACTIVE_PER_KEY", 2, 1)
+	maxQueue = composerEnvInt("CURSOR_COMPOSER_ADMISSION_MAX_QUEUE_PER_KEY", 16, 0)
+	minGap = time.Duration(composerEnvInt("CURSOR_COMPOSER_ADMISSION_MIN_GAP_MS", 1000, 0)) * time.Millisecond
+	return maxActive, maxQueue, minGap
+}
+
+func composerAdmissionApplies(body []byte) bool {
+	return gjson.GetBytes(body, "input.type").String() != "tool_results"
+}
+
+func composerAdmissionKey(apiKey string) string {
+	if fp := composerKeyFingerprint(apiKey); fp != "" {
+		return fp
+	}
+	return "empty"
+}
+
+func composerAdmissionWaitLocked(st *composerAdmissionState, now time.Time, minGap time.Duration) time.Duration {
+	wait := 250 * time.Millisecond
+	if minGap > 0 && !st.lastStart.IsZero() {
+		if gap := st.lastStart.Add(minGap).Sub(now); gap > wait {
+			wait = gap
+		}
+	}
+	return wait
+}
+
+func (g *composerAdmissionGate) acquire(ctx context.Context, apiKey string, body []byte) (*composerAdmissionLease, error) {
+	if !composerAdmissionApplies(body) {
+		return nil, nil
+	}
+	key := composerAdmissionKey(apiKey)
+	queued := false
+	for {
+		maxActive, maxQueue, minGap := composerAdmissionConfig()
+		g.mu.Lock()
+		st := g.states[key]
+		if st == nil {
+			st = &composerAdmissionState{}
+			g.states[key] = st
+		}
+		now := g.nowFn()
+		gapOK := minGap <= 0 || st.lastStart.IsZero() || !now.Before(st.lastStart.Add(minGap))
+		if st.active < maxActive && gapOK {
+			if queued {
+				st.queued--
+				queued = false
+			}
+			st.active++
+			st.lastStart = now
+			active, queuedCount := st.active, st.queued
+			g.mu.Unlock()
+			composerDebugf("[composer] admission admitted key=%s active=%d queued=%d", key, active, queuedCount)
+			return &composerAdmissionLease{g: g, key: key}, nil
+		}
+		if !queued {
+			if st.queued >= maxQueue {
+				retryAfter := composerAdmissionWaitLocked(st, now, minGap)
+				g.mu.Unlock()
+				return nil, &composerAdmissionError{retryAfter: retryAfter}
+			}
+			st.queued++
+			queued = true
+			active, queuedCount := st.active, st.queued
+			composerDebugf("[composer] admission queued key=%s active=%d queued=%d", key, active, queuedCount)
+		}
+		wait := composerAdmissionWaitLocked(st, now, minGap)
+		g.mu.Unlock()
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if queued {
+				g.mu.Lock()
+				if st := g.states[key]; st != nil {
+					st.queued--
+					if st.active == 0 && st.queued == 0 {
+						delete(g.states, key)
+					}
+				}
+				g.mu.Unlock()
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (l *composerAdmissionLease) release() {
+	if l == nil || l.g == nil || l.released {
+		return
+	}
+	l.released = true
+	l.g.mu.Lock()
+	defer l.g.mu.Unlock()
+	st := l.g.states[l.key]
+	if st == nil {
+		return
+	}
+	if st.active > 0 {
+		st.active--
+	}
+	composerDebugf("[composer] admission released key=%s active=%d queued=%d", l.key, st.active, st.queued)
+	if st.active == 0 && st.queued == 0 {
+		delete(l.g.states, l.key)
+	}
+}
+
+type composerAdmissionReadCloser struct {
+	io.ReadCloser
+	lease *composerAdmissionLease
+}
+
+func (rc *composerAdmissionReadCloser) Close() error {
+	err := rc.ReadCloser.Close()
+	rc.lease.release()
+	return err
+}
+
+func composerAdmissionHTTPResponse(err *composerAdmissionError) *http.Response {
+	retrySeconds := composerRetryAfterSeconds(err.retryAfter)
+	body := []byte(fmt.Sprintf(`{"error":%q}`, err.Error()))
+	return &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Status:     http.StatusText(http.StatusTooManyRequests),
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+			"Retry-After":  []string{strconv.Itoa(retrySeconds)},
+		},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+}
+
+func composerRetryAfterSeconds(d time.Duration) int {
+	if d <= 0 {
+		return 1
+	}
+	seconds := int((d + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
 // postAgentTurn POSTs a turn body to the bridge's /agent/turn endpoint (SSE response).
 func (e *CursorExecutor) postAgentTurn(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, body []byte) (*http.Response, error) {
+	admissionLease, err := composerAdmission.acquire(ctx, apiKey, body)
+	if err != nil {
+		var admissionErr *composerAdmissionError
+		if errors.As(err, &admissionErr) {
+			return composerAdmissionHTTPResponse(admissionErr), nil
+		}
+		return nil, err
+	}
 	// ADD-41/ADD-47: validate + structurally build the /agent/turn URL (reject userinfo/query in the base,
 	// require https for non-local hosts) BEFORE sending any credential. A bad/insecure config fails here
 	// with a typed error instead of leaking the Cursor key over a cleartext or mis-joined URL.
 	turnURL, err := buildComposerTurnURL(auth)
 	if err != nil {
+		admissionLease.release()
 		corr := composerCorrelationID()
 		log.Errorf("[composer] postAgentTurn URL REJECTED corr=%s base=%s: %v", corr, redactBridgeURL(resolveComposerBridgeURL(auth)), err)
 		return nil, err
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, turnURL, bytes.NewReader(body))
 	if err != nil {
+		admissionLease.release()
 		return nil, fmt.Errorf("cursor composer: failed to create /agent/turn request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -4642,6 +4909,7 @@ func (e *CursorExecutor) postAgentTurn(ctx context.Context, auth *cliproxyauth.A
 	}
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		admissionLease.release()
 		// M25: redact the URL (userinfo + secret query params) before logging; a transport error string can
 		// itself echo the dialed URL, so sanitize it too.
 		corr := composerCorrelationID()
@@ -4650,5 +4918,8 @@ func (e *CursorExecutor) postAgentTurn(ctx context.Context, auth *cliproxyauth.A
 		return nil, fmt.Errorf("cursor composer: /agent/turn request failed (correlation %s)", corr)
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	if admissionLease != nil && httpResp.Body != nil {
+		httpResp.Body = &composerAdmissionReadCloser{ReadCloser: httpResp.Body, lease: admissionLease}
+	}
 	return httpResp, nil
 }

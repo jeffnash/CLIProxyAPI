@@ -1,8 +1,8 @@
 # Binaries
 cli-proxy-api
-cliproxy
+/cliproxy
 *.exe
-server
+/server
 # Configuration
 config.yaml
 .env
@@ -26,6 +26,7 @@ static/*
 debug/*
 coverage.out
 .cache/
+.meta-harness/
 # Authentication data
 auths/*
 /auths
@@ -69,6 +70,7 @@ _bmad-output/*
 .letta/
 .codex/
 sidecars/cursor-bridge/node_modules/
+sidecars/cursor-bridge/.cursor-agent-store/
 
 # Cursor SDK trace harnesses — local-only debug artifacts. Keep these out of
 # source control; if you need them locally they read CURSOR_API_KEY from env.
