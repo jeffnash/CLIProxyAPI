@@ -2,8 +2,51 @@ package secretdlp
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"math/big"
+	"strconv"
+	"strings"
 	"testing"
 )
+
+func testGenBase58Secret(t *testing.T) string {
+	t.Helper()
+	b := make([]byte, 64)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatalf("rand.Read(): %v", err)
+	}
+	if b[0] == 0 {
+		b[0] = 1
+	}
+	n := new(big.Int).SetBytes(b)
+	fiftyEight := big.NewInt(58)
+	mod := new(big.Int)
+	var sb strings.Builder
+	for n.Sign() > 0 {
+		n.DivMod(n, fiftyEight, mod)
+		sb.WriteByte(base58Alphabet[mod.Int64()])
+	}
+	r := []byte(sb.String())
+	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
+		r[i], r[j] = r[j], r[i]
+	}
+	out := string(r)
+	if base58DecodedLen(out) != 64 {
+		t.Fatalf("generated base58 decodes to %d bytes, want 64", base58DecodedLen(out))
+	}
+	return out
+}
+
+func joinRepeatedInt(value, n int) string {
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = strconv.Itoa(value)
+	}
+	return strings.Join(parts, ",")
+}
 
 func TestBuiltinScannerFindsAssignmentSecret(t *testing.T) {
 	scanner := NewBuiltinScanner(10, 12)
@@ -201,6 +244,19 @@ func TestExplicitRawFindingsSkipsUnmarkedBodiesAndHonorsMaxFindings(t *testing.T
 	}
 }
 
+func TestExplicitRawFindingsFindsKnownProviderWebhookURL(t *testing.T) {
+	// Split literal so this synthetic webhook fixture does not trip provider-side
+	// push-protection scanners; the runtime value is unchanged.
+	webhook := "https://hooks.slack.com/services/T00000000/B00000000/" + "AbCdEfGhIjKlMnOpQrStUvWx"
+	findings := explicitRawFindings([]byte(`{"url":"`+webhook+`"}`), 12, 10)
+	assertFinding(t, findings, webhook)
+	assertRuleAndConfidence(t, findings, webhook, "known-provider-key", 0.95)
+
+	if findings := explicitRawFindings([]byte(`{"url":"https://slack.com/help/articles/000000"}`), 12, 10); len(findings) != 0 {
+		t.Fatalf("findings = %+v, want none for non-webhook Slack URL", findings)
+	}
+}
+
 func TestCompositeScannerDedupesFindings(t *testing.T) {
 	composite := &CompositeScanner{
 		scanners: []Scanner{
@@ -297,9 +353,10 @@ func TestBareCredentialIgnoresIdentifierShapes(t *testing.T) {
 	}
 }
 
-func TestFilterFindingsSubtractsBareTokenEqualToToolName(t *testing.T) {
-	// A tools[].name that happens to equal a credential-shaped string must
-	// suppress the finding everywhere, including content mentions.
+func TestFilterFindingsKeepsBareTokenEqualToToolName(t *testing.T) {
+	// Protocol bytes are protected by segment scoping, but a credential-shaped
+	// value in content must not be allowed to egress raw solely because the same
+	// value appears as an identifier.
 	token := "tp-s8lnnc4nf0a0s296fb63ya9vqzvctz0ohk26q1ewrks0252f"
 	ids := make(IdentifierSet)
 	ids.add(token)
@@ -309,8 +366,397 @@ func TestFilterFindingsSubtractsBareTokenEqualToToolName(t *testing.T) {
 		Source:     "builtin",
 		Confidence: 0.85,
 	}}, ids, Config{RedactThreshold: 0.80})
+	if len(accepted) != 1 || accepted[0].Secret != token || len(shadow) != 0 {
+		t.Fatalf("filterFindings() accepted=%v shadow=%v, want explicit credential accepted", accepted, shadow)
+	}
+}
+
+func TestFilterFindingsStillSubtractsGenericTokenEqualToToolName(t *testing.T) {
+	token := "mcp__codebase-memory-mcp__manage_adr"
+	ids := make(IdentifierSet)
+	ids.add(token)
+	accepted, shadow := filterFindings([]Finding{{
+		Secret:     token,
+		RuleID:     "betterleaks-generic",
+		Source:     "betterleaks",
+		Confidence: 0.90,
+	}}, ids, Config{RedactThreshold: 0.80})
 	if len(accepted) != 0 || len(shadow) != 0 {
-		t.Fatalf("filterFindings() accepted=%v shadow=%v, want identifier subtraction", accepted, shadow)
+		t.Fatalf("filterFindings() accepted=%v shadow=%v, want generic identifier subtraction", accepted, shadow)
+	}
+}
+
+func TestFindingsBySecretKeepsHighestConfidence(t *testing.T) {
+	token := "ghp_A1b2C3d4E5f6A1b2C3d4E5f6A1b2C3d4E5f6"
+	findings := findingsBySecret([]Finding{
+		{Secret: token, RuleID: "known-provider-key", Confidence: 0.95},
+		{Secret: token, RuleID: "bare-credential-prefixed", Confidence: 0.85},
+	})
+	got := findings[token]
+	if got.RuleID != "known-provider-key" || got.Confidence != 0.95 {
+		t.Fatalf("findingsBySecret()[%q] = %+v, want highest confidence", token, got)
+	}
+}
+
+func TestBIP39WordlistEmbedded(t *testing.T) {
+	if len(bip39Wordlist) != 2048 {
+		t.Fatalf("len(bip39Wordlist) = %d, want 2048", len(bip39Wordlist))
+	}
+	sum := sha256.Sum256([]byte(bip39WordlistRaw))
+	if got, want := hex.EncodeToString(sum[:]), "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda"; got != want {
+		t.Fatalf("bip39_english.txt sha256 = %s, want %s", got, want)
+	}
+}
+
+func TestBuiltinScannerFindsExpandedKnownProviderKeys(t *testing.T) {
+	scanner := NewBuiltinScanner(50, 12)
+	for name, token := range map[string]string{
+		"slack webhook":     "https://hooks.slack.com/services/T00000000/B00000000/" + "AbCdEfGhIjKlMnOpQrStUvWx",
+		"discord webhook":   "https://discord.com/api/webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWxYz-123",
+		"google access":     "ya29.A0AfH6SMDLPFixtureToken1234567890abcdef",
+		"google refresh":    "1//0gDLPFixtureRefreshToken1234567890abcdef",
+		"huggingface":       "hf_abcdefghijklmnopqrstuvwxyzABCDEFGH1234",
+		"groq":              "gsk_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN123456",
+		"perplexity":        "pplx-abcdefghijklmnopqrstuvwxyz1234567890ABCD",
+		"together":          "tgp_v1_abcdefghijklmnopqrstuvwxyz1234567890ABCD",
+		"cohere":            "co_abcdefghijklmnopqrstuvwxyz123456",
+		"digitalocean":      "dop_v1_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
+		"pypi":              "pypi-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
+		"docker hub":        "dckr_pat_abcdefghijklmnopqrstuvwxyz1234567890ABCD",
+		"terraform cloud":   "atlasv1.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
+		"stripe restricted": "rk_live_" + "abcdefghijklmnopqrstuvwxyz123456",
+		"square":            "sq0atp-abcdefghijklmnopqrstuvwxyz1234567890",
+		"plaid":             "access-production-abcdefghijklmnopqrstuvwxyz-123456",
+		"sendgrid":          "SG.abcdefghijklmnopqrstuvwxyz.ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+		"mailchimp":         "0123456789abcdef0123456789abcdef" + "-us20",
+		// Split literal so this synthetic fixture does not trip provider-side
+		// push-protection secret scanners; the runtime value is unchanged.
+		"twilio": "SK" + "0123456789abcdef0123456789ABCDEF",
+		"gitlab": "glpat-abcdefghijklmnopqrstuvwxyz123456",
+	} {
+		findings, err := scanner.Scan(context.Background(), testSegments("credential: "+token, ContentText))
+		if err != nil {
+			t.Fatalf("%s Scan() error = %v", name, err)
+		}
+		assertFinding(t, findings, token)
+		assertRuleAndConfidence(t, findings, token, "known-provider-key", 0.95)
+	}
+}
+
+func TestExpandedKnownProviderKeysIgnoreFalsePositives(t *testing.T) {
+	scanner := NewBuiltinScanner(20, 12)
+	for _, s := range []string{
+		"https://slack.com/help/articles/000000",
+		"https://discord.com/channels/123456789012345678/987654321098765432",
+		"ya29.not-long-enough",
+		"hf_short",
+		"co_short",
+		"pplx-project-docs-and-routes",
+		"SG.this.is.documentation",
+		"SKnothexadecimalnothexadecimalnothex",
+	} {
+		findings, err := scanner.Scan(context.Background(), testSegments(s, ContentText))
+		if err != nil {
+			t.Fatalf("Scan(%q) error = %v", s, err)
+		}
+		if len(findings) != 0 {
+			t.Fatalf("Scan(%q) = %+v, want no findings", s, findings)
+		}
+	}
+}
+
+func TestBuiltinScannerFindsContextGatedCloudAndAuthKeys(t *testing.T) {
+	scanner := NewBuiltinScanner(20, 12)
+	awsSecret := "abcdEFGH1234ijklMNOP5678qrstUVWX9012yzAB"
+	azureKey := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/abcdefghijklmnopqrstuvwxyzABCD=="
+	basic := base64.StdEncoding.EncodeToString([]byte("cliproxy:" + "correct-horse-token"))
+	for name, tc := range map[string]struct {
+		text       string
+		secret     string
+		rule       string
+		confidence float64
+	}{
+		"aws secret": {
+			text:       "aws_secret_access_key=" + awsSecret,
+			secret:     awsSecret,
+			rule:       "aws-secret-access-key",
+			confidence: 0.90,
+		},
+		"azure account key": {
+			text:       "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=" + azureKey + ";EndpointSuffix=core.windows.net",
+			secret:     azureKey,
+			rule:       "azure-storage-account-key",
+			confidence: 0.90,
+		},
+		"basic auth": {
+			text:       "Authorization: Basic " + basic,
+			secret:     basic,
+			rule:       "basic-auth",
+			confidence: 0.90,
+		},
+	} {
+		findings, err := scanner.Scan(context.Background(), testSegments(tc.text, ContentText))
+		if err != nil {
+			t.Fatalf("%s Scan() error = %v", name, err)
+		}
+		assertFinding(t, findings, tc.secret)
+		assertRuleAndConfidence(t, findings, tc.secret, tc.rule, tc.confidence)
+	}
+}
+
+func TestContextGatedCloudAndAuthKeysIgnoreFalsePositives(t *testing.T) {
+	scanner := NewBuiltinScanner(20, 12)
+	for _, s := range []string{
+		"abcdEFGH1234ijklMNOP5678qrstUVWX9012yzAB",
+		"sha256:0d17b565c37bcbd895e9d92315a05c1c3c9a29f762b011a10c54a66cd53c9b31",
+		"DefaultEndpointsProtocol=https;AccountName=acct;EndpointSuffix=core.windows.net",
+		"Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte("not-a-secret")),
+		"Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte("user:short")),
+	} {
+		findings, err := scanner.Scan(context.Background(), testSegments(s, ContentText))
+		if err != nil {
+			t.Fatalf("Scan(%q) error = %v", s, err)
+		}
+		if len(findings) != 0 {
+			t.Fatalf("Scan(%q) = %+v, want no findings", s, findings)
+		}
+	}
+}
+
+func TestBuiltinScannerFindsPrivateKeyMaterial(t *testing.T) {
+	scanner := NewBuiltinScanner(20, 12)
+	openSSH := "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmU=\n-----END OPENSSH PRIVATE KEY-----"
+	pgp := "-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: Test\n\nabc123\n-----END PGP PRIVATE KEY BLOCK-----"
+	age := "AGE-SECRET-KEY-1ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGH"
+	for name, tc := range map[string]struct {
+		text       string
+		secret     string
+		rule       string
+		confidence float64
+	}{
+		"openssh": {text: openSSH, secret: openSSH, rule: "pem-private-key", confidence: 1.0},
+		"pgp":     {text: pgp, secret: pgp, rule: "pem-private-key", confidence: 1.0},
+		"age":     {text: age, secret: age, rule: "age-secret-key", confidence: 1.0},
+	} {
+		findings, err := scanner.Scan(context.Background(), testSegments(tc.text, ContentText))
+		if err != nil {
+			t.Fatalf("%s Scan() error = %v", name, err)
+		}
+		assertFinding(t, findings, tc.secret)
+		assertRuleAndConfidence(t, findings, tc.secret, tc.rule, tc.confidence)
+	}
+}
+
+func TestPrivateKeyMaterialIgnoresPublicKeyFalsePositives(t *testing.T) {
+	scanner := NewBuiltinScanner(20, 12)
+	for _, s := range []string{
+		"-----BEGIN PUBLIC KEY-----\nabc123\n-----END PUBLIC KEY-----",
+		"age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+		"-----BEGIN PGP PUBLIC KEY BLOCK-----\nabc123\n-----END PGP PUBLIC KEY BLOCK-----",
+	} {
+		findings, err := scanner.Scan(context.Background(), testSegments(s, ContentText))
+		if err != nil {
+			t.Fatalf("Scan(%q) error = %v", s, err)
+		}
+		if len(findings) != 0 {
+			t.Fatalf("Scan(%q) = %+v, want no findings", s, findings)
+		}
+	}
+}
+
+// puttyKeyFixture returns a structurally valid PPK-style body plus one of its
+// private base64 lines, so tests can assert the redaction span covers it.
+func puttyKeyFixture() (body, privateLine string) {
+	privateLine = "PRIVATEsecretbase64line0000000000000000000000000000000000"
+	body = "PuTTY-User-Key-File-2: ssh-rsa\n" +
+		"Encryption: none\n" +
+		"Comment: rsa-key-20260101\n" +
+		"Public-Lines: 1\n" +
+		"AAAAB3NzaC1yc2EApublicline00000000000000000000000000000000\n" +
+		"Private-Lines: 2\n" +
+		privateLine + "\n" +
+		"PRIVATEsecretbase64line1111111111111111111111111111111111\n" +
+		"Private-MAC: 1a2b3c4d5e6f78901a2b3c4d5e6f78901a2b3c4d"
+	return body, privateLine
+}
+
+func TestBuiltinScannerRedactsFullPuTTYPrivateKeyBlock(t *testing.T) {
+	scanner := NewBuiltinScanner(10, 12)
+	ppk, privateLine := puttyKeyFixture()
+	findings, err := scanner.Scan(context.Background(), testSegments(ppk, ContentText))
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+	// The finding must span through Private-MAC (not stop at the Private-Lines
+	// header), so redacting the matched substring removes the private base64.
+	var got string
+	for _, f := range findings {
+		if strings.Contains(f.Secret, "PuTTY-User-Key-File-") {
+			got = f.Secret
+		}
+	}
+	if got == "" {
+		t.Fatalf("findings = %+v, want PuTTY private key block", findings)
+	}
+	if !strings.Contains(got, privateLine) {
+		t.Fatalf("PuTTY finding does not span private key lines: %q", got)
+	}
+}
+
+func TestExplicitRawFindingsRedactsStandalonePuTTYKey(t *testing.T) {
+	ppk, privateLine := puttyKeyFixture()
+	// A .ppk body carries no -----BEGIN marker; the raw fallback must still find
+	// it via its dedicated PuTTY anchor.
+	findings := explicitRawFindings([]byte(ppk), 12, 10)
+	var got string
+	for _, f := range findings {
+		if strings.Contains(f.Secret, "PuTTY-User-Key-File-") {
+			got = f.Secret
+		}
+	}
+	if got == "" {
+		t.Fatalf("findings = %+v, want standalone .ppk body found on raw fallback", findings)
+	}
+	if !strings.Contains(got, privateLine) {
+		t.Fatalf("raw PuTTY finding does not span private key lines: %q", got)
+	}
+}
+
+func TestCompositeScannerKeepsValidatedRawCredentialWithBenignShape(t *testing.T) {
+	scanner, err := NewScanner(Config{Scanner: "builtin", MaxFindings: 10, MinValueLength: 12})
+	if err != nil {
+		t.Fatalf("NewScanner(): %v", err)
+	}
+	// Letter-heavy Base64 values with '/' separators trip both the wordlike and
+	// separator benign heuristics; a validator/context-gated finding must still
+	// survive the composite re-check instead of being reclassified benign.
+	awsSecret := "abcdEFGH/ijklMNOP/qrstUVWX/yzABcdef/ghij" // 40 base64 chars
+	azureKey := strings.Repeat("abcd/EFGH", 10) + "=="      // 90 base64 chars + padding
+	for name, tc := range map[string]struct {
+		text   string
+		secret string
+	}{
+		"aws slash body":   {text: "aws_secret_access_key=" + awsSecret, secret: awsSecret},
+		"azure slash body": {text: "AccountKey=" + azureKey + ";EndpointSuffix=core.windows.net", secret: azureKey},
+	} {
+		findings, err := scanner.Scan(context.Background(), testSegments(tc.text, ContentText))
+		if err != nil {
+			t.Fatalf("%s Scan() error = %v", name, err)
+		}
+		assertFinding(t, findings, tc.secret)
+	}
+}
+
+func TestBuiltinScannerFindsCryptoWalletMaterial(t *testing.T) {
+	scanner := NewBuiltinScanner(20, 12)
+	solana := testGenBase58Secret(t)
+	evm := "4c0883a69102937d6231471b5dbb6204fe512961708279e4f4c0883a69102937"
+	ed25519 := "[" + joinRepeatedInt(7, 64) + "]"
+	// Canonical BIP39 test vector: 128-bit all-zero entropy, checksum word "about".
+	mnemonic := "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+	for name, tc := range map[string]struct {
+		text       string
+		secret     string
+		rule       string
+		confidence float64
+	}{
+		"solana base58": {text: "wallet keypair " + solana, secret: solana, rule: "solana-keypair-base58", confidence: 1.0},
+		"evm hex":       {text: "private_key=" + evm, secret: evm, rule: "evm-private-key-hex", confidence: 0.90},
+		"ed25519 array": {text: ed25519, secret: ed25519, rule: "ed25519-keypair-json-array", confidence: 0.98},
+		"bip39":         {text: mnemonic, secret: mnemonic, rule: "bip39-mnemonic", confidence: 0.98},
+	} {
+		findings, err := scanner.Scan(context.Background(), testSegments(tc.text, ContentText))
+		if err != nil {
+			t.Fatalf("%s Scan() error = %v", name, err)
+		}
+		assertFinding(t, findings, tc.secret)
+		assertRuleAndConfidence(t, findings, tc.secret, tc.rule, tc.confidence)
+	}
+}
+
+func TestCryptoWalletMaterialIgnoresFalsePositives(t *testing.T) {
+	scanner := NewBuiltinScanner(20, 12)
+	for _, s := range []string{
+		"4c0883a69102937d6231471b5dbb6204fe512961708279e4f4c0883a69102937",
+		"commit 5318b4d5bcd28de64ee5559e671353e16f075ecae9f99c7a79a38af5f869aa46",
+		"sha256:0d17b565c37bcbd895e9d92315a05c1c3c9a29f762b011a10c54a66cd53c9b31",
+		"9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+		"[" + joinRepeatedInt(300, 64) + "]",
+		"[" + joinRepeatedInt(5, 32) + "]",
+		"the quick brown fox jumps over the lazy sleeping dog again today",
+		// 12 valid BIP39 words but an invalid checksum: ordinary prose must not
+		// be redacted as a wallet mnemonic.
+		"abandon ability able about above absent absorb abstract absurd abuse access accident",
+	} {
+		findings, err := scanner.Scan(context.Background(), testSegments(s, ContentText))
+		if err != nil {
+			t.Fatalf("Scan(%q) error = %v", s, err)
+		}
+		if len(findings) != 0 {
+			t.Fatalf("Scan(%q) = %+v, want no findings", s, findings)
+		}
+	}
+}
+
+func TestBuiltinScannerFindsWholeObjectSecrets(t *testing.T) {
+	scanner := NewBuiltinScanner(20, 12)
+	gcpPrivateKeyEscaped := "-----BEGIN PRIVATE KEY-----\\nabc123fixture"
+	gcpPrivateKeyDecoded := "-----BEGIN PRIVATE KEY-----\nabc123fixture"
+	gcpJSON := `{"type":"service_account","project_id":"p","private_key":"` + gcpPrivateKeyEscaped + `"}`
+	ethCiphertext := "7b2274657374223a22646c70227d00112233445566778899aabbccddeeff"
+	ethJSON := `{"version":3,"crypto":{"ciphertext":"` + ethCiphertext + `","kdf":"scrypt"}}`
+	for name, tc := range map[string]struct {
+		segment    Segment
+		secret     string
+		rule       string
+		confidence float64
+	}{
+		"gcp json string": {
+			segment:    Segment{Path: "/messages/0/tool_calls/0/function/arguments", Value: gcpJSON, Kind: ToolArgs},
+			secret:     gcpPrivateKeyDecoded,
+			rule:       "gcp-service-account-json",
+			confidence: 0.98,
+		},
+		"ethereum json string": {
+			segment:    Segment{Path: "/messages/0/content", Value: ethJSON, Kind: ContentText},
+			secret:     ethCiphertext,
+			rule:       "ethereum-keystore-json",
+			confidence: 0.98,
+		},
+		"gcp structured leaves": {
+			segment:    Segment{Path: "/messages/0/content/0/input/private_key", Value: gcpPrivateKeyEscaped, Kind: ToolArgs},
+			secret:     gcpPrivateKeyEscaped,
+			rule:       "gcp-service-account-json",
+			confidence: 0.98,
+		},
+	} {
+		segs := []Segment{tc.segment}
+		if name == "gcp structured leaves" {
+			segs = append(segs, Segment{Path: "/messages/0/content/0/input/type", Value: "service_account", Kind: ToolArgs})
+		}
+		findings, err := scanner.Scan(context.Background(), segs)
+		if err != nil {
+			t.Fatalf("%s Scan() error = %v", name, err)
+		}
+		assertFinding(t, findings, tc.secret)
+		assertRuleAndConfidence(t, findings, tc.secret, tc.rule, tc.confidence)
+	}
+}
+
+func TestWholeObjectSecretsIgnoreFalsePositives(t *testing.T) {
+	scanner := NewBuiltinScanner(20, 12)
+	for _, segs := range [][]Segment{
+		testSegments(`{"type":"service_account","private_key_id":"abc123"}`, ContentText),
+		testSegments(`{"version":3,"crypto":{"ciphertext":"abc123","mac":"def456"}}`, ContentText),
+		{{Path: "/tools/0/input_schema/private_key", Value: "-----BEGIN PRIVATE KEY-----\\nabc", Kind: ContentText}},
+	} {
+		findings, err := scanner.Scan(context.Background(), segs)
+		if err != nil {
+			t.Fatalf("Scan(%+v) error = %v", segs, err)
+		}
+		if len(findings) != 0 {
+			t.Fatalf("Scan(%+v) = %+v, want no findings", segs, findings)
+		}
 	}
 }
 

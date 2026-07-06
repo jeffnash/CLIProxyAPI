@@ -3,6 +3,7 @@ package secretdlp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +32,32 @@ func TestServiceIdentifierFindingDoesNotMutateToolNameOrContentMention(t *testin
 	}
 	if string(redacted) != string(body) {
 		t.Fatalf("redacted body = %q, want unchanged %q", redacted, body)
+	}
+}
+
+func TestServiceCredentialShapedIdentifierStillRedactsContentMention(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	token := "tp-s8lnnc4nf0a0s296fb63ya9vqzvctz0ohk26q1ewrks0252f"
+	svc := newSegmentPolicyTestService(t)
+
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"please protect ` + token + `"}],"tools":[{"type":"function","function":{"name":"` + token + `","parameters":{"type":"object"}}}]}`)
+	c := newSecretDLPTestGinContext("/v1/chat/completions")
+
+	redacted, session, err := svc.RedactGinPayload(c, body)
+	if err != nil {
+		t.Fatalf("RedactGinPayload(): %v", err)
+	}
+	if session == nil {
+		t.Fatal("session = nil, want session for credential-shaped content mention")
+	}
+	if got := strings.Count(string(redacted), token); got != 1 {
+		t.Fatalf("redacted body contains raw token %d times, want only the tool name left: %s", got, redacted)
+	}
+	if !strings.Contains(string(redacted), `"name":"`+token+`"`) {
+		t.Fatalf("redacted body mutated tool name: %s", redacted)
+	}
+	if !strings.Contains(string(redacted), `please protect __CPA_DLP_v1_`) {
+		t.Fatalf("redacted body did not replace content mention with placeholder: %s", redacted)
 	}
 }
 
@@ -146,6 +173,41 @@ func TestServiceShortSchemaKeyDoesNotSuppressRealSecret(t *testing.T) {
 	}
 	if !bytes.Contains(redacted, []byte(`"sk":{"type":"string"}`)) {
 		t.Fatalf("redacted body = %q, want short schema key preserved", redacted)
+	}
+}
+
+func TestServiceWholeObjectDetectorDoesNotMutateToolSchema(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	privateKey := "-----BEGIN PRIVATE KEY-----\\nabc123fixture"
+	gcpJSON := `{"type":"service_account","project_id":"p","private_key":"` + privateKey + `"}`
+	content, err := json.Marshal(gcpJSON)
+	if err != nil {
+		t.Fatalf("json.Marshal(content): %v", err)
+	}
+	description, err := json.Marshal(gcpJSON)
+	if err != nil {
+		t.Fatalf("json.Marshal(description): %v", err)
+	}
+	svc := newSegmentPolicyTestService(t)
+
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":` + string(content) + `}],"tools":[{"type":"function","function":{"name":"Lookup","description":` + string(description) + `,"parameters":{"type":"object"}}}]}`)
+	c := newSecretDLPTestGinContext("/v1/chat/completions")
+
+	redacted, session, err := svc.RedactGinPayload(c, body)
+	if err != nil {
+		t.Fatalf("RedactGinPayload(): %v", err)
+	}
+	if session == nil {
+		t.Fatal("session = nil, want session for content service-account key redaction")
+	}
+	if got := strings.Count(string(redacted), "-----BEGIN PRIVATE KEY-----"); got != 1 {
+		t.Fatalf("redacted body contains private key %d times, want only tool schema copy left: %s", got, redacted)
+	}
+	if !bytes.Contains(redacted, description) {
+		t.Fatalf("redacted body mutated tool description: %s", redacted)
+	}
+	if !bytes.Contains(redacted, []byte("__CPA_DLP_v1_")) {
+		t.Fatalf("redacted body missing placeholder: %s", redacted)
 	}
 }
 
