@@ -524,6 +524,37 @@ nonstream-keepalive-interval: 0
 #  max-retries: 4             # retry intermittent 429s; set to 0 to disable
 #  retry-backoff: "5,15,30,60" # comma-separated seconds for each retry (default: 5s, 15s, 30s, 60s)
 
+# Managed provider configuration (optional; Claude/Anthropic and/or OpenAI-compatible upstreams).
+# Route explicitly via the configured prefix, e.g. `model: "example-<model>"`, or expose non-prefixed IDs depending on priority.
+#managed-providers:
+#  - name: "example-provider"             # required; used as the provider/auth name
+#    prefix: "example-"                   # optional; defaults to "<name>-"
+#    api-key: ""                          # direct key for local config; prefer api-key-env in hosted config
+#    api-key-env: "EXAMPLE_PROVIDER_KEY"  # optional env var lookup
+#    base-url: "https://provider.example/v1"
+#    claude-base-url: ""                  # optional; defaults to base-url
+#    anthropic-base-url: ""               # optional alias for claude-base-url
+#    openai-base-url: ""                  # optional; defaults to base-url
+#    claude-messages-path: "/messages"
+#    openai-chat-path: "/chat/completions"
+#    openai-responses-path: ""            # optional; direct Responses passthrough only when configured
+#    transport-mode: "auto"               # auto (default), claude, openai, or responses
+#    default-transport: "claude"          # claude (default) or openai for non-native inbound formats
+#    model-discovery:
+#      enabled: true
+#      path: "/models"
+#      format: "openai"
+#      ttl: "30m"
+#    models: []                           # optional allowlist (model IDs)
+#    models-exclude: []                   # optional denylist (model IDs)
+#    fallback-models: []                  # optional model IDs used when discovery is unavailable or incomplete
+#    headers: {}                          # optional static upstream headers
+#    priority: "fallback"                 # fallback (default) or primary
+#    secret-redaction: "inherit"          # inherit (default), enabled, or disabled
+#    proxy-url: ""                        # per-auth proxy override
+#    max-retries: 4                       # retry intermittent bootstrap failures; set to 0 to disable
+#    retry-backoff: "5,15,30,60"          # comma-separated seconds for each retry
+
 # Global OAuth model name aliases (per channel)
 # These aliases rename model IDs for both model listing and request routing.
 # Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai.

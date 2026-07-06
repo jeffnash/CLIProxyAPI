@@ -20,6 +20,7 @@ This is the Plus version of [CLIProxyAPI](https://github.com/router-for-me/CLIPr
 > - **More provider adapters & auth flows (Copilot, Grok, etc.)** — so you can route requests through the subscription/provider you already pay for, using a consistent OpenAI-compatible API surface.
 > - **Cursor Composer 2.5 (API key + SDK sidecar)** — route `composer-2.5` and related models through your Cursor subscription via `CURSOR_API_KEY` / `cursor-api-key` YAML. By default ("Cursor Composer Client-Tools"), the patched `@cursor/sdk` agent bridge (`sidecars/cursor-bridge/cursor-agent-bridge.mjs`) owns all Cursor I/O and every tool executes on the client through CLIProxy. Railway starts the bridge on `CURSOR_AGENT_BRIDGE_PORT` (default `9798`) automatically when `CURSOR_API_KEY` is set; set `CURSOR_DIRECT=1` only to opt into the gated legacy direct path.
 > - **Chutes provider support (API key + dynamic model discovery)** — optionally expose Chutes-hosted models via OpenAI-compatible endpoints using `CHUTES_API_KEY` / `CHUTES_BASE_URL`. Supports configurable retry logic with `CHUTES_MAX_RETRIES` (default: 4) and `CHUTES_RETRY_BACKOFF` (default: `5,15,30,60` seconds).
+> - **Managed provider support (API key + dynamic model discovery)** — define externally hosted providers with a base URL, routing prefix, API key, endpoint paths, fallback models, and per-provider transport/redaction policy.
 > - **Passthru model routing (env + YAML)** — declare arbitrary model IDs (e.g. `glm-4.7`) that are forwarded to external upstream APIs (OpenAI-compatible / Anthropic / Responses), with per-route API keys/headers; ideal for hosted deployments (Railway) via `PASSTHRU_MODELS_JSON`.
 > - **Railway-first deployment path** (`scripts/railway_start.sh`, `docs/RAILWAY_GUIDE.md`) — to make it dead simple to spin up a personal, always-on CLIProxyAPI instance you can call from anywhere.
 >   - Log in locally (interactive browser/device flows), then package credentials into `AUTH_BUNDLE` via `scripts/auth_bundle.sh` and restore them in a remote environment.
@@ -112,6 +113,11 @@ Provider & config matrix (fork-specific):
 | Chutes model aliasing + fallbacks | `internal/registry/chutes_models.go` | Generates `chutes-` aliases for explicit routing + contains conservative fallback models. |
 | Chutes executor | `internal/runtime/executor/chutes_executor.go` | Implements OpenAI-compatible chat completions + streams, model fetch/cache, and token counting. |
 | Chutes priority filtering | `sdk/cliproxy/service.go` / `sdk/cliproxy/chutes_priority_hook.go` | `CHUTES_PRIORITY=fallback` hides non-prefixed Chutes IDs when another provider has the same model ID; `chutes-` aliases remain routable. |
+| Managed providers (env + YAML) | `internal/config/config.go` / `docs/RAILWAY_GUIDE.md` | Configure `managed-providers` in YAML or `MANAGED_PROVIDERS_JSON` in env. Each provider declares `name`, `prefix`, API key source, endpoint URLs/paths, model discovery, fallback models, priority, retry settings, and optional redaction policy. |
+| Force managed-provider routing | `sdk/api/handlers/handlers.go` / `sdk/cliproxy/auth/conductor.go` | Use the configured prefix, such as `example-<model>`, to explicitly route to that provider; sets `forced_provider=true` to bypass client model support filtering. |
+| Managed-provider model aliasing + fallbacks | `internal/registry/managed_provider_models.go` | Generates configured-prefix aliases for explicit routing and can publish configured fallback models when live discovery is unavailable. |
+| Managed-provider executor | `internal/runtime/executor/managed_provider_executor.go` | Routes Claude-format callers to a Claude/Anthropic-compatible messages endpoint and OpenAI-format callers to OpenAI-compatible chat completions by default, with optional direct Responses support when configured. |
+| Provider-aware Secret DLP | `internal/secretdlp` / `sdk/api/handlers/handlers.go` | Redacts secrets after provider selection and before upstream execution, restores placeholders on the way back when `SECRET_DLP_MODE=restore`, and supports global, per-provider, and per-auth opt-in/out policy. |
 | OAuth excluded models | `internal/config/config.go` | `oauth-excluded-models` config lets you disable models per provider. |
 | OpenAI-compat upstreams | `internal/config/config.go` | `openai-compatibility` for routing to other OpenAI-compatible providers. |
 | Routing behavior | `internal/config/config.go` | `routing` config controls credential selection/failover. |
@@ -137,6 +143,42 @@ Chutes is an optional OpenAI-compatible upstream. You can route to it either exp
   - `CHUTES_PRIORITY` (`fallback` default hides non-prefixed IDs when another provider offers the same ID; `primary` exposes them)
   - `CHUTES_TEE_PREFERENCE` (`prefer` default), `CHUTES_PROXY_URL` (optional)
   - `CHUTES_MAX_RETRIES` (default `4`; set `0` to disable) — retries intermittent 429s
+
+### Managed providers (quick explainer)
+
+Managed providers are optional externally hosted model providers with Claude/Anthropic-compatible and/or OpenAI-compatible endpoints. They can be configured in YAML under `managed-providers` or through `MANAGED_PROVIDERS_JSON` for hosted environments.
+
+- Explicit routing: set `model: "example-<model>"` when the provider prefix is `example-`.
+- Default transport: `auto`, where Claude-format callers use the messages endpoint, OpenAI-format callers use chat completions, and other formats use `default-transport`.
+- Model discovery: enabled by default via the provider's `/models` endpoint; use `fallback-models` when discovery is unavailable or incomplete.
+- Priority: `fallback` hides non-prefixed IDs when another provider registers the same model ID; prefixed aliases remain routable.
+- Hosted env format:
+  ```json
+  [
+    {
+      "name": "example-provider",
+      "prefix": "example-",
+      "api-key-env": "EXAMPLE_PROVIDER_API_KEY",
+      "base-url": "https://provider.example/v1",
+      "transport-mode": "auto",
+      "default-transport": "claude",
+      "priority": "fallback",
+      "fallback-models": ["model-a", "model-b"]
+    }
+  ]
+  ```
+
+### Secret DLP (quick explainer)
+
+Secret DLP can redact detected secrets after CLIProxyAPI has selected a provider and auth credential, before the payload is sent upstream. In restore mode, placeholders are restored in upstream responses before they are returned to the client.
+
+- Enable with `SECRET_DLP_ENABLED=true`.
+- `SECRET_DLP_MODE=restore` redacts upstream payloads and restores placeholders in responses; `redact` leaves placeholders; `block` rejects requests with findings.
+- `SECRET_DLP_SCANNER=betterleaks` is the default scanner.
+- `SECRET_DLP_LOG_EVENTS=true` logs detection/redaction events without logging the raw secret.
+- `SECRET_DLP_DEFAULT_PROVIDER_POLICY=enabled|disabled` sets the global default.
+- `SECRET_DLP_PROVIDER_OVERRIDES=example-provider=disabled,other-provider=enabled` overrides specific providers.
+- Each managed provider can set `secret-redaction: enabled|disabled|inherit`; auth-level policy takes precedence over provider and global defaults.
 
 If you want the baseline upstream documentation/behavior, start here: https://github.com/luispater/CLIProxyAPI/blob/main/README.md
 

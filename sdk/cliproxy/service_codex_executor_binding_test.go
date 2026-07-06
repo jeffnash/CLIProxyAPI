@@ -85,6 +85,36 @@ func TestEnsureExecutorsForAuth_ChutesBindsChutesExecutor(t *testing.T) {
 	}
 }
 
+func TestEnsureExecutorsForAuth_ManagedProviderBindsManagedProviderExecutor(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				ManagedProviders: []config.ManagedProviderConfig{{
+					Name:    "example-provider",
+					Prefix:  "example-",
+					APIKey:  "test-key",
+					BaseURL: "https://provider.example/v1",
+				}},
+			},
+		},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "managed-auth-1",
+		Provider: "example-provider",
+		Status:   coreauth.StatusActive,
+	}
+
+	service.ensureExecutorsForAuth(auth)
+	bound, ok := service.coreManager.Executor("example-provider")
+	if !ok || bound == nil {
+		t.Fatal("expected managed provider executor after bind")
+	}
+	if _, ok := bound.(*executor.ManagedProviderExecutor); !ok {
+		t.Fatalf("expected *executor.ManagedProviderExecutor, got %T", bound)
+	}
+}
+
 func TestEnsureExecutorsForAuth_XAIBindsAutoExecutor(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},

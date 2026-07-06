@@ -66,6 +66,9 @@ type SDKConfig struct {
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 
+	// ManagedProviders defines first-class externally hosted model providers.
+	ManagedProviders []ManagedProviderConfig `yaml:"managed-providers,omitempty" json:"managed-providers,omitempty"`
+
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
@@ -111,4 +114,41 @@ type StreamingConfig struct {
 	// This tells reverse proxies (Nginx, Railway) to not buffer the response.
 	// Useful when SSE streams get corrupted due to proxy chunking. Default is false.
 	DisableProxyBuffering bool `yaml:"disable-proxy-buffering,omitempty" json:"disable-proxy-buffering,omitempty"`
+}
+
+// ManagedProviderConfig describes an external provider with Claude/OpenAI-compatible endpoints.
+type ManagedProviderConfig struct {
+	Name                  string                              `yaml:"name" json:"name"`
+	Prefix                string                              `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+	APIKey                string                              `yaml:"api-key,omitempty" json:"api-key,omitempty"`
+	APIKeyEnv             string                              `yaml:"api-key-env,omitempty" json:"api-key-env,omitempty"`
+	BaseURL               string                              `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+	ClaudeBaseURL         string                              `yaml:"claude-base-url,omitempty" json:"claude-base-url,omitempty"`
+	AnthropicBaseURL      string                              `yaml:"anthropic-base-url,omitempty" json:"anthropic-base-url,omitempty"`
+	OpenAIBaseURL         string                              `yaml:"openai-base-url,omitempty" json:"openai-base-url,omitempty"`
+	ClaudeMessagesPath    string                              `yaml:"claude-messages-path,omitempty" json:"claude-messages-path,omitempty"`
+	AnthropicMessagesPath string                              `yaml:"anthropic-messages-path,omitempty" json:"anthropic-messages-path,omitempty"`
+	OpenAIChatPath        string                              `yaml:"openai-chat-path,omitempty" json:"openai-chat-path,omitempty"`
+	OpenAIResponsesPath   string                              `yaml:"openai-responses-path,omitempty" json:"openai-responses-path,omitempty"`
+	TransportMode         string                              `yaml:"transport-mode,omitempty" json:"transport-mode,omitempty"`
+	DefaultTransport      string                              `yaml:"default-transport,omitempty" json:"default-transport,omitempty"`
+	ModelDiscovery        ManagedProviderModelDiscoveryConfig `yaml:"model-discovery,omitempty" json:"model-discovery,omitempty"`
+	Models                []string                            `yaml:"models,omitempty" json:"models,omitempty"`
+	ModelsExclude         []string                            `yaml:"models-exclude,omitempty" json:"models-exclude,omitempty"`
+	FallbackModels        []string                            `yaml:"fallback-models,omitempty" json:"fallback-models,omitempty"`
+	Headers               map[string]string                   `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Priority              string                              `yaml:"priority,omitempty" json:"priority,omitempty"`
+	SecretRedaction       string                              `yaml:"secret-redaction,omitempty" json:"secret-redaction,omitempty"`
+	ProxyURL              string                              `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+	MaxRetries            *int                                `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
+	RetryBackoff          string                              `yaml:"retry-backoff,omitempty" json:"retry-backoff,omitempty"`
+}
+
+// ManagedProviderModelDiscoveryConfig controls provider model discovery.
+type ManagedProviderModelDiscoveryConfig struct {
+	Enabled *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	URL     string `yaml:"url,omitempty" json:"url,omitempty"`
+	Path    string `yaml:"path,omitempty" json:"path,omitempty"`
+	Format  string `yaml:"format,omitempty" json:"format,omitempty"`
+	TTL     string `yaml:"ttl,omitempty" json:"ttl,omitempty"`
 }

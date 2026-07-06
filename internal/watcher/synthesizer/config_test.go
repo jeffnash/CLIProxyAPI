@@ -997,6 +997,66 @@ func TestConfigSynthesizer_CodexKeys_SkipsEmptyAndHeaders(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_ManagedProviderKey(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			SDKConfig: config.SDKConfig{
+				ManagedProviders: []config.ManagedProviderConfig{{
+					Name:             "example-provider",
+					Prefix:           "example-",
+					APIKey:           "managed-key",
+					BaseURL:          "https://provider.example/v1",
+					ClaudeBaseURL:    "https://claude.provider.example/v1",
+					OpenAIBaseURL:    "https://openai.provider.example/v1",
+					TransportMode:    "auto",
+					DefaultTransport: "claude",
+					Priority:         "fallback",
+					SecretRedaction:  "disabled",
+					ProxyURL:         "http://proxy.local:8080",
+					FallbackModels:   []string{"glm-5.2"},
+				}},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("Synthesize() error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth len=%d, want 1", len(auths))
+	}
+	auth := auths[0]
+	if auth.Provider != "example-provider" {
+		t.Fatalf("provider=%q, want example-provider", auth.Provider)
+	}
+	if auth.Label != "example-provider-apikey" {
+		t.Fatalf("label=%q, want example-provider-apikey", auth.Label)
+	}
+	if auth.ProxyURL != "http://proxy.local:8080" {
+		t.Fatalf("proxy=%q", auth.ProxyURL)
+	}
+	for key, want := range map[string]string{
+		"api_key":              "managed-key",
+		"base_url":             "https://provider.example/v1",
+		"claude_base_url":      "https://claude.provider.example/v1",
+		"openai_base_url":      "https://openai.provider.example/v1",
+		"transport_mode":       "auto",
+		"default_transport":    "claude",
+		"priority":             "fallback",
+		"prefix":               "example-",
+		"secret_redaction":     "disabled",
+		"fallback_models_json": `["glm-5.2"]`,
+	} {
+		if got := auth.Attributes[key]; got != want {
+			t.Fatalf("attr[%s]=%q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 	tests := []struct {
 		name    string

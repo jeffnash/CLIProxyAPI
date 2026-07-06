@@ -107,6 +107,71 @@ To enable Chutes on Railway, set these environment variables:
 
 Tip: If you want Chutes available but don’t want it to show up in `/v1/models` unless needed, keep `CHUTES_PRIORITY=fallback` and use `chutes-...` for explicit routing.
 
+### Managed providers (optional) API key configuration
+
+This fork supports generic managed providers with Claude/Anthropic-compatible and/or OpenAI-compatible upstream endpoints.
+
+You have two ways to route to a managed provider:
+
+- **Explicit routing (always available when configured):** use the configured prefix, for example `model: "example-model-a"` when the prefix is `example-`.
+- **General routing (optional):** expose non-prefixed model IDs in `/v1/models` and allow normal provider selection.
+
+By default, `transport-mode=auto`: Claude-format incoming requests are sent to the messages endpoint, OpenAI-format incoming requests are sent to chat completions, and other incoming formats use `default-transport` (`claude` by default). Direct Responses passthrough is only used when `openai-responses-path` is configured; otherwise Responses-style callers are routed through chat completions.
+
+On Railway, set `MANAGED_PROVIDERS_JSON` to an array of provider definitions. Keep the real API key in a separate Railway variable and point to it with `api-key-env`.
+
+```json
+[
+  {
+    "name": "example-provider",
+    "prefix": "example-",
+    "api-key-env": "EXAMPLE_PROVIDER_API_KEY",
+    "base-url": "https://provider.example/v1",
+    "transport-mode": "auto",
+    "default-transport": "claude",
+    "model-discovery": {
+      "enabled": true,
+      "path": "/models",
+      "format": "openai",
+      "ttl": "30m"
+    },
+    "fallback-models": ["model-a", "model-b"],
+    "priority": "fallback",
+    "secret-redaction": "inherit",
+    "max-retries": 4,
+    "retry-backoff": "5,15,30,60"
+  }
+]
+```
+
+Managed provider fields:
+
+- `name` (required): provider/auth name used internally for routing.
+- `prefix` (optional): explicit routing prefix; defaults to `<name>-`.
+- `api-key` or `api-key-env`: upstream credential. Use `api-key-env` for hosted deploys.
+- `base-url`, `claude-base-url`, `anthropic-base-url`, `openai-base-url`: upstream endpoint bases.
+- `claude-messages-path`, `openai-chat-path`, `openai-responses-path`: override endpoint paths when the provider differs from the defaults.
+- `models`, `models-exclude`, `fallback-models`: model allowlist, denylist, and fallback IDs.
+- `priority`: `primary` exposes non-prefixed IDs; `fallback` hides non-prefixed IDs when another provider registers the same ID. Prefixed aliases remain routable.
+- `secret-redaction`: `inherit`, `enabled`, or `disabled`.
+- `headers`, `proxy-url`, `max-retries`, `retry-backoff`: optional request and retry controls.
+
+### Secret DLP and provider policy
+
+Secret DLP redacts detected secrets after provider selection and before the upstream request is sent. In `restore` mode, placeholders are restored in upstream responses before clients receive them.
+
+Railway environment variables:
+
+- `SECRET_DLP_ENABLED=true`: turns Secret DLP on.
+- `SECRET_DLP_MODE=restore|redact|block`: `restore` redacts upstream payloads and restores downstream responses.
+- `SECRET_DLP_MASTER_KEY`: stable key used to encrypt restore mappings. Set this for hosted deployments.
+- `SECRET_DLP_SCANNER=betterleaks`: scanner backend; this is the default.
+- `SECRET_DLP_LOG_EVENTS=true`: logs detection/redaction events without logging raw secret values.
+- `SECRET_DLP_DEFAULT_PROVIDER_POLICY=enabled|disabled`: global default for upstream redaction.
+- `SECRET_DLP_PROVIDER_OVERRIDES=example-provider=disabled,other-provider=enabled`: per-provider overrides.
+
+Managed provider `secret-redaction` and auth-level `secret_redaction` attributes can override the global provider policy. This lets one provider inherit the global default while another is explicitly enabled or disabled.
+
 ### Copilot (fork defaults + parity transport)
 
 This fork defaults Copilot requests to:

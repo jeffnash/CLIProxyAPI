@@ -6,6 +6,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
 func TestService_applyChutesModelPriority_PreservesChutesAliases(t *testing.T) {
@@ -72,5 +73,77 @@ func TestService_applyChutesModelPriority_PreservesChutesAliases(t *testing.T) {
 	}
 	if !has("chutes-only-chutes-model") {
 		t.Fatalf("expected chutes-only-chutes-model alias to be preserved")
+	}
+}
+
+func TestService_applyManagedProviderModelPriorities_PreservesManagedAliases(t *testing.T) {
+	t.Parallel()
+
+	mgr := coreauth.NewManager(nil, nil, nil)
+	managedAuth := &coreauth.Auth{
+		ID:       "managed-auth-1",
+		Provider: "example-provider",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"priority": "fallback",
+		},
+	}
+	if _, err := mgr.Register(context.Background(), managedAuth); err != nil {
+		t.Fatalf("mgr.Register(example-provider): %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(managedAuth.ID, "example-provider", []*registry.ModelInfo{
+		{ID: "glm-5.2"},
+		{ID: "example-glm-5.2"},
+		{ID: "only-managed-model"},
+		{ID: "example-only-managed-model"},
+	})
+	reg.RegisterClient("other-auth-1", "other", []*registry.ModelInfo{
+		{ID: "glm-5.2"},
+	})
+
+	t.Cleanup(func() {
+		reg.UnregisterClient(managedAuth.ID)
+		reg.UnregisterClient("other-auth-1")
+	})
+
+	s := &Service{
+		coreManager: mgr,
+		cfg: &config.Config{
+			SDKConfig: config.SDKConfig{
+				ManagedProviders: []config.ManagedProviderConfig{{
+					Name:   "example-provider",
+					Prefix: "example-",
+				}},
+			},
+		},
+	}
+	s.applyManagedProviderModelPriorities()
+
+	after := reg.GetModelsForClient(managedAuth.ID)
+	if len(after) == 0 {
+		t.Fatalf("expected models for managed auth after filtering")
+	}
+	has := func(id string) bool {
+		for _, m := range after {
+			if m != nil && m.ID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	if has("glm-5.2") {
+		t.Fatalf("expected glm-5.2 to be filtered out for managed fallback priority")
+	}
+	if !has("example-glm-5.2") {
+		t.Fatalf("expected example-glm-5.2 alias to be preserved")
+	}
+	if !has("only-managed-model") {
+		t.Fatalf("expected only-managed-model to be preserved")
+	}
+	if !has("example-only-managed-model") {
+		t.Fatalf("expected example-only-managed-model alias to be preserved")
 	}
 }

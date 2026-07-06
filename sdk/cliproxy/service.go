@@ -92,6 +92,9 @@ type Service struct {
 	// chutesRefreshCancel stops the periodic Chutes model refresh loop.
 	chutesRefreshCancel context.CancelFunc
 
+	// managedProviderRefreshCancel stops the periodic managed-provider model refresh loop.
+	managedProviderRefreshCancel context.CancelFunc
+
 	// authManager handles legacy authentication operations.
 	authManager *sdkAuth.Manager
 
@@ -1074,7 +1077,8 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		s.coreManager.RegisterExecutor(executor.NewOpenAICompatExecutor(compatProviderKey, s.cfg))
 		return
 	}
-	switch strings.ToLower(a.Provider) {
+	providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
+	switch providerKey {
 	case "gemini":
 		s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
 	case "vertex":
@@ -1097,7 +1101,10 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 	case "cursor":
 		s.coreManager.RegisterExecutor(executor.NewCursorExecutor(s.cfg))
 	default:
-		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
+		if s.isManagedProvider(providerKey) {
+			s.coreManager.RegisterExecutor(executor.NewManagedProviderExecutor(providerKey, s.cfg))
+			return
+		}
 		if providerKey == "" {
 			providerKey = "openai-compatibility"
 		}
@@ -1145,6 +1152,7 @@ func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey st
 		return
 	}
 	GlobalModelRegistry().RegisterClient(a.ID, providerKey, normalizedModels)
+	s.applyManagedProviderModelPriorities()
 }
 
 func (s *Service) pluginModelsForProvider(providerKey string) []*ModelInfo {
@@ -1634,7 +1642,7 @@ func (s *Service) Run(ctx context.Context) error {
 		redisqueue.SetUsageStatisticsEnabled(true)
 	}
 
-	// Register Chutes priority hook with 500ms debounce
+	// Register explicit-provider priority hook with 500ms debounce.
 	hook := newChutesPriorityHook(s, 500*time.Millisecond)
 	SetGlobalModelRegistryHook(hook)
 
@@ -1787,6 +1795,7 @@ func (s *Service) Run(ctx context.Context) error {
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 		s.startChutesModelAutoRefresh(context.Background(), interval)
+		s.startManagedProviderModelAutoRefresh(context.Background(), interval)
 	}
 
 	select {
@@ -1839,6 +1848,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if s.chutesRefreshCancel != nil {
 			s.chutesRefreshCancel()
 			s.chutesRefreshCancel = nil
+		}
+		if s.managedProviderRefreshCancel != nil {
+			s.managedProviderRefreshCancel()
+			s.managedProviderRefreshCancel = nil
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
@@ -2177,6 +2190,15 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = applyExcludedModels(models, excluded)
 		log.Debugf("cursor: registerModelsForAuth provider=%s authID=%s models=%d excluded=%v", provider, a.ID, len(models), excluded)
 	default:
+		if s.isManagedProvider(provider) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			models = executor.NewManagedProviderExecutor(provider, s.cfg).FetchModels(ctx, a, s.cfg)
+			cancel()
+			if len(models) == 0 {
+				log.Warnf("%s: no dynamic or fallback managed-provider models for auth %s", provider, a.ID)
+			}
+			break
+		}
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
 			providerKey := provider
@@ -2359,6 +2381,39 @@ func (s *Service) startChutesModelAutoRefresh(parent context.Context, interval t
 	}()
 }
 
+func (s *Service) startManagedProviderModelAutoRefresh(parent context.Context, interval time.Duration) {
+	if s == nil || s.coreManager == nil || interval <= 0 {
+		return
+	}
+	if s.managedProviderRefreshCancel != nil {
+		return
+	}
+	providers := s.managedProviderSet()
+	if len(providers) == 0 {
+		return
+	}
+
+	refreshCtx, cancel := context.WithCancel(parent)
+	s.managedProviderRefreshCancel = cancel
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		log.Infof("managed-provider model auto-refresh started (interval=%s)", interval)
+		for {
+			select {
+			case <-refreshCtx.Done():
+				return
+			case <-ticker.C:
+				refreshed := s.refreshModelRegistrationsForProviders(providers)
+				if refreshed > 0 {
+					log.Infof("refreshed managed-provider models for %d auth(s)", refreshed)
+				}
+			}
+		}
+	}()
+}
+
 func (s *Service) refreshModelRegistrationsForProviders(providerSet map[string]bool) int {
 	if s == nil || s.coreManager == nil || len(providerSet) == 0 {
 		return 0
@@ -2366,6 +2421,12 @@ func (s *Service) refreshModelRegistrationsForProviders(providerSet map[string]b
 
 	if providerSet["chutes"] {
 		executor.EvictChutesModelCache()
+	}
+	for providerName := range providerSet {
+		if providerName == "chutes" {
+			continue
+		}
+		executor.EvictManagedProviderModelCache(providerName)
 	}
 
 	auths := s.coreManager.List()
@@ -2832,13 +2893,62 @@ func rewriteModelInfoName(name, oldID, newID string) string {
 // applyChutesModelPriority re-evaluates Chutes model visibility based on current registry state.
 // Priority filtering applies only to non-prefixed model IDs; chutes- prefixed aliases are always retained.
 func (s *Service) applyChutesModelPriority() {
+	s.applyProviderModelPriority("chutes", registry.ChutesModelPrefix)
+}
+
+func (s *Service) applyManagedProviderModelPriorities() {
+	s.applyChutesModelPriority()
+	for _, provider := range s.managedProviders() {
+		s.applyProviderModelPriority(config.ManagedProviderName(provider), config.ManagedProviderPrefix(provider))
+	}
+}
+
+func (s *Service) managedProviders() []config.ManagedProviderConfig {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	return config.NormalizeManagedProviders(s.cfg.ManagedProviders)
+}
+
+func (s *Service) managedProviderSet() map[string]bool {
+	providers := s.managedProviders()
+	if len(providers) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(providers))
+	for _, provider := range providers {
+		if name := config.ManagedProviderName(provider); name != "" {
+			out[name] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (s *Service) isManagedProvider(provider string) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return false
+	}
+	for _, managed := range s.managedProviders() {
+		if config.ManagedProviderName(managed) == provider {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) applyProviderModelPriority(providerName, explicitPrefix string) {
 	if s.coreManager == nil {
 		return
 	}
 	reg := registry.GetGlobalRegistry()
+	providerName = strings.ToLower(strings.TrimSpace(providerName))
 
 	for _, a := range s.coreManager.List() {
-		if strings.ToLower(strings.TrimSpace(a.Provider)) != "chutes" {
+		if strings.ToLower(strings.TrimSpace(a.Provider)) != providerName {
 			continue
 		}
 
@@ -2860,8 +2970,8 @@ func (s *Service) applyChutesModelPriority() {
 
 		filtered := make([]*registry.ModelInfo, 0, len(models))
 		for _, m := range models {
-			// Always retain chutes- prefixed aliases (explicit routing handles)
-			if strings.HasPrefix(m.ID, registry.ChutesModelPrefix) {
+			// Always retain provider-prefixed aliases (explicit routing handles).
+			if strings.HasPrefix(m.ID, explicitPrefix) {
 				filtered = append(filtered, m)
 				continue
 			}
@@ -2870,7 +2980,7 @@ func (s *Service) applyChutesModelPriority() {
 			providers := reg.GetModelProviders(m.ID)
 			hasOtherProvider := false
 			for _, p := range providers {
-				if p != "chutes" {
+				if p != providerName {
 					hasOtherProvider = true
 					break
 				}
@@ -2882,10 +2992,10 @@ func (s *Service) applyChutesModelPriority() {
 			}
 		}
 
-		// Always re-register (never unregister) to preserve chutes- aliases
+		// Always re-register (never unregister) to preserve explicit aliases.
 		if len(filtered) != len(models) {
-			log.Debugf("chutes priority: filtered %d -> %d models for auth %s", len(models), len(filtered), a.ID)
-			reg.RegisterClient(a.ID, "chutes", filtered)
+			log.Debugf("%s priority: filtered %d -> %d models for auth %s", providerName, len(models), len(filtered), a.ID)
+			reg.RegisterClient(a.ID, providerName, filtered)
 		}
 	}
 }

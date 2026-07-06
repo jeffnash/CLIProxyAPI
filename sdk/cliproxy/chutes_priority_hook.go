@@ -10,8 +10,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// chutesPriorityHook implements ModelRegistryHook to apply Chutes priority filtering
-// when non-Chutes models are registered.
+// chutesPriorityHook implements ModelRegistryHook to apply fallback-priority
+// filtering for explicit-routing providers when other models change.
 type chutesPriorityHook struct {
 	service      *Service
 	debounceTime time.Duration
@@ -29,18 +29,18 @@ func newChutesPriorityHook(s *Service, debounce time.Duration) *chutesPriorityHo
 }
 
 func (h *chutesPriorityHook) OnModelsRegistered(ctx context.Context, provider, clientID string, models []*registry.ModelInfo) {
-	// Ignore Chutes registrations - they don't affect priority decisions
-	if strings.ToLower(provider) == "chutes" {
+	// Ignore managed provider registrations to avoid re-evaluation loops.
+	if h.isManagedFallbackPriorityProvider(provider) {
 		return
 	}
 
-	// Non-Chutes provider registered - schedule priority re-evaluation
+	// Other provider registrations may hide fallback-priority base IDs.
 	h.scheduleReeval()
 }
 
 func (h *chutesPriorityHook) OnModelsUnregistered(ctx context.Context, provider, clientID string) {
-	// When non-Chutes provider is removed, Chutes models may become visible again
-	if strings.ToLower(provider) == "chutes" {
+	// Managed provider unregisters do not affect their own explicit aliases.
+	if h.isManagedFallbackPriorityProvider(provider) {
 		return
 	}
 	h.scheduleReeval()
@@ -60,8 +60,15 @@ func (h *chutesPriorityHook) scheduleReeval() {
 		h.pending = false
 		h.mu.Unlock()
 
-		h.service.applyChutesModelPriority()
+		h.service.applyManagedProviderModelPriorities()
 	})
 
-	log.Debug("chutes priority: scheduled priority re-evaluation")
+	log.Debug("provider priority: scheduled priority re-evaluation")
+}
+
+func (h *chutesPriorityHook) isManagedFallbackPriorityProvider(provider string) bool {
+	if strings.EqualFold(strings.TrimSpace(provider), "chutes") {
+		return true
+	}
+	return h != nil && h.service != nil && h.service.isManagedProvider(provider)
 }

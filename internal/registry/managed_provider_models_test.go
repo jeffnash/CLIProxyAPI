@@ -1,0 +1,34 @@
+package registry
+
+import "testing"
+
+func TestGenerateManagedProviderAliases(t *testing.T) {
+	models := GenerateManagedProviderAliases([]*ModelInfo{{ID: "glm-5.2", DisplayName: "GLM 5.2", Description: "base"}}, "example-", "example-provider")
+	if !hasManagedProviderModelID(models, "glm-5.2") {
+		t.Fatal("missing base model")
+	}
+	if !hasManagedProviderModelID(models, "example-glm-5.2") {
+		t.Fatal("missing explicit alias")
+	}
+}
+
+func TestGetManagedProviderFallbackModelsIncludesRequestedFallbacksAndAliases(t *testing.T) {
+	models := GetManagedProviderFallbackModels("example-provider", "example-", "Example Provider", []string{"glm-5.2", "qwen3.7-max"})
+	for _, id := range []string{"glm-5.2", "qwen3.7-max"} {
+		if !hasManagedProviderModelID(models, id) {
+			t.Fatalf("missing fallback model %q", id)
+		}
+		if !hasManagedProviderModelID(models, "example-"+id) {
+			t.Fatalf("missing fallback alias %q", "example-"+id)
+		}
+	}
+}
+
+func hasManagedProviderModelID(models []*ModelInfo, id string) bool {
+	for _, model := range models {
+		if model != nil && model.ID == id {
+			return true
+		}
+	}
+	return false
+}

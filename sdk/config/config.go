@@ -18,6 +18,8 @@ type PayloadConfig = internalconfig.PayloadConfig
 type PayloadRule = internalconfig.PayloadRule
 type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
+type ManagedProviderConfig = internalconfig.ManagedProviderConfig
+type ManagedProviderModelDiscoveryConfig = internalconfig.ManagedProviderModelDiscoveryConfig
 
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
@@ -54,4 +56,24 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 
 func NormalizeCommentIndentation(data []byte) []byte {
 	return internalconfig.NormalizeCommentIndentation(data)
+}
+
+func ManagedProviderName(provider ManagedProviderConfig) string {
+	return internalconfig.ManagedProviderName(provider)
+}
+
+func ManagedProviderPrefix(provider ManagedProviderConfig) string {
+	return internalconfig.ManagedProviderPrefix(provider)
+}
+
+func NormalizeManagedProviders(providers []ManagedProviderConfig) []ManagedProviderConfig {
+	return internalconfig.NormalizeManagedProviders(providers)
+}
+
+func FindManagedProvider(cfg *SDKConfig, name string) (ManagedProviderConfig, bool) {
+	return internalconfig.FindManagedProvider(cfg, name)
+}
+
+func FindManagedProviderByPrefix(cfg *SDKConfig, model string) (ManagedProviderConfig, string, bool) {
+	return internalconfig.FindManagedProviderByPrefix(cfg, model)
 }

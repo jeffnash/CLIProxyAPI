@@ -3,10 +3,12 @@ package synthesizer
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -43,6 +45,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeVertexCompat(ctx)...)
 	// Chutes API keys
 	out = append(out, s.synthesizeChutesKeys(ctx)...)
+	// Managed provider API keys
+	out = append(out, s.synthesizeManagedProviderKeys(ctx)...)
 	// Cursor API keys
 	out = append(out, s.synthesizeCursorKeys(ctx)...)
 	// Passthru routes
@@ -257,6 +261,121 @@ func (s *ConfigSynthesizer) synthesizeChutesKeys(ctx *SynthesisContext) []*corea
 		UpdatedAt:  now,
 	}
 	return []*coreauth.Auth{a}
+}
+
+// synthesizeManagedProviderKeys creates Auth entries for generic managed providers.
+func (s *ConfigSynthesizer) synthesizeManagedProviderKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	providers := config.NormalizeManagedProviders(cfg.ManagedProviders)
+	out := make([]*coreauth.Auth, 0, len(providers))
+	for _, provider := range providers {
+		name := config.ManagedProviderName(provider)
+		if name == "" {
+			continue
+		}
+		key := strings.TrimSpace(provider.APIKey)
+		if key == "" && provider.APIKeyEnv != "" {
+			key = strings.TrimSpace(os.Getenv(provider.APIKeyEnv))
+		}
+		if key == "" {
+			continue
+		}
+		base := strings.TrimSpace(provider.BaseURL)
+		claudeBase := firstManagedProviderNonEmpty(provider.ClaudeBaseURL, provider.AnthropicBaseURL)
+		openAIBase := strings.TrimSpace(provider.OpenAIBaseURL)
+		proxyURL := strings.TrimSpace(provider.ProxyURL)
+
+		id, token := idGen.Next("managed-provider:"+name+":apikey", key, base, claudeBase, openAIBase)
+		attrs := map[string]string{
+			"source":   fmt.Sprintf("config:managed-providers.%s[%s]", name, token),
+			"api_key":  key,
+			"provider": name,
+			"prefix":   config.ManagedProviderPrefix(provider),
+			"label":    name,
+		}
+		if base != "" {
+			attrs["base_url"] = base
+		}
+		if claudeBase != "" {
+			attrs["claude_base_url"] = claudeBase
+		}
+		if openAIBase != "" {
+			attrs["openai_base_url"] = openAIBase
+		}
+		if provider.ClaudeMessagesPath != "" {
+			attrs["claude_messages_path"] = provider.ClaudeMessagesPath
+		}
+		if provider.AnthropicMessagesPath != "" {
+			attrs["anthropic_messages_path"] = provider.AnthropicMessagesPath
+		}
+		if provider.OpenAIChatPath != "" {
+			attrs["openai_chat_path"] = provider.OpenAIChatPath
+		}
+		if provider.OpenAIResponsesPath != "" {
+			attrs["openai_responses_path"] = provider.OpenAIResponsesPath
+		}
+		if provider.ModelDiscovery.Path != "" {
+			attrs["models_path"] = provider.ModelDiscovery.Path
+		}
+		if provider.TransportMode != "" {
+			attrs["transport_mode"] = provider.TransportMode
+		}
+		if provider.DefaultTransport != "" {
+			attrs["default_transport"] = provider.DefaultTransport
+		}
+		if provider.Priority != "" {
+			attrs["priority"] = provider.Priority
+		}
+		if provider.SecretRedaction != "" {
+			attrs["secret_redaction"] = provider.SecretRedaction
+		}
+		if provider.RetryBackoff != "" {
+			attrs["retry_backoff"] = provider.RetryBackoff
+		}
+		if provider.MaxRetries != nil {
+			attrs["max_retries"] = strconv.Itoa(*provider.MaxRetries)
+		}
+		addStringListAttr(attrs, "models_json", provider.Models)
+		addStringListAttr(attrs, "models_exclude_json", provider.ModelsExclude)
+		addStringListAttr(attrs, "fallback_models_json", provider.FallbackModels)
+		addConfigHeadersToAttrs(provider.Headers, attrs)
+
+		a := &coreauth.Auth{
+			ID:         id,
+			Provider:   name,
+			Label:      name + "-apikey",
+			Status:     coreauth.StatusActive,
+			ProxyURL:   proxyURL,
+			Attributes: attrs,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+func firstManagedProviderNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func addStringListAttr(attrs map[string]string, key string, values []string) {
+	if len(values) == 0 {
+		return
+	}
+	data, err := json.Marshal(values)
+	if err != nil {
+		return
+	}
+	attrs[key] = string(data)
 }
 
 // synthesizeGeminiKeys creates Auth entries for Gemini API keys.

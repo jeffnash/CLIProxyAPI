@@ -27,3 +27,29 @@ func TestGetRequestDetails_ChutesPrefixRouting(t *testing.T) {
 		t.Fatalf("metadata[forced_provider]=%v (type %T), want true", metadata["forced_provider"], metadata["forced_provider"])
 	}
 }
+
+func TestGetRequestDetails_ManagedProviderPrefixRouting(t *testing.T) {
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		ManagedProviders: []sdkconfig.ManagedProviderConfig{{
+			Name:   "example-provider",
+			Prefix: "example-",
+		}},
+	}, coreauth.NewManager(nil, nil, nil))
+
+	providers, model, metadata, err := handler.getRequestDetailsWithOptions("example-glm-5.2", false)
+	if err != nil {
+		t.Fatalf("getRequestDetails(): %v", err)
+	}
+	if len(providers) != 1 || providers[0] != "example-provider" {
+		t.Fatalf("providers=%v, want [example-provider]", providers)
+	}
+	if model != "glm-5.2" {
+		t.Fatalf("model=%q, want %q", model, "glm-5.2")
+	}
+	if metadata == nil {
+		t.Fatalf("metadata=nil, want forced_provider=true")
+	}
+	if v, ok := metadata["forced_provider"].(bool); !ok || !v {
+		t.Fatalf("metadata[forced_provider]=%v (type %T), want true", metadata["forced_provider"], metadata["forced_provider"])
+	}
+}
