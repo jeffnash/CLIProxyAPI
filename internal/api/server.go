@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/secretdlp"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -224,6 +226,9 @@ type Server struct {
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
 
+	// secretDLP protects outbound provider traffic from client-supplied secrets.
+	secretDLP *secretdlp.Service
+
 	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
 	managementRoutesRegistered atomic.Bool
 	// managementRoutesEnabled controls whether management endpoints serve real handlers.
@@ -265,6 +270,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create gin engine
 	engine := gin.New()
+	if errTrustedProxies := engine.SetTrustedProxies(nil); errTrustedProxies != nil {
+		log.Warnf("failed to disable trusted proxy headers: %v", errTrustedProxies)
+	}
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}
@@ -272,6 +280,18 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.GinLogrusRecovery())
+
+	secretDLP, errSecretDLP := secretdlp.NewFromEnvWithProviderPolicy(cfg.SecretDLP.DefaultProviderPolicy, cfg.SecretDLP.ProviderOverrides)
+	if errSecretDLP != nil {
+		log.Warnf("secret dlp disabled because initialization failed: %v", errSecretDLP)
+	}
+	// Secret-DLP intentionally runs before caller-supplied extraMiddleware so it can
+	// normalize encodings and install response log transforms before provider egress.
+	// Provider redaction itself runs after auth selection.
+	if secretDLP != nil && secretDLP.Enabled() {
+		engine.Use(secretdlp.Middleware(secretDLP))
+		log.Info("secret dlp middleware enabled")
+	}
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
 	}
@@ -315,9 +335,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
 		pluginHost:          optionState.pluginHost,
+		secretDLP:           secretDLP,
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.handlers.SetPluginHost(optionState.pluginHost)
+	s.handlers.SetSecretDLP(secretDLP)
 	if optionState.pluginHost != nil {
 		optionState.pluginHost.SetModelExecutor(s.handlers)
 		optionState.pluginHost.SetAuthManager(authManager)
@@ -1558,10 +1580,27 @@ func (s *Server) Stop(ctx context.Context) error {
 			log.Debugf("failed to close shared listener: %v", errClose)
 		}
 	}
+	if s.secretDLP != nil {
+		s.secretDLP.StartDrain()
+	}
 
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", err)
+	}
+	if s.secretDLP != nil {
+		drainCtx := ctx
+		cancel := func() {}
+		if timeout := s.secretDLP.DrainTimeout(); timeout > 0 {
+			drainCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		if err := s.secretDLP.Drain(drainCtx); err != nil {
+			log.Warnf("secret dlp drain did not complete cleanly: %v", err)
+		}
+		cancel()
+		if err := s.secretDLP.Close(); err != nil {
+			log.Warnf("secret dlp close failed: %v", err)
+		}
 	}
 
 	log.Debug("API server stopped")
@@ -1575,7 +1614,10 @@ func (s *Server) Stop(ctx context.Context) error {
 //   - gin.HandlerFunc: The CORS middleware handler
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
+		if origin := allowedCORSOrigin(c.Request.Header.Get("Origin")); origin != "" {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Vary", "Origin")
+		}
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "*")
 		c.Header("Access-Control-Expose-Headers", corsExposedResponseHeadersJoined)
@@ -1587,6 +1629,30 @@ func corsMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func allowedCORSOrigin(origin string) string {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return ""
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return ""
+	}
+	host := parsed.Hostname()
+	if host == "localhost" {
+		return origin
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return origin
+	}
+	return ""
 }
 
 func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {

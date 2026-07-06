@@ -18,6 +18,16 @@ import (
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
 const responseBodyOverrideContextKey = "RESPONSE_BODY_OVERRIDE"
 const websocketTimelineOverrideContextKey = "WEBSOCKET_TIMELINE_OVERRIDE"
+const responseLogTransformContextKey = "RESPONSE_LOG_TRANSFORM"
+
+type BodyTransformFunc func([]byte) []byte
+
+func SetResponseLogTransform(c *gin.Context, fn BodyTransformFunc) {
+	if c == nil || fn == nil {
+		return
+	}
+	c.Set(responseLogTransformContextKey, fn)
+}
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
@@ -42,8 +52,9 @@ type ResponseWriterWrapper struct {
 	requestInfo         *RequestInfo               // requestInfo holds the details of the original request.
 	statusCode          int                        // statusCode stores the HTTP status code of the response.
 	headers             map[string][]string        // headers stores the response headers.
-	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
-	firstChunkTimestamp time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
+	ginCtx              *gin.Context
+	logOnErrorOnly      bool      // logOnErrorOnly enables logging only when an error response is detected.
+	firstChunkTimestamp time.Time // firstChunkTimestamp captures TTFB for streaming responses.
 }
 
 // NewResponseWriterWrapper creates and initializes a new ResponseWriterWrapper.
@@ -56,14 +67,37 @@ type ResponseWriterWrapper struct {
 //
 // Returns:
 //   - A pointer to a new ResponseWriterWrapper.
-func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger, requestInfo *RequestInfo) *ResponseWriterWrapper {
+func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger, requestInfo *RequestInfo, ginCtx ...*gin.Context) *ResponseWriterWrapper {
+	var gc *gin.Context
+	if len(ginCtx) > 0 {
+		gc = ginCtx[0]
+	}
 	return &ResponseWriterWrapper{
 		ResponseWriter: w,
 		body:           &bytes.Buffer{},
 		logger:         logger,
 		requestInfo:    requestInfo,
 		headers:        make(map[string][]string),
+		ginCtx:         gc,
 	}
+}
+
+func (w *ResponseWriterWrapper) transformResponseLogChunk(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	if w == nil || w.ginCtx == nil {
+		return append([]byte(nil), data...)
+	}
+	value, ok := w.ginCtx.Get(responseLogTransformContextKey)
+	if !ok {
+		return append([]byte(nil), data...)
+	}
+	fn, ok := value.(BodyTransformFunc)
+	if !ok || fn == nil {
+		return append([]byte(nil), data...)
+	}
+	return fn(data)
 }
 
 // Write wraps the underlying ResponseWriter's Write method to capture response data.
@@ -78,6 +112,7 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.Write(data)
+	logData := w.transformResponseLogChunk(data)
 
 	// THEN: Handle logging based on response type
 	if w.isStreaming && w.chunkChannel != nil {
@@ -87,14 +122,14 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 		}
 		// For streaming responses: Send to async logging channel (non-blocking)
 		select {
-		case w.chunkChannel <- append([]byte(nil), data...): // Non-blocking send with copy
+		case w.chunkChannel <- logData: // Non-blocking send with copy
 		default: // Channel full, skip logging to avoid blocking
 		}
 		return n, err
 	}
 
 	if w.shouldBufferResponseBody() {
-		w.body.Write(data)
+		w.body.Write(logData)
 	}
 
 	return n, err
@@ -126,6 +161,7 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 
 	// CRITICAL: Write to client first (zero latency)
 	n, err := w.ResponseWriter.WriteString(data)
+	logData := w.transformResponseLogChunk([]byte(data))
 
 	// THEN: Capture for logging
 	if w.isStreaming && w.chunkChannel != nil {
@@ -134,14 +170,14 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 			w.firstChunkTimestamp = time.Now()
 		}
 		select {
-		case w.chunkChannel <- []byte(data):
+		case w.chunkChannel <- logData:
 		default:
 		}
 		return n, err
 	}
 
 	if w.shouldBufferResponseBody() {
-		w.body.WriteString(data)
+		w.body.Write(logData)
 	}
 	return n, err
 }
@@ -398,7 +434,7 @@ func (w *ResponseWriterWrapper) extractAPIResponse(c *gin.Context) []byte {
 	if !ok || len(data) == 0 {
 		return nil
 	}
-	return data
+	return w.transformResponseLogChunk(data)
 }
 
 func (w *ResponseWriterWrapper) extractAPIRequestSource(c *gin.Context) *logging.FileBodySource {
@@ -418,7 +454,7 @@ func (w *ResponseWriterWrapper) extractAPIWebsocketTimeline(c *gin.Context) []by
 	if !ok || len(data) == 0 {
 		return nil
 	}
-	return bytes.Clone(data)
+	return w.transformResponseLogChunk(data)
 }
 
 func (w *ResponseWriterWrapper) extractAPIWebsocketTimelineSource(c *gin.Context) *logging.FileBodySource {
@@ -448,7 +484,7 @@ func (w *ResponseWriterWrapper) extractRequestBody(c *gin.Context) []byte {
 
 func (w *ResponseWriterWrapper) extractResponseBody(c *gin.Context) []byte {
 	if body := extractBodyOverride(c, responseBodyOverrideContextKey); len(body) > 0 {
-		return body
+		return w.transformResponseLogChunk(body)
 	}
 	if w.body == nil || w.body.Len() == 0 {
 		return nil
@@ -648,7 +684,7 @@ func mergeFileBodySource(payload []byte, source *logging.FileBodySource) ([]byte
 		}
 		buf.WriteByte('\n')
 	}
-	if errWrite := source.WriteTo(&buf); errWrite != nil {
+	if _, errWrite := source.WriteTo(&buf); errWrite != nil {
 		return nil, errWrite
 	}
 	return buf.Bytes(), nil

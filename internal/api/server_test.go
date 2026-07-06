@@ -123,6 +123,27 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	}
 }
 
+func TestAllowedCORSOriginOnlyAllowsLoopback(t *testing.T) {
+	tests := []struct {
+		name   string
+		origin string
+		want   string
+	}{
+		{name: "localhost", origin: "http://localhost:5173", want: "http://localhost:5173"},
+		{name: "ipv4 loopback", origin: "http://127.0.0.1:5173", want: "http://127.0.0.1:5173"},
+		{name: "ipv6 loopback", origin: "http://[::1]:5173", want: "http://[::1]:5173"},
+		{name: "remote", origin: "https://example.com", want: ""},
+		{name: "invalid", origin: "not a url", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := allowedCORSOrigin(tt.origin); got != tt.want {
+				t.Fatalf("allowedCORSOrigin(%q) = %q, want %q", tt.origin, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestOAuthCallbackRouteSkipsManagementKeyMiddleware(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 

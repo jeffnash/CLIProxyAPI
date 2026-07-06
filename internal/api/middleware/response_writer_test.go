@@ -154,6 +154,28 @@ func TestFinalizeStreamingWritesAPIWebsocketTimeline(t *testing.T) {
 	}
 }
 
+func TestResponseWriterAppliesLogTransformButWritesRawClientBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	SetResponseLogTransform(c, func(body []byte) []byte {
+		return bytes.ReplaceAll(body, []byte("sk-live-testsecret123"), []byte("__CPA_DLP_v1_test__"))
+	})
+
+	wrapper := NewResponseWriterWrapper(c.Writer, &testRequestLogger{enabled: true}, &RequestInfo{}, c)
+	if _, err := wrapper.Write([]byte(`{"echo":"sk-live-testsecret123"}`)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	if got := recorder.Body.String(); got != `{"echo":"sk-live-testsecret123"}` {
+		t.Fatalf("client body = %q, want raw response", got)
+	}
+	if got := string(wrapper.extractResponseBody(c)); got != `{"echo":"__CPA_DLP_v1_test__"}` {
+		t.Fatalf("logged body = %q, want transformed response", got)
+	}
+}
+
 type testRequestLogger struct {
 	enabled bool
 }

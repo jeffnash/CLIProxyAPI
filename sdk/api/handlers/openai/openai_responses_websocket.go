@@ -221,7 +221,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	clientIP := websocketClientAddress(c)
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, clientIP)
 
-	requestLogEnabled := h != nil && h.Cfg != nil && h.Cfg.RequestLog
+	requestLogEnabled := false
+	if h != nil {
+		if cfg := h.CurrentConfig(); cfg != nil {
+			requestLogEnabled = cfg.RequestLog
+		}
+	}
 	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
 
 	wsDone := make(chan struct{})
@@ -278,6 +283,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	pinnedAuthID := ""
 	lastAttemptedAuthID := ""
 	passthroughModelName := ""
+	var secretDLPDone func()
 	sessionAuthByID := func(authID string) (*coreauth.Auth, bool) {
 		if h == nil || h.AuthManager == nil {
 			return nil, false
@@ -302,6 +308,37 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
 			continue
+		}
+		if h != nil && h.SecretDLP != nil {
+			redactedPayload, secretDLPSession, errDLP := h.SecretDLP.RedactGinPayload(c, payload)
+			if errDLP != nil {
+				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), &interfaces.ErrorMessage{
+					StatusCode: http.StatusUnprocessableEntity,
+					Error:      errDLP,
+				})
+				markAPIResponseTimestamp(c)
+				errorPayload, errWrite := writeResponsesWebsocketError(conn, wsTimelineLog, &interfaces.ErrorMessage{
+					StatusCode: http.StatusUnprocessableEntity,
+					Error:      errDLP,
+				})
+				log.Infof(
+					"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",
+					passthroughSessionID,
+					websocket.TextMessage,
+					websocketPayloadEventType(errorPayload),
+					websocketPayloadPreview(errorPayload),
+				)
+				if errWrite != nil {
+					wsTerminateErr = errWrite
+					return
+				}
+				continue
+			}
+			if secretDLPSession != nil && secretDLPDone == nil {
+				secretDLPDone = h.SecretDLP.BeginRequest()
+				defer secretDLPDone()
+			}
+			payload = redactedPayload
 		}
 		// log.Infof(
 		// 	"responses websocket: downstream_in id=%s type=%d event=%s payload=%s",
@@ -1412,7 +1449,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				// 	websocketPayloadEventType(payloads[i]),
 				// 	websocketPayloadPreview(payloads[i]),
 				// )
-				if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payloads[i], time.Now()); errWrite != nil {
+				logPayload := payloads[i]
+				if h != nil && h.SecretDLP != nil {
+					logPayload = h.SecretDLP.RedactForLog(context.WithValue(context.Background(), "gin", c), payloads[i])
+				}
+				if errWrite := writeResponsesWebsocketPayload(conn, wsTimelineLog, payloads[i], time.Now(), logPayload); errWrite != nil {
 					log.Warnf(
 						"responses websocket: downstream_out write failed id=%s event=%s error=%v",
 						sessionID,
@@ -1708,9 +1749,13 @@ func setWebsocketBody(c *gin.Context, key string, body string) {
 	c.Set(key, []byte(trimmedBody))
 }
 
-func writeResponsesWebsocketPayload(conn *websocket.Conn, wsTimelineLog websocketTimelineAppender, payload []byte, timestamp time.Time) error {
+func writeResponsesWebsocketPayload(conn *websocket.Conn, wsTimelineLog websocketTimelineAppender, payload []byte, timestamp time.Time, logPayload ...[]byte) error {
+	timelinePayload := payload
+	if len(logPayload) > 0 && len(logPayload[0]) > 0 {
+		timelinePayload = logPayload[0]
+	}
 	if wsTimelineLog != nil {
-		wsTimelineLog.Append("response", payload, timestamp)
+		wsTimelineLog.Append("response", timelinePayload, timestamp)
 	}
 	return conn.WriteMessage(websocket.TextMessage, payload)
 }

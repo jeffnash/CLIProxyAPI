@@ -53,7 +53,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 		}
 
 		// Create response writer wrapper
-		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo)
+		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo, c)
 		if !loggerEnabled {
 			wrapper.logOnErrorOnly = true
 		}

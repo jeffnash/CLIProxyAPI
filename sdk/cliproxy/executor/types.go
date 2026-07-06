@@ -56,6 +56,14 @@ type RequestAfterAuthInterceptor func(context.Context, RequestAfterAuthIntercept
 
 // RequestAfterAuthInterceptRequest describes a selected-auth request before executor translation.
 type RequestAfterAuthInterceptRequest struct {
+	// Provider is the selected provider for this attempt.
+	Provider string
+	// AuthID is the selected auth ID for this attempt.
+	AuthID string
+	// AuthLabel is the selected auth label for this attempt.
+	AuthLabel string
+	// SecretRedactionPolicy is an optional selected-auth provider policy override.
+	SecretRedactionPolicy string
 	// SourceFormat is the original client protocol format.
 	SourceFormat sdktranslator.Format
 	// ToFormat is the selected upstream protocol format.
@@ -76,6 +84,8 @@ type RequestAfterAuthInterceptRequest struct {
 
 // RequestAfterAuthInterceptResponse returns selected-auth request modifications.
 type RequestAfterAuthInterceptResponse struct {
+	// Err aborts provider execution before the request is sent upstream.
+	Err error
 	// Headers replaces matching current request headers and preserves headers not mentioned here.
 	Headers http.Header
 	// Body replaces the current request body only when non-empty.

@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	requestlogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/secretdlp"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -1478,6 +1479,197 @@ func TestForwardResponsesWebsocketLogsAttemptedResponseOnWriteFailure(t *testing
 	if errServer := <-serverErrCh; errServer != nil {
 		t.Fatalf("server error: %v", errServer)
 	}
+}
+
+func TestForwardResponsesWebsocketLogsRedactedOutboundPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const secret = "sk-testdlpfixture0000000000000000000000000000"
+	svc := newResponsesWebsocketDLPService(t)
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	base.SetSecretDLP(svc)
+	h := NewOpenAIResponsesAPIHandler(base)
+
+	serverErrCh := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = r
+		redacted, _, errDLP := svc.RedactGinPayload(ctx, []byte(`{"api_key":"`+secret+`"}`))
+		if errDLP != nil {
+			serverErrCh <- errDLP
+			return
+		}
+		if bytes.Contains(redacted, []byte(secret)) || !bytes.Contains(redacted, []byte("__CPA_DLP_v1_")) {
+			serverErrCh <- fmt.Errorf("DLP setup did not redact request: %q", redacted)
+			return
+		}
+
+		data := make(chan []byte, 1)
+		errCh := make(chan *interfaces.ErrorMessage)
+		data <- []byte(`data: {"type":"response.completed","response":{"id":"resp-1","output":[{"type":"message","content":"` + secret + `"}]}}` + "\n\n")
+		close(data)
+		close(errCh)
+
+		timelineLog := newInMemoryWebsocketTimelineLog()
+		if errClose := conn.Close(); errClose != nil {
+			serverErrCh <- errClose
+			return
+		}
+
+		_, _, _, _, err = h.forwardResponsesWebsocket(
+			ctx,
+			conn,
+			func(...interface{}) {},
+			data,
+			errCh,
+			timelineLog,
+			"session-1",
+		)
+		if err == nil {
+			serverErrCh <- errors.New("expected websocket write failure")
+			return
+		}
+		timeline := timelineLog.String()
+		if strings.Contains(timeline, secret) {
+			serverErrCh <- fmt.Errorf("websocket timeline leaked secret: %s", timeline)
+			return
+		}
+		if !strings.Contains(timeline, "__CPA_DLP_v1_") {
+			serverErrCh <- fmt.Errorf("websocket timeline missing placeholder: %s", timeline)
+			return
+		}
+		serverErrCh <- nil
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	if errServer := <-serverErrCh; errServer != nil {
+		t.Fatalf("server error: %v", errServer)
+	}
+}
+
+func TestResponsesWebsocketRedactsInboundFrameBeforeTimeline(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const secret = "sk-testdlpfixture0000000000000000000000000000"
+	modelName := "secret-dlp-ws-model"
+	executor := &websocketDirectCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{
+		ID:       "auth-secret-dlp-ws",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: modelName}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{RequestLog: true}, manager)
+	base.SetSecretDLP(newResponsesWebsocketDLPService(t))
+	h := NewOpenAIResponsesAPIHandler(base)
+	logsDir := t.TempDir()
+
+	timelineCh := make(chan string, 1)
+	router := gin.New()
+	router.GET("/v1/responses/ws", func(c *gin.Context) {
+		source, errSource := requestlogging.NewFileBodySourceInDir(logsDir, "websocket-timeline-test")
+		if errSource != nil {
+			timelineCh <- ""
+			return
+		}
+		c.Set(requestlogging.WebsocketTimelineSourceContextKey, source)
+		h.ResponsesWebsocket(c)
+		timeline := ""
+		if value, exists := c.Get(wsTimelineBodyKey); exists {
+			if body, ok := value.([]byte); ok {
+				timeline = string(body)
+			}
+		} else if value, exists := c.Get(requestlogging.WebsocketTimelineSourceContextKey); exists {
+			if source, ok := value.(*requestlogging.FileBodySource); ok {
+				body, _ := source.Bytes()
+				timeline = string(body)
+				_ = source.Cleanup()
+			}
+		}
+		timelineCh <- timeline
+	})
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+
+	request := []byte(`{"type":"response.create","model":"` + modelName + `","api_key":"` + secret + `","input":[{"type":"message","role":"user","content":"hello"}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, request); errWrite != nil {
+		t.Fatalf("write websocket message: %v", errWrite)
+	}
+	if _, _, errRead := conn.ReadMessage(); errRead != nil {
+		t.Fatalf("read websocket response: %v", errRead)
+	}
+	_ = conn.Close()
+
+	payloads := executor.Payloads()
+	if len(payloads) == 0 {
+		t.Fatal("expected executor to capture redacted websocket payload")
+	}
+	if bytes.Contains(payloads[0], []byte(secret)) {
+		t.Fatalf("upstream payload leaked secret: %q", payloads[0])
+	}
+	if !bytes.Contains(payloads[0], []byte("__CPA_DLP_v1_")) {
+		t.Fatalf("upstream payload missing placeholder: %q", payloads[0])
+	}
+
+	select {
+	case timeline := <-timelineCh:
+		if strings.Contains(timeline, secret) {
+			t.Fatalf("websocket timeline leaked secret: %s", timeline)
+		}
+		if !strings.Contains(timeline, "__CPA_DLP_v1_") {
+			t.Fatalf("websocket timeline missing placeholder: %s", timeline)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for websocket timeline")
+	}
+}
+
+func newResponsesWebsocketDLPService(t *testing.T) *secretdlp.Service {
+	t.Helper()
+	svc, err := secretdlp.New(secretdlp.Config{
+		Enabled:        true,
+		Mode:           secretdlp.ModeRestore,
+		MasterKey:      []byte("master-key"),
+		TTL:            time.Minute,
+		MaxFindings:    10,
+		MinValueLength: 12,
+		Scanner:        "builtin",
+	})
+	if err != nil {
+		t.Fatalf("secretdlp.New(): %v", err)
+	}
+	return svc
 }
 
 func TestResponsesWebsocketTimelineRecordsDisconnectEvent(t *testing.T) {

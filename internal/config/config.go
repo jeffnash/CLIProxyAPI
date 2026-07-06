@@ -186,6 +186,9 @@ type Config struct {
 	// Chutes holds Chutes API configuration.
 	Chutes ChutesConfig `yaml:"chutes" json:"chutes"`
 
+	// SecretDLP controls provider-scoped secret redaction policy.
+	SecretDLP SecretDLPConfig `yaml:"secret-dlp,omitempty" json:"secret-dlp,omitempty"`
+
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
@@ -466,6 +469,12 @@ type ChutesConfig struct {
 	// If fewer values than max-retries, the last value is repeated.
 	// Default: "5,15,30,60"
 	RetryBackoff string `yaml:"retry-backoff,omitempty" json:"retry-backoff,omitempty"`
+}
+
+// SecretDLPConfig contains provider-level secret redaction policy.
+type SecretDLPConfig struct {
+	DefaultProviderPolicy string            `yaml:"default-provider-policy,omitempty" json:"default-provider-policy,omitempty"`
+	ProviderOverrides     map[string]string `yaml:"provider-overrides,omitempty" json:"provider-overrides,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -1312,6 +1321,25 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.Chutes.RetryBackoff = env
 	}
 
+	// Load generic managed providers from env. Env wins by provider name.
+	if env := strings.TrimSpace(os.Getenv("MANAGED_PROVIDERS_JSON")); env != "" {
+		var providers []ManagedProviderConfig
+		if err := json.Unmarshal([]byte(env), &providers); err != nil {
+			if !optional {
+				return nil, fmt.Errorf("failed to parse MANAGED_PROVIDERS_JSON: %w", err)
+			}
+		} else {
+			cfg.ManagedProviders = MergeManagedProviders(cfg.ManagedProviders, providers)
+		}
+	}
+
+	if env := strings.TrimSpace(os.Getenv("SECRET_DLP_DEFAULT_PROVIDER_POLICY")); env != "" {
+		cfg.SecretDLP.DefaultProviderPolicy = strings.ToLower(env)
+	}
+	if env := strings.TrimSpace(os.Getenv("SECRET_DLP_PROVIDER_OVERRIDES")); env != "" {
+		cfg.SecretDLP.ProviderOverrides = mergeStringMap(cfg.SecretDLP.ProviderOverrides, parseKeyValueList(env))
+	}
+
 	// Cursor API key from environment (useful for Railway deployments).
 	// Must run BEFORE SanitizeCursorKeys so the env-sourced key gets sanitized.
 	if env := strings.TrimSpace(os.Getenv("CURSOR_API_KEY")); env != "" {
@@ -1365,6 +1393,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Normalize OAuth proxy pools.
 	cfg.OAuthProxyPool = NormalizeOAuthProxyPool(cfg.OAuthProxyPool)
+
+	// Normalize managed providers and DLP provider policy.
+	cfg.ManagedProviders = NormalizeManagedProviders(cfg.ManagedProviders)
+	cfg.SecretDLP.DefaultProviderPolicy = strings.ToLower(strings.TrimSpace(cfg.SecretDLP.DefaultProviderPolicy))
+	cfg.SecretDLP.ProviderOverrides = normalizeStringMap(cfg.SecretDLP.ProviderOverrides)
 
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
@@ -1990,6 +2023,67 @@ func splitAndTrim(csv string) []string {
 	for _, part := range parts {
 		if trimmed := strings.TrimSpace(part); trimmed != "" {
 			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func parseKeyValueList(raw string) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(entry, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.ToLower(strings.TrimSpace(value))
+		if !ok || key == "" || value == "" {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func mergeStringMap(existing, incoming map[string]string) map[string]string {
+	if len(incoming) == 0 {
+		return normalizeStringMap(existing)
+	}
+	out := normalizeStringMap(existing)
+	if out == nil {
+		out = make(map[string]string, len(incoming))
+	}
+	for key, value := range incoming {
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.ToLower(strings.TrimSpace(value))
+		if key != "" && value != "" {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func normalizeStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.ToLower(strings.TrimSpace(value))
+		if key != "" && value != "" {
+			out[key] = value
 		}
 	}
 	if len(out) == 0 {

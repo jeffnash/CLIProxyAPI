@@ -440,6 +440,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 	}
 
 	var snapshot *Auth
+	var persistSnapshot *Auth
 	now := time.Now()
 
 	m.mu.Lock()
@@ -479,14 +480,17 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				auth.Status = StatusActive
 			}
 			auth.UpdatedAt = now
-			if errPersist := m.persist(ctx, auth); errPersist != nil {
-				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
-			}
 			snapshot = auth.Clone()
+			persistSnapshot = snapshot.Clone()
 		}
 	}
 	m.mu.Unlock()
 
+	if persistSnapshot != nil {
+		if errPersist := m.persist(ctx, persistSnapshot); errPersist != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", persistSnapshot.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+		}
+	}
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
 	}
@@ -499,12 +503,19 @@ func (m *Manager) SetSelector(selector Selector) {
 	if selector == nil {
 		selector = &RoundRobinSelector{}
 	}
+	var old Selector
 	m.mu.Lock()
+	old = m.selector
 	m.selector = selector
 	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
+	}
+	if old != nil && old != selector {
+		if stoppable, ok := old.(StoppableSelector); ok {
+			stoppable.Stop()
+		}
 	}
 }
 
@@ -753,6 +764,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 
 	now := time.Now()
 	var snapshot *Auth
+	var persistSnapshot *Auth
 	models := make([]string, 0)
 	registeredModels := modelsForRegisteredAuth(authID)
 	cooldownStateChanged := false
@@ -798,17 +810,17 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		auth.Status = StatusActive
 	}
 	auth.UpdatedAt = now
-	if errPersist := m.persist(ctx, auth); errPersist != nil {
-		m.mu.Unlock()
-		return nil, nil, errPersist
-	}
 	snapshot = auth.Clone()
+	persistSnapshot = snapshot.Clone()
 	if trackCooldownState {
 		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 	}
 	m.mu.Unlock()
 
+	if errPersist := m.persist(ctx, persistSnapshot); errPersist != nil {
+		return nil, nil, errPersist
+	}
 	for _, modelKey := range models {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(authID, modelKey)
 		registry.GetGlobalRegistry().ResumeClientModel(authID, modelKey)
@@ -1099,6 +1111,19 @@ func (m *Manager) nextModelPoolOffset(key string, size int) int {
 		return 0
 	}
 	return offset % size
+}
+
+func deleteModelPoolOffsetsForAuth(offsets map[string]int, authID string) {
+	authID = strings.ToLower(strings.TrimSpace(authID))
+	if authID == "" {
+		return
+	}
+	prefix := authID + "|"
+	for key := range offsets {
+		if strings.HasPrefix(strings.ToLower(key), prefix) {
+			delete(offsets, key)
+		}
+	}
 }
 
 func rotateStrings(values []string, offset int) []string {
@@ -1863,7 +1888,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		execReq := req
 		execReq.Model = execModel
 		execOpts := opts
-		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+		var errIntercept error
+		execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(ctx, executor, auth, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+		if errIntercept != nil {
+			return nil, errIntercept
+		}
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
@@ -2102,6 +2131,7 @@ func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	if provider == "" {
 		return
 	}
+	provider = strings.ToLower(provider)
 
 	var replaced ProviderExecutor
 	m.mu.Lock()
@@ -2229,7 +2259,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
 	if m.modelPoolOffsets != nil {
-		delete(m.modelPoolOffsets, id)
+		deleteModelPoolOffsetsForAuth(m.modelPoolOffsets, id)
 	}
 	for sessionID, sessionAuths := range m.homeRuntimeAuths {
 		if sessionAuths == nil {
@@ -2265,7 +2295,10 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 	if m == nil || authID == "" {
 		return
 	}
-	if invalidator, ok := m.selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	if invalidator, ok := selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
 		invalidator.InvalidateAuth(authID)
 	}
 }
@@ -2414,27 +2447,44 @@ type requestToFormatResolver interface {
 	RequestToFormat(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format
 }
 
-func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExecutor, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options) {
+func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, requestedModel string) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
 	if opts.RequestAfterAuthInterceptor == nil {
-		return req, opts
+		return req, opts, nil
+	}
+	authID := ""
+	authLabel := ""
+	secretRedactionPolicy := ""
+	if auth != nil {
+		authID = auth.ID
+		authLabel = auth.Label
+		if auth.Attributes != nil {
+			secretRedactionPolicy = strings.TrimSpace(auth.Attributes["secret_redaction"])
+		}
 	}
 	toFormat := requestToFormat(provider, executor, req, opts)
 	resp := opts.RequestAfterAuthInterceptor(ctx, cliproxyexecutor.RequestAfterAuthInterceptRequest{
-		SourceFormat:   opts.SourceFormat,
-		ToFormat:       toFormat,
-		Model:          req.Model,
-		RequestedModel: requestedModel,
-		Stream:         opts.Stream,
-		Headers:        cloneRequestHeaders(opts.Headers),
-		Body:           bytes.Clone(req.Payload),
-		Metadata:       opts.Metadata,
+		Provider:              provider,
+		AuthID:                authID,
+		AuthLabel:             authLabel,
+		SecretRedactionPolicy: secretRedactionPolicy,
+		SourceFormat:          opts.SourceFormat,
+		ToFormat:              toFormat,
+		Model:                 req.Model,
+		RequestedModel:        requestedModel,
+		Stream:                opts.Stream,
+		Headers:               cloneRequestHeaders(opts.Headers),
+		Body:                  bytes.Clone(req.Payload),
+		Metadata:              opts.Metadata,
 	})
+	if resp.Err != nil {
+		return req, opts, resp.Err
+	}
 	opts.Headers = mergeRequestHeaders(opts.Headers, resp.Headers, resp.ClearHeaders)
 	if len(resp.Body) > 0 {
 		req.Payload = bytes.Clone(resp.Body)
 		opts.OriginalRequest = bytes.Clone(resp.Body)
 	}
-	return req, opts
+	return req, opts, nil
 }
 
 func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
@@ -2565,7 +2615,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq := req
 			execReq.Model = upstreamModel
 			execOpts := opts
-			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			var errIntercept error
+			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, auth, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			if errIntercept != nil {
+				return cliproxyexecutor.Response{}, errIntercept
+			}
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
@@ -2667,7 +2721,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execReq := req
 			execReq.Model = upstreamModel
 			execOpts := opts
-			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			var errIntercept error
+			execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(execCtx, executor, auth, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
+			if errIntercept != nil {
+				return cliproxyexecutor.Response{}, errIntercept
+			}
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
@@ -3538,6 +3596,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	var authSnapshot *Auth
+	var persistSnapshot *Auth
 	cooldownStateChanged := false
 
 	m.mu.Lock()
@@ -3690,14 +3749,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
+		persistSnapshot = authSnapshot.Clone()
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 			cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 		}
 	}
 	m.mu.Unlock()
+	if persistSnapshot != nil {
+		_ = m.persist(ctx, persistSnapshot)
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
@@ -3942,8 +4004,9 @@ func refreshErrorFromError(err error) *Error {
 	}
 	authErr := &Error{Message: err.Error(), HTTPStatus: statusCode}
 	if statusCode == http.StatusUnauthorized {
-		authErr.Code = "unauthorized"
-		authErr.Retryable = false
+		authErr.Code = "refresh_unauthorized"
+		authErr.HTTPStatus = 0
+		authErr.Retryable = true
 	}
 	return authErr
 }
@@ -4316,10 +4379,17 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 }
 
 func (m *Manager) useSchedulerFastPath() bool {
-	if m == nil || m.scheduler == nil {
+	if m == nil {
 		return false
 	}
-	return isBuiltInSelector(m.selector)
+	m.mu.RLock()
+	selector := m.selector
+	scheduler := m.scheduler
+	m.mu.RUnlock()
+	if scheduler == nil {
+		return false
+	}
+	return isBuiltInSelector(selector)
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -5338,12 +5408,13 @@ func (m *Manager) StopAutoRefresh() {
 	cancel := m.refreshCancel
 	m.refreshCancel = nil
 	m.refreshLoop = nil
+	selector := m.selector
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
-	if stoppable, ok := m.selector.(StoppableSelector); ok {
+	if stoppable, ok := selector.(StoppableSelector); ok {
 		stoppable.Stop()
 	}
 }
@@ -5631,10 +5702,10 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		if current := m.auths[id]; current != nil {
 			current.LastError = refreshErrorFromError(err)
 			if unauthorized {
-				current.NextRefreshAfter = time.Time{}
+				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 				current.Unavailable = true
 				current.Status = StatusError
-				current.StatusMessage = "unauthorized"
+				current.StatusMessage = "refresh unauthorized"
 			} else {
 				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			}
@@ -5666,7 +5737,53 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if m.shouldRefresh(updated, now) {
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
-	_, _ = m.Update(ctx, updated)
+	m.applyRefreshUpdate(ctx, id, updated)
+}
+
+func (m *Manager) applyRefreshUpdate(ctx context.Context, id string, refreshed *Auth) {
+	if m == nil || refreshed == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = strings.TrimSpace(refreshed.ID)
+	}
+	if id == "" {
+		return
+	}
+	refreshedSnapshot := refreshed.Clone()
+	var snapshot *Auth
+
+	m.mu.Lock()
+	current := m.auths[id]
+	if current != nil {
+		current.Metadata = refreshedSnapshot.Metadata
+		current.Attributes = refreshedSnapshot.Attributes
+		current.Storage = refreshedSnapshot.Storage
+		current.Runtime = refreshedSnapshot.Runtime
+		current.LastRefreshedAt = refreshedSnapshot.LastRefreshedAt
+		current.NextRefreshAfter = refreshedSnapshot.NextRefreshAfter
+		current.UpdatedAt = refreshedSnapshot.UpdatedAt
+		if current.UpdatedAt.IsZero() {
+			current.UpdatedAt = time.Now()
+		}
+		current.EnsureIndex()
+		snapshot = current.Clone()
+	}
+	m.mu.Unlock()
+
+	if snapshot == nil {
+		return
+	}
+	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
+	if m.scheduler != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	m.queueRefreshReschedule(id)
+	_ = m.persist(ctx, snapshot)
+	m.hook.OnAuthUpdated(ctx, snapshot.Clone())
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
