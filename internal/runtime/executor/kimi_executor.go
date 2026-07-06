@@ -93,8 +93,8 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
+	payload := bytes.Clone(req.Payload)
+	originalTranslated, body := translateRequestPairForPayloadConfig(e.cfg, from, to, baseModel, originalPayload, payload, false)
 
 	// Strip kimi- prefix for upstream API
 	upstreamModel := stripKimiPrefix(baseModel)
@@ -203,8 +203,8 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), true)
+	payload := bytes.Clone(req.Payload)
+	originalTranslated, body := translateRequestPairForPayloadConfig(e.cfg, from, to, baseModel, originalPayload, payload, true)
 
 	// Strip kimi- prefix for upstream API
 	upstreamModel := stripKimiPrefix(baseModel)
@@ -305,20 +305,21 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				}
 			}
 		}
-		doneChunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
-		for i := range doneChunks {
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Payload: doneChunks[i]}:
-			case <-ctx.Done():
-				return
-			}
-		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
+			}
+			return
+		}
+		doneChunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, []byte("[DONE]"), &param)
+		for i := range doneChunks {
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Payload: doneChunks[i]}:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()

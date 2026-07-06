@@ -215,7 +215,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		c.Header("Cache-Control", "no-cache, no-transform")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
-		if h.Cfg.Streaming.DisableProxyBuffering {
+		if cfg := h.CurrentConfig(); cfg != nil && cfg.Streaming.DisableProxyBuffering {
 			c.Header("X-Accel-Buffering", "no") // Disable proxy buffering for SSE
 		}
 	}
@@ -242,6 +242,15 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, okPendingErr := handlers.PendingStreamError(errChan); okPendingErr {
+					h.WriteErrorResponse(c, errMsg)
+					if errMsg != nil {
+						cliCancel(errMsg.Error)
+					} else {
+						cliCancel(nil)
+					}
+					return
+				}
 				// Closed without data
 				if alt == "" {
 					setSSEHeaders()

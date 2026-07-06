@@ -204,7 +204,7 @@ func (o *KiroOAuth) exchangeCodeForToken(ctx context.Context, code, codeVerifier
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Debugf("token exchange failed (status %d): %s", resp.StatusCode, string(respBody))
+		log.Debugf("token exchange failed (status %d): %s", resp.StatusCode, util.SummarizeSensitiveBody(respBody, 512))
 		return nil, fmt.Errorf("token exchange failed (status %d)", resp.StatusCode)
 	}
 
@@ -262,7 +262,7 @@ func (o *KiroOAuth) RefreshToken(ctx context.Context, refreshToken string) (*Kir
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Debugf("token refresh failed (status %d): %s", resp.StatusCode, string(respBody))
+		log.Debugf("token refresh failed (status %d): %s", resp.StatusCode, util.SummarizeSensitiveBody(respBody, 512))
 		return nil, fmt.Errorf("token refresh failed (status %d)", resp.StatusCode)
 	}
 

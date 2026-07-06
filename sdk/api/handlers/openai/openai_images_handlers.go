@@ -74,7 +74,7 @@ func (h *OpenAIAPIHandler) newImagesStreamKeepAliveTicker() (*time.Ticker, <-cha
 	if h == nil || h.BaseAPIHandler == nil {
 		return nil, nil
 	}
-	interval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	interval := handlers.StreamingKeepAliveInterval(h.CurrentConfig())
 	if interval <= 0 {
 		return nil, nil
 	}

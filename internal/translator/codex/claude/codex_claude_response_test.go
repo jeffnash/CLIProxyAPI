@@ -766,7 +766,7 @@ func TestConvertCodexResponseToClaude_CachesStreamToolCallByClaudeVisibleID(t *t
 	}
 
 	ctx := context.Background()
-	originalRequest := []byte(`{"tools":[{"name":"lookup","input_schema":{"type":"object","properties":{}}}]}`)
+	originalRequest := []byte(`{"model":"claude-3-opus","tools":[{"name":"lookup","input_schema":{"type":"object","properties":{}}}]}`)
 	var param any
 
 	outputs := ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, []byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"`+longCallID+`","name":"lookup","arguments":{"query":"repo status"}}}`), &param)

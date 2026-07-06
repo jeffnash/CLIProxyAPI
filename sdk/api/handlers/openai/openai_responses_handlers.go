@@ -593,7 +593,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Cache-Control", "no-cache, no-transform")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
-		if h.Cfg.Streaming.DisableProxyBuffering {
+		if cfg := h.CurrentConfig(); cfg != nil && cfg.Streaming.DisableProxyBuffering {
 			c.Header("X-Accel-Buffering", "no") // Disable proxy buffering for SSE
 		}
 	}
@@ -621,6 +621,15 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
+				if errMsg, okPendingErr := handlers.PendingStreamError(errChan); okPendingErr {
+					h.WriteErrorResponse(c, errMsg)
+					if errMsg != nil {
+						cliCancel(errMsg.Error)
+					} else {
+						cliCancel(nil)
+					}
+					return
+				}
 				// Stream closed without data? Send headers and done.
 				setSSEHeaders()
 				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)

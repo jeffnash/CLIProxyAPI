@@ -211,16 +211,21 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 
 	// 4. Get config: suffix priority over body
 	var config ThinkingConfig
+	configFromSuffix := false
 	if suffixResult.HasSuffix {
 		config = parseSuffixToConfig(suffixResult.RawSuffix, providerFormat, model)
-		log.WithFields(log.Fields{
-			"provider": providerFormat,
-			"model":    model,
-			"mode":     config.Mode,
-			"budget":   config.Budget,
-			"level":    config.Level,
-		}).Debug("thinking: config from model suffix |")
-	} else {
+		if hasThinkingConfig(config) {
+			configFromSuffix = true
+			log.WithFields(log.Fields{
+				"provider": providerFormat,
+				"model":    model,
+				"mode":     config.Mode,
+				"budget":   config.Budget,
+				"level":    config.Level,
+			}).Debug("thinking: config from model suffix |")
+		}
+	}
+	if !configFromSuffix {
 		config = extractThinkingConfig(body, providerFormat)
 		if hasThinkingConfig(config) {
 			log.WithFields(log.Fields{
@@ -242,7 +247,7 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	}
 
 	// 5. Validate and normalize configuration
-	validated, err := ValidateConfig(config, modelInfo, fromFormat, providerFormat, suffixResult.HasSuffix)
+	validated, err := ValidateConfig(config, modelInfo, fromFormat, providerFormat, configFromSuffix)
 	if err != nil {
 		log.WithFields(log.Fields{
 			"provider": providerFormat,
@@ -330,16 +335,21 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 
 	// Get config: suffix priority over body
 	var config ThinkingConfig
+	configFromSuffix := false
 	if suffixResult.HasSuffix {
 		config = parseSuffixToConfig(suffixResult.RawSuffix, toFormat, modelID)
-		log.WithFields(log.Fields{
-			"provider": toFormat,
-			"model":    modelID,
-			"mode":     config.Mode,
-			"budget":   config.Budget,
-			"level":    config.Level,
-		}).Debug("thinking: config from model suffix |")
-	} else {
+		if hasThinkingConfig(config) {
+			configFromSuffix = true
+			log.WithFields(log.Fields{
+				"provider": toFormat,
+				"model":    modelID,
+				"mode":     config.Mode,
+				"budget":   config.Budget,
+				"level":    config.Level,
+			}).Debug("thinking: config from model suffix |")
+		}
+	}
+	if !configFromSuffix {
 		config = extractThinkingConfig(body, fromFormat)
 		if !hasThinkingConfig(config) && fromFormat != toFormat {
 			config = extractThinkingConfig(body, toFormat)

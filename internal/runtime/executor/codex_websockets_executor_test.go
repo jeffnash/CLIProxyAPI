@@ -20,6 +20,94 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func dialClosingWebsocketForTest(t *testing.T) *websocket.Conn {
+	t.Helper()
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(server.Close)
+
+	conn, _, errDial := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	return conn
+}
+
+func assertCodexReadChannelStillOpen(t *testing.T, ch chan codexWebsocketRead) {
+	t.Helper()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("active read channel was closed: %v", recovered)
+		}
+	}()
+	ch <- codexWebsocketRead{}
+}
+
+func TestCodexReadUpstreamLoopDoesNotCloseActiveReadChannelOnReadError(t *testing.T) {
+	conn := dialClosingWebsocketForTest(t)
+	sess := &codexWebsocketSession{}
+	readCh := make(chan codexWebsocketRead, 1)
+	sess.setActive(readCh)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&CodexWebsocketsExecutor{}).readUpstreamLoop(sess, conn)
+	}()
+
+	var ev codexWebsocketRead
+	select {
+	case ev = <-readCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for read error")
+	}
+	if ev.err == nil {
+		t.Fatalf("read event error is nil: %#v", ev)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not return after upstream close")
+	}
+	assertCodexReadChannelStillOpen(t, readCh)
+}
+
+func TestXAIReadUpstreamLoopDoesNotCloseActiveReadChannelOnReadError(t *testing.T) {
+	conn := dialClosingWebsocketForTest(t)
+	sess := &codexWebsocketSession{}
+	readCh := make(chan codexWebsocketRead, 1)
+	sess.setActive(readCh)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&XAIWebsocketsExecutor{}).readUpstreamLoop(sess, conn)
+	}()
+
+	var ev codexWebsocketRead
+	select {
+	case ev = <-readCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for read error")
+	}
+	if ev.err == nil {
+		t.Fatalf("read event error is nil: %#v", ev)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not return after upstream close")
+	}
+	assertCodexReadChannelStillOpen(t, readCh)
+}
+
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)
 

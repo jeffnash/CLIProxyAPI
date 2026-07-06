@@ -624,6 +624,50 @@ func TestBuildXAIWebsocketRequestBodySetsStoreAndKeepsPromptCacheKey(t *testing.
 	}
 }
 
+func TestXAIWebsocketIDStateStorePrunesStaleAndCapacity(t *testing.T) {
+	store := &xaiWebsocketIDStateStore{sessions: map[string]*xaiWebsocketIDState{
+		"stale": {lastAccess: time.Now().Add(-xaiWebsocketIDStateTTL - time.Minute)},
+	}}
+	if state := getXAIWebsocketIDState(store, "fresh"); state == nil {
+		t.Fatal("getXAIWebsocketIDState() returned nil")
+	}
+	if _, ok := store.sessions["stale"]; ok {
+		t.Fatal("stale session was not pruned")
+	}
+
+	store = &xaiWebsocketIDStateStore{sessions: make(map[string]*xaiWebsocketIDState)}
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < xaiWebsocketIDStateMaxSessions; i++ {
+		store.sessions[fmt.Sprintf("session-%04d", i)] = &xaiWebsocketIDState{lastAccess: base.Add(time.Duration(i) * time.Second)}
+	}
+	if state := getXAIWebsocketIDState(store, "new-session"); state == nil {
+		t.Fatal("getXAIWebsocketIDState() returned nil for new session")
+	}
+	if got := len(store.sessions); got != xaiWebsocketIDStateMaxSessions {
+		t.Fatalf("sessions = %d, want %d", got, xaiWebsocketIDStateMaxSessions)
+	}
+	if _, ok := store.sessions["session-0000"]; ok {
+		t.Fatal("oldest session was not evicted")
+	}
+}
+
+func TestXAIWebsocketIDStateTrimsTranscript(t *testing.T) {
+	state := &xaiWebsocketIDState{}
+	items := make([][]byte, 0, xaiWebsocketIDStateMaxTranscriptItems+5)
+	for i := 0; i < xaiWebsocketIDStateMaxTranscriptItems+5; i++ {
+		items = append(items, []byte(fmt.Sprintf(`{"type":"message","id":"item-%03d"}`, i)))
+	}
+	state.replaceTranscriptWithItems(items...)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if got := len(state.transcriptInput); got != xaiWebsocketIDStateMaxTranscriptItems {
+		t.Fatalf("transcript items = %d, want %d", got, xaiWebsocketIDStateMaxTranscriptItems)
+	}
+	if bytes.Contains(state.transcriptInput[0], []byte(`item-000`)) {
+		t.Fatalf("oldest transcript item was retained: %s", state.transcriptInput[0])
+	}
+}
+
 func TestXAIWebsocketsExecuteStreamCompletesGenerateFalseWarmup(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	capturedPayload := make(chan []byte, 1)

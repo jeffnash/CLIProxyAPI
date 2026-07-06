@@ -150,7 +150,6 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 
 			if len(chunkOutputs) > 0 {
 				results = append(results, chunkOutputs...)
-				return true
 			}
 
 			// Handle tool calls delta
@@ -203,11 +202,10 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 				})
 
 				// Don't output anything for tool call deltas - wait for completion
-				return true
 			}
 
 			// Handle finish reason
-			if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
+			if finishReason := choice.Get("finish_reason"); finishReason.Exists() && finishReason.Type != gjson.Null && finishReason.String() != "" {
 				geminiFinishReason := mapOpenAIFinishReasonToGemini(finishReason.String())
 				template, _ = sjson.SetBytes(template, "candidates.0.finishReason", geminiFinishReason)
 
@@ -248,18 +246,17 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 					(*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator = make(map[int]*ToolCallAccumulator)
 				}
 
+				if usage := root.Get("usage"); usage.Exists() {
+					template = setGeminiUsageMetadata(template, usage)
+				}
 				results = append(results, template)
 				return true
 			}
 
 			// Handle usage information
 			if usage := root.Get("usage"); usage.Exists() {
-				template, _ = sjson.SetBytes(template, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
-				template, _ = sjson.SetBytes(template, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
-				template, _ = sjson.SetBytes(template, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
-				if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
-					template, _ = sjson.SetBytes(template, "usageMetadata.thoughtsTokenCount", reasoningTokens)
-				}
+				template = setGeminiUsageMetadata(template, usage)
+				results = append(results, template)
 				return true
 			}
 
@@ -268,6 +265,16 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 		return results
 	}
 	return [][]byte{}
+}
+
+func setGeminiUsageMetadata(template []byte, usage gjson.Result) []byte {
+	template, _ = sjson.SetBytes(template, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
+	template, _ = sjson.SetBytes(template, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
+	template, _ = sjson.SetBytes(template, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
+	if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
+		template, _ = sjson.SetBytes(template, "usageMetadata.thoughtsTokenCount", reasoningTokens)
+	}
+	return template
 }
 
 // mapOpenAIFinishReasonToGemini maps OpenAI finish reasons to Gemini finish reasons

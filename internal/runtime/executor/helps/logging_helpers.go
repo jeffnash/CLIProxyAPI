@@ -445,6 +445,7 @@ func writeAttemptResponse(ginCtx *gin.Context, attempt *upstreamAttempt, payload
 		attempt.response = &strings.Builder{}
 	}
 	attempt.response.Write(payload)
+	appendAggregatedResponse(ginCtx, payload)
 }
 
 func updateAggregatedRequest(ginCtx *gin.Context, attempts []*upstreamAttempt) {
@@ -462,7 +463,26 @@ func updateAggregatedResponseIfMemoryBacked(ginCtx *gin.Context, attempts []*ups
 	if apiResponseSourceOrNil(ginCtx) != nil {
 		return
 	}
+	if _, exists := ginCtx.Get(apiResponseKey); exists {
+		return
+	}
 	updateAggregatedResponse(ginCtx, attempts)
+}
+
+func appendAggregatedResponse(ginCtx *gin.Context, payload []byte) {
+	if ginCtx == nil || len(payload) == 0 || apiResponseSourceOrNil(ginCtx) != nil {
+		return
+	}
+	if existing, exists := ginCtx.Get(apiResponseKey); exists {
+		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
+			combined := make([]byte, 0, len(existingBytes)+len(payload))
+			combined = append(combined, existingBytes...)
+			combined = append(combined, payload...)
+			ginCtx.Set(apiResponseKey, combined)
+			return
+		}
+	}
+	ginCtx.Set(apiResponseKey, bytes.Clone(payload))
 }
 
 func updateAggregatedResponse(ginCtx *gin.Context, attempts []*upstreamAttempt) {

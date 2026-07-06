@@ -143,7 +143,9 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds := []tea.Cmd{a.dashboard.Init()}
 		if a.logsEnabled {
 			a.initialized[tabLogs] = true
-			cmds = append(cmds, a.logs.Init())
+			var logsCmd tea.Cmd
+			a.logs, logsCmd = a.logs.Start()
+			cmds = append(cmds, logsCmd)
 		}
 		return a, tea.Batch(cmds...)
 
@@ -159,10 +161,11 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if !a.logsEnabled {
 					a.initialized[tabLogs] = false
+					a.logs = a.logs.Stop()
 				}
 				if !logsEnabledBefore && a.logsEnabled {
 					a.initialized[tabLogs] = true
-					cmdLogs = a.logs.Init()
+					a.logs, cmdLogs = a.logs.Start()
 				}
 			}
 		}
@@ -320,7 +323,9 @@ func (a *App) initTabIfNeeded(_ int) tea.Cmd {
 		if !a.logsEnabled {
 			return nil
 		}
-		return a.logs.Init()
+		var cmd tea.Cmd
+		a.logs, cmd = a.logs.Start()
+		return cmd
 	}
 	return nil
 }

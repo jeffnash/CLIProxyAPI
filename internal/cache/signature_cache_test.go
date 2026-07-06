@@ -105,6 +105,25 @@ func TestCacheSignature_BasicStorageAndRetrieval(t *testing.T) {
 	}
 }
 
+func TestCacheSignatureBoundsGroupSize(t *testing.T) {
+	ClearSignatureCache("")
+	signature := "abc123validSignature1234567890123456789012345678901234567890"
+	for i := 0; i < SignatureCacheMaxEntries+1; i++ {
+		CacheSignature(testModelName, string(rune('a'))+string(rune(i)), signature)
+	}
+	val, ok := signatureCache.Load(GetModelGroup(testModelName))
+	if !ok {
+		t.Fatal("signature cache group missing")
+	}
+	sc := val.(*groupCache)
+	sc.mu.RLock()
+	got := len(sc.entries)
+	sc.mu.RUnlock()
+	if got != SignatureCacheMaxEntries {
+		t.Fatalf("cache entries = %d, want %d", got, SignatureCacheMaxEntries)
+	}
+}
+
 func TestGetCachedSignatureRequiredHomeReadAndSlidingExpire(t *testing.T) {
 	ClearSignatureCache("")
 	text := "thinking text"

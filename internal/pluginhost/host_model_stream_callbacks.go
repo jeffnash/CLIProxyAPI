@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -16,6 +17,10 @@ func (h *Host) callHostModelExecuteStream(ctx context.Context, request []byte) (
 	if !req.Stream {
 		return nil, fmt.Errorf("host.model.execute_stream requires stream=true")
 	}
+	req.HostCallbackID = strings.TrimSpace(req.HostCallbackID)
+	if req.HostCallbackID == "" {
+		return nil, fmt.Errorf("host.model.execute_stream requires host_callback_id")
+	}
 	executor := h.currentModelExecutor()
 	if executor == nil {
 		return nil, fmt.Errorf("host model executor is unavailable")
@@ -27,9 +32,14 @@ func (h *Host) callHostModelExecuteStream(ctx context.Context, request []byte) (
 	}
 	// Detach request cancellation while preserving callback values; callback cleanup owns the model stream lifetime.
 	streamCtx, cancel := context.WithCancel(context.WithoutCancel(callbackCtx))
+	cleanupRegistered := false
+	defer func() {
+		if !cleanupRegistered {
+			cancel()
+		}
+	}()
 	stream, errMsg := executor.ExecuteModelStream(streamCtx, modelExecutionRequestFromPlugin(req.HostModelExecutionRequest, skipPluginID))
 	if errMsg != nil {
-		cancel()
 		return nil, modelExecutionError(errMsg)
 	}
 	streamID := ""
@@ -37,14 +47,12 @@ func (h *Host) callHostModelExecuteStream(ctx context.Context, request []byte) (
 		streamID = h.modelStreams.open(req.HostCallbackID, stream.Chunks, cancel)
 	}
 	if streamID == "" {
-		cancel()
 		return nil, fmt.Errorf("host model stream bridge is unavailable")
 	}
-	if req.HostCallbackID != "" {
-		h.addCallbackCleanup(req.HostCallbackID, func() {
-			h.modelStreams.close(streamID)
-		})
-	}
+	h.addCallbackCleanup(req.HostCallbackID, func() {
+		h.modelStreams.close(streamID)
+	})
+	cleanupRegistered = true
 	return marshalRPCResult(pluginapi.HostModelStreamResponse{
 		StatusCode: stream.StatusCode,
 		Headers:    cloneHeader(stream.Headers),

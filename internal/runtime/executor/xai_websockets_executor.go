@@ -53,7 +53,15 @@ type xaiWebsocketIDState struct {
 	downstreamToUpstream map[string]string
 	sequence             int
 	transcriptInput      []json.RawMessage
+	lastAccess           time.Time
 }
+
+const (
+	xaiWebsocketIDStateTTL                = 3 * time.Hour
+	xaiWebsocketIDStateMaxSessions        = 4096
+	xaiWebsocketIDStateMaxTranscriptItems = 128
+	xaiWebsocketIDStateMaxTranscriptBytes = 1 << 20
+)
 
 type xaiWebsocketRequestIDMapper struct {
 	state                *xaiWebsocketIDState
@@ -81,14 +89,50 @@ func getXAIWebsocketIDState(store *xaiWebsocketIDStateStore, sessionID string) *
 	if store.sessions == nil {
 		store.sessions = make(map[string]*xaiWebsocketIDState)
 	}
+	now := time.Now()
+	pruneXAIWebsocketIDStatesLocked(store, now)
 	if state := store.sessions[sessionID]; state != nil {
+		state.lastAccess = now
 		return state
 	}
+	pruneXAIWebsocketIDStateCapacityLocked(store)
 	state := &xaiWebsocketIDState{
 		downstreamToUpstream: make(map[string]string),
+		lastAccess:           now,
 	}
 	store.sessions[sessionID] = state
 	return state
+}
+
+func pruneXAIWebsocketIDStatesLocked(store *xaiWebsocketIDStateStore, now time.Time) {
+	for id, state := range store.sessions {
+		if state == nil || (!state.lastAccess.IsZero() && now.Sub(state.lastAccess) > xaiWebsocketIDStateTTL) {
+			delete(store.sessions, id)
+		}
+	}
+}
+
+func pruneXAIWebsocketIDStateCapacityLocked(store *xaiWebsocketIDStateStore) {
+	for len(store.sessions) >= xaiWebsocketIDStateMaxSessions {
+		var oldestID string
+		var oldestTime time.Time
+		first := true
+		for id, state := range store.sessions {
+			if state == nil {
+				oldestID = id
+				break
+			}
+			if first || state.lastAccess.Before(oldestTime) {
+				oldestID = id
+				oldestTime = state.lastAccess
+				first = false
+			}
+		}
+		if oldestID == "" {
+			return
+		}
+		delete(store.sessions, oldestID)
+	}
 }
 
 func deleteXAIWebsocketIDState(store *xaiWebsocketIDStateStore, sessionID string) {
@@ -195,6 +239,7 @@ func (s *xaiWebsocketIDState) recordTranscriptTurn(requestPayload []byte, comple
 	}
 	s.transcriptInput = append(s.transcriptInput, inputItems...)
 	s.transcriptInput = append(s.transcriptInput, outputItems...)
+	s.trimTranscriptLocked()
 }
 
 func (s *xaiWebsocketIDState) replaceTranscriptWithItems(items ...[]byte) {
@@ -211,7 +256,17 @@ func (s *xaiWebsocketIDState) replaceTranscriptWithItems(items ...[]byte) {
 	}
 	s.mu.Lock()
 	s.transcriptInput = next
+	s.trimTranscriptLocked()
 	s.mu.Unlock()
+}
+
+func (s *xaiWebsocketIDState) trimTranscriptLocked() {
+	if len(s.transcriptInput) > xaiWebsocketIDStateMaxTranscriptItems {
+		s.transcriptInput = append([]json.RawMessage(nil), s.transcriptInput[len(s.transcriptInput)-xaiWebsocketIDStateMaxTranscriptItems:]...)
+	}
+	for len(s.transcriptInput) > 1 && len(xaiMarshalRawMessages(s.transcriptInput)) > xaiWebsocketIDStateMaxTranscriptBytes {
+		s.transcriptInput = append([]json.RawMessage(nil), s.transcriptInput[1:]...)
+	}
 }
 
 func xaiJSONRawMessages(result gjson.Result) []json.RawMessage {
@@ -1021,10 +1076,8 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 				select {
 				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
 				case <-done:
-				default:
 				}
 				sess.clearActive(ch)
-				close(ch)
 			}
 			e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			return
@@ -1041,10 +1094,8 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 					select {
 					case ch <- codexWebsocketRead{conn: conn, err: errBinary}:
 					case <-done:
-					default:
 					}
 					sess.clearActive(ch)
-					close(ch)
 				}
 				e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
 				return

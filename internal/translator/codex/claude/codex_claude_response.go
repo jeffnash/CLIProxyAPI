@@ -87,6 +87,7 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 	output := make([]byte, 0, 512)
 	rootResult := gjson.ParseBytes(rawJSON)
 	params := (*param).(*ConvertCodexResponseToClaudeParams)
+	cacheScope := codexClaudeToolCallScope(originalRequestRawJSON)
 	tolerateGrokComposerStream := isGrokComposerClaudeStreamRepairModel(modelName)
 
 	// Once the Claude message has been stopped, nothing further is valid: a late content block,
@@ -209,7 +210,7 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 			params.HasToolCall = true
 			params.HasReceivedArgumentsDelta = false
 			callID := shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(itemResult.Get("call_id").String()))
-			rememberCodexClaudeToolCall(callID, itemResult)
+			rememberCodexClaudeToolCall(cacheScope, callID, itemResult)
 
 			name := itemResult.Get("name").String()
 			key := codexFunctionCallKey(rootResult, itemResult)
@@ -304,7 +305,7 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 				}
 			} else {
 				callID := shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(itemResult.Get("call_id").String()))
-				rememberCodexClaudeToolCall(callID, itemResult)
+				rememberCodexClaudeToolCall(cacheScope, callID, itemResult)
 				var blockIndex int
 				if tolerateGrokComposerStream {
 					var ok bool
@@ -597,6 +598,7 @@ func codexStreamErrorToClaudeError(rootResult gjson.Result) []byte {
 // the information into a single response that matches the Claude Code API format.
 func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, originalRequestRawJSON, _ []byte, rawJSON []byte, _ *any) []byte {
 	revNames := buildReverseMapFromClaudeOriginalShortToOriginal(originalRequestRawJSON)
+	cacheScope := codexClaudeToolCallScope(originalRequestRawJSON)
 
 	rootResult := gjson.ParseBytes(rawJSON)
 	typeStr := rootResult.Get("type").String()
@@ -699,7 +701,7 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 				}
 
 				callID := shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(item.Get("call_id").String()))
-				rememberCodexClaudeToolCall(callID, item)
+				rememberCodexClaudeToolCall(cacheScope, callID, item)
 				toolBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 				toolBlock, _ = sjson.SetBytes(toolBlock, "id", callID)
 				toolBlock, _ = sjson.SetBytes(toolBlock, "name", name)

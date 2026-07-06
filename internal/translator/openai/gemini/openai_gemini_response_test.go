@@ -120,6 +120,40 @@ func TestStreamFunctionCallIDDeterministicAcrossRuns(t *testing.T) {
 	}
 }
 
+func TestStreamIgnoresNullFinishReason(t *testing.T) {
+	frames := streamConvert(t, []string{
+		`data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`,
+	})
+	if len(frames) != 0 {
+		t.Fatalf("frames = %d, want 0 for null finish_reason: %s", len(frames), frames[0])
+	}
+}
+
+func TestStreamCombinedFinalChunkKeepsContentToolFinishAndUsage(t *testing.T) {
+	frames := streamConvert(t, []string{
+		`data: {"choices":[{"index":0,"delta":{"content":"done","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`,
+	})
+	if len(frames) != 2 {
+		t.Fatalf("frames = %d, want content frame plus final frame: %v", len(frames), frames)
+	}
+	if got := gjson.GetBytes(frames[0], "candidates.0.content.parts.0.text").String(); got != "done" {
+		t.Fatalf("content frame text = %q, want done", got)
+	}
+	calls := findFunctionCallParts(frames)
+	if len(calls) != 1 {
+		t.Fatalf("function call count = %d, want 1 (frames=%v)", len(calls), frames)
+	}
+	if got := calls[0].Get("name").String(); got != "lookup" {
+		t.Fatalf("function call name = %q, want lookup", got)
+	}
+	if got := gjson.GetBytes(frames[1], "candidates.0.finishReason").String(); got != "STOP" {
+		t.Fatalf("finishReason = %q, want STOP", got)
+	}
+	if got := gjson.GetBytes(frames[1], "usageMetadata.totalTokenCount").Int(); got != 5 {
+		t.Fatalf("totalTokenCount = %d, want 5", got)
+	}
+}
+
 // TestStreamOmitsFunctionCallIDWhenAbsent verifies that when the OpenAI stream
 // never carries an id, functionCall.id is NOT written (so the request side falls
 // back to its deterministic mint instead of seeing an empty id). C-GEMID keeps

@@ -25,6 +25,17 @@ func ApplyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string
 	return ApplyPayloadConfigWithRequest(cfg, model, protocol, "", root, payload, original, requestedModel, requestPath, nil)
 }
 
+// PayloadConfigMayNeedOriginal reports whether payload rules can consult the
+// pre-mutation translated request. Override and filter rules only inspect the
+// current payload, so executors can skip expensive original translations unless
+// default rules are configured.
+func PayloadConfigMayNeedOriginal(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return len(cfg.Payload.Default) != 0 || len(cfg.Payload.DefaultRaw) != 0
+}
+
 // ApplyPayloadConfigWithRequest applies payload config using source protocol and request header gates.
 func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProtocol, root string, payload, original []byte, requestedModel string, requestPath string, headers http.Header) []byte {
 	if cfg == nil || len(payload) == 0 {

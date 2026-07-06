@@ -1180,6 +1180,36 @@ func TestConvertClaudeRequestToOpenAI_ToolResultRoleGate(t *testing.T) {
 	})
 }
 
+func TestConvertClaudeRequestToOpenAI_ToolChoiceNone(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-3-opus",
+		"messages":[{"role":"user","content":"hello"}],
+		"tool_choice":{"type":"none"}
+	}`)
+
+	result := ConvertClaudeRequestToOpenAI("test-model", inputJSON, false)
+	if got := gjson.GetBytes(result, "tool_choice").String(); got != "none" {
+		t.Fatalf("tool_choice = %q, want none", got)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ForwardsTemperatureAndTopP(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-3-opus",
+		"messages":[{"role":"user","content":"hello"}],
+		"temperature":0.2,
+		"top_p":0.9
+	}`)
+
+	result := ConvertClaudeRequestToOpenAI("test-model", inputJSON, false)
+	if got := gjson.GetBytes(result, "temperature").Float(); got != 0.2 {
+		t.Fatalf("temperature = %v, want 0.2", got)
+	}
+	if got := gjson.GetBytes(result, "top_p").Float(); got != 0.9 {
+		t.Fatalf("top_p = %v, want 0.9", got)
+	}
+}
+
 // TestConvertClaudeRequestToOpenAI_ToolResultRoleGateSystemDeveloper is the second ADD-81
 // regression test: a system- or developer-authored message containing a tool_result part is
 // also not emitted as a role:"tool" message.

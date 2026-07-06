@@ -27,11 +27,13 @@ func (h *Handler) putStringList(c *gin.Context, set func([]string), after func()
 		}
 		arr = obj.Items
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(arr)
 	if after != nil {
 		after()
 	}
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) patchStringList(c *gin.Context, target *[]string, after func()) {
@@ -45,12 +47,14 @@ func (h *Handler) patchStringList(c *gin.Context, target *[]string, after func()
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if body.Index != nil && body.Value != nil && *body.Index >= 0 && *body.Index < len(*target) {
 		(*target)[*body.Index] = *body.Value
 		if after != nil {
 			after()
 		}
-		h.persist(c)
+		h.persistLocked(c)
 		return
 	}
 	if body.Old != nil && body.New != nil {
@@ -60,7 +64,7 @@ func (h *Handler) patchStringList(c *gin.Context, target *[]string, after func()
 				if after != nil {
 					after()
 				}
-				h.persist(c)
+				h.persistLocked(c)
 				return
 			}
 		}
@@ -68,13 +72,15 @@ func (h *Handler) patchStringList(c *gin.Context, target *[]string, after func()
 		if after != nil {
 			after()
 		}
-		h.persist(c)
+		h.persistLocked(c)
 		return
 	}
 	c.JSON(400, gin.H{"error": "missing fields"})
 }
 
 func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, err := fmt.Sscanf(idxStr, "%d", &idx)
@@ -83,7 +89,7 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 			if after != nil {
 				after()
 			}
-			h.persist(c)
+			h.persistLocked(c)
 			return
 		}
 	}
@@ -98,7 +104,7 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 		if after != nil {
 			after()
 		}
-		h.persist(c)
+		h.persistLocked(c)
 		return
 	}
 	c.JSON(400, gin.H{"error": "missing index or value"})

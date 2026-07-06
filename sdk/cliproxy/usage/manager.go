@@ -175,6 +175,7 @@ type Manager struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
 	queue  []queueItem
+	limit  int
 	closed bool
 
 	pluginsMu sync.RWMutex
@@ -182,9 +183,14 @@ type Manager struct {
 	named     map[string]int
 }
 
+const defaultQueueLimit = 512
+
 // NewManager constructs a manager with a buffered queue.
 func NewManager(buffer int) *Manager {
-	m := &Manager{}
+	if buffer <= 0 {
+		buffer = defaultQueueLimit
+	}
+	m := &Manager{limit: buffer}
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
@@ -267,9 +273,21 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		m.mu.Unlock()
 		return
 	}
-	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
+	m.enqueueLocked(queueItem{ctx: ctx, record: record})
 	m.mu.Unlock()
 	m.cond.Signal()
+}
+
+func (m *Manager) enqueueLocked(item queueItem) {
+	if m.limit <= 0 {
+		m.limit = defaultQueueLimit
+	}
+	if len(m.queue) >= m.limit {
+		copy(m.queue, m.queue[1:])
+		m.queue[len(m.queue)-1] = item
+		return
+	}
+	m.queue = append(m.queue, item)
 }
 
 func (m *Manager) run(ctx context.Context) {

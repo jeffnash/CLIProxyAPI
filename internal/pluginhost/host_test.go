@@ -1111,6 +1111,57 @@ func TestHostUnloadAndShutdownWaitForBlockingRegister(t *testing.T) {
 	}
 }
 
+func TestHostShutdownAllClosesBridgeStreams(t *testing.T) {
+	h := New()
+	streamID, chunks, _ := h.streams.open(context.Background())
+	if streamID == "" {
+		t.Fatal("stream id is empty")
+	}
+
+	h.ShutdownAll()
+
+	select {
+	case chunk, ok := <-chunks:
+		if ok && chunk.Err == nil {
+			t.Fatalf("shutdown stream chunk = %+v, want error or closed channel", chunk)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("stream was not closed by ShutdownAll")
+	}
+}
+
+func TestHostShutdownAllDoesNotHoldApplyMuWhileClientShutdownBlocks(t *testing.T) {
+	h := New()
+	client := &blockingShutdownPluginClient{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h.loaded["alpha"] = &loadedPlugin{
+		id:      "alpha",
+		name:    "Alpha",
+		path:    "/tmp/alpha.so",
+		version: "v1",
+		client:  client,
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		h.ShutdownAll()
+		close(shutdownDone)
+	}()
+	waitForHostTestSignal(t, client.started, "client shutdown start")
+
+	applyDone := make(chan struct{})
+	go func() {
+		h.ApplyConfig(context.Background(), &config.Config{})
+		close(applyDone)
+	}()
+	waitForHostTestSignal(t, applyDone, "ApplyConfig while client shutdown is blocked")
+
+	close(client.release)
+	waitForHostTestSignal(t, shutdownDone, "ShutdownAll completion")
+}
+
 func TestSortRecordsPriorityDescendingAndIDTieBreak(t *testing.T) {
 	records := []capabilityRecord{
 		{id: "charlie", priority: 1},
@@ -1141,6 +1192,21 @@ func (c *capturePluginClient) Call(ctx context.Context, method string, request [
 }
 
 func (c *capturePluginClient) Shutdown() {}
+
+type blockingShutdownPluginClient struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingShutdownPluginClient) Call(context.Context, string, []byte) ([]byte, error) {
+	return marshalRPCResult(rpcEmptyResponse{})
+}
+
+func (c *blockingShutdownPluginClient) Shutdown() {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+}
 
 type blockingOpenLoader struct {
 	inner     *testSymbolLoader

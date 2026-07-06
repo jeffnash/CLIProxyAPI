@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -25,7 +26,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-const homeCertificateRequestTimeout = 30 * time.Second
+const (
+	homeCertificateRequestTimeout     = 30 * time.Second
+	homeCertificateMaxRESPBulkPayload = 1 << 20
+)
 
 type homeJWTClaims struct {
 	CertificateID    string `json:"certificate_id"`
@@ -306,13 +310,26 @@ func requestClientCertificate(ctx context.Context, claims homeJWTClaims, csrPEM 
 	dialCtx, cancel := context.WithTimeout(ctx, homeCertificateRequestTimeout)
 	defer cancel()
 	addr := net.JoinHostPort(strings.TrimSpace(claims.IP), strconv.Itoa(claims.Port))
-	conn, errDial := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+	conn, errDial := (&tls.Dialer{
+		NetDialer: &net.Dialer{},
+		Config: &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true,
+		},
+	}).DialContext(dialCtx, "tcp", addr)
 	if errDial != nil {
 		return response, errDial
 	}
 	defer func() {
 		_ = conn.Close()
 	}()
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return response, fmt.Errorf("home certificate request requires tls")
+	}
+	if errVerify := verifyTLSConnectionFingerprint(tlsConn, claims.CAFingerprint); errVerify != nil {
+		return response, errVerify
+	}
 	if deadline, ok := dialCtx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
@@ -330,6 +347,26 @@ func requestClientCertificate(ctx context.Context, claims homeJWTClaims, csrPEM 
 		return response, fmt.Errorf("home certificate request failed")
 	}
 	return response, nil
+}
+
+func verifyTLSConnectionFingerprint(conn *tls.Conn, expectedFingerprint string) error {
+	if conn == nil {
+		return fmt.Errorf("home certificate request missing tls connection")
+	}
+	if err := conn.Handshake(); err != nil {
+		return err
+	}
+	expected := normalizeFingerprint(expectedFingerprint)
+	if expected == "" {
+		return fmt.Errorf("home ca fingerprint is required")
+	}
+	for _, cert := range conn.ConnectionState().PeerCertificates {
+		sum := sha256.Sum256(cert.Raw)
+		if hex.EncodeToString(sum[:]) == expected {
+			return nil
+		}
+	}
+	return fmt.Errorf("home ca fingerprint mismatch")
 }
 
 func encodeRESPArray(args ...string) []byte {
@@ -364,6 +401,9 @@ func readRESPBulk(reader *bufio.Reader) ([]byte, error) {
 		}
 		if size < 0 {
 			return nil, fmt.Errorf("home certificate request returned nil")
+		}
+		if size > homeCertificateMaxRESPBulkPayload {
+			return nil, fmt.Errorf("home certificate request response too large: %d bytes", size)
 		}
 		payload := make([]byte, size+2)
 		if _, errFull := io.ReadFull(reader, payload); errFull != nil {

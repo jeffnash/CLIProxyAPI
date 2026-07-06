@@ -154,7 +154,7 @@ func (k *KiroAuth) makeRequest(ctx context.Context, target string, accessToken s
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, util.SummarizeSensitiveBody(body, 512))
 	}
 
 	return body, nil

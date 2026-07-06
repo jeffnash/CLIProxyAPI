@@ -64,6 +64,7 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	Model       string
 	CreatedAt   int64
 	ToolNameMap map[string]string
+	Stream      bool
 	// SawToolCall is true once at least one tool_use content_block_start has
 	// been emitted on the wire. Using raw upstream tool_calls presence here
 	// can produce stop_reason=tool_use with zero announced tool blocks.
@@ -130,6 +131,7 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 			Model:                       "",
 			CreatedAt:                   0,
 			ToolNameMap:                 nil,
+			Stream:                      originalRequestIsStream(originalRequestRawJSON),
 			SawToolCall:                 false,
 			ContentAccumulator:          strings.Builder{},
 			ToolCallsAccumulator:        nil,
@@ -162,12 +164,20 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
 
-	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
-	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams).ThinkingEnabled)
+	if !(*param).(*ConvertOpenAIResponseToAnthropicParams).Stream {
+		return convertOpenAINonStreamingToAnthropic(
+			rawJSON,
+			(*param).(*ConvertOpenAIResponseToAnthropicParams).ThinkingEnabled,
+			(*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap,
+		)
 	} else {
 		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
+}
+
+func originalRequestIsStream(originalRequestRawJSON []byte) bool {
+	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
+	return streamResult.Exists() && streamResult.Type != gjson.False
 }
 
 func effectiveOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) string {
@@ -465,7 +475,7 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 
 // convertOpenAINonStreamingToAnthropic converts OpenAI non-streaming response to Anthropic format.
 // thinkingEnabled (ADD-66) gates whether reasoning_content is rendered as Anthropic thinking blocks.
-func convertOpenAINonStreamingToAnthropic(rawJSON []byte, thinkingEnabled bool) [][]byte {
+func convertOpenAINonStreamingToAnthropic(rawJSON []byte, thinkingEnabled bool, toolNameMap map[string]string) [][]byte {
 	root := gjson.ParseBytes(rawJSON)
 
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
@@ -502,7 +512,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte, thinkingEnabled bool) 
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 				toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
-				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolCall.Get("function.name").String())
+				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", util.MapToolName(toolNameMap, toolCall.Get("function.name").String()))
 
 				argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
 				if argsStr != "" && gjson.Valid(argsStr) {

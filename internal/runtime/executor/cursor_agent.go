@@ -30,7 +30,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -410,13 +409,8 @@ func streamCursorAgentEvents(ctx context.Context, cfg *config.Config, auth *clip
 			return
 		}
 
-		// Frames are read on a goroutine and delivered over `frames` so the main
-		// loop can apply an idle timeout. The agent bidi stream never sends
-		// turn_ended for a text-only reply — after the assistant finishes it
-		// just emits a heartbeat every ~10s forever. We therefore treat the
-		// turn as complete once the stream goes quiet (no content frame) for
-		// cursorAgentIdleTimeout after at least one content frame. Heartbeats
-		// (10s apart) never reset the timer, so they can't keep us alive.
+		// Frames are read on a goroutine and delivered over `frames`; completion
+		// is driven by upstream EOF/trailers or caller cancellation.
 		type agentFrame struct {
 			field   int
 			payload []byte
@@ -453,24 +447,10 @@ func streamCursorAgentEvents(ctx context.Context, cfg *config.Config, auth *clip
 			}
 		}()
 
-		const cursorAgentIdleTimeout = 1200 * time.Millisecond
-		idle := time.NewTimer(time.Hour) // effectively disarmed until first content
-		defer idle.Stop()
-		sawContent := false
-		armIdle := func() {
-			sawContent = true
-			idle.Reset(cursorAgentIdleTimeout)
-		}
-
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-idle.C:
-				if sawContent {
-					log.Debugf("cursor agent: req=%s idle-complete after content", requestID)
-					return
-				}
 			case fr, ok := <-frames:
 				if !ok {
 					if st := resp.Trailer.Get("grpc-status"); st != "" && st != "0" {
@@ -481,7 +461,7 @@ func streamCursorAgentEvents(ctx context.Context, cfg *config.Config, auth *clip
 				switch fr.field {
 				case 1: // interaction_update
 					if inner := decodeProtobufFields(fr.payload); len(inner) > 0 && inner[0].Number == 13 {
-						break // heartbeat — do not reset idle timer
+						break // heartbeat
 					} else if len(inner) > 0 && os.Getenv("CURSOR_AGENT_DUMP") == "1" && (inner[0].Number == 2 || inner[0].Number == 3 || inner[0].Number == 7) {
 						log.Infof("cursor agent: req=%s toolframe case=%d hex=%x", requestID, inner[0].Number, inner[0].Value)
 					}
@@ -491,7 +471,6 @@ func streamCursorAgentEvents(ctx context.Context, cfg *config.Config, auth *clip
 							return
 						}
 					}
-					armIdle() // any non-heartbeat content keeps the turn alive
 					if done {
 						return // explicit turn_ended (e.g. when a tool call closes the turn)
 					}

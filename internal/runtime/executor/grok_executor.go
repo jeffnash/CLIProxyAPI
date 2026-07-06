@@ -319,7 +319,7 @@ func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		scanner.Buffer(nil, bufSize)
 
 		timeoutTracker := newStreamTimeoutTracker(e.cfg)
-		timeoutCh := timeoutTracker.Start(streamCtx)
+		timeoutCh := timeoutTracker.Start(streamCtx, cancel)
 
 		var param any
 		for scanner.Scan() {
@@ -331,22 +331,28 @@ func (e *GrokExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			chunks := sdktranslator.TranslateStream(streamCtx, sdktranslator.FromString("grok"), opts.SourceFormat, req.Model, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				if !sendStreamChunk(streamCtx, out, cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}) {
+					return
+				}
 			}
 		}
 		timeoutReason := timeoutTracker.Reason(timeoutCh)
-		doneChunks := sdktranslator.TranslateStream(streamCtx, sdktranslator.FromString("grok"), opts.SourceFormat, req.Model, bytes.Clone(opts.OriginalRequest), body, []byte("[DONE]"), &param)
 		if timeoutReason != "" {
-			out <- cliproxyexecutor.StreamChunk{Payload: []byte(buildTimeoutStreamChunk(req.Model, timeoutReason))}
-		}
-		for i := range doneChunks {
-			out <- cliproxyexecutor.StreamChunk{Payload: []byte(doneChunks[i])}
+			timeoutErr := fmt.Errorf("grok executor: %s", timeoutReason)
+			helps.RecordAPIResponseError(ctx, e.cfg, timeoutErr)
+			reporter.PublishFailure(ctx)
+			_ = sendStreamChunk(streamCtx, out, cliproxyexecutor.StreamChunk{Err: timeoutErr})
+			return
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			if timeoutReason == "" {
-				helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-				reporter.PublishFailure(ctx)
-				out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+			reporter.PublishFailure(ctx)
+			_ = sendStreamChunk(streamCtx, out, cliproxyexecutor.StreamChunk{Err: errScan})
+			return
+		}
+		doneChunks := sdktranslator.TranslateStream(streamCtx, sdktranslator.FromString("grok"), opts.SourceFormat, req.Model, bytes.Clone(opts.OriginalRequest), body, []byte("[DONE]"), &param)
+		for i := range doneChunks {
+			if !sendStreamChunk(streamCtx, out, cliproxyexecutor.StreamChunk{Payload: []byte(doneChunks[i])}) {
 				return
 			}
 		}
@@ -481,6 +487,8 @@ type streamTimeoutTracker struct {
 	mu            sync.Mutex
 }
 
+var streamTimeoutTrackerTick = time.Second
+
 func newStreamTimeoutTracker(cfg *config.Config) *streamTimeoutTracker {
 	now := time.Now()
 	return &streamTimeoutTracker{
@@ -497,10 +505,10 @@ func (t *streamTimeoutTracker) MarkChunk() {
 	t.mu.Unlock()
 }
 
-func (t *streamTimeoutTracker) Start(ctx context.Context) <-chan string {
+func (t *streamTimeoutTracker) Start(ctx context.Context, cancel context.CancelFunc) <-chan string {
 	reasonCh := make(chan string, 1)
 	go func() {
-		ticker := time.NewTicker(time.Second)
+		ticker := time.NewTicker(streamTimeoutTrackerTick)
 		defer ticker.Stop()
 		defer close(reasonCh)
 		for {
@@ -512,6 +520,9 @@ func (t *streamTimeoutTracker) Start(ctx context.Context) <-chan string {
 					select {
 					case reasonCh <- reason:
 					default:
+					}
+					if cancel != nil {
+						cancel()
 					}
 					return
 				}

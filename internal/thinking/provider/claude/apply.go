@@ -150,18 +150,23 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 			return result, nil
 		}
 
-		// Legacy fallback: enable thinking without specifying budget_tokens.
-		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
-		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-		result, _ = sjson.DeleteBytes(result, "output_config.effort")
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
-		}
-		return result, nil
+		// Legacy Claude has no valid auto-thinking wire format. Omit thinking
+		// controls so upstream defaults apply instead of sending type=enabled
+		// without the required budget_tokens field.
+		return deleteClaudeThinkingControls(body), nil
 
 	default:
 		return body, nil
 	}
+}
+
+func deleteClaudeThinkingControls(body []byte) []byte {
+	result, _ := sjson.DeleteBytes(body, "thinking")
+	result, _ = sjson.DeleteBytes(result, "output_config.effort")
+	if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
+		result, _ = sjson.DeleteBytes(result, "output_config")
+	}
+	return result
 }
 
 // normalizeClaudeBudget applies Claude-specific constraints to ensure max_tokens > budget_tokens.
@@ -237,13 +242,7 @@ func applyCompatibleClaude(body []byte, config thinking.ThinkingConfig) ([]byte,
 		}
 		return result, nil
 	case thinking.ModeAuto:
-		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
-		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-		result, _ = sjson.DeleteBytes(result, "output_config.effort")
-		if oc := gjson.GetBytes(result, "output_config"); oc.Exists() && oc.IsObject() && len(oc.Map()) == 0 {
-			result, _ = sjson.DeleteBytes(result, "output_config")
-		}
-		return result, nil
+		return deleteClaudeThinkingControls(body), nil
 	case thinking.ModeLevel:
 		// For user-defined models, interpret ModeLevel as Claude adaptive thinking effort.
 		// Upstream is responsible for validating whether the target model supports it.

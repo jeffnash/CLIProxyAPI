@@ -46,6 +46,65 @@ func TestAuthDispatchRequestDefaultsCountToOne(t *testing.T) {
 	}
 }
 
+func TestRequestClientCertificateStartsTLSBeforeSendingSecret(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("listen: %v", errListen)
+	}
+	defer func() { _ = listener.Close() }()
+
+	firstByte := make(chan byte, 1)
+	go func() {
+		conn, errAccept := listener.Accept()
+		if errAccept != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		var b [1]byte
+		if _, errRead := conn.Read(b[:]); errRead == nil {
+			firstByte <- b[0]
+		}
+	}()
+
+	_, portRaw, errSplit := net.SplitHostPort(listener.Addr().String())
+	if errSplit != nil {
+		t.Fatalf("SplitHostPort: %v", errSplit)
+	}
+	port, errPort := strconv.Atoi(portRaw)
+	if errPort != nil {
+		t.Fatalf("Atoi(port): %v", errPort)
+	}
+	_, errRequest := requestClientCertificate(context.Background(), homeJWTClaims{
+		CertificateID:    "cert-id",
+		CAFingerprint:    strings.Repeat("a", 64),
+		EnrollmentSecret: "secret-value",
+		IP:               "127.0.0.1",
+		Port:             port,
+	}, []byte("csr"))
+	if errRequest == nil {
+		t.Fatal("requestClientCertificate() error = nil, want TLS handshake failure")
+	}
+	select {
+	case got := <-firstByte:
+		if got == '*' {
+			t.Fatal("client sent plaintext RESP before TLS")
+		}
+		if got != 0x16 {
+			t.Fatalf("first byte = 0x%x, want TLS handshake record 0x16", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for client first byte")
+	}
+}
+
+func TestReadRESPBulkRejectsOversizedPayload(t *testing.T) {
+	raw := fmt.Sprintf("$%d\r\n", homeCertificateMaxRESPBulkPayload+1)
+	if _, err := readRESPBulk(bufio.NewReader(strings.NewReader(raw))); err == nil {
+		t.Fatal("readRESPBulk() error = nil, want oversized response error")
+	}
+}
+
 func TestRedisOptionsHomeTLSDisabled(t *testing.T) {
 	client := New(config.HomeConfig{
 		Enabled: true,

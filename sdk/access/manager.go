@@ -48,7 +48,7 @@ func (m *Manager) Authenticate(ctx context.Context, r *http.Request) (*Result, *
 	}
 	providers := m.Providers()
 	if len(providers) == 0 {
-		return nil, nil
+		return nil, NewNoCredentialsError()
 	}
 
 	var (

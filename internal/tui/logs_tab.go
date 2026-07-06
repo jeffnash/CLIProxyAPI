@@ -23,16 +23,23 @@ type logsTabModel struct {
 	filter     string // "", "debug", "info", "warn", "error"
 	after      int64
 	lastErr    error
+	generation uint64
 }
 
 type logsPollMsg struct {
-	lines  []string
-	latest int64
-	err    error
+	lines      []string
+	latest     int64
+	err        error
+	generation uint64
 }
 
-type logsTickMsg struct{}
-type logLineMsg string
+type logsTickMsg struct {
+	generation uint64
+}
+type logLineMsg struct {
+	line       string
+	generation uint64
+}
 
 func newLogsTabModel(client *Client, hook *LogHook) logsTabModel {
 	return logsTabModel{
@@ -50,18 +57,30 @@ func (m logsTabModel) Init() tea.Cmd {
 	return m.fetchLogs
 }
 
+func (m logsTabModel) Start() (logsTabModel, tea.Cmd) {
+	m.generation++
+	return m, m.Init()
+}
+
+func (m logsTabModel) Stop() logsTabModel {
+	m.generation++
+	return m
+}
+
 func (m logsTabModel) fetchLogs() tea.Msg {
 	lines, latest, err := m.client.GetLogs(m.after, 200)
 	return logsPollMsg{
-		lines:  lines,
-		latest: latest,
-		err:    err,
+		lines:      lines,
+		latest:     latest,
+		err:        err,
+		generation: m.generation,
 	}
 }
 
 func (m logsTabModel) waitForNextPoll() tea.Cmd {
+	generation := m.generation
 	return tea.Tick(2*time.Second, func(_ time.Time) tea.Msg {
-		return logsTickMsg{}
+		return logsTickMsg{generation: generation}
 	})
 }
 
@@ -73,7 +92,7 @@ func (m logsTabModel) waitForLog() tea.Msg {
 	if !ok {
 		return nil
 	}
-	return logLineMsg(line)
+	return logLineMsg{line: line, generation: m.generation}
 }
 
 func (m logsTabModel) Update(msg tea.Msg) (logsTabModel, tea.Cmd) {
@@ -82,11 +101,17 @@ func (m logsTabModel) Update(msg tea.Msg) (logsTabModel, tea.Cmd) {
 		m.viewport.SetContent(m.renderLogs())
 		return m, nil
 	case logsTickMsg:
+		if msg.generation != m.generation {
+			return m, nil
+		}
 		if m.hook != nil {
 			return m, nil
 		}
 		return m, m.fetchLogs
 	case logsPollMsg:
+		if msg.generation != m.generation {
+			return m, nil
+		}
 		if m.hook != nil {
 			return m, nil
 		}
@@ -108,7 +133,10 @@ func (m logsTabModel) Update(msg tea.Msg) (logsTabModel, tea.Cmd) {
 		}
 		return m, m.waitForNextPoll()
 	case logLineMsg:
-		m.lines = append(m.lines, string(msg))
+		if msg.generation != m.generation {
+			return m, nil
+		}
+		m.lines = append(m.lines, msg.line)
 		if len(m.lines) > m.maxLines {
 			m.lines = m.lines[len(m.lines)-m.maxLines:]
 		}

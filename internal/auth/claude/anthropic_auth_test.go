@@ -59,6 +59,29 @@ func TestRefreshTokensWithRetry_429BlocksImmediateReplay(t *testing.T) {
 	}
 }
 
+func TestClaudeRefreshBlockHashesAndPrunesTokens(t *testing.T) {
+	resetClaudeRefreshState()
+	defer resetClaudeRefreshState()
+
+	token := "raw_refresh_token"
+	setClaudeRefreshBlockedUntil(token, time.Now().Add(time.Minute))
+	if _, ok := claudeRefreshBlock[token]; ok {
+		t.Fatalf("refresh block map contains raw refresh token key")
+	}
+	if _, ok := claudeRefreshBlock[claudeRefreshBlockKey(token)]; !ok {
+		t.Fatalf("refresh block map missing hashed token key")
+	}
+
+	setClaudeRefreshBlockedUntil("expired_refresh_token", time.Now().Add(-time.Minute))
+	if len(claudeRefreshBlock) != 1 {
+		t.Fatalf("refresh block entries = %d, want only active hashed token", len(claudeRefreshBlock))
+	}
+	clearClaudeRefreshBlockedUntil(token)
+	if len(claudeRefreshBlock) != 0 {
+		t.Fatalf("refresh block entries after clear = %d, want 0", len(claudeRefreshBlock))
+	}
+}
+
 func TestRefreshTokens_DeduplicatesConcurrentRefresh(t *testing.T) {
 	resetClaudeRefreshState()
 	defer resetClaudeRefreshState()

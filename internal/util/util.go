@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -215,8 +216,10 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 
 	// On Windows, os.Rename cannot overwrite an existing file.
 	// Remove the destination first; ignore not-exist errors.
-	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("atomic write: remove existing file failed: %w", err)
+	if runtime.GOOS == "windows" {
+		if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("atomic write: remove existing file failed: %w", err)
+		}
 	}
 
 	// Atomic rename

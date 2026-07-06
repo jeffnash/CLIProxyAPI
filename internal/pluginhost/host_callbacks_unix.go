@@ -15,15 +15,21 @@ import "C"
 
 import (
 	"context"
+	"fmt"
 	"unsafe"
 )
 
 //export cliproxyHostCall
-func cliproxyHostCall(hostCtx unsafe.Pointer, method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
+func cliproxyHostCall(hostCtx unsafe.Pointer, method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) (ret C.int) {
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			ret = writeHostCallResponse(marshalRPCError("host_call_panic", fmt.Sprintf("%v", recovered)), response)
+		}
+	}()
 	if hostCtx == nil || method == nil {
 		return 1
 	}
@@ -45,6 +51,10 @@ func cliproxyHostCall(hostCtx unsafe.Pointer, method *C.char, request *C.uint8_t
 	if errCall != nil {
 		resp = marshalRPCError("host_call_failed", errCall.Error())
 	}
+	return writeHostCallResponse(resp, response)
+}
+
+func writeHostCallResponse(resp []byte, response *C.cliproxy_buffer) C.int {
 	if len(resp) == 0 || response == nil {
 		return 0
 	}

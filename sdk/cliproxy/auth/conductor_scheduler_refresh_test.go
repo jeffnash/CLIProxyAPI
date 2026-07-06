@@ -45,7 +45,7 @@ func (e unauthorizedRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth
 	return nil, errors.New("token refresh failed with status 401: invalid_grant")
 }
 
-func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.T) {
+func TestManager_RefreshAuthUnauthorizedFailureBacksOffAndRetries(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(unauthorizedRefreshTestExecutor{
@@ -72,21 +72,81 @@ func TestManager_RefreshAuthUnauthorizedFailureStopsAutoRefreshRetry(t *testing.
 	if updated.LastError == nil {
 		t.Fatal("expected unauthorized refresh failure to be recorded")
 	}
-	if got := updated.LastError.StatusCode(); got != http.StatusUnauthorized {
-		t.Fatalf("LastError.StatusCode() = %d, want %d", got, http.StatusUnauthorized)
+	if got := updated.LastError.StatusCode(); got != 0 {
+		t.Fatalf("LastError.StatusCode() = %d, want 0 for retryable refresh failure", got)
 	}
-	if updated.LastError.Code != "unauthorized" {
-		t.Fatalf("LastError.Code = %q, want unauthorized", updated.LastError.Code)
+	if updated.LastError.Code != "refresh_unauthorized" {
+		t.Fatalf("LastError.Code = %q, want refresh_unauthorized", updated.LastError.Code)
 	}
-	if !updated.NextRefreshAfter.IsZero() {
-		t.Fatalf("NextRefreshAfter = %s, want zero for unauthorized refresh failure", updated.NextRefreshAfter)
+	if updated.NextRefreshAfter.IsZero() {
+		t.Fatal("NextRefreshAfter is zero, want refresh backoff")
 	}
 	now := time.Now()
 	if manager.shouldRefresh(updated, now) {
-		t.Fatal("expected unauthorized auth to stop refresh attempts")
+		t.Fatal("expected refresh backoff to delay retry")
 	}
-	if _, shouldSchedule := nextRefreshCheckAt(now, updated, time.Second); shouldSchedule {
-		t.Fatal("expected unauthorized auth to be removed from the auto-refresh schedule")
+	if _, shouldSchedule := nextRefreshCheckAt(now, updated, time.Second); !shouldSchedule {
+		t.Fatal("expected unauthorized refresh failure to remain on the auto-refresh schedule")
+	}
+}
+
+func TestManager_RefreshUpdatePreservesLiveModelCooldown(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	nextRetry := time.Now().Add(30 * time.Minute).Truncate(time.Second)
+
+	auth := &Auth{
+		ID:       "refresh-merge",
+		Provider: "codex",
+		Status:   StatusError,
+		Metadata: map[string]any{
+			"access_token": "old-token",
+		},
+		ModelStates: map[string]*ModelState{
+			"model-1": {
+				Status:         StatusError,
+				StatusMessage:  "quota",
+				NextRetryAfter: nextRetry,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: nextRetry,
+					BackoffLevel:  2,
+				},
+			},
+		},
+	}
+	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	refreshed := auth.Clone()
+	refreshed.Metadata = map[string]any{"access_token": "new-token"}
+	refreshed.ModelStates = nil
+	refreshed.Status = StatusActive
+	refreshed.StatusMessage = ""
+	refreshed.LastRefreshedAt = time.Now()
+	refreshed.UpdatedAt = refreshed.LastRefreshedAt
+	refreshed.NextRefreshAfter = refreshed.LastRefreshedAt.Add(time.Hour)
+
+	manager.applyRefreshUpdate(ctx, auth.ID, refreshed)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth %q after refresh update", auth.ID)
+	}
+	if got := updated.Metadata["access_token"]; got != "new-token" {
+		t.Fatalf("access_token = %v, want new-token", got)
+	}
+	state := updated.ModelStates["model-1"]
+	if state == nil {
+		t.Fatal("model cooldown state was removed")
+	}
+	if !state.NextRetryAfter.Equal(nextRetry) {
+		t.Fatalf("NextRetryAfter = %s, want %s", state.NextRetryAfter, nextRetry)
+	}
+	if !state.Quota.Exceeded || state.Quota.BackoffLevel != 2 {
+		t.Fatalf("quota state = %#v, want exceeded backoff level 2", state.Quota)
 	}
 }
 

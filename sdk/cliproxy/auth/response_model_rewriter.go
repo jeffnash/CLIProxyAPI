@@ -12,6 +12,10 @@ var modelFieldPaths = []string{"model", "modelVersion", "response.model", "respo
 
 const maxPendingBufSize = 1 << 20 // 1MB limit for pending buffer
 
+func mayContainModelRewriteField(data []byte) bool {
+	return bytes.Contains(data, []byte(`"model"`)) || bytes.Contains(data, []byte(`"modelVersion"`))
+}
+
 func rewriteSSEPayloadLines(payload []byte, targetModel string) []byte {
 	if targetModel == "" || len(payload) == 0 {
 		return payload
@@ -20,7 +24,7 @@ func rewriteSSEPayloadLines(payload []byte, targetModel string) []byte {
 	out := make([][]byte, 0, len(lines))
 	for _, line := range lines {
 		prefix, jsonData, ok := extractSSEDataLine(line)
-		if ok && len(jsonData) > 0 && jsonData[0] == '{' && gjson.ValidBytes(jsonData) {
+		if ok && len(jsonData) > 0 && jsonData[0] == '{' && mayContainModelRewriteField(jsonData) && gjson.ValidBytes(jsonData) {
 			rewritten := rewriteModelInResponse(jsonData, targetModel)
 			line = append(append([]byte{}, prefix...), rewritten...)
 		}
@@ -89,7 +93,13 @@ func (r *StreamRewriter) RewriteChunk(chunk []byte) []byte {
 
 	// Handle raw JSON chunks (Gemini/OpenAI format without SSE "data:" prefix)
 	trimmed := bytes.TrimSpace(chunk)
-	if len(trimmed) > 0 && trimmed[0] == '{' && gjson.ValidBytes(trimmed) {
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		if !mayContainModelRewriteField(trimmed) {
+			return trimmed
+		}
+		if !gjson.ValidBytes(trimmed) {
+			return chunk
+		}
 		rewritten := trimmed
 		if r.options.RewriteModel != "" {
 			rewritten = rewriteModelInResponse(rewritten, r.options.RewriteModel)
@@ -141,6 +151,14 @@ func (r *StreamRewriter) RewriteChunk(chunk []byte) []byte {
 
 		dataPrefix, jsonData, found := extractSSEDataLine(line)
 		if found && len(jsonData) > 0 && jsonData[0] == '{' {
+			if !mayContainModelRewriteField(jsonData) {
+				if pendingEvent != nil {
+					result = append(result, pendingEvent)
+					pendingEvent = nil
+				}
+				result = append(result, line)
+				continue
+			}
 			if !gjson.ValidBytes(jsonData) {
 				if pendingEvent != nil {
 					r.pendingBuf = append(pendingEvent, '\n')

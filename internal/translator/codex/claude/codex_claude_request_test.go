@@ -289,13 +289,6 @@ func TestConvertClaudeRequestToCodex_RepairsCachedOrphanToolResult(t *testing.T)
 	t.Cleanup(resetCodexClaudeToolCallCacheForTest)
 
 	callID := "toolu_cached_parallel_read"
-	rememberCodexClaudeToolCall(callID, gjson.Parse(`{
-		"type":"function_call",
-		"call_id":"provider_call_id",
-		"name":"Read",
-		"arguments":{"file_path":"AGENTS.md"}
-	}`))
-
 	inputJSON := `{
 		"model": "claude-3-opus",
 		"messages": [
@@ -304,6 +297,12 @@ func TestConvertClaudeRequestToCodex_RepairsCachedOrphanToolResult(t *testing.T)
 			]}
 		]
 	}`
+	rememberCodexClaudeToolCall(codexClaudeToolCallScope([]byte(inputJSON)), callID, gjson.Parse(`{
+		"type":"function_call",
+		"call_id":"provider_call_id",
+		"name":"Read",
+		"arguments":{"file_path":"AGENTS.md"}
+	}`))
 
 	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
 	inputs := gjson.GetBytes(result, "input").Array()
@@ -331,6 +330,37 @@ func TestConvertClaudeRequestToCodex_RepairsCachedOrphanToolResult(t *testing.T)
 	}
 	if got := repairedCall.Get("arguments.file_path").String(); got != "AGENTS.md" {
 		t.Fatalf("repaired arguments.file_path = %q, want AGENTS.md. Output: %s", got, string(result))
+	}
+}
+
+func TestConvertClaudeRequestToCodex_DoesNotRepairCachedToolResultAcrossScope(t *testing.T) {
+	resetCodexClaudeToolCallCacheForTest()
+	t.Cleanup(resetCodexClaudeToolCallCacheForTest)
+
+	callID := "toolu_cached_parallel_read"
+	otherRequest := []byte(`{"model":"other-model","tools":[{"name":"Read"}]}`)
+	rememberCodexClaudeToolCall(codexClaudeToolCallScope(otherRequest), callID, gjson.Parse(`{
+		"type":"function_call",
+		"call_id":"provider_call_id",
+		"name":"Read",
+		"arguments":{"file_path":"AGENTS.md"}
+	}`))
+
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{"role": "user", "content": [
+				{"type":"tool_result","tool_use_id":"` + callID + `","content":"ok"}
+			]}
+		]
+	}`
+
+	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
+	inputs := gjson.GetBytes(result, "input").Array()
+	for _, item := range inputs {
+		if item.Get("type").String() == "function_call" && item.Get("call_id").String() == callID {
+			t.Fatalf("unexpected cross-scope repaired function_call. Output: %s", string(result))
+		}
 	}
 }
 

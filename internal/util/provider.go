@@ -4,6 +4,7 @@
 package util
 
 import (
+	"encoding/json"
 	"net/url"
 	"strings"
 
@@ -232,6 +233,73 @@ func MaskSensitiveHeaderValue(key, value string) string {
 	default:
 		return value
 	}
+}
+
+// SummarizeSensitiveBody returns a bounded, log-safe representation of an upstream body.
+func SummarizeSensitiveBody(body []byte, maxLen int) string {
+	if maxLen <= 0 {
+		maxLen = 512
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return ""
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil {
+		redacted := redactSensitiveJSON(decoded)
+		if raw, errMarshal := json.Marshal(redacted); errMarshal == nil {
+			return truncateString(string(raw), maxLen)
+		}
+	}
+	return truncateString(trimmed, maxLen)
+}
+
+func redactSensitiveJSON(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			if isSensitiveBodyKey(key) {
+				if s, ok := item.(string); ok {
+					out[key] = HideAPIKey(s)
+				} else {
+					out[key] = "[REDACTED]"
+				}
+				continue
+			}
+			out[key] = redactSensitiveJSON(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = redactSensitiveJSON(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func isSensitiveBodyKey(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	return strings.Contains(key, "token") ||
+		strings.Contains(key, "secret") ||
+		strings.Contains(key, "api_key") ||
+		strings.Contains(key, "apikey") ||
+		strings.Contains(key, "api-key") ||
+		key == "code" ||
+		key == "cookie"
+}
+
+func truncateString(value string, maxLen int) string {
+	if len(value) <= maxLen {
+		return value
+	}
+	if maxLen <= 3 {
+		return value[:maxLen]
+	}
+	return value[:maxLen-3] + "..."
 }
 
 // MaskSensitiveQuery masks sensitive query parameters, e.g. auth_token, within the raw query string.

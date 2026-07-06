@@ -502,6 +502,20 @@ func TestNonStream_ReasoningContent_Gated(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIResponseToClaudeNonStreamingHelperRestoresToolName(t *testing.T) {
+	originalReq := []byte(`{"stream":false,"tools":[{"name":"_GetUserProfile"}]}`)
+	body := []byte(`data: {"id":"c1","model":"m","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"getuserprofile","arguments":"{}"}}]}}]}`)
+	var param any
+
+	chunks := ConvertOpenAIResponseToClaude(context.Background(), "", originalReq, nil, body, &param)
+	if len(chunks) != 1 {
+		t.Fatalf("chunks = %d, want 1", len(chunks))
+	}
+	if got := gjson.GetBytes(chunks[0], "content.0.name").String(); got != "_GetUserProfile" {
+		t.Fatalf("tool name = %q, want restored original; body=%s", got, chunks[0])
+	}
+}
+
 func TestNonStream_ArrayReasoning_Gated(t *testing.T) {
 	// content as an array containing a "reasoning" item.
 	body := `{"id":"c1","model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":[{"type":"reasoning","text":"hidden cot"},{"type":"text","text":"hi"}]}}]}`

@@ -519,7 +519,7 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 
 func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !bytes.Contains(payload, []byte(`"usage"`)) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	usageNode := gjson.GetBytes(payload, "usage")
@@ -539,7 +539,7 @@ func ParseClaudeUsage(data []byte) usage.Detail {
 
 func ParseClaudeStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !bytes.Contains(payload, []byte(`"usage"`)) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	usageNode := gjson.GetBytes(payload, "usage")
@@ -616,7 +616,7 @@ func ParseGeminiUsage(data []byte) usage.Detail {
 
 func ParseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !mayContainGeminiUsageKey(payload) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	node := gjson.GetBytes(payload, "usageMetadata")
@@ -631,7 +631,7 @@ func ParseGeminiStreamUsage(line []byte) (usage.Detail, bool) {
 
 func ParseGeminiCLIStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !mayContainGeminiUsageKey(payload) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	root := gjson.ParseBytes(payload)
@@ -677,7 +677,7 @@ func ParseAntigravityUsage(data []byte) usage.Detail {
 
 func ParseAntigravityStreamUsage(line []byte) (usage.Detail, bool) {
 	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !mayContainGeminiUsageKey(payload) || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
 	node := gjson.GetBytes(payload, "response.usageMetadata")
@@ -691,6 +691,10 @@ func ParseAntigravityStreamUsage(line []byte) (usage.Detail, bool) {
 		return usage.Detail{}, false
 	}
 	return parseGeminiFamilyUsageDetail(node), true
+}
+
+func mayContainGeminiUsageKey(payload []byte) bool {
+	return bytes.Contains(payload, []byte(`"usageMetadata"`)) || bytes.Contains(payload, []byte(`"usage_metadata"`))
 }
 
 var stopChunkWithoutUsage sync.Map

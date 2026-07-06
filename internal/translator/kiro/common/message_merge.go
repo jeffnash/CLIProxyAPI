@@ -82,10 +82,12 @@ func mergeMessageContent(msg1, msg2 gjson.Result) string {
 	if len(blocks1) > 0 && len(blocks2) > 0 {
 		if blocks1[len(blocks1)-1]["type"] == "text" && blocks2[0]["type"] == "text" {
 			// Merge the last text block of msg1 with the first text block of msg2
-			text1 := blocks1[len(blocks1)-1]["text"].(string)
-			text2 := blocks2[0]["text"].(string)
-			blocks1[len(blocks1)-1]["text"] = text1 + "\n" + text2
-			blocks2 = blocks2[1:] // Remove the merged block from blocks2
+			text1, ok1 := blocks1[len(blocks1)-1]["text"].(string)
+			text2, ok2 := blocks2[0]["text"].(string)
+			if ok1 && ok2 {
+				blocks1[len(blocks1)-1]["text"] = text1 + "\n" + text2
+				blocks2 = blocks2[1:] // Remove the merged block from blocks2
+			}
 		}
 	}
 

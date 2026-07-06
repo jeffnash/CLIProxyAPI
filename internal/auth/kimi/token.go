@@ -6,11 +6,10 @@ package kimi
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 // KimiTokenStorage stores OAuth2 token information for Kimi API authentication.
@@ -83,28 +82,19 @@ func (ts *KimiTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "kimi"
 
-	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
-	}
-
-	f, err := os.Create(authFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to create token file: %w", err)
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-
 	// Merge metadata using helper
 	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
 	if errMerge != nil {
 		return fmt.Errorf("failed to merge metadata: %w", errMerge)
 	}
 
-	encoder := json.NewEncoder(f)
-	encoder.SetIndent("", "  ")
-	if err = encoder.Encode(data); err != nil {
-		return fmt.Errorf("failed to write token to file: %w", err)
+	encoded, errMarshal := json.MarshalIndent(data, "", "  ")
+	if errMarshal != nil {
+		return fmt.Errorf("failed to marshal token to file: %w", errMarshal)
+	}
+	encoded = append(encoded, '\n')
+	if errWrite := util.AtomicWriteFile(authFilePath, encoded, 0o600); errWrite != nil {
+		return fmt.Errorf("failed to write token to file: %w", errWrite)
 	}
 	return nil
 }

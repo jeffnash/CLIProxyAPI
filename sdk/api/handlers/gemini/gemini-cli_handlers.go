@@ -86,7 +86,7 @@ func (h *GeminiCLIAPIHandler) Models() []map[string]any {
 // CLIHandler handles CLI-specific requests for Gemini API operations.
 // It restricts access to localhost only and routes requests to appropriate internal handlers.
 func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
-	if h.Cfg == nil || !h.Cfg.EnableGeminiCLIEndpoint {
+	if cfg := h.CurrentConfig(); cfg == nil || !cfg.EnableGeminiCLIEndpoint {
 		c.JSON(http.StatusForbidden, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: "Gemini CLI endpoint is disabled",
@@ -135,7 +135,7 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 			req.Header[key] = value
 		}
 
-		httpClient := util.SetProxy(h.Cfg, &http.Client{})
+		httpClient := util.SetProxy(h.CurrentConfig(), &http.Client{})
 
 		resp, err := httpClient.Do(req)
 		if err != nil {
@@ -194,7 +194,7 @@ func (h *GeminiCLIAPIHandler) handleInternalStreamGenerateContent(c *gin.Context
 		c.Header("Cache-Control", "no-cache, no-transform")
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
-		if h.Cfg.Streaming.DisableProxyBuffering {
+		if cfg := h.CurrentConfig(); cfg != nil && cfg.Streaming.DisableProxyBuffering {
 			c.Header("X-Accel-Buffering", "no") // Disable proxy buffering for SSE
 		}
 	}

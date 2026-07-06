@@ -81,3 +81,18 @@ func (b *hostHTTPStreamBridge) close(id string) {
 		entry.cancel()
 	}
 }
+
+func (b *hostHTTPStreamBridge) closeAll() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	ids := make([]string, 0, len(b.streams))
+	for id := range b.streams {
+		ids = append(ids, id)
+	}
+	b.mu.Unlock()
+	for _, id := range ids {
+		b.close(id)
+	}
+}

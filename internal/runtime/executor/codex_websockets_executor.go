@@ -195,7 +195,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated, body := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, false)
+	originalTranslated, body := translateCodexRequestPair(e.cfg, from, to, baseModel, originalPayload, req.Payload, false)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -617,15 +617,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			if msgType != websocket.TextMessage {
 				if msgType == websocket.BinaryMessage {
-					err = fmt.Errorf("codex websockets executor: unexpected binary message")
+					errUnexpected := fmt.Errorf("codex websockets executor: unexpected binary message")
 					terminateReason = "unexpected_binary"
-					terminateErr = err
-					helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", err)
-					reporter.PublishFailure(ctx, err)
+					terminateErr = errUnexpected
+					helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", errUnexpected)
+					reporter.PublishFailure(ctx, errUnexpected)
 					if sess != nil {
-						e.invalidateUpstreamConn(sess, conn, "unexpected_binary", err)
+						e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errUnexpected)
 					}
-					_ = send(cliproxyexecutor.StreamChunk{Err: err})
+					_ = send(cliproxyexecutor.StreamChunk{Err: errUnexpected})
 					return
 				}
 				continue
@@ -1439,10 +1439,8 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 				select {
 				case ch <- codexWebsocketRead{conn: conn, err: errRead}:
 				case <-done:
-				default:
 				}
 				sess.clearActive(ch)
-				close(ch)
 			}
 			e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			return
@@ -1459,10 +1457,8 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 					select {
 					case ch <- codexWebsocketRead{conn: conn, err: errBinary}:
 					case <-done:
-					default:
 					}
 					sess.clearActive(ch)
-					close(ch)
 				}
 				e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
 				return

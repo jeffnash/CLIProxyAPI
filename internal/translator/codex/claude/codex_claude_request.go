@@ -258,7 +258,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 
 	}
 
-	template = repairCodexClaudeOrphanToolOutputs(template)
+	template = repairCodexClaudeOrphanToolOutputs(template, codexClaudeToolCallScope(rawJSON))
 
 	// Convert tools declarations to the expected format for the Codex API.
 	toolsResult := rootResult.Get("tools")
@@ -376,7 +376,7 @@ func shortenCodexCallIDIfNeeded(id string) string {
 	return id[:prefixLen] + suffix
 }
 
-func repairCodexClaudeOrphanToolOutputs(body []byte) []byte {
+func repairCodexClaudeOrphanToolOutputs(body []byte, cacheScope string) []byte {
 	input := gjson.GetBytes(body, "input")
 	if !input.Exists() || !input.IsArray() {
 		return body
@@ -402,7 +402,7 @@ func repairCodexClaudeOrphanToolOutputs(body []byte) []byte {
 			callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
 			if callID != "" {
 				if _, ok := seenCalls[callID]; !ok {
-					if cached, found := cachedCodexClaudeToolCall(callID); found {
+					if cached, found := cachedCodexClaudeToolCall(cacheScope, callID); found {
 						repaired = append(repaired, cached)
 						seenCalls[callID] = struct{}{}
 						changed = true

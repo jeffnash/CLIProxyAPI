@@ -231,13 +231,11 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
 
-func translateCodexRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) ([]byte, []byte) {
-	if bytes.Equal(originalPayload, payload) {
-		body := sdktranslator.TranslateRequest(from, to, model, payload, stream)
-		return body, body
-	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, model, originalPayload, stream)
+func translateCodexRequestPair(cfg *config.Config, from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool) ([]byte, []byte) {
 	body := sdktranslator.TranslateRequest(from, to, model, payload, stream)
+	originalTranslated := originalTranslatedForPayloadConfig(cfg, originalPayload, payload, body, func(source []byte) []byte {
+		return sdktranslator.TranslateRequest(from, to, model, source, stream)
+	})
 	return originalTranslated, body
 }
 
@@ -788,7 +786,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated, body := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, false)
+	originalTranslated, body := translateCodexRequestPair(e.cfg, from, to, baseModel, originalPayload, req.Payload, false)
 
 	if aliasEffort != "" {
 		body = setReasoningEffortByAlias(body, modelForUpstream, aliasEffort)
@@ -989,7 +987,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated, body := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, false)
+	originalTranslated, body := translateCodexRequestPair(e.cfg, from, to, baseModel, originalPayload, req.Payload, false)
 
 	if aliasEffort != "" {
 		body = setReasoningEffortByAlias(body, modelForUpstream, aliasEffort)
@@ -1117,7 +1115,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated, body := translateCodexRequestPair(from, to, baseModel, originalPayload, req.Payload, true)
+	originalTranslated, body := translateCodexRequestPair(e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
 
 	if aliasEffort != "" {
 		body = setReasoningEffortByAlias(body, modelForUpstream, aliasEffort)

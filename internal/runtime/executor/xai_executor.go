@@ -821,8 +821,11 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
-	originalTranslated := translateXAIResponsesRequest(from, to, baseModel, originalPayload, stream)
-	body := translateXAIResponsesRequest(from, to, baseModel, bytes.Clone(req.Payload), stream)
+	payload := bytes.Clone(req.Payload)
+	body := translateXAIResponsesRequest(from, to, baseModel, payload, stream)
+	originalTranslated := originalTranslatedForPayloadConfig(e.cfg, originalPayload, payload, body, func(source []byte) []byte {
+		return translateXAIResponsesRequest(from, to, baseModel, bytes.Clone(source), stream)
+	})
 
 	var err error
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())

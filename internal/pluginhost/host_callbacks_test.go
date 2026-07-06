@@ -139,9 +139,15 @@ func TestHostHTTPDoStreamCallbackReturnsBeforeUpstreamCompletes(t *testing.T) {
 	defer server.Close()
 	defer close(release)
 
-	rawReq, errMarshal := json.Marshal(pluginapi.HTTPRequest{
-		Method: http.MethodGet,
-		URL:    server.URL,
+	host := New()
+	callbackID, closeCallback := host.openCallbackContext(context.Background())
+	defer closeCallback()
+	rawReq, errMarshal := json.Marshal(rpcHostHTTPRequest{
+		HostCallbackID: callbackID,
+		Request: &httpRequest{
+			Method: http.MethodGet,
+			URL:    server.URL,
+		},
 	})
 	if errMarshal != nil {
 		t.Fatalf("marshal request: %v", errMarshal)
@@ -152,7 +158,6 @@ func TestHostHTTPDoStreamCallbackReturnsBeforeUpstreamCompletes(t *testing.T) {
 		err error
 	}
 	done := make(chan callResult, 1)
-	host := New()
 	go func() {
 		rawResp, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostHTTPDoStream, rawReq)
 		done <- callResult{raw: rawResp, err: errCall}
@@ -455,6 +460,8 @@ func TestHostModelStreamReadAfterCallbackCloseReturnsDone(t *testing.T) {
 
 func TestHostModelExecuteStreamStartupErrorCleansUp(t *testing.T) {
 	host := New()
+	callbackID, closeCallback := host.openCallbackContext(context.Background())
+	defer closeCallback()
 	ctxSeen := make(chan context.Context, 1)
 	host.SetModelExecutor(&fakeHostModelExecutor{
 		executeModelStream: func(ctx context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage) {
@@ -465,12 +472,15 @@ func TestHostModelExecuteStreamStartupErrorCleansUp(t *testing.T) {
 		},
 	})
 
-	rawReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{
-		EntryProtocol: "openai",
-		ExitProtocol:  "openai",
-		Model:         "model-1",
-		Stream:        true,
-		Body:          []byte(`{"stream":true}`),
+	rawReq, errMarshal := json.Marshal(rpcHostModelExecutionRequest{
+		HostCallbackID: callbackID,
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: "openai",
+			ExitProtocol:  "openai",
+			Model:         "model-1",
+			Stream:        true,
+			Body:          []byte(`{"stream":true}`),
+		},
 	})
 	if errMarshal != nil {
 		t.Fatalf("marshal request: %v", errMarshal)
@@ -537,6 +547,8 @@ func TestHostModelCallbacksValidateStreamMode(t *testing.T) {
 
 func TestHostModelCallbacksRequireExecutor(t *testing.T) {
 	host := New()
+	callbackID, closeCallback := host.openCallbackContext(context.Background())
+	defer closeCallback()
 
 	rawExecuteReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{
 		EntryProtocol: "openai",
@@ -551,11 +563,14 @@ func TestHostModelCallbacksRequireExecutor(t *testing.T) {
 		t.Fatalf("execute callback error = %v, want unavailable executor error", errCall)
 	}
 
-	rawStreamReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{
-		EntryProtocol: "openai",
-		ExitProtocol:  "openai",
-		Model:         "model-1",
-		Stream:        true,
+	rawStreamReq, errMarshal := json.Marshal(rpcHostModelExecutionRequest{
+		HostCallbackID: callbackID,
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: "openai",
+			ExitProtocol:  "openai",
+			Model:         "model-1",
+			Stream:        true,
+		},
 	})
 	if errMarshal != nil {
 		t.Fatalf("marshal execute stream request: %v", errMarshal)
@@ -679,12 +694,17 @@ func TestHostModelStreamExplicitCloseCancelsStream(t *testing.T) {
 
 func openHostModelStreamForTest(t *testing.T, host *Host) string {
 	t.Helper()
-	rawReq, errMarshal := json.Marshal(pluginapi.HostModelExecutionRequest{
-		EntryProtocol: "openai",
-		ExitProtocol:  "openai",
-		Model:         "model-1",
-		Stream:        true,
-		Body:          []byte(`{"stream":true}`),
+	callbackID, closeCallback := host.openCallbackContext(context.Background())
+	t.Cleanup(closeCallback)
+	rawReq, errMarshal := json.Marshal(rpcHostModelExecutionRequest{
+		HostCallbackID: callbackID,
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: "openai",
+			ExitProtocol:  "openai",
+			Model:         "model-1",
+			Stream:        true,
+			Body:          []byte(`{"stream":true}`),
+		},
 	})
 	if errMarshal != nil {
 		t.Fatalf("marshal request: %v", errMarshal)

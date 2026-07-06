@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
@@ -12,6 +13,8 @@ import (
 
 // zeroWidthSpace is the Unicode zero-width space character used for obfuscation.
 const zeroWidthSpace = "\u200B"
+
+var sensitiveWordMatcherCache sync.Map // map[string]*SensitiveWordMatcher
 
 // SensitiveWordMatcher holds the compiled regex for matching sensitive words.
 type SensitiveWordMatcher struct {
@@ -50,12 +53,22 @@ func BuildSensitiveWordMatcher(words []string) *SensitiveWordMatcher {
 	}
 
 	pattern := "(?i)" + strings.Join(escaped, "|")
+	if cached, ok := sensitiveWordMatcherCache.Load(pattern); ok {
+		if matcher, ok := cached.(*SensitiveWordMatcher); ok {
+			return matcher
+		}
+	}
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil
 	}
 
-	return &SensitiveWordMatcher{regex: re}
+	matcher := &SensitiveWordMatcher{regex: re}
+	actual, _ := sensitiveWordMatcherCache.LoadOrStore(pattern, matcher)
+	if cached, ok := actual.(*SensitiveWordMatcher); ok {
+		return cached
+	}
+	return matcher
 }
 
 // obfuscateWord inserts a zero-width space after the first grapheme.

@@ -273,6 +273,45 @@ func TestCommitAndPushLockedPushesBeforeRunningGC(t *testing.T) {
 	}
 }
 
+func TestCommitAndPushLockedRejectsDivergentRemote(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master",
+		testBranchSpec{name: "master", contents: "remote master branch\n"},
+	)
+
+	storeA := NewGitTokenStore(remoteDir, "", "", "")
+	storeA.SetBaseDir(filepath.Join(root, "workspace-a", "auths"))
+	if err := storeA.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository A: %v", err)
+	}
+	storeB := NewGitTokenStore(remoteDir, "", "", "")
+	storeB.SetBaseDir(filepath.Join(root, "workspace-b", "auths"))
+	if err := storeB.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository B: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "workspace-a", "branch.txt"), []byte("workspace A update\n"), 0o600); err != nil {
+		t.Fatalf("write workspace A marker: %v", err)
+	}
+	storeA.mu.Lock()
+	err := storeA.commitAndPushLocked("Update from workspace A", "branch.txt")
+	storeA.mu.Unlock()
+	if err != nil {
+		t.Fatalf("commitAndPushLocked A: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "workspace-b", "branch.txt"), []byte("workspace B stale update\n"), 0o600); err != nil {
+		t.Fatalf("write workspace B marker: %v", err)
+	}
+	storeB.mu.Lock()
+	err = storeB.commitAndPushLocked("Update from stale workspace B", "branch.txt")
+	storeB.mu.Unlock()
+	if err == nil {
+		t.Fatal("commitAndPushLocked B succeeded, want divergent push rejection")
+	}
+	assertRemoteBranchContents(t, remoteDir, "master", "workspace A update\n")
+}
+
 func TestEnsureRepositoryFollowsRenamedRemoteDefaultBranchWhenAvailable(t *testing.T) {
 	root := t.TempDir()
 	remoteDir := setupGitRemoteRepository(t, root, "master",

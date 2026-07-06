@@ -121,10 +121,6 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	defer w.authRescanMu.Unlock()
 
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-		if w.shouldDebounceRemove(normalizedName, now) {
-			log.Debugf("debouncing remove event for %s", filepath.Base(event.Name))
-			return
-		}
 		// Atomic replace on some platforms may surface as Rename (or Remove) before the new file is ready.
 		// Wait briefly; if the path exists again, treat as an update instead of removal.
 		time.Sleep(replaceCheckDelay)
@@ -135,6 +131,10 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 			}
 			log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
 			w.addOrUpdateClientLocked(event.Name)
+			return
+		}
+		if w.shouldDebounceRemove(normalizedName, now) {
+			log.Debugf("debouncing remove event for %s", filepath.Base(event.Name))
 			return
 		}
 		if !w.isKnownAuthFile(event.Name) {

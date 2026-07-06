@@ -32,6 +32,9 @@ const (
 
 	// CacheCleanupInterval controls how often stale entries are purged
 	CacheCleanupInterval = 10 * time.Minute
+
+	// SignatureCacheMaxEntries bounds each in-process model-group cache.
+	SignatureCacheMaxEntries = 4096
 )
 
 // signatureCache stores signatures by model group -> textHash -> SignatureEntry
@@ -151,7 +154,30 @@ func CacheSignatureBestEffort(ctx context.Context, modelName, text, signature st
 		Signature: signature,
 		Timestamp: time.Now(),
 	}
+	pruneSignatureGroupToMaxLocked(sc)
 	return true
+}
+
+func pruneSignatureGroupToMaxLocked(sc *groupCache) {
+	if sc == nil || len(sc.entries) <= SignatureCacheMaxEntries {
+		return
+	}
+	for len(sc.entries) > SignatureCacheMaxEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for key, entry := range sc.entries {
+			if first || entry.Timestamp.Before(oldestTime) {
+				oldestKey = key
+				oldestTime = entry.Timestamp
+				first = false
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(sc.entries, oldestKey)
+	}
 }
 
 // GetCachedSignature retrieves a cached signature for a given model group and text.

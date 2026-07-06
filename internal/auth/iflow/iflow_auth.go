@@ -136,8 +136,9 @@ func (ia *IFlowAuth) doTokenRequest(ctx context.Context, req *http.Request) (*IF
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Debugf("iflow token request failed: status=%d body=%s", resp.StatusCode, string(body))
-		return nil, fmt.Errorf("iflow token: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		summary := util.SummarizeSensitiveBody(body, 512)
+		log.Debugf("iflow token request failed: status=%d body=%s", resp.StatusCode, summary)
+		return nil, fmt.Errorf("iflow token: %d %s", resp.StatusCode, summary)
 	}
 
 	var tokenResp IFlowTokenResponse
@@ -154,7 +155,7 @@ func (ia *IFlowAuth) doTokenRequest(ctx context.Context, req *http.Request) (*IF
 	}
 
 	if tokenResp.AccessToken == "" {
-		log.Debug(string(body))
+		log.Debug(util.SummarizeSensitiveBody(body, 512))
 		return nil, fmt.Errorf("iflow token: missing access token in response")
 	}
 
@@ -203,8 +204,9 @@ func (ia *IFlowAuth) FetchUserInfo(ctx context.Context, accessToken string) (*us
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Debugf("iflow api key failed: status=%d body=%s", resp.StatusCode, string(body))
-		return nil, fmt.Errorf("iflow api key: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		summary := util.SummarizeSensitiveBody(body, 512)
+		log.Debugf("iflow api key failed: status=%d body=%s", resp.StatusCode, summary)
+		return nil, fmt.Errorf("iflow api key: %d %s", resp.StatusCode, summary)
 	}
 
 	var result userInfoResponse
@@ -385,8 +387,9 @@ func (ia *IFlowAuth) fetchAPIKeyInfo(ctx context.Context, cookie string) (*iFlow
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Debugf("iflow cookie GET request failed: status=%d body=%s", resp.StatusCode, string(body))
-		return nil, fmt.Errorf("iflow cookie: GET request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		summary := util.SummarizeSensitiveBody(body, 512)
+		log.Debugf("iflow cookie GET request failed: status=%d body=%s", resp.StatusCode, summary)
+		return nil, fmt.Errorf("iflow cookie: GET request failed with status %d: %s", resp.StatusCode, summary)
 	}
 
 	var keyResp iFlowAPIKeyResponse
@@ -464,8 +467,9 @@ func (ia *IFlowAuth) RefreshAPIKey(ctx context.Context, cookie, name string) (*i
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		log.Debugf("iflow cookie POST request failed: status=%d body=%s", resp.StatusCode, string(body))
-		return nil, fmt.Errorf("iflow cookie refresh: POST request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		summary := util.SummarizeSensitiveBody(body, 512)
+		log.Debugf("iflow cookie POST request failed: status=%d body=%s", resp.StatusCode, summary)
+		return nil, fmt.Errorf("iflow cookie refresh: POST request failed with status %d: %s", resp.StatusCode, summary)
 	}
 
 	var keyResp iFlowAPIKeyResponse

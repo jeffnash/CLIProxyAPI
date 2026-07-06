@@ -65,9 +65,14 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 	}
 
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
-		// Only send message_stop if we have actually output content
-		if (*param).(*Params).HasContent {
-			return [][]byte{translatorcommon.AppendSSEEventString(nil, "message_stop", `{"type":"message_stop"}`, 3)}
+		p := (*param).(*Params)
+		output := make([]byte, 0, 256)
+		if p.HasFirstResponse && !p.HasFinalEvents {
+			output = appendGeminiClaudeFinalEvents(output, p, gjson.Result{}, "")
+		}
+		if p.HasFirstResponse || p.HasFinalEvents || p.HasContent {
+			output = translatorcommon.AppendSSEEventString(output, "message_stop", `{"type":"message_stop"}`, 3)
+			return [][]byte{output}
 		}
 		return [][]byte{}
 	}
@@ -246,38 +251,39 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 		}
 	}
 
-	usageResult := gjson.GetBytes(rawJSON, "usageMetadata")
-	if usageResult.Exists() && bytes.Contains(rawJSON, []byte(`"finishReason"`)) && !(*param).(*Params).HasFinalEvents {
-		promptTC := usageResult.Get("promptTokenCount")
-		candidatesTC := usageResult.Get("candidatesTokenCount")
-		thoughtsTC := usageResult.Get("thoughtsTokenCount")
-
-		hasAnyUsage := (promptTC.Exists() && promptTC.Type != gjson.Null) || (candidatesTC.Exists() && candidatesTC.Type != gjson.Null) || (thoughtsTC.Exists() && thoughtsTC.Type != gjson.Null)
-		if hasAnyUsage && (*param).(*Params).HasContent {
-			// Only send final events if we have actually output content
-			if (*param).(*Params).ResponseType != 0 {
-				appendEvent("content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, (*param).(*Params).ResponseIndex))
-				(*param).(*Params).ResponseType = 0
-			}
-
-			template := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
-			if (*param).(*Params).SawToolCall {
-				template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
-			} else if finish := gjson.GetBytes(rawJSON, "candidates.0.finishReason"); finish.Exists() && finish.String() == "MAX_TOKENS" {
-				template = []byte(`{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
-			}
-
-			thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
-			candidatesTokenCount := usageResult.Get("candidatesTokenCount").Int()
-			template, _ = sjson.SetBytes(template, "usage.output_tokens", candidatesTokenCount+thoughtsTokenCount)
-			template, _ = sjson.SetBytes(template, "usage.input_tokens", usageResult.Get("promptTokenCount").Int())
-
-			appendEvent("message_delta", string(template))
-			(*param).(*Params).HasFinalEvents = true
-		}
+	if finish := gjson.GetBytes(rawJSON, "candidates.0.finishReason"); finish.Exists() && !(*param).(*Params).HasFinalEvents {
+		output = appendGeminiClaudeFinalEvents(output, (*param).(*Params), gjson.GetBytes(rawJSON, "usageMetadata"), finish.String())
 	}
 
 	return [][]byte{output}
+}
+
+func appendGeminiClaudeFinalEvents(output []byte, p *Params, usageResult gjson.Result, finishReason string) []byte {
+	if p == nil || p.HasFinalEvents {
+		return output
+	}
+	if p.ResponseType != 0 {
+		output = translatorcommon.AppendSSEEventString(output, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, p.ResponseIndex), 3)
+		p.ResponseType = 0
+	}
+
+	template := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+	if p.SawToolCall {
+		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+	} else if finishReason == "MAX_TOKENS" {
+		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+	}
+
+	if usageResult.Exists() {
+		thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
+		candidatesTokenCount := usageResult.Get("candidatesTokenCount").Int()
+		template, _ = sjson.SetBytes(template, "usage.output_tokens", candidatesTokenCount+thoughtsTokenCount)
+		template, _ = sjson.SetBytes(template, "usage.input_tokens", usageResult.Get("promptTokenCount").Int())
+	}
+
+	output = translatorcommon.AppendSSEEventString(output, "message_delta", string(template), 3)
+	p.HasFinalEvents = true
+	return output
 }
 
 // ConvertGeminiResponseToClaudeNonStream converts a non-streaming Gemini response to a non-streaming Claude response.

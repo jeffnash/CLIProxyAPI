@@ -75,6 +75,31 @@ func TestConvertClaudeResponseToOpenAI_StreamUsageMergesMessageStartUsage(t *tes
 	}
 }
 
+func TestConvertClaudeResponseToOpenAI_StreamToolCallIndexUsesToolOrdinal(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	ConvertClaudeResponseToOpenAI(ctx, "claude-opus-4-6", nil, nil, []byte(`data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"first","input":{}}}`), &param)
+	ConvertClaudeResponseToOpenAI(ctx, "claude-opus-4-6", nil, nil, []byte(`data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}`), &param)
+	first := ConvertClaudeResponseToOpenAI(ctx, "claude-opus-4-6", nil, nil, []byte(`data: {"type":"content_block_stop","index":2}`), &param)
+	if len(first) != 1 {
+		t.Fatalf("first stop chunks = %d, want 1", len(first))
+	}
+	if got := gjson.GetBytes(first[0], "choices.0.delta.tool_calls.0.index").Int(); got != 0 {
+		t.Fatalf("first tool index = %d, want 0; chunk=%s", got, first[0])
+	}
+
+	ConvertClaudeResponseToOpenAI(ctx, "claude-opus-4-6", nil, nil, []byte(`data: {"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"toolu_2","name":"second","input":{}}}`), &param)
+	ConvertClaudeResponseToOpenAI(ctx, "claude-opus-4-6", nil, nil, []byte(`data: {"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"{}"}}`), &param)
+	second := ConvertClaudeResponseToOpenAI(ctx, "claude-opus-4-6", nil, nil, []byte(`data: {"type":"content_block_stop","index":4}`), &param)
+	if len(second) != 1 {
+		t.Fatalf("second stop chunks = %d, want 1", len(second))
+	}
+	if got := gjson.GetBytes(second[0], "choices.0.delta.tool_calls.0.index").Int(); got != 1 {
+		t.Fatalf("second tool index = %d, want 1; chunk=%s", got, second[0])
+	}
+}
+
 func TestConvertClaudeResponseToOpenAINonStream_UsageIncludesCachedTokens(t *testing.T) {
 	rawJSON := []byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-opus-4-6\"}}\n" +
 		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":13,\"output_tokens\":4,\"cache_read_input_tokens\":22000,\"cache_creation_input_tokens\":31}}\n")

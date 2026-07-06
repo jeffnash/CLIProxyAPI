@@ -11,6 +11,11 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+var (
+	retryAfterSecondsPattern = regexp.MustCompile(`after\s+(\d+)s\.?`)
+	retryAfterHumanPattern   = regexp.MustCompile(`after\s+((?:\d+h)?(?:\d+m)?(?:\d+s)?)\.?`)
+)
+
 // DeleteJSONField removes a top-level or nested JSON field from a payload.
 func DeleteJSONField(body []byte, key string) []byte {
 	if key == "" || len(body) == 0 {
@@ -59,16 +64,14 @@ func ParseRetryDelay(errorBody []byte) (*time.Duration, error) {
 
 	message := gjson.GetBytes(errorBody, "error.message").String()
 	if message != "" {
-		re := regexp.MustCompile(`after\s+(\d+)s\.?`)
-		if matches := re.FindStringSubmatch(message); len(matches) > 1 {
+		if matches := retryAfterSecondsPattern.FindStringSubmatch(message); len(matches) > 1 {
 			seconds, err := strconv.Atoi(matches[1])
 			if err == nil {
 				duration := time.Duration(seconds) * time.Second
 				return &duration, nil
 			}
 		}
-		reHuman := regexp.MustCompile(`after\s+((?:\d+h)?(?:\d+m)?(?:\d+s)?)\.?`)
-		if matches := reHuman.FindStringSubmatch(strings.ToLower(message)); len(matches) > 1 {
+		if matches := retryAfterHumanPattern.FindStringSubmatch(strings.ToLower(message)); len(matches) > 1 {
 			duration, err := time.ParseDuration(matches[1])
 			if err == nil && duration > 0 {
 				return &duration, nil

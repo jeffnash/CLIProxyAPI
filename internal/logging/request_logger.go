@@ -33,6 +33,11 @@ import (
 
 var requestLogID atomic.Uint64
 
+var (
+	filenameUnsafePattern = regexp.MustCompile(`[<>:"|?*\s]`)
+	filenameHyphenPattern = regexp.MustCompile(`-+`)
+)
+
 const (
 	WebsocketTimelineSourceContextKey    = "WEBSOCKET_TIMELINE_SOURCE"
 	APIRequestSourceContextKey           = "API_REQUEST_SOURCE"
@@ -206,29 +211,33 @@ func (s *FileBodySource) Paths() []string {
 }
 
 // WriteTo merges all ordered parts into w.
-func (s *FileBodySource) WriteTo(w io.Writer) error {
+func (s *FileBodySource) WriteTo(w io.Writer) (int64, error) {
 	if s == nil || w == nil {
-		return nil
+		return 0, nil
 	}
 	paths := s.Paths()
 	wrote := false
+	var total int64
 	for _, path := range paths {
 		file, errOpen := os.Open(path)
 		if errOpen != nil {
 			if os.IsNotExist(errOpen) {
 				continue
 			}
-			return errOpen
+			return total, errOpen
 		}
 		if wrote {
-			if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
+			nWrite, errWrite := io.WriteString(w, "\n")
+			total += int64(nWrite)
+			if errWrite != nil {
 				if errClose := file.Close(); errClose != nil {
 					log.WithError(errClose).Warn("failed to close log part file")
 				}
-				return errWrite
+				return total, errWrite
 			}
 		}
-		_, errCopy := io.Copy(w, file)
+		nCopy, errCopy := io.Copy(w, file)
+		total += nCopy
 		if errClose := file.Close(); errClose != nil {
 			log.WithError(errClose).Warn("failed to close log part file")
 			if errCopy == nil {
@@ -236,17 +245,17 @@ func (s *FileBodySource) WriteTo(w io.Writer) error {
 			}
 		}
 		if errCopy != nil {
-			return errCopy
+			return total, errCopy
 		}
 		wrote = true
 	}
-	return nil
+	return total, nil
 }
 
 // Bytes merges all ordered parts into memory.
 func (s *FileBodySource) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
-	if errWrite := s.WriteTo(&buf); errWrite != nil {
+	if _, errWrite := s.WriteTo(&buf); errWrite != nil {
 		return nil, errWrite
 	}
 	return buf.Bytes(), nil
@@ -406,15 +415,15 @@ type StreamingLogWriter interface {
 // It provides file-based logging functionality for HTTP requests and responses.
 type FileRequestLogger struct {
 	// enabled indicates whether request logging is currently enabled.
-	enabled bool
+	enabled atomic.Bool
 
 	// logsDir is the directory where log files are stored.
 	logsDir string
 
 	// errorLogsMaxFiles limits the number of error log files retained.
-	errorLogsMaxFiles int
+	errorLogsMaxFiles atomic.Int64
 
-	homeEnabled bool
+	homeEnabled atomic.Bool
 }
 
 type homeRequestLogPayload struct {
@@ -447,7 +456,7 @@ func cloneHeaders(headers map[string][]string) map[string][]string {
 }
 
 func (l *FileRequestLogger) forwardRequestLogToHome(ctx context.Context, headers map[string][]string, requestID string, logText string) error {
-	if l == nil || !l.homeEnabled {
+	if l == nil || !l.homeEnabled.Load() {
 		return nil
 	}
 	client := currentHomeRequestLogClient()
@@ -488,12 +497,10 @@ func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorL
 			logsDir = filepath.Join(configDir, logsDir)
 		}
 	}
-	return &FileRequestLogger{
-		enabled:           enabled,
-		logsDir:           logsDir,
-		errorLogsMaxFiles: errorLogsMaxFiles,
-		homeEnabled:       false,
-	}
+	logger := &FileRequestLogger{logsDir: logsDir}
+	logger.enabled.Store(enabled)
+	logger.errorLogsMaxFiles.Store(int64(errorLogsMaxFiles))
+	return logger
 }
 
 // SetHomeEnabled toggles home request-log forwarding.
@@ -502,7 +509,7 @@ func (l *FileRequestLogger) SetHomeEnabled(enabled bool) {
 	if l == nil {
 		return
 	}
-	l.homeEnabled = enabled
+	l.homeEnabled.Store(enabled)
 }
 
 // IsEnabled returns whether request logging is currently enabled.
@@ -510,7 +517,7 @@ func (l *FileRequestLogger) SetHomeEnabled(enabled bool) {
 // Returns:
 //   - bool: True if logging is enabled, false otherwise
 func (l *FileRequestLogger) IsEnabled() bool {
-	return l.enabled
+	return l != nil && l.enabled.Load()
 }
 
 // SetEnabled updates the request logging enabled state.
@@ -519,12 +526,18 @@ func (l *FileRequestLogger) IsEnabled() bool {
 // Parameters:
 //   - enabled: Whether request logging should be enabled
 func (l *FileRequestLogger) SetEnabled(enabled bool) {
-	l.enabled = enabled
+	if l == nil {
+		return
+	}
+	l.enabled.Store(enabled)
 }
 
 // SetErrorLogsMaxFiles updates the maximum number of error log files to retain.
 func (l *FileRequestLogger) SetErrorLogsMaxFiles(maxFiles int) {
-	l.errorLogsMaxFiles = maxFiles
+	if l == nil {
+		return
+	}
+	l.errorLogsMaxFiles.Store(int64(maxFiles))
 }
 
 // NewFileBodySource creates a temp-backed source under the request log directory.
@@ -583,11 +596,13 @@ func (l *FileRequestLogger) LogRequestWithOptionsAndAllSources(url, method strin
 func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline []byte, websocketTimelineSource *FileBodySource, apiRequest []byte, apiRequestSource *FileBodySource, apiResponse []byte, apiResponseSource *FileBodySource, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource, apiResponseErrors []*interfaces.ErrorMessage, force bool, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
 	defer cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource, apiWebsocketTimelineSource)
 
-	if !l.enabled && !force {
+	enabled := l.IsEnabled()
+	homeEnabled := l != nil && l.homeEnabled.Load()
+	if !enabled && !force {
 		return nil
 	}
 
-	if l.homeEnabled && l.enabled {
+	if homeEnabled && enabled {
 		responseToWrite, decompressErr := l.decompressResponse(responseHeaders, response)
 		if decompressErr != nil {
 			responseToWrite = response
@@ -630,7 +645,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 
 	// Generate filename with request ID
 	filename := l.generateFilename(url, requestID)
-	if force && !l.enabled {
+	if force && !enabled {
 		filename = l.generateErrorFilename(url, requestID)
 	}
 	filePath := filepath.Join(l.logsDir, filename)
@@ -691,7 +706,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		return fmt.Errorf("failed to write log file: %w", writeErr)
 	}
 
-	if force && !l.enabled {
+	if force && !enabled {
 		if errCleanup := l.cleanupOldErrorLogs(); errCleanup != nil {
 			log.WithError(errCleanup).Warn("failed to clean up old error logs")
 		}
@@ -713,11 +728,11 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 //   - StreamingLogWriter: A writer for streaming response chunks
 //   - error: An error if logging initialization fails, nil otherwise
 func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[string][]string, body []byte, requestID string) (StreamingLogWriter, error) {
-	if !l.enabled {
+	if !l.IsEnabled() {
 		return &NoOpStreamingLogWriter{}, nil
 	}
 
-	if l.homeEnabled {
+	if l.homeEnabled.Load() {
 		client := currentHomeRequestLogClient()
 		if client == nil || !client.HeartbeatOK() {
 			return &NoOpStreamingLogWriter{}, nil
@@ -844,12 +859,10 @@ func (l *FileRequestLogger) sanitizeForFilename(path string) string {
 	sanitized = strings.ReplaceAll(sanitized, ":", "-")
 
 	// Replace other problematic characters with hyphens
-	reg := regexp.MustCompile(`[<>:"|?*\s]`)
-	sanitized = reg.ReplaceAllString(sanitized, "-")
+	sanitized = filenameUnsafePattern.ReplaceAllString(sanitized, "-")
 
 	// Remove multiple consecutive hyphens
-	reg = regexp.MustCompile(`-+`)
-	sanitized = reg.ReplaceAllString(sanitized, "-")
+	sanitized = filenameHyphenPattern.ReplaceAllString(sanitized, "-")
 
 	// Remove leading/trailing hyphens
 	sanitized = strings.Trim(sanitized, "-")
@@ -864,7 +877,8 @@ func (l *FileRequestLogger) sanitizeForFilename(path string) string {
 
 // cleanupOldErrorLogs keeps only the newest errorLogsMaxFiles forced error log files.
 func (l *FileRequestLogger) cleanupOldErrorLogs() error {
-	if l.errorLogsMaxFiles <= 0 {
+	maxFiles := int(l.errorLogsMaxFiles.Load())
+	if maxFiles <= 0 {
 		return nil
 	}
 
@@ -895,7 +909,7 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 		files = append(files, logFile{name: name, modTime: info.ModTime()})
 	}
 
-	if len(files) <= l.errorLogsMaxFiles {
+	if len(files) <= maxFiles {
 		return nil
 	}
 
@@ -903,7 +917,7 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 		return files[i].modTime.After(files[j].modTime)
 	})
 
-	for _, file := range files[l.errorLogsMaxFiles:] {
+	for _, file := range files[maxFiles:] {
 		if errRemove := os.Remove(filepath.Join(l.logsDir, file.name)); errRemove != nil {
 			log.WithError(errRemove).Warnf("failed to remove old error log: %s", file.name)
 		}
@@ -1223,7 +1237,7 @@ func writeAPISectionWithSource(w io.Writer, sectionHeader string, sectionPrefix 
 		}
 	}
 	tracker := &trailingNewlineTrackingWriter{writer: w}
-	if errWrite := source.WriteTo(tracker); errWrite != nil {
+	if _, errWrite := source.WriteTo(tracker); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeSectionSpacing(w, tracker.trailingNewlines); errWrite != nil {
@@ -1242,7 +1256,7 @@ func writePreformattedAPISectionWithSource(w io.Writer, sectionHeader string, se
 		}
 	}
 	tracker := &trailingNewlineTrackingWriter{writer: w}
-	if errWrite := source.WriteTo(tracker); errWrite != nil {
+	if _, errWrite := source.WriteTo(tracker); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeSectionSpacing(w, tracker.trailingNewlines); errWrite != nil {

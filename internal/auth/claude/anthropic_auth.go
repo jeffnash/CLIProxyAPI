@@ -5,6 +5,8 @@ package claude
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,19 +63,46 @@ func resetClaudeRefreshState() {
 func claudeRefreshBlockedUntil(refreshToken string) time.Time {
 	claudeRefreshMu.Lock()
 	defer claudeRefreshMu.Unlock()
-	return claudeRefreshBlock[refreshToken]
+	now := time.Now()
+	pruneClaudeRefreshBlockLocked(now)
+	blockedUntil := claudeRefreshBlock[claudeRefreshBlockKey(refreshToken)]
+	if !blockedUntil.IsZero() && !blockedUntil.After(now) {
+		delete(claudeRefreshBlock, claudeRefreshBlockKey(refreshToken))
+		return time.Time{}
+	}
+	return blockedUntil
 }
 
 func setClaudeRefreshBlockedUntil(refreshToken string, until time.Time) {
 	claudeRefreshMu.Lock()
 	defer claudeRefreshMu.Unlock()
-	claudeRefreshBlock[refreshToken] = until
+	now := time.Now()
+	pruneClaudeRefreshBlockLocked(now)
+	key := claudeRefreshBlockKey(refreshToken)
+	if !until.After(now) {
+		delete(claudeRefreshBlock, key)
+		return
+	}
+	claudeRefreshBlock[key] = until
 }
 
 func clearClaudeRefreshBlockedUntil(refreshToken string) {
 	claudeRefreshMu.Lock()
 	defer claudeRefreshMu.Unlock()
-	delete(claudeRefreshBlock, refreshToken)
+	delete(claudeRefreshBlock, claudeRefreshBlockKey(refreshToken))
+}
+
+func claudeRefreshBlockKey(refreshToken string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(refreshToken)))
+	return hex.EncodeToString(sum[:])
+}
+
+func pruneClaudeRefreshBlockLocked(now time.Time) {
+	for key, until := range claudeRefreshBlock {
+		if until.IsZero() || !until.After(now) {
+			delete(claudeRefreshBlock, key)
+		}
+	}
 }
 
 func clampClaudeRefreshBackoff(d time.Duration) time.Duration {

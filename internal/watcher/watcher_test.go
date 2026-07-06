@@ -1141,6 +1141,54 @@ func TestHandleEventAtomicReplaceChangedTriggersUpdate(t *testing.T) {
 	}
 }
 
+func TestHandleEventAtomicReplaceDoesNotDebounceLaterDelete(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir+"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+	authFile := filepath.Join(authDir, "replace-then-delete.json")
+	content := []byte(`{"type":"demo","v":2}`)
+	if err := os.WriteFile(authFile, content, 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+	oldSum := sha256.Sum256([]byte(`{"type":"demo","v":1}`))
+
+	var reloads int32
+	w := &Watcher{
+		authDir:        authDir,
+		configPath:     configPath,
+		lastAuthHashes: make(map[string]string),
+		reloadCallback: func(*config.Config) { atomic.AddInt32(&reloads, 1) },
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	normalized := w.normalizeAuthPath(authFile)
+	w.lastAuthHashes[normalized] = hexString(oldSum[:])
+
+	w.handleEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Rename})
+	w.clientsMutex.Lock()
+	_, debounced := w.lastRemoveTimes[normalized]
+	w.clientsMutex.Unlock()
+	if debounced {
+		t.Fatal("atomic replace recorded a remove debounce timestamp")
+	}
+
+	if err := os.Remove(authFile); err != nil {
+		t.Fatalf("remove auth file: %v", err)
+	}
+	w.handleEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Remove})
+	if atomic.LoadInt32(&reloads) != 0 {
+		t.Fatalf("expected auth delete to avoid global reload, got %d", reloads)
+	}
+	if _, ok := w.lastAuthHashes[normalized]; ok {
+		t.Fatal("expected later delete to remove auth hash")
+	}
+}
+
 func TestHandleEventRemoveUnknownFileIgnored(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := filepath.Join(tmpDir, "auth")

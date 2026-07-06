@@ -653,8 +653,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if updatedAuth != nil {
 		auth = updatedAuth
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalTranslated, translated := translateRequestPairForPayloadConfig(e.cfg, from, to, baseModel, originalPayload, req.Payload, false)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -875,8 +874,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if updatedAuth != nil {
 		auth = updatedAuth
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated, translated := translateRequestPairForPayloadConfig(e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -1346,8 +1344,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		auth = updatedAuth
 	}
 
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated, translated := translateRequestPairForPayloadConfig(e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -1566,6 +1563,15 @@ attemptLoop:
 						}
 					}
 				}
+				if errScan := scanner.Err(); errScan != nil {
+					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+					reporter.PublishFailure(ctx, errScan)
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+					case <-ctx.Done():
+					}
+					return
+				}
 				tail := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("[DONE]"), &param)
 				for i := range tail {
 					select {
@@ -1574,16 +1580,7 @@ attemptLoop:
 						return
 					}
 				}
-				if errScan := scanner.Err(); errScan != nil {
-					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-					reporter.PublishFailure(ctx, errScan)
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-					case <-ctx.Done():
-					}
-				} else {
-					reporter.EnsurePublished(ctx)
-				}
+				reporter.EnsurePublished(ctx)
 			}(httpResp)
 			return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 		}

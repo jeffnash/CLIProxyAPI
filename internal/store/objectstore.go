@@ -408,6 +408,7 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 		Prefix:    prefix,
 		Recursive: true,
 	})
+	seen := make(map[string]struct{})
 	for object := range objectCh {
 		if object.Err != nil {
 			return fmt.Errorf("object store: list auth objects: %w", object.Err)
@@ -426,6 +427,7 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 			log.WithField("key", object.Key).Warn("object store: skip auth outside mirror")
 			continue
 		}
+		seen[cleanRel] = struct{}{}
 		local := filepath.Join(s.authDir, cleanRel)
 		if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
 			return fmt.Errorf("object store: prepare auth subdir: %w", err)
@@ -443,7 +445,33 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 			return fmt.Errorf("object store: write auth %s: %w", local, errWrite)
 		}
 	}
+	if err := removeAuthFilesAbsentFromBucket(s.authDir, seen); err != nil {
+		return err
+	}
 	return nil
+}
+
+func removeAuthFilesAbsentFromBucket(authDir string, seen map[string]struct{}) error {
+	return filepath.WalkDir(authDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(authDir, path)
+		if err != nil {
+			return fmt.Errorf("object store: resolve auth mirror path: %w", err)
+		}
+		cleanRel := filepath.Clean(rel)
+		if _, ok := seen[cleanRel]; ok {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("object store: remove stale auth %s: %w", path, err)
+		}
+		return nil
+	})
 }
 
 func (s *ObjectTokenStore) uploadAuth(ctx context.Context, path string) error {

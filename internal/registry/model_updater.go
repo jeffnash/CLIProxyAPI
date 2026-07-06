@@ -212,9 +212,12 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 		{"codex", oldData.CodexTeam, newData.CodexTeam},
 		{"codex", oldData.CodexPlus, newData.CodexPlus},
 		{"codex", oldData.CodexPro, newData.CodexPro},
+		{"qwen", oldData.Qwen, newData.Qwen},
+		{"iflow", oldData.IFlow, newData.IFlow},
 		{"kimi", oldData.Kimi, newData.Kimi},
 		{"antigravity", oldData.Antigravity, newData.Antigravity},
 		{"xai", oldData.XAI, newData.XAI},
+		{"cursor", oldData.Cursor, newData.Cursor},
 	}
 
 	seen := make(map[string]bool, len(sections))

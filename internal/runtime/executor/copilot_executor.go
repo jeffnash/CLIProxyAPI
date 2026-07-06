@@ -700,7 +700,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 			httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 			if reqErr != nil {
 				reporter.PublishFailure(ctx)
-				out <- cliproxyexecutor.StreamChunk{Err: reqErr}
+				_ = sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: reqErr})
 				return
 			}
 			e.applyCopilotHeaders(httpReq, copilotToken, req.Payload, opts.Headers)
@@ -725,7 +725,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 					continue
 				}
 				reporter.PublishFailure(ctx)
-				out <- cliproxyexecutor.StreamChunk{Err: reqErr}
+				_ = sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: reqErr})
 				return
 			}
 
@@ -739,7 +739,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 				if readErr != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 					reporter.PublishFailure(ctx)
-					out <- cliproxyexecutor.StreamChunk{Err: readErr}
+					_ = sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: readErr})
 					return
 				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, data)
@@ -750,12 +750,16 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 					continue
 				}
 				reporter.PublishFailure(ctx)
-				out <- cliproxyexecutor.StreamChunk{Err: status}
+				_ = sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: status})
 				return
 			}
 
 			var param any
+			sendFailed := false
 			errRead := e.streamCopilotSSELinesWithIdleBudget(ctx, httpResp.Body, idleBudget, func(line []byte) {
+				if sendFailed {
+					return
+				}
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
 				// Parse usage from final chunk if present
@@ -774,11 +778,18 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 				chunks := sdktranslator.TranslateStream(ctx, to, from, translatorModel, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
 				for i := range chunks {
 					emittedAnyPayload = true
-					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+					if !sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}) {
+						sendFailed = true
+						_ = httpResp.Body.Close()
+						return
+					}
 				}
 			})
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("copilot executor: close response body error: %v", errClose)
+			}
+			if sendFailed {
+				return
 			}
 
 			if errRead == nil {
@@ -792,7 +803,7 @@ func (e *CopilotExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.
 			}
 
 			reporter.PublishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errRead}
+			_ = sendStreamChunk(ctx, out, cliproxyexecutor.StreamChunk{Err: errRead})
 			return
 		}
 	}()

@@ -28,6 +28,8 @@ type ConvertAnthropicResponseToOpenAIParams struct {
 	Usage        claudeUsageTokens
 	// Tool calls accumulator for streaming
 	ToolCallsAccumulator map[int]*ToolCallAccumulator
+	ToolCallOrdinals     map[int]int
+	NextToolCallOrdinal  int
 }
 
 type claudeUsageTokens struct {
@@ -136,6 +138,9 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 			if (*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator == nil {
 				(*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator = make(map[int]*ToolCallAccumulator)
 			}
+			if (*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallOrdinals == nil {
+				(*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallOrdinals = make(map[int]int)
+			}
 			(*param).(*ConvertAnthropicResponseToOpenAIParams).Usage.Merge(message.Get("usage"))
 		}
 		return [][]byte{template}
@@ -154,10 +159,17 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 				if (*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator == nil {
 					(*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator = make(map[int]*ToolCallAccumulator)
 				}
+				if (*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallOrdinals == nil {
+					(*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallOrdinals = make(map[int]int)
+				}
 
 				(*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator[index] = &ToolCallAccumulator{
 					ID:   toolCallID,
 					Name: toolName,
+				}
+				if _, exists := (*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallOrdinals[index]; !exists {
+					(*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallOrdinals[index] = (*param).(*ConvertAnthropicResponseToOpenAIParams).NextToolCallOrdinal
+					(*param).(*ConvertAnthropicResponseToOpenAIParams).NextToolCallOrdinal++
 				}
 
 				// Don't output anything yet - wait for complete tool call
@@ -215,7 +227,11 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 				if arguments == "" {
 					arguments = "{}"
 				}
-				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.index", index)
+				ordinal := index
+				if ordinalForBlock, ok := (*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallOrdinals[index]; ok {
+					ordinal = ordinalForBlock
+				}
+				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.index", ordinal)
 				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.id", accumulator.ID)
 				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.type", "function")
 				template, _ = sjson.SetBytes(template, "choices.0.delta.tool_calls.0.function.name", accumulator.Name)
@@ -223,6 +239,7 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 
 				// Clean up the accumulator for this index
 				delete((*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallsAccumulator, index)
+				delete((*param).(*ConvertAnthropicResponseToOpenAIParams).ToolCallOrdinals, index)
 
 				return [][]byte{template}
 			}

@@ -386,7 +386,6 @@ func (h *Host) UnloadPlugin(id string) bool {
 	}
 
 	h.applyMu.Lock()
-	defer h.applyMu.Unlock()
 
 	targets := make([]pluginUnloadTarget, 0)
 	h.mu.Lock()
@@ -402,6 +401,7 @@ func (h *Host) UnloadPlugin(id string) bool {
 	}
 	if len(targets) == 0 {
 		h.mu.Unlock()
+		h.applyMu.Unlock()
 		return false
 	}
 	delete(h.loaded, id)
@@ -419,6 +419,9 @@ func (h *Host) UnloadPlugin(id string) bool {
 
 	h.refreshThinkingProviders(records)
 	h.RegisterFrontendAuthProviders()
+	h.closeBridgeStreams()
+	h.applyMu.Unlock()
+
 	for _, target := range targets {
 		if target.client != nil {
 			target.client.Shutdown()
@@ -435,7 +438,6 @@ func (h *Host) ShutdownAll() {
 	}
 
 	h.applyMu.Lock()
-	defer h.applyMu.Unlock()
 
 	targets := make([]pluginUnloadTarget, 0)
 	h.mu.Lock()
@@ -486,9 +488,27 @@ func (h *Host) ShutdownAll() {
 
 	h.refreshThinkingProviders(nil)
 	h.RegisterFrontendAuthProviders()
+	h.closeBridgeStreams()
+	h.applyMu.Unlock()
+
 	for _, target := range targets {
 		target.client.Shutdown()
 		log.WithFields(pluginLogFields(target.id, target.name, target.version, target.path)).Info("pluginhost: plugin unloaded")
+	}
+}
+
+func (h *Host) closeBridgeStreams() {
+	if h == nil {
+		return
+	}
+	if h.streams != nil {
+		h.streams.closeAll("plugin host shutting down")
+	}
+	if h.httpStreams != nil {
+		h.httpStreams.closeAll()
+	}
+	if h.modelStreams != nil {
+		h.modelStreams.closeAll()
 	}
 }
 

@@ -11,8 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -130,8 +128,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	basePayload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+	originalTranslated, basePayload := translateRequestPairForPayloadConfig(e.cfg, from, to, baseModel, originalPayload, req.Payload, false)
 
 	basePayload, err = thinking.ApplyThinking(basePayload, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -291,8 +288,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	basePayload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	originalTranslated, basePayload := translateRequestPairForPayloadConfig(e.cfg, from, to, baseModel, originalPayload, req.Payload, true)
 
 	basePayload, err = thinking.ApplyThinking(basePayload, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -430,14 +426,6 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 					}
 				}
 
-				segments := sdktranslator.TranslateStream(respCtx, to, responseFormat, attemptModel, opts.OriginalRequest, reqBody, []byte("[DONE]"), &param)
-				for i := range segments {
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Payload: segments[i]}:
-					case <-ctx.Done():
-						return
-					}
-				}
 				if errScan := scanner.Err(); errScan != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 					reporter.PublishFailure(ctx, errScan)
@@ -446,6 +434,14 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 					case <-ctx.Done():
 					}
 					return
+				}
+				segments := sdktranslator.TranslateStream(respCtx, to, responseFormat, attemptModel, opts.OriginalRequest, reqBody, []byte("[DONE]"), &param)
+				for i := range segments {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: segments[i]}:
+					case <-ctx.Done():
+						return
+					}
 				}
 				reporter.EnsurePublished(ctx)
 				return
@@ -976,69 +972,9 @@ func fixGeminiCLIImageAspectRatio(modelName string, rawJSON []byte) []byte {
 func newGeminiStatusErr(statusCode int, body []byte) statusErr {
 	err := statusErr{code: statusCode, msg: string(body)}
 	if statusCode == http.StatusTooManyRequests {
-		if retryAfter, parseErr := parseRetryDelay(body); parseErr == nil && retryAfter != nil {
+		if retryAfter, parseErr := helps.ParseRetryDelay(body); parseErr == nil && retryAfter != nil {
 			err.retryAfter = retryAfter
 		}
 	}
 	return err
-}
-
-// parseRetryDelay extracts the retry delay from a Google API 429 error response.
-// The error response contains a RetryInfo.retryDelay field in the format "0.847655010s".
-// Returns the parsed duration or an error if it cannot be determined.
-func parseRetryDelay(errorBody []byte) (*time.Duration, error) {
-	// Try to parse the retryDelay from the error response
-	// Format: error.details[].retryDelay where @type == "type.googleapis.com/google.rpc.RetryInfo"
-	details := gjson.GetBytes(errorBody, "error.details")
-	if details.Exists() && details.IsArray() {
-		for _, detail := range details.Array() {
-			typeVal := detail.Get("@type").String()
-			if typeVal == "type.googleapis.com/google.rpc.RetryInfo" {
-				retryDelay := detail.Get("retryDelay").String()
-				if retryDelay != "" {
-					// Parse duration string like "0.847655010s"
-					duration, err := time.ParseDuration(retryDelay)
-					if err != nil {
-						return nil, fmt.Errorf("failed to parse duration")
-					}
-					return &duration, nil
-				}
-			}
-		}
-
-		// Fallback: try ErrorInfo.metadata.quotaResetDelay (e.g., "373.801628ms")
-		for _, detail := range details.Array() {
-			typeVal := detail.Get("@type").String()
-			if typeVal == "type.googleapis.com/google.rpc.ErrorInfo" {
-				quotaResetDelay := detail.Get("metadata.quotaResetDelay").String()
-				if quotaResetDelay != "" {
-					duration, err := time.ParseDuration(quotaResetDelay)
-					if err == nil {
-						return &duration, nil
-					}
-				}
-			}
-		}
-	}
-
-	// Fallback: parse from error.message "Your quota will reset after Xs."
-	message := gjson.GetBytes(errorBody, "error.message").String()
-	if message != "" {
-		re := regexp.MustCompile(`after\s+(\d+)s\.?`)
-		if matches := re.FindStringSubmatch(message); len(matches) > 1 {
-			seconds, err := strconv.Atoi(matches[1])
-			if err == nil {
-				duration := time.Duration(seconds) * time.Second
-				return &duration, nil
-			}
-		}
-		reHuman := regexp.MustCompile(`after\s+((?:\d+h)?(?:\d+m)?(?:\d+s)?)\.?`)
-		if matches := reHuman.FindStringSubmatch(strings.ToLower(message)); len(matches) > 1 {
-			if duration, err := time.ParseDuration(matches[1]); err == nil && duration > 0 {
-				return &duration, nil
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("no RetryInfo found")
 }

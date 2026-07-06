@@ -60,3 +60,38 @@ func TestConvertGeminiResponseToClaude_SignatureOnlyPartDoesNotOpenEmptyTextBloc
 		t.Fatalf("DONE chunk must still emit message_stop after final events: %s", outputText)
 	}
 }
+
+func TestConvertGeminiResponseToClaude_EmptyFinishedCandidateEmitsFinalEvents(t *testing.T) {
+	requestJSON := []byte(`{"model":"gemini-test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	finishChunk := []byte(`{
+		"candidates": [{"finishReason": "STOP"}],
+		"usageMetadata": {
+			"promptTokenCount": 7,
+			"totalTokenCount": 7
+		},
+		"modelVersion": "gemini-test",
+		"responseId": "resp-empty"
+	}`)
+
+	var param any
+	ctx := context.Background()
+	output := bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-test", requestJSON, requestJSON, finishChunk, &param), nil)
+	output = append(output, bytes.Join(ConvertGeminiResponseToClaude(ctx, "gemini-test", requestJSON, requestJSON, []byte("[DONE]"), &param), nil)...)
+	outputText := string(output)
+
+	if !strings.Contains(outputText, `"type":"message_start"`) {
+		t.Fatalf("expected message_start for empty finished candidate: %s", outputText)
+	}
+	if !strings.Contains(outputText, `"type":"message_delta"`) {
+		t.Fatalf("expected message_delta for empty finished candidate: %s", outputText)
+	}
+	if !strings.Contains(outputText, `"input_tokens":7`) {
+		t.Fatalf("expected usage on message_delta: %s", outputText)
+	}
+	if strings.Contains(outputText, `"type":"content_block_stop"`) {
+		t.Fatalf("must not stop an unopened content block: %s", outputText)
+	}
+	if !strings.Contains(outputText, `"type":"message_stop"`) {
+		t.Fatalf("DONE must emit message_stop for empty finished candidate: %s", outputText)
+	}
+}

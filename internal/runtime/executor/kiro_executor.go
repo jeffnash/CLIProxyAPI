@@ -63,6 +63,24 @@ var (
 	usageUpdateTimeInterval  = 15 * time.Second // Or every 15 seconds, whichever comes first
 )
 
+func sleepKiroRetryWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		time.Sleep(delay)
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // kiroEndpointConfig bundles endpoint URL with its compatible Origin and AmzTarget values.
 // This solves the "triple mismatch" problem where different endpoints require matching
 // Origin and X-Amz-Target header values.
@@ -457,7 +475,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 						backoff = 30 * time.Second
 					}
 					log.Warnf("kiro: server error %d, retrying in %v (attempt %d/%d)", httpResp.StatusCode, backoff, attempt+1, maxRetries)
-					time.Sleep(backoff)
+					if errSleep := sleepKiroRetryWithContext(ctx, backoff); errSleep != nil {
+						return resp, errSleep
+					}
 					continue
 				}
 				log.Errorf("kiro: server error %d after %d retries", httpResp.StatusCode, maxRetries)
@@ -795,7 +815,9 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 						backoff = 30 * time.Second
 					}
 					log.Warnf("kiro: stream server error %d, retrying in %v (attempt %d/%d)", httpResp.StatusCode, backoff, attempt+1, maxRetries)
-					time.Sleep(backoff)
+					if errSleep := sleepKiroRetryWithContext(ctx, backoff); errSleep != nil {
+						return nil, errSleep
+					}
 					continue
 				}
 				log.Errorf("kiro: stream server error %d after %d retries", httpResp.StatusCode, maxRetries)
