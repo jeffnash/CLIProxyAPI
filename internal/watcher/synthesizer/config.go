@@ -338,6 +338,9 @@ func (s *ConfigSynthesizer) synthesizeManagedProviderKeys(ctx *SynthesisContext)
 		if provider.MaxRetries != nil {
 			attrs["max_retries"] = strconv.Itoa(*provider.MaxRetries)
 		}
+		if provider.QuotaCooldownMaxSeconds != nil {
+			attrs["quota_cooldown_max_seconds"] = strconv.Itoa(*provider.QuotaCooldownMaxSeconds)
+		}
 		addStringListAttr(attrs, "models_json", provider.Models)
 		addStringListAttr(attrs, "models_exclude_json", provider.ModelsExclude)
 		addStringListAttr(attrs, "fallback_models_json", provider.FallbackModels)

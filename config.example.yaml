@@ -554,6 +554,9 @@ nonstream-keepalive-interval: 0
 #    proxy-url: ""                        # per-auth proxy override
 #    max-retries: 4                       # retry intermittent bootstrap failures; set to 0 to disable
 #    retry-backoff: "5,15,30,60"          # comma-separated seconds for each retry
+#    quota-cooldown-max-seconds: 60       # hard-cap the 429/quota cooldown for this provider
+#                                         # (the global cooldown escalates up to 30m; set e.g. 60
+#                                         # so a rate-limited/credit-exhausted provider recovers fast)
 
 # Global OAuth model name aliases (per channel)
 # These aliases rename model IDs for both model listing and request routing.

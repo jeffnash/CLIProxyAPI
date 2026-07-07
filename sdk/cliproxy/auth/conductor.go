@@ -3706,9 +3706,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								backoffLevel := state.Quota.BackoffLevel
 								if !disableCooling {
 									if result.RetryAfter != nil {
-										next = now.Add(*result.RetryAfter)
+										next = now.Add(capQuotaCooldown(auth, *result.RetryAfter))
 									} else {
 										cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
+										cooldown = capQuotaCooldown(auth, cooldown)
 										if cooldown > 0 {
 											next = now.Add(cooldown)
 										}
@@ -4240,9 +4241,10 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		var next time.Time
 		if !disableCooling {
 			if retryAfter != nil {
-				next = now.Add(*retryAfter)
+				next = now.Add(capQuotaCooldown(auth, *retryAfter))
 			} else {
 				cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
+				cooldown = capQuotaCooldown(auth, cooldown)
 				if cooldown > 0 {
 					next = now.Add(cooldown)
 				}
@@ -4281,6 +4283,22 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 		return quotaBackoffMax, prevLevel
 	}
 	return cooldown, prevLevel + 1
+}
+
+// capQuotaCooldown clamps a quota/429 cooldown duration to the auth's
+// per-provider cap (quota_cooldown_max_seconds) when configured. This lets a
+// provider recover quickly instead of escalating toward the global 30m cap.
+func capQuotaCooldown(auth *Auth, d time.Duration) time.Duration {
+	if auth == nil {
+		return d
+	}
+	if secs, ok := auth.QuotaCooldownMaxOverride(); ok {
+		maxDur := time.Duration(secs) * time.Second
+		if d > maxDur {
+			return maxDur
+		}
+	}
+	return d
 }
 
 // List returns all auth entries currently known by the manager.

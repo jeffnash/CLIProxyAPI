@@ -497,6 +497,31 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 	return 0, false
 }
 
+// QuotaCooldownMaxOverride returns the auth-scoped cap (in seconds) on how long a
+// 429/quota error may cool this auth down. It is read from the
+// "quota_cooldown_max_seconds" attribute (managed providers) or the equivalent
+// metadata key (other sources). A non-negative value caps the cooldown duration.
+func (a *Auth) QuotaCooldownMaxOverride() (int, bool) {
+	if a == nil {
+		return 0, false
+	}
+	if a.Attributes != nil {
+		if val, ok := a.Attributes["quota_cooldown_max_seconds"]; ok {
+			if parsed, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && parsed >= 0 {
+				return parsed, true
+			}
+		}
+	}
+	if a.Metadata != nil {
+		if val, ok := a.Metadata["quota_cooldown_max_seconds"]; ok {
+			if parsed, okParse := parseIntAny(val); okParse && parsed >= 0 {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func parseBoolAny(val any) (bool, bool) {
 	switch typed := val.(type) {
 	case bool:

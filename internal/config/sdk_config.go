@@ -142,6 +142,10 @@ type ManagedProviderConfig struct {
 	ProxyURL              string                              `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 	MaxRetries            *int                                `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
 	RetryBackoff          string                              `yaml:"retry-backoff,omitempty" json:"retry-backoff,omitempty"`
+	// QuotaCooldownMaxSeconds caps how long a 429/quota error cools this provider
+	// down. The global cooldown escalates up to 30m; set this (e.g. 60) to hard-cap
+	// the lockout for this provider so it recovers quickly. 0/unset uses the default.
+	QuotaCooldownMaxSeconds *int `yaml:"quota-cooldown-max-seconds,omitempty" json:"quota-cooldown-max-seconds,omitempty"`
 }
 
 // ManagedProviderModelDiscoveryConfig controls provider model discovery.
