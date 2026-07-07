@@ -51,7 +51,7 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 	}
 
 	rules := cfg.Payload
-	hasPayloadRules := len(rules.Default) != 0 || len(rules.DefaultRaw) != 0 || len(rules.Override) != 0 || len(rules.OverrideRaw) != 0 || len(rules.Filter) != 0
+	hasPayloadRules := len(rules.Default) != 0 || len(rules.DefaultRaw) != 0 || len(rules.Override) != 0 || len(rules.OverrideRaw) != 0 || len(rules.Filter) != 0 || len(rules.DropTools) != 0
 	if hasPayloadRules {
 		model = strings.TrimSpace(model)
 		requestedModel = strings.TrimSpace(requestedModel)
@@ -186,9 +186,65 @@ func ApplyPayloadConfigWithRequest(cfg *config.Config, model, protocol, fromProt
 					}
 				}
 			}
+			// Apply drop-tools rules: remove matching tools from the payload's tools array.
+			for i := range rules.DropTools {
+				rule := &rules.DropTools[i]
+				if !payloadModelRulesMatch(rule.Models, protocol, fromProtocol, headers, out, root, candidates) {
+					continue
+				}
+				out = dropToolsFromPayload(out, root, rule.Tools)
+			}
 		}
 	}
 	return out
+}
+
+// dropToolsFromPayload removes tools whose name matches any entry in names from
+// the payload's tools array. It handles both Anthropic-style tools (tools[].name)
+// and OpenAI-style tools (tools[].function.name). Matching is by exact name or by
+// the segment after the last "__" so short names match MCP-prefixed tool names.
+func dropToolsFromPayload(payload []byte, root string, names []string) []byte {
+	if len(names) == 0 {
+		return payload
+	}
+	toolsPath := buildPayloadPath(root, "tools")
+	if toolsPath == "" {
+		return payload
+	}
+	arr := gjson.GetBytes(payload, toolsPath)
+	if !arr.IsArray() {
+		return payload
+	}
+	items := arr.Array()
+	// Delete from the end so earlier indices stay valid as elements are removed.
+	for i := len(items) - 1; i >= 0; i-- {
+		name := strings.TrimSpace(items[i].Get("name").String())
+		if name == "" {
+			name = strings.TrimSpace(items[i].Get("function.name").String())
+		}
+		if name == "" || !toolNameMatchesDrop(name, names) {
+			continue
+		}
+		if updated, errDel := sjson.DeleteBytes(payload, toolsPath+"."+strconv.Itoa(i)); errDel == nil {
+			payload = updated
+		}
+	}
+	return payload
+}
+
+// toolNameMatchesDrop reports whether name matches any drop entry, either by
+// exact match or by the "__"-delimited suffix (MCP tools carry a server prefix).
+func toolNameMatchesDrop(name string, names []string) bool {
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		if name == n || strings.HasSuffix(name, "__"+n) {
+			return true
+		}
+	}
+	return false
 }
 
 func isImagesEndpointRequestPath(path string) bool {

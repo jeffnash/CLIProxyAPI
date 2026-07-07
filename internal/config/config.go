@@ -244,6 +244,10 @@ type PassthruRoute struct {
 	Payload               *PassthruPayload   `yaml:"payload,omitempty" json:"payload,omitempty"`
 	RateLimit             *PassthruRateLimit `yaml:"rate-limit,omitempty" json:"rate-limit,omitempty"`
 	Lenient               bool               `yaml:"lenient,omitempty" json:"lenient,omitempty"`
+	// DropTools removes tools by name from the request before forwarding to this
+	// route's upstream. Shorthand for a payload drop-tools rule scoped to this
+	// route; useful when a strict upstream rejects specific tool schemas.
+	DropTools []string `yaml:"drop-tools,omitempty" json:"drop-tools,omitempty"`
 }
 
 // PassthruPayload defines route-scoped payload parameter rules.
@@ -258,6 +262,8 @@ type PassthruPayload struct {
 	OverrideRaw map[string]any `yaml:"override-raw,omitempty" json:"override-raw,omitempty"`
 	// Filter removes parameters from the request payload by JSON path.
 	Filter []string `yaml:"filter,omitempty" json:"filter,omitempty"`
+	// DropTools removes tools by name from the request payload before forwarding.
+	DropTools []string `yaml:"drop-tools,omitempty" json:"drop-tools,omitempty"`
 }
 
 // PassthruRateLimit configures per-route retry and cooldown behavior.
@@ -558,6 +564,8 @@ type PayloadConfig struct {
 	OverrideRaw []PayloadRule `yaml:"override-raw" json:"override-raw"`
 	// Filter defines rules that remove parameters from the payload by JSON path.
 	Filter []PayloadFilterRule `yaml:"filter" json:"filter"`
+	// DropTools defines rules that remove specific tools (by name) from the payload.
+	DropTools []PayloadDropToolsRule `yaml:"drop-tools" json:"drop-tools"`
 }
 
 // PayloadFilterRule describes a rule to remove specific JSON paths from matching model payloads.
@@ -566,6 +574,22 @@ type PayloadFilterRule struct {
 	Models []PayloadModelRule `yaml:"models" json:"models"`
 	// Params lists JSON paths (gjson/sjson syntax) to remove from the payload.
 	Params []string `yaml:"params" json:"params"`
+}
+
+// PayloadDropToolsRule describes a rule to remove specific tools by name from
+// matching model payloads. Some strict upstreams reject the whole request when a
+// particular tool schema is present; dropping just those tools lets the rest of
+// the request through. Works for any provider (passthru and custom providers)
+// since it runs in the shared payload rule engine.
+type PayloadDropToolsRule struct {
+	// Models lists model entries with name pattern and protocol constraint.
+	Models []PayloadModelRule `yaml:"models" json:"models"`
+	// Tools lists tool names to remove. A tool matches by exact name or by the
+	// segment after the last "__" (so a short name like "get_console_message"
+	// matches an MCP tool named "mcp__server__get_console_message"). Matching
+	// covers both Anthropic-style tools (tools[].name) and OpenAI-style tools
+	// (tools[].function.name).
+	Tools []string `yaml:"tools" json:"tools"`
 }
 
 // PayloadRule describes a single rule targeting a list of models with parameter updates.
@@ -1455,13 +1479,29 @@ func (cfg *Config) AddPassthruPayloadRules() {
 	overrideRules := make([]PayloadRule, 0)
 	overrideRawRules := make([]PayloadRule, 0)
 	filterRules := make([]PayloadFilterRule, 0)
+	dropToolsRules := make([]PayloadDropToolsRule, 0)
 	for i := range cfg.Passthru {
 		route := &cfg.Passthru[i]
-		if route.Payload == nil || passthruPayloadEmpty(*route.Payload) {
+		// Collect drop-tools from the route shorthand and the payload block.
+		dropTools := cloneStringSlice(route.DropTools)
+		if route.Payload != nil {
+			dropTools = append(dropTools, route.Payload.DropTools...)
+		}
+		payloadEmpty := route.Payload == nil || passthruPayloadEmpty(*route.Payload)
+		if payloadEmpty && len(dropTools) == 0 {
 			continue
 		}
 		models := passthruPayloadModelRules(route)
 		if len(models) == 0 {
+			continue
+		}
+		if len(dropTools) > 0 {
+			dropToolsRules = append(dropToolsRules, PayloadDropToolsRule{
+				Models: models,
+				Tools:  cloneStringSlice(dropTools),
+			})
+		}
+		if route.Payload == nil {
 			continue
 		}
 		payload := route.Payload
@@ -1503,6 +1543,7 @@ func (cfg *Config) AddPassthruPayloadRules() {
 	cfg.Payload.Override = append(cfg.Payload.Override, overrideRules...)
 	cfg.Payload.OverrideRaw = append(cfg.Payload.OverrideRaw, overrideRawRules...)
 	cfg.Payload.Filter = append(cfg.Payload.Filter, filterRules...)
+	cfg.Payload.DropTools = append(cfg.Payload.DropTools, dropToolsRules...)
 }
 
 func passthruPayloadEmpty(payload PassthruPayload) bool {
