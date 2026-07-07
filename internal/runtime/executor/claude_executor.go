@@ -195,6 +195,24 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	return httpClient.Do(httpReq)
 }
 
+// passthruUpstreamModel returns the model name to send upstream, honoring a
+// passthru route's upstream_model attribute override and falling back to
+// baseModel. This keeps the non-streaming Execute/CountTokens paths consistent
+// with ExecuteStream so passthru routes that rename the upstream model (e.g. a
+// local alias mapped to a different provider model) forward the correct name.
+func passthruUpstreamModel(auth *cliproxyauth.Auth, baseModel string) string {
+	modelForUpstream := baseModel
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
+			modelForUpstream = thinking.ParseSuffix(v).ModelName
+		}
+	}
+	if strings.TrimSpace(modelForUpstream) == "" {
+		modelForUpstream = baseModel
+	}
+	return modelForUpstream
+}
+
 func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
@@ -219,7 +237,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	originalPayload := originalPayloadSource
 	originalTranslated, body := translateRequestPairForPayloadConfig(e.cfg, from, to, baseModel, originalPayload, req.Payload, stream)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, _ = sjson.SetBytes(body, "model", passthruUpstreamModel(auth, baseModel))
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -403,16 +421,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FromString("claude")
-	modelForUpstream := baseModel
-	// Check auth attributes for passthru route upstream_model override.
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["upstream_model"]); v != "" {
-			modelForUpstream = thinking.ParseSuffix(v).ModelName
-		}
-	}
-	if strings.TrimSpace(modelForUpstream) == "" {
-		modelForUpstream = baseModel
-	}
+	modelForUpstream := passthruUpstreamModel(auth, baseModel)
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -696,7 +705,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, _ = sjson.SetBytes(body, "model", passthruUpstreamModel(auth, baseModel))
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = rebuildMidSystemMessagesToTopLevel(body)
 	}
