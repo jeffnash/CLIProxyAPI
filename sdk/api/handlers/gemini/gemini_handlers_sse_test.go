@@ -34,3 +34,23 @@ func TestWriteGeminiSSEData_MultilineDataIsSplitIntoDataLines(t *testing.T) {
 		t.Fatalf("unexpected output: %q", got)
 	}
 }
+
+func TestWriteGeminiSSEData_PreservesAlreadyFramedData(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if wrote := writeGeminiSSEData(rec, []byte("data: {\"ok\":true}\n\n")); !wrote {
+		t.Fatalf("expected wrote=true")
+	}
+	if got := rec.Body.String(); got != "data: {\"ok\":true}\n\n" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+}
+
+func TestWriteGeminiSSEData_SkipsAlreadyFramedDone(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if wrote := writeGeminiSSEData(rec, []byte("data: [DONE]\n\n")); wrote {
+		t.Fatalf("expected wrote=false")
+	}
+	if got := rec.Body.String(); got != "" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+}

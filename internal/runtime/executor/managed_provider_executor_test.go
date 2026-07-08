@@ -10,6 +10,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -144,6 +145,50 @@ func TestManagedProviderExecutorOpenAISourceUsesChatCompletionsEndpoint(t *testi
 	}
 	if !strings.Contains(string(resp.Payload), `"ok"`) {
 		t.Fatalf("payload=%s", resp.Payload)
+	}
+}
+
+func TestManagedProviderExecutorOpenAIStreamNormalizesSSEFrames(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("path=%q, want /v1/chat/completions", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	cfg := managedProviderTestConfig(srv.URL + "/v1")
+	exec := NewManagedProviderExecutor("example-provider", cfg)
+	result, err := exec.ExecuteStream(context.Background(), managedProviderTestAuth(srv.URL+"/v1"), cliproxyexecutor.Request{
+		Model:   "qwen3.7-max",
+		Payload: []byte(`{"model":"qwen3.7-max","stream":true,"messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, ResponseFormat: sdktranslator.FormatOpenAI})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var chunks []string
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		if strings.TrimSpace(string(chunk.Payload)) == "" {
+			continue
+		}
+		chunks = append(chunks, string(chunk.Payload))
+	}
+
+	got := strings.Join(chunks, "")
+	if strings.Contains(got, "data:") {
+		t.Fatalf("stream chunks must be unframed JSON for OpenAI handler, got %q", got)
+	}
+	if strings.Contains(got, "[DONE]") {
+		t.Fatalf("stream chunks must not forward upstream DONE marker, got %q", got)
+	}
+	if !strings.Contains(got, `"content":"ok"`) {
+		t.Fatalf("stream chunks missing content: %q", got)
 	}
 }
 

@@ -34,3 +34,23 @@ func TestWriteOpenAISSEData_MultilineDataIsSplitIntoDataLines(t *testing.T) {
 		t.Fatalf("unexpected output: %q", got)
 	}
 }
+
+func TestWriteOpenAISSEData_PreservesAlreadyFramedData(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if wrote := writeOpenAISSEData(rec, []byte("data: {\"ok\":true}\n\n")); !wrote {
+		t.Fatalf("expected wrote=true")
+	}
+	if got := rec.Body.String(); got != "data: {\"ok\":true}\n\n" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+}
+
+func TestWriteOpenAISSEData_SkipsAlreadyFramedDone(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if wrote := writeOpenAISSEData(rec, []byte("data: [DONE]\n\n")); wrote {
+		t.Fatalf("expected wrote=false")
+	}
+	if got := rec.Body.String(); got != "" {
+		t.Fatalf("unexpected output: %q", got)
+	}
+}

@@ -617,6 +617,9 @@ func (e *ManagedProviderExecutor) translateNonStream(ctx context.Context, prepar
 
 func (e *ManagedProviderExecutor) translateStreamChunk(ctx context.Context, prepared managedProviderPreparedRequest, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, line []byte, param *any) [][]byte {
 	if prepared.responseFormat == prepared.targetFormat {
+		if sdktranslator.HasStreamResponseTransformer(prepared.targetFormat, prepared.responseFormat) {
+			return sdktranslator.TranslateStream(ctx, prepared.targetFormat, prepared.responseFormat, req.Model, opts.OriginalRequest, prepared.body, line, param)
+		}
 		return [][]byte{append(bytes.Clone(line), '\n')}
 	}
 	return sdktranslator.TranslateStream(ctx, prepared.targetFormat, prepared.responseFormat, req.Model, opts.OriginalRequest, prepared.body, line, param)

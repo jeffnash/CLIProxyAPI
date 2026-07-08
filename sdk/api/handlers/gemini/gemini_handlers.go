@@ -21,8 +21,18 @@ import (
 )
 
 func writeGeminiSSEData(w http.ResponseWriter, chunk []byte) bool {
-	if len(bytes.TrimSpace(chunk)) == 0 {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 {
 		return false
+	}
+	if bytes.HasPrefix(trimmed, []byte("data:")) {
+		data := bytes.TrimSpace(trimmed[len("data:"):])
+		if bytes.Equal(data, []byte("[DONE]")) {
+			return false
+		}
+		_, _ = w.Write(bytes.TrimRight(trimmed, "\r\n"))
+		_, _ = w.Write([]byte("\n\n"))
+		return true
 	}
 	// Write SSE-compliant multiline data: split on '\n' and emit one "data:" line per segment.
 	lines := bytes.Split(bytes.TrimSuffix(chunk, []byte("\n")), []byte("\n"))

@@ -25,8 +25,18 @@ import (
 )
 
 func writeOpenAISSEData(w http.ResponseWriter, chunk []byte) bool {
-	if len(bytes.TrimSpace(chunk)) == 0 {
+	trimmed := bytes.TrimSpace(chunk)
+	if len(trimmed) == 0 {
 		return false
+	}
+	if bytes.HasPrefix(trimmed, []byte("data:")) {
+		data := bytes.TrimSpace(trimmed[len("data:"):])
+		if bytes.Equal(data, []byte("[DONE]")) {
+			return false
+		}
+		_, _ = w.Write(bytes.TrimRight(trimmed, "\r\n"))
+		_, _ = fmt.Fprint(w, "\n\n")
+		return true
 	}
 	// Write SSE-compliant multiline data: split on '\n' and emit one "data:" line per segment.
 	// (Streaming JSON chunks should not contain literal newlines, but this avoids malformed framing
