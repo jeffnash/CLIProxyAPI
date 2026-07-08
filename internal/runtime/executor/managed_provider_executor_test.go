@@ -708,6 +708,56 @@ func TestManagedProviderPinnedIntentIgnoresCooldownButDemotesUnsupported(t *test
 	}
 }
 
+func TestManagedProviderStreamBootstrapFallbackIgnoresCooledFallbacks(t *testing.T) {
+	clearManagedProviderStateForTest(t)
+	enabled := true
+	provider := config.ManagedProviderConfig{
+		Name:    "example-provider",
+		Prefix:  "example-",
+		APIKey:  "test-key",
+		BaseURL: "https://provider.example/v1",
+		RouteHealth: config.ManagedProviderRouteHealthConfig{
+			Enabled:   &enabled,
+			StatePath: t.TempDir() + "/managed_provider_health.json",
+			Cooldown:  "1h",
+		},
+	}
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ManagedProviders: []config.ManagedProviderConfig{provider}}}
+	exec := NewManagedProviderExecutor("example-provider", cfg)
+	creds := exec.creds(nil)
+	plan := exec.transportPlan(nil, cliproxyexecutor.Request{Model: "qwen3.7-max"}, cliproxyexecutor.Options{
+		Stream:         true,
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: sdktranslator.FormatOpenAI,
+		Metadata: map[string]any{
+			cliproxyexecutor.ManagedProviderTransportMetadataKey: "openai-completions",
+		},
+	})
+	if got := strings.Join(plan.Transports, ","); got != managedProviderTransportOpenAI+","+managedProviderTransportClaude {
+		t.Fatalf("transports=%s, want openai,claude", got)
+	}
+	if !exec.hasUsableStreamBootstrapFallback(creds, "qwen3.7-max", plan.Transports[1:]) {
+		t.Fatalf("fallback should be usable before health marks it cooled")
+	}
+
+	recordManagedProviderTransportHealth(cfg, provider, "example-provider", "qwen3.7-max", managedProviderTransportClaude, managedProviderHealthOutcome{
+		Timeout: true,
+		Err:     errManagedProviderFirstStreamEventTimeout,
+	})
+	if exec.hasUsableStreamBootstrapFallback(creds, "qwen3.7-max", plan.Transports[1:]) {
+		t.Fatalf("cooled fallback should not enable stream bootstrap timeout")
+	}
+
+	recordManagedProviderTransportHealth(cfg, provider, "example-provider", "qwen3.7-max", managedProviderTransportClaude, managedProviderHealthOutcome{
+		Success:    true,
+		StatusCode: http.StatusOK,
+		Latency:    10 * time.Millisecond,
+	})
+	if !exec.hasUsableStreamBootstrapFallback(creds, "qwen3.7-max", plan.Transports[1:]) {
+		t.Fatalf("successful fallback health should re-enable stream bootstrap timeout")
+	}
+}
+
 func TestManagedProviderSelectTransportAutoAndConfig(t *testing.T) {
 	cfg := managedProviderTestConfig("https://provider.example/v1")
 	exec := NewManagedProviderExecutor("example-provider", cfg)

@@ -222,7 +222,8 @@ func (e *ManagedProviderExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		reporter.SetTranslatedReasoningEffort(prepared.body, prepared.targetFormat.String())
 
 		var errTransport error
-		bootstrap, errTransport = e.openStreamTransport(ctx, auth, creds, prepared, transport, idx < len(plan.Transports)-1)
+		hasFallback := e.hasUsableStreamBootstrapFallback(creds, prepared.baseModel, plan.Transports[idx+1:])
+		bootstrap, errTransport = e.openStreamTransport(ctx, auth, creds, prepared, transport, hasFallback)
 		if errTransport == nil {
 			selectedTransport = transport
 			recordManagedProviderTransportHealth(e.cfg, creds.provider, e.Identifier(), prepared.baseModel, transport, managedProviderHealthOutcome{
@@ -963,6 +964,32 @@ func (e *ManagedProviderExecutor) transportAvailable(creds managedProviderCreden
 	default:
 		return false
 	}
+}
+
+func (e *ManagedProviderExecutor) hasUsableStreamBootstrapFallback(creds managedProviderCredentials, model string, fallbackTransports []string) bool {
+	available := e.availableTransports(creds, fallbackTransports...)
+	if len(available) == 0 {
+		return false
+	}
+	if !managedProviderHealthEnabled(creds.provider) {
+		return true
+	}
+	path := managedProviderHealthStatePath(e.cfg, creds.provider)
+	now := time.Now().UTC()
+	managedProviderHealth.mu.Lock()
+	defer managedProviderHealth.mu.Unlock()
+	managedProviderHealth.ensureLoadedLocked(path)
+	for _, transport := range available {
+		record := managedProviderHealth.records[managedProviderHealthKey(e.Identifier(), model, transport)]
+		if record == nil {
+			return true
+		}
+		if record.UnsupportedUntil.After(now) || record.CooldownUntil.After(now) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func filterManagedProviderCompatibleTransports(transports []string, sourceFormat, responseFormat sdktranslator.Format, stream bool) []string {
