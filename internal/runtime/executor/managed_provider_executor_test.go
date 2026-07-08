@@ -295,13 +295,13 @@ func TestManagedProviderExecutorFetchModelsGeneratesExplicitAliases(t *testing.T
 	}
 }
 
-func TestManagedProviderExecutorResponsesAliasFallsBackToChatCompletions(t *testing.T) {
+func TestManagedProviderExecutorResponsesAliasSkipsIncompatibleOpenAIChatFallback(t *testing.T) {
 	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		switch r.URL.Path {
 		case "/v1/responses":
-			http.Error(w, `{"error":"not implemented"}`, http.StatusNotImplemented)
+			t.Fatalf("responses transport should be skipped without OpenAI chat response translator")
 		case "/v1/chat/completions":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
@@ -330,8 +330,8 @@ func TestManagedProviderExecutorResponsesAliasFallsBackToChatCompletions(t *test
 	if !strings.Contains(string(resp.Payload), `"ok"`) {
 		t.Fatalf("payload=%s", resp.Payload)
 	}
-	if got := strings.Join(paths, ","); got != "/v1/responses,/v1/chat/completions" {
-		t.Fatalf("paths=%s, want responses then chat completions", got)
+	if got := strings.Join(paths, ","); got != "/v1/chat/completions" {
+		t.Fatalf("paths=%s, want incompatible responses skipped", got)
 	}
 }
 
@@ -398,6 +398,156 @@ func TestManagedProviderExecutorAnthropicStreamNoFirstEventFallsBackToResponses(
 	pathsMu.Unlock()
 	if got != "/v1/messages,/v1/responses" {
 		t.Fatalf("paths=%s, want anthropic then responses", got)
+	}
+}
+
+func TestManagedProviderExecutorOpenAIStreamDropsHeartbeatLines(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: : PING\n\n"))
+		_, _ = w.Write([]byte(`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}` + "\n\n"))
+		_, _ = w.Write([]byte(": keep-alive\n\n"))
+		_, _ = w.Write([]byte("data: : PING\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	cfg := managedProviderTestConfig(srv.URL + "/v1")
+	exec := NewManagedProviderExecutor("example-provider", cfg)
+	result, err := exec.ExecuteStream(context.Background(), managedProviderTestAuth(srv.URL+"/v1"), cliproxyexecutor.Request{
+		Model:   "qwen3.7-max",
+		Payload: []byte(`{"model":"qwen3.7-max","messages":[{"role":"user","content":"hello"}],"stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: sdktranslator.FormatOpenAI,
+		Metadata: map[string]any{
+			cliproxyexecutor.ManagedProviderTransportMetadataKey: "openai-completions",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var payload []byte
+	for {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				body := string(payload)
+				if strings.Contains(body, ": PING") {
+					t.Fatalf("payload includes upstream heartbeat: %q", body)
+				}
+				if strings.Contains(body, "keep-alive") {
+					t.Fatalf("payload includes upstream comment: %q", body)
+				}
+				if !strings.Contains(body, `"content":"ok"`) {
+					t.Fatalf("payload=%q, want valid OpenAI chunk", body)
+				}
+				return
+			}
+			if chunk.Err != nil {
+				t.Fatalf("stream chunk error: %v", chunk.Err)
+			}
+			payload = append(payload, chunk.Payload...)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for stream, payload=%q", string(payload))
+		}
+	}
+}
+
+func TestManagedProviderStreamControlLineFiltering(t *testing.T) {
+	tests := []struct {
+		name       string
+		line       string
+		drop       bool
+		meaningful bool
+	}{
+		{name: "empty", line: "", drop: false, meaningful: false},
+		{name: "comment", line: ": keep-alive", drop: true, meaningful: false},
+		{name: "ping-event", line: "event: ping", drop: true, meaningful: false},
+		{name: "heartbeat-event", line: "event: response.heartbeat", drop: true, meaningful: false},
+		{name: "empty-data", line: "data:", drop: true, meaningful: false},
+		{name: "data-comment", line: "data: : PING", drop: true, meaningful: false},
+		{name: "json-ping-type", line: `data: {"type":"ping"}`, drop: true, meaningful: false},
+		{name: "json-ping-event", line: `data: {"event":"heartbeat"}`, drop: true, meaningful: false},
+		{name: "done", line: "data: [DONE]", drop: false, meaningful: true},
+		{name: "openai-json", line: `data: {"choices":[]}`, drop: false, meaningful: true},
+		{name: "claude-event", line: "event: message_start", drop: false, meaningful: true},
+		{name: "responses-event", line: "event: response.output_text.delta", drop: false, meaningful: true},
+		{name: "claude-json", line: `data: {"type":"message_start"}`, drop: false, meaningful: true},
+		{name: "responses-json", line: `data: {"type":"response.output_text.delta","delta":"ok"}`, drop: false, meaningful: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := managedProviderShouldDropUpstreamStreamLine([]byte(tt.line)); got != tt.drop {
+				t.Fatalf("managedProviderShouldDropUpstreamStreamLine(%q)=%v, want %v", tt.line, got, tt.drop)
+			}
+			if got := managedProviderMeaningfulStreamLine([]byte(tt.line)); got != tt.meaningful {
+				t.Fatalf("managedProviderMeaningfulStreamLine(%q)=%v, want %v", tt.line, got, tt.meaningful)
+			}
+		})
+	}
+}
+
+func TestManagedProviderTransportCompatibilityMatrix(t *testing.T) {
+	tests := []struct {
+		name     string
+		source   sdktranslator.Format
+		target   string
+		response sdktranslator.Format
+		want     bool
+	}{
+		{name: "openai client to chat transport", source: sdktranslator.FormatOpenAI, target: managedProviderTransportOpenAI, response: sdktranslator.FormatOpenAI, want: true},
+		{name: "openai client to claude transport", source: sdktranslator.FormatOpenAI, target: managedProviderTransportClaude, response: sdktranslator.FormatOpenAI, want: true},
+		{name: "openai client to responses transport lacks translator", source: sdktranslator.FormatOpenAI, target: managedProviderTransportResponses, response: sdktranslator.FormatOpenAI, want: false},
+		{name: "responses client to responses transport", source: sdktranslator.FormatOpenAIResponse, target: managedProviderTransportResponses, response: sdktranslator.FormatOpenAIResponse, want: true},
+		{name: "responses client to chat transport", source: sdktranslator.FormatOpenAIResponse, target: managedProviderTransportOpenAI, response: sdktranslator.FormatOpenAIResponse, want: true},
+		{name: "responses client to claude transport", source: sdktranslator.FormatOpenAIResponse, target: managedProviderTransportClaude, response: sdktranslator.FormatOpenAIResponse, want: true},
+		{name: "claude client to claude transport", source: sdktranslator.FormatClaude, target: managedProviderTransportClaude, response: sdktranslator.FormatClaude, want: true},
+		{name: "claude client to chat transport", source: sdktranslator.FormatClaude, target: managedProviderTransportOpenAI, response: sdktranslator.FormatClaude, want: true},
+		{name: "claude client to responses transport lacks translator", source: sdktranslator.FormatClaude, target: managedProviderTransportResponses, response: sdktranslator.FormatClaude, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := managedProviderTransportFormatsCompatible(tt.source, managedProviderTransportFormat(tt.target), tt.response, true)
+			if got != tt.want {
+				t.Fatalf("managedProviderTransportFormatsCompatible(%q,%q,%q,stream=true)=%v, want %v", tt.source, tt.target, tt.response, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagedProviderTransportPlanSkipsIncompatibleResponsesFallbacks(t *testing.T) {
+	cfg := managedProviderTestConfig("https://example.invalid/v1")
+	cfg.ManagedProviders[0].OpenAIResponsesPath = "/responses"
+	exec := NewManagedProviderExecutor("example-provider", cfg)
+	auth := managedProviderTestAuth("https://example.invalid/v1")
+
+	plan := exec.transportPlan(auth, cliproxyexecutor.Request{Model: "qwen3.7-max"}, cliproxyexecutor.Options{
+		Stream:         true,
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: sdktranslator.FormatOpenAI,
+		Metadata: map[string]any{
+			cliproxyexecutor.ManagedProviderTransportMetadataKey: "openai-responses",
+		},
+	})
+	if got := strings.Join(plan.Transports, ","); got != managedProviderTransportOpenAI+","+managedProviderTransportClaude {
+		t.Fatalf("transports=%s, want incompatible responses skipped before chat and claude", got)
+	}
+
+	plan = exec.transportPlan(auth, cliproxyexecutor.Request{Model: "qwen3.7-max"}, cliproxyexecutor.Options{
+		Stream:         true,
+		SourceFormat:   sdktranslator.FormatClaude,
+		ResponseFormat: sdktranslator.FormatClaude,
+		Metadata: map[string]any{
+			cliproxyexecutor.ManagedProviderTransportMetadataKey: "anthropic",
+		},
+	})
+	if got := strings.Join(plan.Transports, ","); got != managedProviderTransportClaude+","+managedProviderTransportOpenAI {
+		t.Fatalf("transports=%s, want incompatible responses skipped between claude and chat", got)
 	}
 }
 
@@ -604,8 +754,8 @@ func TestManagedProviderSelectTransportAutoAndConfig(t *testing.T) {
 		Metadata: map[string]any{
 			cliproxyexecutor.ManagedProviderTransportMetadataKey: "openai-responses",
 		},
-	}); got != managedProviderTransportResponses {
-		t.Fatalf("metadata forced transport=%q, want responses", got)
+	}); got != managedProviderTransportOpenAI {
+		t.Fatalf("metadata forced incompatible responses transport=%q, want compatible openai fallback", got)
 	}
 }
 

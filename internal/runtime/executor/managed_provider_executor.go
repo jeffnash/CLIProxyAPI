@@ -24,6 +24,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -273,6 +274,9 @@ func (e *ManagedProviderExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		scanner := bootstrap.Scanner
 		var param any
 		emitLine := func(line []byte) bool {
+			if managedProviderShouldDropUpstreamStreamLine(line) {
+				return true
+			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if prepared.targetFormat == sdktranslator.FormatClaude {
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
@@ -585,7 +589,61 @@ func managedProviderMeaningfulStreamLine(line []byte) bool {
 	if len(trimmed) == 0 {
 		return false
 	}
-	return !bytes.HasPrefix(trimmed, []byte(":"))
+	if managedProviderShouldDropUpstreamStreamLine(trimmed) {
+		return false
+	}
+	return true
+}
+
+func managedProviderShouldDropUpstreamStreamLine(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return false
+	}
+	if bytes.HasPrefix(trimmed, []byte(":")) {
+		return true
+	}
+	if eventName, ok := managedProviderSSEFieldPayload(trimmed, "event:"); ok {
+		return managedProviderIsControlSSEName(string(eventName))
+	}
+	payload, ok := managedProviderSSEDataPayload(trimmed)
+	return ok && managedProviderIsControlSSEDataPayload(payload)
+}
+
+func managedProviderSSEDataPayload(trimmed []byte) ([]byte, bool) {
+	return managedProviderSSEFieldPayload(trimmed, "data:")
+}
+
+func managedProviderSSEFieldPayload(trimmed []byte, field string) ([]byte, bool) {
+	if len(trimmed) < len(field) || !bytes.EqualFold(trimmed[:len(field)], []byte(field)) {
+		return nil, false
+	}
+	return bytes.TrimSpace(trimmed[len(field):]), true
+}
+
+func managedProviderIsControlSSEDataPayload(payload []byte) bool {
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 || bytes.HasPrefix(payload, []byte(":")) {
+		return true
+	}
+	if !gjson.ValidBytes(payload) {
+		return false
+	}
+	for _, path := range []string{"type", "event"} {
+		if managedProviderIsControlSSEName(gjson.GetBytes(payload, path).String()) {
+			return true
+		}
+	}
+	return false
+}
+
+func managedProviderIsControlSSEName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch name {
+	case "ping", "heartbeat", "keepalive", "keep-alive", "keep_alive":
+		return true
+	}
+	return strings.HasSuffix(name, ".ping") || strings.HasSuffix(name, ".heartbeat")
 }
 
 func bootstrapStatus(bootstrap *managedProviderStreamBootstrap) int {
@@ -842,6 +900,20 @@ func (e *ManagedProviderExecutor) transportPlan(auth *cliproxyauth.Auth, req cli
 		demoteCooldown = true
 	}
 	plan.Transports = demoteUnavailableManagedProviderTransports(e.cfg, creds.provider, e.Identifier(), baseModel, plan.Transports, demoteCooldown)
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+	beforeCompatibilityFilter := append([]string(nil), plan.Transports...)
+	plan.Transports = filterManagedProviderCompatibleTransports(plan.Transports, opts.SourceFormat, responseFormat, opts.Stream)
+	if skipped := skippedManagedProviderTransports(beforeCompatibilityFilter, plan.Transports); len(skipped) > 0 {
+		log.WithFields(log.Fields{
+			"provider":           e.Identifier(),
+			"model":              baseModel,
+			"intent":             plan.Intent,
+			"skipped_transports": strings.Join(skipped, ","),
+			"source_format":      opts.SourceFormat.String(),
+			"response_format":    responseFormat.String(),
+			"stream":             opts.Stream,
+		}).Info("managed provider: skipped incompatible transports")
+	}
 	plan.Transports = uniqueManagedProviderTransports(plan.Transports)
 	log.WithFields(log.Fields{
 		"provider":          e.Identifier(),
@@ -850,7 +922,7 @@ func (e *ManagedProviderExecutor) transportPlan(auth *cliproxyauth.Auth, req cli
 		"transports":        strings.Join(plan.Transports, ","),
 		"dynamic_selection": plan.DynamicSelection,
 		"source_format":     opts.SourceFormat.String(),
-		"response_format":   cliproxyexecutor.ResponseFormatOrSource(opts).String(),
+		"response_format":   responseFormat.String(),
 		"default_transport": defaultTransport,
 	}).Info("managed provider: selected transport plan")
 	return plan
@@ -891,6 +963,62 @@ func (e *ManagedProviderExecutor) transportAvailable(creds managedProviderCreden
 	default:
 		return false
 	}
+}
+
+func filterManagedProviderCompatibleTransports(transports []string, sourceFormat, responseFormat sdktranslator.Format, stream bool) []string {
+	if len(transports) == 0 {
+		return transports
+	}
+	out := make([]string, 0, len(transports))
+	for _, transport := range transports {
+		targetFormat := managedProviderTransportFormat(transport)
+		if managedProviderTransportFormatsCompatible(sourceFormat, targetFormat, responseFormat, stream) {
+			out = append(out, transport)
+		}
+	}
+	return out
+}
+
+func skippedManagedProviderTransports(before, after []string) []string {
+	if len(before) == 0 {
+		return nil
+	}
+	kept := make(map[string]int, len(after))
+	for _, transport := range after {
+		kept[normalizeManagedProviderTransport(transport)]++
+	}
+	var skipped []string
+	for _, transport := range before {
+		transport = normalizeManagedProviderTransport(transport)
+		if transport == "" {
+			continue
+		}
+		if kept[transport] > 0 {
+			kept[transport]--
+			continue
+		}
+		skipped = append(skipped, transport)
+	}
+	return skipped
+}
+
+func managedProviderTransportFormatsCompatible(sourceFormat, targetFormat, responseFormat sdktranslator.Format, stream bool) bool {
+	if sourceFormat == "" || targetFormat == "" {
+		return true
+	}
+	if responseFormat == "" {
+		responseFormat = sourceFormat
+	}
+	if sourceFormat != targetFormat && !sdktranslator.HasRequestTransformer(sourceFormat, targetFormat) {
+		return false
+	}
+	if responseFormat == targetFormat {
+		return true
+	}
+	if stream {
+		return sdktranslator.HasStreamResponseTransformer(responseFormat, targetFormat)
+	}
+	return sdktranslator.HasNonStreamResponseTransformer(responseFormat, targetFormat)
 }
 
 func uniqueManagedProviderTransports(transports []string) []string {
