@@ -4,38 +4,76 @@
 // Purpose: route EVERY tool the Cursor agent runs to Claude Code (the end user's
 // machine) instead of executing it on the sidecar, and never touch the sidecar's
 // filesystem. We do this at the SDK's single server-side tool-dispatch seam:
-// the unary (class N) and stream (class P) adapters both funnel through
+// the unary (class _) and stream (class P) adapters both funnel through
 // `exec.execute(...)`, keyed by the stable protobuf oneof case `t.message.case`.
 //
-// Three tiny replacements (all logic lives in the sidecar via globalThis, so the
+// As of @cursor/sdk@1.0.23 the local-executor (and these seams) live in the
+// webpack async chunk dist/cjs/973.js, NOT the main dist/cjs/index.js entry.
+// The main entry only lazy-loads that chunk via a.e(973) on createLocalExecutor.
+// This patcher therefore:
+//   1. Patches 973.js (the four anchors + MARK + dispatch self-test harness).
+//   2. Stamps index.js with MARK + an eager-load of the local-executor chunk so
+//      requiring @cursor/sdk installs the seam globals (needed by loadSdk /
+//      startup self-tests that run before any agent turn).
+//
+// Four tiny replacements (all logic lives in the sidecar via globalThis, so the
 // patch stays minimal and robust):
-//   1. serializeResult/serializeStream factory `$`: when the result carries
+//   1. serializeResult/serializeStream factory `U`: when the result carries
 //      `__ccJson`, build the proper protobuf result via `<MsgType>.fromJson(...)`
 //      (handles nested oneofs correctly — plain partial objects silently drop them).
-//      It also publishes the live `$` as `globalThis.__CC_SELFTEST_SERIALIZE` so a
+//      It also publishes the live `U` as `globalThis.__CC_SELFTEST_SERIALIZE` so a
 //      startup self-test (ADD-74) can drive real result payloads through this exact
 //      seam and fail-fast if fromJson cannot construct the SDK shape.
 //   2. unary exec call -> `globalThis.__CC_EXEC_U` (falls back to native if unset).
 //   3. stream exec call -> `globalThis.__CC_EXEC_S` (falls back to native if unset).
+//   4. advertise client tools as mcp_tools via globalThis.__CC_GET_ADVERTISE__.
 //
-// If the globals are not installed (e.g. SDK used standalone), behavior is native.
+// If the globals are not installed (e.g. SDK used standalone), behavior is native
+// only when __CC_ALLOW_NATIVE is set; otherwise dispatch refuses.
 //
 // On any anchor mismatch or version drift the patcher fails LOUD (non-zero exit)
 // so a new SDK release is re-verified before shipping. The SHA-256 of the pristine
-// bundle is gated FAIL-CLOSED (M27): a drifted byte-stream aborts the patch unless an
-// explicit development escape hatch is set, BEFORE any anchor replacement runs.
+// 973.js chunk is gated FAIL-CLOSED (M27): a drifted byte-stream aborts the patch
+// unless an explicit development escape hatch is set, BEFORE any anchor replacement runs.
+//
+// ── Notes for the NEXT @cursor/sdk bump ──────────────────────────────────────
+// 1. Chunk id may change. 1.0.23 put the seams in webpack chunk 973.js (see BUNDLE_REL).
+//    On a new release, re-scan dist/cjs/*.js for `.exec.execute` + `hookContextCollector`
+//    (and/or `providerIdentifier` advertise map) — do NOT assume 973.js forever.
+//    Update BUNDLE_REL + EXPECTED_BUNDLE_SHA256 + PINNED_VERSION together.
+// 2. Unary site now passes `hookContextCollector` in the execute options. Keep that in
+//    the native-fallback path of the unary `to` string (and declare `var i=[]` in the
+//    DISPATCH self-test harness so the positive-control native path does not
+//    ReferenceError under "use strict").
+// 3. The `to` strings MUST track minified free-var names in the live site (r/e/o/t,
+//    factory `U`, `h.yT`, advertise array `u`, …). Bridge injection semantics stay the
+//    same, but a pure `from`-only update is not enough when the minifier renames locals
+//    — adapt `to` (and the harness param list) in lockstep, then re-run the self-tests.
+// 4. Index eager-load stamp (INDEX_EAGER_LOAD) also embeds chunk ids 745+973. If those
+//    change, re-read createLocalExecutor's `a.e(...)` pair in index.js and update the
+//    stamp. Inject MUST stay a comma-expression IIFE (the slot is `...,module.exports=o`).
+// 5. After updating anchors: run patcher twice (exit 0 both), `npm test`, `npm run selftest`,
+//    `node --check` on the patched chunk + index, and confirm seam markers +
+//    __CC_SELFTEST_* globals install on require("@cursor/sdk").
 
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 
-const PINNED_VERSION = "1.0.14";
-// SHA-256 of the pristine dist/cjs/index.js the anchors were verified against. On any SDK bump this
-// changes — re-run anchor verification, then update PINNED_VERSION and this hash. The patcher logs the
-// observed hash every run so a reviewer can confirm they patched the exact byte-stream.
-const EXPECTED_BUNDLE_SHA256 = "fe49583a88f280b6efa32729dd724d10d5a07a04fcc1cdb16a75733678a8d7db";
+const PINNED_VERSION = "1.0.23";
+// SHA-256 of the pristine dist/cjs/973.js (local-executor chunk) the anchors were verified against.
+// On any SDK bump this changes — re-verify anchors (chunk id may also change; see "Notes for the
+// NEXT @cursor/sdk bump" above), then update PINNED_VERSION, BUNDLE_REL, and this hash.
+// The patcher logs the observed hash every run.
+const EXPECTED_BUNDLE_SHA256 = "829ced604bb88908e49fcf5cd31eb22bce4e57d32074b2846d86a6c5afa26881";
+// Relative path of the chunk that holds the tool-dispatch seams (minified local-executor).
+// 1.0.14 lived in dist/cjs/index.js; 1.0.23 split it into webpack chunk 973.
+// Chunk id is NOT stable across SDK releases — re-discover on bump (see notes above).
+const BUNDLE_REL = path.join("dist", "cjs", "973.js");
+const INDEX_REL = path.join("dist", "cjs", "index.js");
 const sdkRoot = path.join(__dirname, "..", "node_modules", "@cursor", "sdk");
-const target = path.join(sdkRoot, "dist", "cjs", "index.js");
+const target = path.join(sdkRoot, BUNDLE_REL);
+const indexTarget = path.join(sdkRoot, INDEX_REL);
 // An already-patched bundle is detected as stale WITHOUT bumping this marker: the anchor `from` strings
 // (pristine forms) won't match an already-patched bundle, so the anchor-count check fails loud (and the SHA
 // gate also rejects a non-pristine byte-stream), forcing a pristine reinstall (npm ci) before re-patching.
@@ -54,6 +92,16 @@ const target = path.join(sdkRoot, "dist", "cjs", "index.js");
 // bridge assertPatched() change), but it DOES require adding that seam's sentinel token to
 // REQUIRED_SEAM_TOKENS so the capability check keeps rejecting bundles that pre-date the seam.
 const MARK = "/*cursor-composer-clienttools-patched-v1*/";
+
+// Idempotent stamp on the main entry so require("@cursor/sdk") eagerly evaluates the patched local-executor
+// chunk (installs __CC_SELFTEST_* + live dispatch sites). Without this, seams only load on first agent turn.
+// MUST be an expression (comma-expression slot before module.exports=o), not a bare try/catch statement.
+const INDEX_EAGER_MARK = "/*cursor-composer-clienttools-eager-v1*/";
+// a is the webpack require; a.e(N) sync-requires ./N.js under the CJS runtime; a(modId) evaluates the module.
+// Chunk ids 745+973 are the createLocalExecutor dependency pair for @cursor/sdk@1.0.23.
+const INDEX_EAGER_LOAD =
+  INDEX_EAGER_MARK +
+  '(()=>{try{a.e(745);a.e(973);a("./src/agent/local-executor.ts")}catch(__e){}})(),';
 
 // CAPABILITY tokens (ADD-102 / Comment 7): the sentinel substrings every CURRENT patched bundle MUST contain.
 // A bundle that starts with MARK is only treated as already-patched (idempotent re-run) when ALL of these are
@@ -106,37 +154,42 @@ function shaOverrideEnabled(env) {
 
 const edits = [
   {
-    // ADD-74: capture the LIVE patched `$` factory onto a global so the bridge can drive representative
+    // ADD-74: capture the LIVE patched `U` factory onto a global so the bridge can drive representative
     // result `__ccJson` payloads through the REAL serializer at startup (selfTestResultSerialize), proving
-    // the fromJson seam constructs the SDK protobuf shape — not merely that dispatch is intercepted. `$` and
-    // its closed-over `I.yT` (ExecClientMessage) are module-internal, so the capture MUST sit next to the
+    // the fromJson seam constructs the SDK protobuf shape — not merely that dispatch is intercepted. `U` and
+    // its closed-over `h.yT` (ExecClientMessage) are module-internal, so the capture MUST sit next to the
     // definition (the appended tail harness cannot see them). Appended to `to` only; `from` is unchanged so a
     // pristine bundle still matches, and the `expect:1` count below still guards the single seam.
+    //
+    // v1.0.23 minifier renames: `$` -> `U`, `I.yT` -> `h.yT`, params `(t,n)`/`r` -> `(t,r)`/`n`.
     name: "serializeResult/serializeStream fromJson",
     expect: 1,
-    from: `function $(e){return function(t,n){const r={case:e,value:n};return new I.yT({id:t,message:r})}}`,
-    to: `function $(e){return function(t,n){if(n&&typeof n==="object"&&"__ccJson"in n){var __j=n.__ccJson,__f=I.yT.fields.list().find(function(f){return f.localName===e||f.name===e});if(__f&&__f.T){try{n=__f.T.fromJson(__j)}catch(__err){throw new Error("[clienttools] sidecar sent invalid result shape for "+e+": "+((__err&&__err.message)||__err))}}else{throw new Error("[clienttools] unknown result case "+e+" (no ExecClientMessage field) -- sidecar mapping out of sync with SDK")}}var r={case:e,value:n};return new I.yT({id:t,message:r})}}try{globalThis.__CC_SELFTEST_SERIALIZE=$}catch(__e){}`,
+    from: `function U(e){return function(t,r){const n={case:e,value:r};return new h.yT({id:t,message:n})}}`,
+    to: `function U(e){return function(t,r){if(r&&typeof r==="object"&&"__ccJson"in r){var __j=r.__ccJson,__f=h.yT.fields.list().find(function(f){return f.localName===e||f.name===e});if(__f&&__f.T){try{r=__f.T.fromJson(__j)}catch(__err){throw new Error("[clienttools] sidecar sent invalid result shape for "+e+": "+((__err&&__err.message)||__err))}}else{throw new Error("[clienttools] unknown result case "+e+" (no ExecClientMessage field) -- sidecar mapping out of sync with SDK")}}var n={case:e,value:r};return new h.yT({id:t,message:n})}}try{globalThis.__CC_SELFTEST_SERIALIZE=U}catch(__e){}`,
   },
   {
+    // v1.0.23: unary site gained hookContextCollector; free vars are r/e/o/t (was n/e/s/t) and result is `a`.
     name: "unary tool dispatch -> CC",
     expect: 1,
-    from: `o=await n.exec.execute(e,s,{execId:t.execId})`,
-    to: `o=await(globalThis.__CC_EXEC_U?globalThis.__CC_EXEC_U(n,e,s,t):(globalThis.__CC_ALLOW_NATIVE?n.exec.execute(e,s,{execId:t.execId}):Promise.reject(new Error("[clienttools] no bridge installed (set globalThis.__CC_ALLOW_NATIVE to allow native sidecar exec) -- refusing"))))`,
+    from: `a=await r.exec.execute(e,o,{execId:t.execId,hookContextCollector:i})`,
+    to: `a=await(globalThis.__CC_EXEC_U?globalThis.__CC_EXEC_U(r,e,o,t):(globalThis.__CC_ALLOW_NATIVE?r.exec.execute(e,o,{execId:t.execId,hookContextCollector:i}):Promise.reject(new Error("[clienttools] no bridge installed (set globalThis.__CC_ALLOW_NATIVE to allow native sidecar exec) -- refusing"))))`,
   },
   {
+    // v1.0.23: stream free vars r/e/o/t; result binding is `i` (was `o` on n).
     name: "stream tool dispatch -> CC",
     expect: 1,
-    from: `o=n.exec.execute(e,s,{execId:t.execId});for await`,
-    to: `o=(globalThis.__CC_EXEC_S?globalThis.__CC_EXEC_S(n,e,s,t):(globalThis.__CC_ALLOW_NATIVE?n.exec.execute(e,s,{execId:t.execId}):(async function*(){throw new Error("[clienttools] no bridge installed (set globalThis.__CC_ALLOW_NATIVE to allow native sidecar exec) -- refusing")})()));for await`,
+    from: `i=r.exec.execute(e,o,{execId:t.execId});for await`,
+    to: `i=(globalThis.__CC_EXEC_S?globalThis.__CC_EXEC_S(r,e,o,t):(globalThis.__CC_ALLOW_NATIVE?r.exec.execute(e,o,{execId:t.execId}):(async function*(){throw new Error("[clienttools] no bridge installed (set globalThis.__CC_ALLOW_NATIVE to allow native sidecar exec) -- refusing")})()));for await`,
   },
   {
     // Advertise the CLIENT's tools (incl. MCP tools) to the Cursor model by appending them to the
     // run request's mcp_tools. __CC_GET_ADVERTISE__ reads the current session's tool inventory
     // (via AsyncLocalStorage) so concurrent sessions stay isolated. No MCP server/child-process.
+    // v1.0.23: source array minified name is `u` (was `c`).
     name: "advertise client tools as mcp_tools",
     expect: 1,
-    from: `=c.map((e=>({name:e.name,providerIdentifier`,
-    to: `=(Array.isArray(c)?c.slice():[]).concat(globalThis.__CC_GET_ADVERTISE__?globalThis.__CC_GET_ADVERTISE__():[]).map((e=>({name:e.name,providerIdentifier`,
+    from: `=u.map((e=>({name:e.name,providerIdentifier`,
+    to: `=(Array.isArray(u)?u.slice():[]).concat(globalThis.__CC_GET_ADVERTISE__?globalThis.__CC_GET_ADVERTISE__():[]).map((e=>({name:e.name,providerIdentifier`,
   },
 ];
 
@@ -240,11 +293,15 @@ function replaceAnchors(src) {
 }
 
 function buildDispatchSelfTestHarness() {
-  const unaryExpr = findEdit("unary tool dispatch -> CC").to.replace(/^o=await/, "");
-  const streamExpr = findEdit("stream tool dispatch -> CC").to.replace(/^o=/, "").replace(/;for await$/, "");
+  // Strip the live-site assignment prefix. v1.0.23 uses `a=await` (unary) and `i=` (stream); keep this
+  // tolerant of single-letter minified bindings. Free vars in the expression are r,e,o,t (and unary
+  // native fallback also closes over hookContextCollector `i` — declare it in the harness so the
+  // positive-control native path does not ReferenceError under "use strict").
+  const unaryExpr = findEdit("unary tool dispatch -> CC").to.replace(/^\w+=await/, "");
+  const streamExpr = findEdit("stream tool dispatch -> CC").to.replace(/^\w+=/, "").replace(/;for await$/, "");
   const harness =
-    `\n;globalThis.__CC_SELFTEST_DISPATCH_U=function(n,e,s,t){return Promise.resolve(${unaryExpr})};` +
-    `globalThis.__CC_SELFTEST_DISPATCH_S=function(n,e,s,t){return ${streamExpr}};\n`;
+    `\n;globalThis.__CC_SELFTEST_DISPATCH_U=function(r,e,o,t){var i=[];return Promise.resolve(${unaryExpr})};` +
+    `globalThis.__CC_SELFTEST_DISPATCH_S=function(r,e,o,t){return ${streamExpr}};\n`;
   assertAscii("self-test harness", harness);
   return harness;
 }
@@ -298,6 +355,33 @@ function applyPatch({ src, version, env = {} }) {
   return { alreadyPatched: false, patchedSrc: out, observedSha: sha.observedSha, messages };
 }
 
+// Stamp the main entry so requiring @cursor/sdk evaluates the patched local-executor chunk immediately.
+// Idempotent: skips when INDEX_EAGER_MARK is already present. Fails loud if the inject site is missing.
+function stampIndexEntry(indexSrc) {
+  if (typeof indexSrc !== "string") {
+    throw new PatchError("bad-input", "stampIndexEntry requires the index source as a latin1 string");
+  }
+  if (indexSrc.includes(INDEX_EAGER_MARK)) {
+    return { alreadyStamped: true, stampedSrc: indexSrc, messages: [{ level: "log", text: "index entry already eager-stamped" }] };
+  }
+  assertAscii("INDEX_EAGER_LOAD", INDEX_EAGER_LOAD);
+  // webpack CJS entry ends with: })(),module.exports=o})();
+  const needle = "module.exports=o})();";
+  const idx = indexSrc.lastIndexOf(needle);
+  if (idx < 0) {
+    throw new PatchError(
+      "index-inject-site-missing",
+      `cannot find ${JSON.stringify(needle)} in dist/cjs/index.js — SDK entry shape changed; re-verify eager-load inject`,
+    );
+  }
+  const stampedSrc = indexSrc.slice(0, idx) + INDEX_EAGER_LOAD + indexSrc.slice(idx);
+  return {
+    alreadyStamped: false,
+    stampedSrc,
+    messages: [{ level: "log", text: "stamped index.js with eager local-executor load (seams install on require)" }],
+  };
+}
+
 function emit(messages) {
   for (const m of messages) {
     if (m.level === "warn") console.warn(`[clienttools] ${m.text}`);
@@ -338,15 +422,38 @@ function main() {
   }
 
   emit(result.messages);
-  if (result.alreadyPatched) {
-    process.exit(0);
+  if (!result.alreadyPatched) {
+    try {
+      fs.writeFileSync(target, result.patchedSrc, "latin1");
+    } catch (e) {
+      return fail(`cannot write bundle: ${e.message}`);
+    }
   }
 
+  // Always ensure the main entry eagerly loads the patched chunk (idempotent).
+  let indexSrc;
   try {
-    fs.writeFileSync(target, result.patchedSrc, "latin1");
+    indexSrc = fs.readFileSync(indexTarget, "latin1");
   } catch (e) {
-    return fail(`cannot write bundle: ${e.message}`);
+    return fail(`cannot read index entry ${indexTarget}: ${e.message}`);
   }
+  let stamped;
+  try {
+    stamped = stampIndexEntry(indexSrc);
+  } catch (e) {
+    if (e instanceof PatchError) return fail(e.message);
+    return fail(`unexpected index stamp failure: ${e && e.message ? e.message : e}`);
+  }
+  emit(stamped.messages);
+  if (!stamped.alreadyStamped) {
+    try {
+      fs.writeFileSync(indexTarget, stamped.stampedSrc, "latin1");
+    } catch (e) {
+      return fail(`cannot write index entry: ${e.message}`);
+    }
+  }
+
+  process.exit(0);
 }
 
 if (require.main === module) {
@@ -355,10 +462,13 @@ if (require.main === module) {
 
 module.exports = {
   applyPatch,
+  stampIndexEntry,
   PatchError,
   PINNED_VERSION,
   EXPECTED_BUNDLE_SHA256,
+  BUNDLE_REL,
   MARK,
+  INDEX_EAGER_MARK,
   REQUIRED_SEAM_TOKENS,
   DISPATCH_EDIT_NAMES,
   SHA_OVERRIDE_ENV,

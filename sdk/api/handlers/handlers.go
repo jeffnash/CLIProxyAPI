@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -295,6 +296,17 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
 	return meta
+}
+
+func addAuthSelectionModelMetadata(meta map[string]any, model string) {
+	if meta == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	meta[coreexecutor.AuthSelectionModelMetadataKey] = model
 }
 
 func setReasoningEffortMetadata(meta map[string]any, handlerType, model string, rawJSON []byte) {
@@ -725,13 +737,17 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	originalRequestedModel := modelName
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
+	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
+		return nil, nil, errMsg
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, extraMeta, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision)
+	providers, normalizedModel, extraMeta, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	if len(extraMeta) > 0 {
 		if reqMeta == nil {
@@ -742,6 +758,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 		}
 	}
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
@@ -803,10 +820,11 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	if routeDecision.ExecutorPluginID != "" {
 		return h.countWithPluginExecutor(ctx, handlerType, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, extraMeta, errMsg := h.providersForExecution(modelName, originalRequestedModel, false, routeDecision)
+	providers, normalizedModel, extraMeta, errMsg := h.providersForExecution(modelName, originalRequestedModel, false, routeDecision, execOptions)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	if len(extraMeta) > 0 {
 		if reqMeta == nil {
@@ -817,6 +835,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 		}
 	}
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
 	payload := rawJSON
@@ -905,6 +924,7 @@ func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerTyp
 func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt string, stream bool, execOptions modelExecutionOptions) (coreexecutor.Request, coreexecutor.Options) {
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, modelName, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
@@ -1122,16 +1142,23 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	originalRequestedModel := modelName
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
+	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errMsg
+		close(errChan)
+		return nil, nil, errChan
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.streamWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, extraMeta, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision)
+	providers, normalizedModel, extraMeta, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	reqMeta := requestExecutionMetadata(ctx)
 	if len(extraMeta) > 0 {
 		if reqMeta == nil {
@@ -1142,6 +1169,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 	}
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
@@ -1453,6 +1481,68 @@ func validateSSEDataJSON(chunk []byte) error {
 	return nil
 }
 
+func preferExecutionProvider(providers []string, preferred string) []string {
+	preferred = strings.ToLower(strings.TrimSpace(preferred))
+	if preferred == "" || len(providers) < 2 {
+		return providers
+	}
+	preferredIndex := -1
+	for i := range providers {
+		if strings.ToLower(strings.TrimSpace(providers[i])) == preferred {
+			preferredIndex = i
+			break
+		}
+	}
+	if preferredIndex <= 0 {
+		return providers
+	}
+	out := make([]string, 0, len(providers))
+	out = append(out, providers[preferredIndex])
+	out = append(out, providers[:preferredIndex]...)
+	out = append(out, providers[preferredIndex+1:]...)
+	return out
+}
+
+func adjustExecutionProvidersForEntryProtocol(entryProtocol string, providers []string) []string {
+	if entryProtocol == Interactions {
+		return preferExecutionProvider(providers, GeminiInteractions)
+	}
+	if supportsNativeInteractionsEntryProtocol(entryProtocol) {
+		return providers
+	}
+	return excludeExecutionProvider(providers, GeminiInteractions)
+}
+
+func supportsNativeInteractionsEntryProtocol(entryProtocol string) bool {
+	switch entryProtocol {
+	case Interactions, OpenAI, OpenaiResponse, Claude, Gemini:
+		return true
+	default:
+		return false
+	}
+}
+
+func excludeExecutionProvider(providers []string, excluded string) []string {
+	excluded = strings.ToLower(strings.TrimSpace(excluded))
+	if excluded == "" || len(providers) == 0 {
+		return providers
+	}
+	excludedIndex := -1
+	for i := range providers {
+		if strings.ToLower(strings.TrimSpace(providers[i])) == excluded {
+			excludedIndex = i
+			break
+		}
+	}
+	if excludedIndex == -1 {
+		return providers
+	}
+	out := make([]string, 0, len(providers)-1)
+	out = append(out, providers[:excludedIndex]...)
+	out = append(out, providers[excludedIndex+1:]...)
+	return out
+}
+
 func statusFromError(err error) int {
 	if err == nil {
 		return 0
@@ -1470,11 +1560,37 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	return providers, normalizedModel, err
 }
 
+func validateNativeInteractionsExecution(entryProtocol string, execOptions modelExecutionOptions, routeDecision modelRouteDecision) *interfaces.ErrorMessage {
+	forcedProvider := strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))
+	if forcedProvider == "" || entryProtocol != Interactions {
+		return nil
+	}
+	if routeDecision.ExecutorPluginID != "" {
+		return nativeInteractionsExecutionError()
+	}
+	if routeProvider := strings.ToLower(strings.TrimSpace(routeDecision.Provider)); routeProvider != "" && routeProvider != forcedProvider {
+		return nativeInteractionsExecutionError()
+	}
+	return nil
+}
+
+func nativeInteractionsExecutionError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      fmt.Errorf("agent is only supported for native interactions execution"),
+	}
+}
+
 // providersForExecution resolves the providers and normalized model for a request. When a model
 // router selected a built-in provider, it skips model->provider resolution and uses the router's
 // provider (with an optional target model); otherwise it falls back to the registry-based path.
-func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision) ([]string, string, map[string]any, *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision, execOptions modelExecutionOptions) ([]string, string, map[string]any, *interfaces.ErrorMessage) {
+	forcedProvider := strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))
 	if routeDecision.Provider != "" {
+		// Check if ForcedProvider conflicts with route decision
+		if forcedProvider != "" && forcedProvider != strings.ToLower(strings.TrimSpace(routeDecision.Provider)) {
+			return nil, "", nil, nativeInteractionsExecutionError()
+		}
 		normalizedModel := originalRequestedModel
 		if routeDecision.Model != "" {
 			normalizedModel = routeDecision.Model
@@ -1483,6 +1599,10 @@ func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel
 			return nil, "", nil, errMsg
 		}
 		return []string{routeDecision.Provider}, normalizedModel, nil, nil
+	}
+	// If ForcedProvider is set and no route decision, use it
+	if forcedProvider != "" {
+		return []string{forcedProvider}, originalRequestedModel, nil, nil
 	}
 	return h.getRequestDetailsWithOptions(modelName, allowImageModel)
 }
@@ -1515,6 +1635,11 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	case strings.HasPrefix(lower, registry.IFlowModelPrefix):
 		rawModel = strings.TrimSpace(rawModel[len(registry.IFlowModelPrefix):])
 		forcedProvider = "iflow"
+	case strings.HasPrefix(lower, registry.CursorModelPrefix):
+		// cursor-grok-4.5 → force Cursor (vs xAI's bare grok-4.5). Same pattern as copilot-/codex-.
+		// Strips to the bare SDK id (grok-4.5 / composer-2.5 / …) for the bridge/executor.
+		rawModel = strings.TrimSpace(rawModel[len(registry.CursorModelPrefix):])
+		forcedProvider = "cursor"
 	}
 	if forcedProvider == "" {
 		if provider, unprefixed, protocol, ok := config.FindManagedProviderByProtocolPrefix(h.CurrentConfig(), rawModel); ok {

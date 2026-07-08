@@ -773,6 +773,57 @@ test("FAST-BILLING: composerModelSelection passes fast=false for composer-2.5 (C
   assert.deepEqual(composerModelSelection("claude-sonnet-4-6"), { id: "claude-sonnet-4-6" });
 });
 
+test("GROK-4.5: composerModelSelection maps cursor-grok-4.5* (and bare SDK ids) to SDK grok-4.5 + effort/fast", () => {
+  // Client-facing ids are cursor-grok-4.5* so they never collide with xAI's grok-4.5 on /v1/models.
+  // Confirmed via Cursor.models.list(): SDK id "grok-4.5", params effort{low,medium,high} + fast{false,true}.
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5-fast"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "true" }, { id: "effort", value: "high" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5-low"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5-medium"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "false" }, { id: "effort", value: "medium" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5-xhigh"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5-fast-xhigh"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "true" }, { id: "effort", value: "high" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5-fast-medium"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "true" }, { id: "effort", value: "medium" }],
+  });
+  // Bare SDK/CLI forms still work when already on the cursor bridge path (e.g. model alias rewrite).
+  assert.deepEqual(composerModelSelection("grok-4.5"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }],
+  });
+  assert.deepEqual(composerModelSelection("grok-4.5-fast-xhigh"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "true" }, { id: "effort", value: "high" }],
+  });
+  // max/minimal clamp onto the SDK set.
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5-max"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5-minimal"), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }],
+  });
+});
+
 test("#85: maybePauseForTools waits for the full announced step batch, bounded, and never pauses early", () => {
   // The SDK announces each tool of a step via tool-call-started BEFORE our dispatch emits it. The pause waits
   // for the rest of the wave (so a slow burst lands in ONE turn_end) instead of guessing with the debounce.

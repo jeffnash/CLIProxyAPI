@@ -72,6 +72,13 @@ function revertDispatchSites(src, names = DISPATCH_EDIT_NAMES) {
   return out;
 }
 
+// v1.0.23: tool seams live in dist/cjs/973.js (webpack local-executor chunk), not index.js.
+test("BUNDLE_REL points at the local-executor chunk for the pinned SDK", () => {
+  const { BUNDLE_REL } = patcher;
+  assert.ok(BUNDLE_REL, "BUNDLE_REL must be exported");
+  assert.match(BUNDLE_REL.replace(/\\/g, "/"), /dist\/cjs\/973\.js$/, "v1.0.23 seams are in webpack chunk 973.js");
+});
+
 // Sanity: our synthetic bundle never collides with the recorded pristine hash (otherwise the "drifted"
 // tests below would be testing the wrong branch).
 const driftedSrc = makeAnchoredBundle();
@@ -343,7 +350,11 @@ test("ADD-102: the live-site guard does NOT false-positive — the GENUINE patch
   const patched = makePatchedBundle();
   // Sanity: the harness genuinely contains the native call + exec globals, yet the bundle is still accepted —
   // proving the guard keys off the FULL framed `from`, not the bare native-call substring.
-  assert.ok(patched.includes("n.exec.execute(e,s,{execId:t.execId})"), "fixture: the appended harness embeds the bare native call");
+  // v1.0.23 harness embeds the native call with free vars r/e/o/t (and optional hookContextCollector).
+  assert.ok(
+    patched.includes("r.exec.execute(e,o,{execId:t.execId") || patched.includes("n.exec.execute(e,s,{execId:t.execId})"),
+    "fixture: the appended harness embeds the bare native call",
+  );
   assert.ok(patched.includes("__CC_EXEC_U") && patched.includes("__CC_EXEC_S"), "fixture: the harness embeds the exec globals");
   const res = applyPatch({ src: patched, version: PINNED_VERSION, env: {} });
   assert.equal(res.alreadyPatched, true, "a genuinely-patched bundle must NOT be flagged stale by the live-site guard");
@@ -391,27 +402,29 @@ test("happy path: a SHA-matching pristine bundle patches without override (verif
   assert.match(res.patchedSrc, /globalThis\.__CC_SELFTEST_DISPATCH_U=/);
   assert.match(res.patchedSrc, /globalThis\.__CC_SELFTEST_DISPATCH_S=/);
 
-  // ADD-74: the patched `$` factory must also publish itself as globalThis.__CC_SELFTEST_SERIALIZE so the
+  // ADD-74: the patched serialize factory must also publish itself as globalThis.__CC_SELFTEST_SERIALIZE so the
   // result-serialize self-test can drive real __ccJson payloads through the live fromJson seam.
-  assert.match(res.patchedSrc, /try\{globalThis\.__CC_SELFTEST_SERIALIZE=\$\}catch\(__e\)\{\}/);
+  // v1.0.23 minifier name is `U` (was `$` in 1.0.14).
+  assert.match(res.patchedSrc, /try\{globalThis\.__CC_SELFTEST_SERIALIZE=U\}catch\(__e\)\{\}/);
 
   // Idempotency: feeding the patched output back in must short-circuit (it now starts with MARK).
   const again = applyPatch({ src: res.patchedSrc, version: PINNED_VERSION, env: {} });
   assert.equal(again.alreadyPatched, true);
 });
 
-test("ADD-74: the __CC_SELFTEST_SERIALIZE capture is part of the single `$` edit and sits next to its definition", () => {
-  // The serialize-capture lives INSIDE the `$` edit's `to` string (not a separately-appended tail), because
-  // `$` and its closed-over I.yT are module-internal and unreachable from the appended dispatch harness. This
-  // pins that placement so a future refactor cannot accidentally move the capture out of scope.
+test("ADD-74: the __CC_SELFTEST_SERIALIZE capture is part of the single serialize edit and sits next to its definition", () => {
+  // The serialize-capture lives INSIDE the serialize edit's `to` string (not a separately-appended tail), because
+  // the factory and its closed-over ExecClientMessage (h.yT) are module-internal and unreachable from the
+  // appended dispatch harness. This pins that placement so a future refactor cannot accidentally move the
+  // capture out of scope. v1.0.23 minifier: factory `U`, message type `h.yT`.
   const serializeEdit = edits.find((e) => e.name === "serializeResult/serializeStream fromJson");
-  assert.ok(serializeEdit, "the $ serializer edit must exist");
-  assert.equal(serializeEdit.expect, 1, "the $ seam is a single anchor; the capture must ride along with it (one count guards both)");
-  // The capture must immediately follow the `$` function definition in the `to` (so `$` is in scope).
+  assert.ok(serializeEdit, "the serializeResult/serializeStream edit must exist");
+  assert.equal(serializeEdit.expect, 1, "the serialize seam is a single anchor; the capture must ride along with it (one count guards both)");
+  // The capture must immediately follow the factory function definition in the `to` (so the factory is in scope).
   assert.match(
     serializeEdit.to,
-    /new I\.yT\(\{id:t,message:r\}\)\}\}try\{globalThis\.__CC_SELFTEST_SERIALIZE=\$\}catch\(__e\)\{\}$/,
-    "the capture must be appended directly after the `$` function body, capturing the live factory",
+    /new h\.yT\(\{id:t,message:n\}\)\}\}try\{globalThis\.__CC_SELFTEST_SERIALIZE=U\}catch\(__e\)\{\}$/,
+    "the capture must be appended directly after the serialize factory body, capturing the live factory",
   );
   // The pristine `from` must NOT mention the capture (so a pristine bundle still matches the anchor).
   assert.doesNotMatch(serializeEdit.from, /__CC_SELFTEST_SERIALIZE/, "the pristine `from` anchor must not contain the capture");
@@ -461,8 +474,10 @@ test("CLI entrypoint short-circuits on the installed already-patched bundle (exi
 });
 
 function sdkBundleMissingReason() {
+  const { BUNDLE_REL } = patcher;
   const bundle = path.join(
-    fileURLToPath(new URL("../node_modules/@cursor/sdk/dist/cjs/index.js", import.meta.url)),
+    fileURLToPath(new URL("../node_modules/@cursor/sdk", import.meta.url)),
+    BUNDLE_REL,
   );
-  return existsSync(bundle) ? false : "@cursor/sdk bundle not installed (run npm ci); CLI smoke test skipped";
+  return existsSync(bundle) ? false : "@cursor/sdk local-executor chunk not installed (run npm ci); CLI smoke test skipped";
 }

@@ -191,20 +191,31 @@ const RUN_AS_MAIN = process.argv[1] === fileURLToPath(import.meta.url);
 // Loading is lazy (loadSdk) so this module can be imported for unit tests without pulling the SDK's
 // heavy/native deps; the real server calls loadSdk() at startup (fail-closed) BEFORE it accepts traffic.
 const require = createRequire(import.meta.url);
-// assertPatched greps the bundle's first 64 bytes for the PATCH-MARKER 'cursor-composer-clienttools-patched-v1'.
-// Comment 7 / ADD-102 / PATCH-MARKER-CAPABILITY contract: the patcher (scripts/apply-clienttools-patch.cjs)
-// keeps this marker at -v1 and instead does a CAPABILITY check (the marker alone does not prove a bundle is
-// current — a partial/stale patch with the marker but a missing seam fails closed in the patcher with a
-// 'stale-bundle' error). So this grep STAYS at -v1 and is intentionally NOT bumped. If the team ever bumps the
-// patcher's MARK to -v2, this grep string MUST be bumped in LOCKSTEP (same commit) or an old patched bundle
-// would be wrongly accepted here. The full per-seam capability verification lives on the patcher side; the
-// runtime self-tests (selfTestBundleSeam / selfTestResultSerialization) additionally prove the live seams work.
+// assertPatched greps the LOCAL-EXECUTOR chunk for the PATCH-MARKER 'cursor-composer-clienttools-patched-v1'.
+// As of @cursor/sdk@1.0.23 the tool-dispatch seams live in webpack chunk dist/cjs/973.js (lazy local-executor),
+// not the main index.js entry. The patcher stamps that chunk; require("@cursor/sdk") still resolves to index.js
+// (which the patcher also eager-stamps so the chunk evaluates on load). Comment 7 / ADD-102 / PATCH-MARKER-
+// CAPABILITY contract: the patcher (scripts/apply-clienttools-patch.cjs) keeps this marker at -v1 and instead
+// does a CAPABILITY check (the marker alone does not prove a bundle is current — a partial/stale patch with the
+// marker but a missing seam fails closed in the patcher with a 'stale-bundle' error). So this grep STAYS at -v1
+// and is intentionally NOT bumped. If the team ever bumps the patcher's MARK to -v2, this grep string MUST be
+// bumped in LOCKSTEP (same commit) or an old patched bundle would be wrongly accepted here. The full per-seam
+// capability verification lives on the patcher side; the runtime self-tests (selfTestBundleSeam /
+// selfTestResultSerialization) additionally prove the live seams work.
 function assertPatched(p) {
   if (!p.endsWith(path.join("dist", "cjs", "index.js"))) {
     throw new Error(`[bridge] @cursor/sdk resolved to ${p}, expected dist/cjs/index.js — refusing to start (tools would run natively on the sidecar FS).`);
   }
-  if (!readFileSync(p, "latin1").slice(0, 64).includes("cursor-composer-clienttools-patched-v1")) {
-    throw new Error(`[bridge] @cursor/sdk at ${p} is NOT patched (missing cursor-composer-clienttools-patched-v1). Run scripts/apply-clienttools-patch.cjs (reinstall a pristine bundle first if it was patched by an older version). Refusing to start.`);
+  // v1.0.23+: seams are in the local-executor webpack chunk (973.js), not the main entry.
+  const chunk = path.join(path.dirname(p), "973.js");
+  let chunkSrc;
+  try {
+    chunkSrc = readFileSync(chunk, "latin1");
+  } catch (e) {
+    throw new Error(`[bridge] @cursor/sdk local-executor chunk missing at ${chunk} (${(e && e.message) || e}). Run scripts/apply-clienttools-patch.cjs after installing @cursor/sdk@1.0.23. Refusing to start.`);
+  }
+  if (!chunkSrc.slice(0, 64).includes("cursor-composer-clienttools-patched-v1")) {
+    throw new Error(`[bridge] @cursor/sdk local-executor chunk at ${chunk} is NOT patched (missing cursor-composer-clienttools-patched-v1). Run scripts/apply-clienttools-patch.cjs (reinstall a pristine bundle first if it was patched by an older version). Refusing to start.`);
   }
 }
 let _sdk = null;
@@ -1957,23 +1968,50 @@ function writeDurableFingerprint(cursorKey, agentId, fp) {
 }
 
 // composerModelSelection maps an incoming model id to a Cursor SDK ModelSelection ({ id, params }) using this
-// fork's GPT-style dash-suffix convention (e.g. gpt-5.2-xhigh). Cursor's DEFAULT composer-2.5/composer-2 variant
-// is fast=true — the more EXPENSIVE fast tier (confirmed via Cursor.models.list(): a `fast` boolean param whose
-// fast=true variant is isDefault), so a bare { id } silently selects fast. Mapping:
-//   composer-2.5         -> { fast:false }                    (the full tier; omit suffix => our default)
-//   composer-2.5-fast    -> { fast:true }                     (the fast variant, an available model)
-//   composer-2.5-<level> -> { fast:false, thinking:<level> }  (reasoning effort; per the Cursor docs composer
-//                                                              accepts `thinking`, values vary by account)
-// Non-composer / unrecognized ids pass through unchanged (Cursor resolves their own default). The level value is
-// passed THROUGH (Cursor validates) so the per-account level set never has to be hardcoded.
+// fork's GPT-style dash-suffix convention (e.g. gpt-5.2-xhigh). Confirmed via Cursor.models.list() +
+// `cursor-agent models` on @cursor/sdk@1.0.23 / local CLI:
+//
+//   composer-2.5 / composer-2:
+//     DEFAULT variant is fast=true (costly). Mapping:
+//       composer-2.5         -> { fast:false }
+//       composer-2.5-fast    -> { fast:true }
+//       composer-2.5-<level> -> { fast:false, thinking:<level> }  (SDK param id is `thinking`)
+//
+//   Cursor Grok 4.5 (SDK id "grok-4.5"; display "Cursor Grok 4.5"):
+//     CLIENT-FACING ids are namespaced `cursor-grok-4.5*` so they never collide with xAI's `grok-4.5`
+//     (owned_by xai) on /v1/models. The bridge strips the `cursor-` prefix, then maps onto the SDK id.
+//     Params: effort ∈ {low,medium,high}, fast ∈ {false,true}. DEFAULT variant is effort=high + fast=true
+//     (costly). CLI lists grok-4.5-xhigh / grok-4.5-fast-xhigh / …. Mapping (xhigh/max → high; minimal/none → low):
+//       cursor-grok-4.5              -> { id:grok-4.5, fast:false, effort:high }
+//       cursor-grok-4.5-fast         -> { id:grok-4.5, fast:true,  effort:high }
+//       cursor-grok-4.5-low          -> { id:grok-4.5, fast:false, effort:low }
+//       cursor-grok-4.5-fast-medium  -> { id:grok-4.5, fast:true,  effort:medium }
+//       cursor-grok-4.5-xhigh        -> { id:grok-4.5, fast:false, effort:high }
+//     Bare SDK/CLI forms (grok-4.5, grok-4.5-fast, …) are still accepted when the request is already on the
+//     cursor bridge path (e.g. a model alias that rewrites to the upstream SDK id).
+//
+// Non-recognized ids pass through unchanged (Cursor resolves their own default). Composer thinking levels are
+// passed THROUGH (Cursor validates). Grok effort is clamped to the SDK's {low,medium,high} set.
 const COMPOSER_THINKING_LEVELS = new Set(["minimal", "none", "low", "medium", "high", "xhigh", "max"]);
+// Map GPT/CLI-style effort suffixes onto the grok-4.5 SDK `effort` values (only low|medium|high exist).
+function mapGrokEffort(level) {
+  if (!level) return null;
+  const l = String(level).toLowerCase();
+  if (l === "low" || l === "medium" || l === "high") return l;
+  if (l === "xhigh" || l === "max") return "high";
+  if (l === "minimal" || l === "none") return "low";
+  return null;
+}
 function composerModelSelection(model) {
   const raw = String(model || "");
   let id = raw;
+  // Disambiguate from xAI grok-4.5: client-facing Cursor ids are cursor-grok-4.5*. Strip only that prefix.
+  if (/^cursor-grok-4\.5/i.test(id)) id = id.slice("cursor-".length);
   let fast = "false";
   let thinking = null;
   // Suffix order is base[-fast][-<level>]: strip the innermost reasoning level first, then the -fast variant, so
   // composer-2.5-fast-high -> { fast:true, thinking:high }, composer-2.5-high -> { fast:false, thinking:high }.
+  // Same strip applies to (cursor-)grok-4.5-fast-xhigh -> base grok-4.5 + fast + effort.
   const d = id.lastIndexOf("-");
   if (d > 0 && COMPOSER_THINKING_LEVELS.has(id.slice(d + 1).toLowerCase())) {
     thinking = id.slice(d + 1).toLowerCase();
@@ -1985,7 +2023,14 @@ function composerModelSelection(model) {
     if (thinking) params.push({ id: "thinking", value: thinking });
     return { id, params };
   }
-  return { id: raw }; // non-composer / unrecognized: pass the original id through (Cursor resolves its default)
+  if (id === "grok-4.5") {
+    // Bare / missing level => effort=high (matches CLI's primary "Cursor Grok 4.5" = grok-4.5-xhigh).
+    // Always set fast explicitly so we never silently inherit Cursor's costly fast=true default.
+    // SDK id stays "grok-4.5" regardless of the client-facing cursor- prefix.
+    const effort = mapGrokEffort(thinking) || "high";
+    return { id: "grok-4.5", params: [{ id: "fast", value: fast }, { id: "effort", value: effort }] };
+  }
+  return { id: raw }; // non-recognized: pass the original id through (Cursor resolves its default)
 }
 
 async function ensureAgent(session, model) {

@@ -81,6 +81,14 @@ var GrokModels = map[string]GrokModelConfig{
 		MaxOutput:      32768,
 		RateLimitModel: "grok-4-1-thinking-1108b",
 	},
+	"grok-4.5": {
+		GrokModel:      "grok-4.5",
+		ModelMode:      "MODEL_MODE_AUTO",
+		RequiresSuper:  false,
+		ContextWindow:  500000,
+		MaxOutput:      65536,
+		RateLimitModel: "grok-4.5",
+	},
 	"grok-imagine-0.9": {
 		GrokModel:      "grok-3",
 		ModelMode:      "MODEL_MODE_FAST",

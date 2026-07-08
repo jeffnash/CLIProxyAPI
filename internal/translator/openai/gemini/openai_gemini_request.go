@@ -90,6 +90,24 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 			out, _ = sjson.SetBytes(out, "n", candidateCount.Int())
 		}
 
+		if responseModalities := genConfig.Get("responseModalities"); responseModalities.Exists() && responseModalities.IsArray() {
+			var modalities []string
+			responseModalities.ForEach(func(_, value gjson.Result) bool {
+				switch strings.ToLower(strings.TrimSpace(value.String())) {
+				case "text":
+					modalities = append(modalities, "text")
+				case "image":
+					modalities = append(modalities, "image")
+				case "audio":
+					modalities = append(modalities, "audio")
+				}
+				return true
+			})
+			if len(modalities) > 0 {
+				out, _ = sjson.SetBytes(out, "modalities", modalities)
+			}
+		}
+
 		// Map Gemini thinkingConfig to OpenAI reasoning_effort.
 		// Always perform conversion to support allowCompat models that may not be in registry.
 		// Note: Google official Python SDK sends snake_case fields (thinking_level/thinking_budget).
@@ -149,6 +167,9 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 
 	// Stream parameter
 	out, _ = sjson.SetBytes(out, "stream", stream)
+	if serviceTier := root.Get("service_tier"); serviceTier.Exists() && serviceTier.Type == gjson.String {
+		out, _ = sjson.SetBytes(out, "service_tier", serviceTier.String())
+	}
 
 	// Process contents (Gemini messages) -> OpenAI messages.
 	// Track the tool-call ids we DERIVE (or minted) per function name, in call order,
@@ -181,16 +202,7 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				}
 
 				// Handle inline data (e.g., images)
-				if inlineData := part.Get("inlineData"); inlineData.Exists() {
-					mimeType := inlineData.Get("mimeType").String()
-					if mimeType == "" {
-						mimeType = "application/octet-stream"
-					}
-					data := inlineData.Get("data").String()
-					imageURL := fmt.Sprintf("data:%s;base64,%s", mimeType, data)
-
-					contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
-					contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
+				if contentPart, ok := openAIContentPartFromGeminiInlineData(part); ok {
 					msg, _ = sjson.SetRawBytes(msg, "content.-1", contentPart)
 					hasContent = true
 				}
@@ -270,18 +282,8 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 					}
 
 					// Handle inline data (e.g., images)
-					if inlineData := part.Get("inlineData"); inlineData.Exists() {
+					if contentPart, ok := openAIContentPartFromGeminiInlineData(part); ok {
 						onlyTextContent = false
-
-						mimeType := inlineData.Get("mimeType").String()
-						if mimeType == "" {
-							mimeType = "application/octet-stream"
-						}
-						data := inlineData.Get("data").String()
-						imageURL := fmt.Sprintf("data:%s;base64,%s", mimeType, data)
-
-						contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
-						contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", imageURL)
 						contentWrapper, _ = sjson.SetRawBytes(contentWrapper, "arr.-1", contentPart)
 						contentPartsCount++
 					}
@@ -310,6 +312,8 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						var toolCallID string
 						if id := functionCall.Get("id").String(); id != "" {
 							toolCallID = id
+						} else if callID := functionCall.Get("call_id").String(); callID != "" {
+							toolCallID = callID
 						} else {
 							toolCallID = mintDeterministicToolCallID(fnName, mintedCountByName[fnName])
 							mintedCountByName[fnName]++
@@ -373,6 +377,8 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						var toolCallID string
 						if id := functionResponse.Get("id").String(); id != "" {
 							toolCallID = id
+						} else if callID := functionResponse.Get("call_id").String(); callID != "" {
+							toolCallID = callID
 						} else if q := mintedByName[respName]; len(q) > 0 {
 							toolCallID = q[0]
 							mintedByName[respName] = q[1:]
@@ -603,4 +609,127 @@ func setOpenAIAllowedTools(out []byte, names []string) []byte {
 	}
 	out, _ = sjson.SetRawBytes(out, "allowed_tools", allowed)
 	return out
+}
+
+func openAIContentPartFromGeminiInlineData(part gjson.Result) ([]byte, bool) {
+	inlineData := part.Get("inlineData")
+	if !inlineData.Exists() {
+		inlineData = part.Get("inline_data")
+	}
+	if !inlineData.Exists() {
+		return nil, false
+	}
+	mimeType := inlineData.Get("mimeType").String()
+	if mimeType == "" {
+		mimeType = inlineData.Get("mime_type").String()
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	data := inlineData.Get("data").String()
+	if data == "" {
+		return nil, false
+	}
+	dataURL := fmt.Sprintf("data:%s;base64,%s", mimeType, data)
+	lowerMimeType := strings.ToLower(mimeType)
+	switch {
+	case strings.HasPrefix(lowerMimeType, "image/"):
+		contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
+		contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", dataURL)
+		return contentPart, true
+	case strings.HasPrefix(lowerMimeType, "audio/"):
+		contentPart := []byte(`{"type":"input_audio","input_audio":{"data":"","format":""}}`)
+		contentPart, _ = sjson.SetBytes(contentPart, "input_audio.data", data)
+		contentPart, _ = sjson.SetBytes(contentPart, "input_audio.format", openAIInputAudioFormatFromMIME(mimeType))
+		return contentPart, true
+	case strings.HasPrefix(lowerMimeType, "video/"):
+		contentPart := []byte(`{"type":"video_url","video_url":{"url":""}}`)
+		contentPart, _ = sjson.SetBytes(contentPart, "video_url.url", dataURL)
+		return contentPart, true
+	default:
+		contentPart := []byte(`{"type":"file","file":{"filename":"","file_data":""}}`)
+		contentPart, _ = sjson.SetBytes(contentPart, "file.filename", openAIFileNameFromMIME(mimeType))
+		contentPart, _ = sjson.SetBytes(contentPart, "file.file_data", data)
+		return contentPart, true
+	}
+}
+
+func openAIContentPartFromGeminiFileData(part gjson.Result) ([]byte, bool) {
+	fileData := part.Get("fileData")
+	if !fileData.Exists() {
+		fileData = part.Get("file_data")
+	}
+	if !fileData.Exists() {
+		return nil, false
+	}
+	fileURI := fileData.Get("fileUri").String()
+	if fileURI == "" {
+		fileURI = fileData.Get("file_uri").String()
+	}
+	if fileURI == "" {
+		return nil, false
+	}
+	mimeType := fileData.Get("mimeType").String()
+	if mimeType == "" {
+		mimeType = fileData.Get("mime_type").String()
+	}
+	lowerMimeType := strings.ToLower(mimeType)
+	if strings.HasPrefix(lowerMimeType, "image/") {
+		contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
+		contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", fileURI)
+		return contentPart, true
+	}
+	if strings.HasPrefix(lowerMimeType, "video/") {
+		contentPart := []byte(`{"type":"video_url","video_url":{"url":""}}`)
+		contentPart, _ = sjson.SetBytes(contentPart, "video_url.url", fileURI)
+		return contentPart, true
+	}
+	if strings.HasPrefix(lowerMimeType, "application/") || strings.HasPrefix(lowerMimeType, "text/") {
+		contentPart := []byte(`{"type":"file","file":{"filename":"","file_url":""}}`)
+		contentPart, _ = sjson.SetBytes(contentPart, "file.filename", openAIFileNameFromMIME(mimeType))
+		contentPart, _ = sjson.SetBytes(contentPart, "file.file_url", fileURI)
+		return contentPart, true
+	}
+	fileInfo := "File: " + fileURI
+	if mimeType != "" {
+		fileInfo += " (Type: " + mimeType + ")"
+	}
+	contentPart := []byte(`{"type":"text","text":""}}`)
+	contentPart, _ = sjson.SetBytes(contentPart, "text", fileInfo)
+	return contentPart, true
+}
+
+func openAIInputAudioFormatFromMIME(mimeType string) string {
+	switch strings.ToLower(strings.TrimSpace(mimeType)) {
+	case "audio/wav", "audio/wave", "audio/x-wav":
+		return "wav"
+	case "audio/flac":
+		return "flac"
+	case "audio/opus", "audio/ogg":
+		return "opus"
+	case "audio/pcm", "audio/l16":
+		return "pcm16"
+	default:
+		return "mp3"
+	}
+}
+
+func openAIFileNameFromMIME(mimeType string) string {
+	switch strings.ToLower(strings.TrimSpace(mimeType)) {
+	case "application/pdf":
+		return "document.pdf"
+	case "text/plain":
+		return "document.txt"
+	case "text/csv":
+		return "document.csv"
+	case "application/json":
+		return "document.json"
+	case "application/xml", "text/xml":
+		return "document.xml"
+	default:
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(mimeType)), "video/") {
+			return "video"
+		}
+		return "document"
+	}
 }

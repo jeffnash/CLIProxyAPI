@@ -2393,6 +2393,26 @@
       "max_completion_tokens": 256000
     },
     {
+      "id": "grok-4.5",
+      "object": "model",
+      "created": 1783526400,
+      "owned_by": "xai",
+      "type": "xai",
+      "display_name": "Grok 4.5",
+      "name": "grok-4.5",
+      "description": "SpaceXAI's intelligent coding model for agentic software, engineering, and workflow tasks.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high"
+        ]
+      }
+    },
+    {
       "id": "grok-4.3",
       "object": "model",
       "created": 1775606400,
@@ -2551,6 +2571,36 @@
       "description": "Cursor Composer latest alias (currently 2.5)",
       "context_length": 200000,
       "max_completion_tokens": 64000
+    },
+    {
+      "id": "grok-4.5",
+      "object": "model",
+      "created": 1783526400,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Cursor Grok 4.5",
+      "description": "Cursor Grok 4.5 (SDK id grok-4.5). Force Cursor vs xAI with cursor-grok-4.5 (same pattern as copilot-/codex-). Variants: grok-4.5-fast, grok-4.5-{low,medium,high,xhigh}.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": ["low", "medium", "high", "xhigh"]
+      }
+    },
+    {
+      "id": "grok-4.5-fast",
+      "object": "model",
+      "created": 1783526400,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Cursor Grok 4.5 Fast",
+      "description": "Cursor Grok 4.5 Fast (SDK id grok-4.5, fast=true). Force with cursor-grok-4.5-fast.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": ["low", "medium", "high", "xhigh"]
+      }
     }
   ]
 }
