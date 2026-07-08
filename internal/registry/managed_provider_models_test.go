@@ -12,6 +12,19 @@ func TestGenerateManagedProviderAliases(t *testing.T) {
 	}
 }
 
+func TestGenerateManagedProviderProtocolAliases(t *testing.T) {
+	models := GenerateManagedProviderAliases([]*ModelInfo{{ID: "glm-5.2", DisplayName: "GLM 5.2", Description: "base"}}, "example-", "example-provider")
+	models = GenerateManagedProviderProtocolAliases(models, "example-", "example-provider", ManagedProviderAnthropicProtocolPrefix, ManagedProviderOpenAIProtocolPrefix)
+	for _, id := range []string{"anthropic-example-glm-5.2", "openai-example-glm-5.2"} {
+		if !hasManagedProviderModelID(models, id) {
+			t.Fatalf("missing protocol alias %q", id)
+		}
+	}
+	if hasManagedProviderModelID(models, "anthropic-glm-5.2") {
+		t.Fatal("generated raw protocol alias without provider prefix")
+	}
+}
+
 func TestGetManagedProviderFallbackModelsIncludesRequestedFallbacksAndAliases(t *testing.T) {
 	models := GetManagedProviderFallbackModels("example-provider", "example-", "Example Provider", []string{"glm-5.2", "qwen3.7-max"})
 	for _, id := range []string{"glm-5.2", "qwen3.7-max"} {

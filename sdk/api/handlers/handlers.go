@@ -1497,6 +1497,7 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	// These bypass client model registration filtering by setting forced_provider=true.
 	rawModel := trimmed
 	forcedProvider := ""
+	forcedManagedProviderTransport := ""
 	lower := strings.ToLower(rawModel)
 	switch {
 	case strings.HasPrefix(lower, registry.CopilotModelPrefix):
@@ -1516,7 +1517,11 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 		forcedProvider = "iflow"
 	}
 	if forcedProvider == "" {
-		if provider, unprefixed, ok := config.FindManagedProviderByPrefix(h.CurrentConfig(), rawModel); ok {
+		if provider, unprefixed, protocol, ok := config.FindManagedProviderByProtocolPrefix(h.CurrentConfig(), rawModel); ok {
+			rawModel = unprefixed
+			forcedProvider = config.ManagedProviderName(provider)
+			forcedManagedProviderTransport = protocol
+		} else if provider, unprefixed, ok := config.FindManagedProviderByPrefix(h.CurrentConfig(), rawModel); ok {
 			rawModel = unprefixed
 			forcedProvider = config.ManagedProviderName(provider)
 		}
@@ -1573,6 +1578,9 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 			metadata = make(map[string]any, 1)
 		}
 		metadata["forced_provider"] = true
+		if forcedManagedProviderTransport != "" {
+			metadata[coreexecutor.ManagedProviderTransportMetadataKey] = forcedManagedProviderTransport
+		}
 	} else {
 		providers = util.GetProviderName(baseModel)
 		// Fallback: if baseModel has no provider but differs from resolvedModelName,

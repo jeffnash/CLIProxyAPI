@@ -529,6 +529,8 @@ nonstream-keepalive-interval: 0
 #managed-providers:
 #  - name: "example-provider"             # required; used as the provider/auth name
 #    prefix: "example-"                   # optional; defaults to "<name>-"
+#    # Model aliases include "<prefix><model>" plus protocol-forced aliases
+#    # "anthropic-<prefix><model>" and "openai-<prefix><model>" when those transports are configured.
 #    api-key: ""                          # direct key for local config; prefer api-key-env in hosted config
 #    api-key-env: "EXAMPLE_PROVIDER_KEY"  # optional env var lookup
 #    base-url: "https://provider.example/v1"

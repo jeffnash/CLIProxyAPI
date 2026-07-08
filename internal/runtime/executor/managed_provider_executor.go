@@ -433,6 +433,9 @@ func (e *ManagedProviderExecutor) FetchModels(ctx context.Context, auth *cliprox
 		return e.fallbackModels(creds)
 	}
 	models = registry.GenerateManagedProviderAliases(models, creds.prefix, creds.label)
+	protocolPrefixes := creds.protocolAliasPrefixes()
+	models = registry.GenerateManagedProviderProtocolAliases(models, creds.prefix, creds.label, protocolPrefixes...)
+	addManagedProviderProtocolAliases(aliases, creds.prefix, protocolPrefixes...)
 
 	managedProviderModelCacheMu.Lock()
 	managedProviderModelCache[cacheKey] = &managedProviderModelCacheEntry{
@@ -541,6 +544,11 @@ func (e *ManagedProviderExecutor) selectTransport(auth *cliproxyauth.Auth, opts 
 		}
 		if v := normalizeManagedProviderTransport(auth.Attributes["default_transport"]); v != "" {
 			defaultTransport = v
+		}
+	}
+	if opts.Metadata != nil {
+		if v := normalizeManagedProviderTransport(metadataValueString(opts.Metadata[cliproxyexecutor.ManagedProviderTransportMetadataKey])); v != "" {
+			mode = v
 		}
 	}
 	switch normalizeManagedProviderTransport(mode) {
@@ -727,6 +735,9 @@ func managedProviderFilterSet(values []string, prefix string) map[string]bool {
 
 func resolveManagedProviderModel(providerName, prefix, modelID string) string {
 	stripped := modelID
+	for _, protocolPrefix := range []string{registry.ManagedProviderAnthropicProtocolPrefix, registry.ManagedProviderOpenAIProtocolPrefix} {
+		stripped = strings.TrimPrefix(stripped, protocolPrefix)
+	}
 	if prefix != "" {
 		stripped = strings.TrimPrefix(stripped, prefix)
 	}
@@ -748,6 +759,27 @@ func resolveManagedProviderModel(providerName, prefix, modelID string) string {
 		return strings.TrimSpace(info.UpstreamID)
 	}
 	return stripped
+}
+
+func addManagedProviderProtocolAliases(aliases map[string]string, providerPrefix string, protocolPrefixes ...string) {
+	if len(aliases) == 0 || strings.TrimSpace(providerPrefix) == "" || len(protocolPrefixes) == 0 {
+		return
+	}
+	for alias, upstream := range cloneStringMap(aliases) {
+		if !strings.HasPrefix(alias, providerPrefix) {
+			continue
+		}
+		for _, protocolPrefix := range protocolPrefixes {
+			protocolPrefix = strings.TrimSpace(protocolPrefix)
+			if protocolPrefix == "" {
+				continue
+			}
+			if !strings.HasSuffix(protocolPrefix, "-") {
+				protocolPrefix += "-"
+			}
+			aliases[protocolPrefix+alias] = upstream
+		}
+	}
 }
 
 func restoreManagedProviderAliasMap(providerName string, aliases map[string]string) {
@@ -831,6 +863,28 @@ func (e *ManagedProviderExecutor) creds(auth *cliproxyauth.Auth) managedProvider
 	return out
 }
 
+func (c managedProviderCredentials) protocolAliasPrefixes() []string {
+	prefixes := make([]string, 0, 2)
+	if strings.TrimSpace(c.claudeBaseURL) != "" && strings.TrimSpace(c.claudePath) != "" {
+		prefixes = append(prefixes, registry.ManagedProviderAnthropicProtocolPrefix)
+	}
+	if strings.TrimSpace(c.openAIBaseURL) != "" && strings.TrimSpace(c.openAIChatPath) != "" {
+		prefixes = append(prefixes, registry.ManagedProviderOpenAIProtocolPrefix)
+	}
+	return prefixes
+}
+
+func metadataValueString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case fmt.Stringer:
+		return v.String()
+	default:
+		return ""
+	}
+}
+
 func (e *ManagedProviderExecutor) sdkConfig() *config.SDKConfig {
 	if e == nil || e.cfg == nil {
 		return nil
@@ -843,6 +897,7 @@ func (e *ManagedProviderExecutor) fallbackModels(creds managedProviderCredential
 	if len(models) == 0 {
 		return nil
 	}
+	models = registry.GenerateManagedProviderProtocolAliases(models, creds.prefix, creds.label, creds.protocolAliasPrefixes()...)
 	aliases := make(map[string]string)
 	for _, model := range models {
 		if model == nil {

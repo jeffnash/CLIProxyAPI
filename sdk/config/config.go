@@ -77,3 +77,7 @@ func FindManagedProvider(cfg *SDKConfig, name string) (ManagedProviderConfig, bo
 func FindManagedProviderByPrefix(cfg *SDKConfig, model string) (ManagedProviderConfig, string, bool) {
 	return internalconfig.FindManagedProviderByPrefix(cfg, model)
 }
+
+func FindManagedProviderByProtocolPrefix(cfg *SDKConfig, model string) (ManagedProviderConfig, string, string, bool) {
+	return internalconfig.FindManagedProviderByProtocolPrefix(cfg, model)
+}

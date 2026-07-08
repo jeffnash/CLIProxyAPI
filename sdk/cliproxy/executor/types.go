@@ -28,6 +28,11 @@ const ReasoningEffortMetadataKey = "reasoning_effort"
 // ServiceTierMetadataKey stores the client-requested service tier for usage logs.
 const ServiceTierMetadataKey = "service_tier"
 
+// ManagedProviderTransportMetadataKey forces the backend transport used by managed
+// providers. Supported values are provider-specific but include "anthropic" and
+// "openai" for Claude Messages and OpenAI Chat Completions compatible transports.
+const ManagedProviderTransportMetadataKey = "managed_provider_transport"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

@@ -9,6 +9,9 @@ const (
 	ManagedProviderSecretRedactionInherit  = "inherit"
 	ManagedProviderSecretRedactionEnabled  = "enabled"
 	ManagedProviderSecretRedactionDisabled = "disabled"
+
+	ManagedProviderProtocolAnthropic = "anthropic"
+	ManagedProviderProtocolOpenAI    = "openai"
 )
 
 // MergeManagedProviders merges provider entries by name, with later entries replacing earlier ones.
@@ -124,6 +127,31 @@ func FindManagedProviderByPrefix(cfg *SDKConfig, model string) (ManagedProviderC
 		}
 	}
 	return ManagedProviderConfig{}, model, false
+}
+
+// FindManagedProviderByProtocolPrefix returns a managed provider when model uses
+// "<protocol>-<provider-prefix><model>", such as "anthropic-vsllm-qwen3.7-max".
+func FindManagedProviderByProtocolPrefix(cfg *SDKConfig, model string) (ManagedProviderConfig, string, string, bool) {
+	if cfg == nil {
+		return ManagedProviderConfig{}, model, "", false
+	}
+	for _, candidate := range []struct {
+		prefix   string
+		protocol string
+	}{
+		{ManagedProviderProtocolAnthropic + "-", ManagedProviderProtocolAnthropic},
+		{ManagedProviderProtocolOpenAI + "-", ManagedProviderProtocolOpenAI},
+	} {
+		trimmed := strings.TrimSpace(model)
+		if !strings.HasPrefix(strings.ToLower(trimmed), candidate.prefix) {
+			continue
+		}
+		remainder := strings.TrimSpace(trimmed[len(candidate.prefix):])
+		if provider, unprefixed, ok := FindManagedProviderByPrefix(cfg, remainder); ok {
+			return provider, unprefixed, candidate.protocol, true
+		}
+	}
+	return ManagedProviderConfig{}, model, "", false
 }
 
 // ManagedProviderDiscoveryEnabled reports whether /models discovery should be attempted.

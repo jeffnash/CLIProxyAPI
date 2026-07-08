@@ -163,11 +163,14 @@ func TestManagedProviderExecutorFetchModelsGeneratesExplicitAliases(t *testing.T
 
 	cfg := managedProviderTestConfig(srv.URL + "/v1")
 	models := NewManagedProviderExecutor("example-provider", cfg).FetchModels(context.Background(), nil, cfg)
-	if !hasModelID(models, "glm-5.2") || !hasModelID(models, "example-glm-5.2") {
+	if !hasModelID(models, "glm-5.2") || !hasModelID(models, "example-glm-5.2") ||
+		!hasModelID(models, "anthropic-example-glm-5.2") || !hasModelID(models, "openai-example-glm-5.2") {
 		t.Fatalf("expected base and alias models, got %#v", modelIDs(models))
 	}
-	if got := resolveManagedProviderModel("example-provider", "example-", "example-glm-5.2"); got != "glm-5.2" {
-		t.Fatalf("resolveManagedProviderModel()=%q, want glm-5.2", got)
+	for _, alias := range []string{"example-glm-5.2", "anthropic-example-glm-5.2", "openai-example-glm-5.2"} {
+		if got := resolveManagedProviderModel("example-provider", "example-", alias); got != "glm-5.2" {
+			t.Fatalf("resolveManagedProviderModel(%q)=%q, want glm-5.2", alias, got)
+		}
 	}
 }
 
@@ -191,6 +194,22 @@ func TestManagedProviderSelectTransportAutoAndConfig(t *testing.T) {
 	exec = NewManagedProviderExecutor("example-provider", cfg)
 	if got := exec.selectTransport(nil, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude}); got != managedProviderTransportOpenAI {
 		t.Fatalf("forced transport=%q, want openai", got)
+	}
+	if got := exec.selectTransport(nil, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Metadata: map[string]any{
+			cliproxyexecutor.ManagedProviderTransportMetadataKey: "anthropic",
+		},
+	}); got != managedProviderTransportClaude {
+		t.Fatalf("metadata forced transport=%q, want claude", got)
+	}
+	if got := exec.selectTransport(nil, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatClaude,
+		Metadata: map[string]any{
+			cliproxyexecutor.ManagedProviderTransportMetadataKey: "openai",
+		},
+	}); got != managedProviderTransportOpenAI {
+		t.Fatalf("metadata forced transport=%q, want openai", got)
 	}
 }
 
