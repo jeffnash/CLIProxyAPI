@@ -114,9 +114,20 @@ This fork supports generic managed providers with Claude/Anthropic-compatible an
 You have two ways to route to a managed provider:
 
 - **Explicit routing (always available when configured):** use the configured prefix, for example `model: "example-model-a"` when the prefix is `example-`.
+- **Protocol-pinned explicit routing:** use `anthropic-example-<model>`, `openai-example-<model>`, `openai-responses-example-<model>`, or `openai-completions-example-<model>` to pin the preferred backend transport while still allowing configured fallbacks.
 - **General routing (optional):** expose non-prefixed model IDs in `/v1/models` and allow normal provider selection.
 
-By default, `transport-mode=auto`: Claude-format incoming requests are sent to the messages endpoint, OpenAI-format incoming requests are sent to chat completions, and other incoming formats use `default-transport` (`claude` by default). Direct Responses passthrough is only used when `openai-responses-path` is configured; otherwise Responses-style callers are routed through chat completions.
+Any client-facing endpoint can use any managed-provider alias. CLIProxyAPI translates the incoming request format to the selected backend transport, then translates the upstream response/stream back to the client-requested format.
+
+Transport selection:
+
+- `anthropic-...`: Anthropic/messages first, then OpenAI Responses, then OpenAI Chat Completions.
+- `openai-responses-...`: OpenAI Responses first, then Chat Completions, then Anthropic/messages.
+- `openai-completions-...`: OpenAI Chat Completions first, then Responses, then Anthropic/messages.
+- `openai-...`: best OpenAI transport, Responses or Chat Completions, then Anthropic/messages.
+- Bare provider prefix (`example-...`) or exposed unprefixed IDs: best available transport across all configured transports.
+
+Auto routing prefers the client-native protocol on ties. Anthropic callers prefer the messages endpoint, OpenAI Responses callers prefer `/responses`, and Chat Completions callers prefer `/chat/completions` when health scores are otherwise equal.
 
 On Railway, set `MANAGED_PROVIDERS_JSON` to an array of provider definitions. Keep the real API key in a separate Railway variable and point to it with `api-key-env`.
 
@@ -127,6 +138,9 @@ On Railway, set `MANAGED_PROVIDERS_JSON` to an array of provider definitions. Ke
     "prefix": "example-",
     "api-key-env": "EXAMPLE_PROVIDER_API_KEY",
     "base-url": "https://provider.example/v1",
+    "claude-messages-path": "/messages",
+    "openai-chat-path": "/chat/completions",
+    "openai-responses-path": "/responses",
     "transport-mode": "auto",
     "default-transport": "claude",
     "model-discovery": {
@@ -134,6 +148,16 @@ On Railway, set `MANAGED_PROVIDERS_JSON` to an array of provider definitions. Ke
       "path": "/models",
       "format": "openai",
       "ttl": "30m"
+    },
+    "route-health": {
+      "enabled": true,
+      "probe-enabled": true,
+      "probe-interval": "15m",
+      "probe-timeout": "8s",
+      "first-event-timeout": "",
+      "cooldown": "5m",
+      "unsupported-ttl": "6h",
+      "max-concurrent-probes": 2
     },
     "fallback-models": ["model-a", "model-b"],
     "priority": "fallback",
@@ -155,6 +179,12 @@ Managed provider fields:
 - `priority`: `primary` exposes non-prefixed IDs; `fallback` hides non-prefixed IDs when another provider registers the same ID. Prefixed aliases remain routable.
 - `secret-redaction`: `inherit`, `enabled`, or `disabled`.
 - `headers`, `proxy-url`, `max-retries`, `retry-backoff`: optional request and retry controls.
+- `route-health`: optional transport health and probing controls.
+  - Health state is persisted under the Railway volume when `RAILWAY_VOLUME_MOUNT_PATH` is available, otherwise under `auth-dir`.
+  - Cooldowns are only set for transport availability signals: network failures, timeouts, HTTP 408, retryable 429/5xx, and explicit unsupported/not-implemented endpoint responses. Request-specific 400/401/403 errors are recorded but do not poison transport health.
+  - Protocol-pinned aliases only demote away from their primary transport when that transport is explicitly unsupported. Auto routes can demote cooled-down transports.
+  - `first-event-timeout` is off by default. When set, stream bootstrap can fail over if the upstream accepts the connection but emits no meaningful SSE event before the timeout and another fallback remains.
+  - Background probes are per-provider limited by `max-concurrent-probes` and respect `probe-interval`.
 
 ### Secret DLP and provider policy
 
@@ -165,7 +195,15 @@ Railway environment variables:
 - `SECRET_DLP_ENABLED=true`: turns Secret DLP on.
 - `SECRET_DLP_MODE=restore|redact|block`: `restore` redacts upstream payloads and restores downstream responses.
 - `SECRET_DLP_MASTER_KEY`: stable key used to encrypt restore mappings. Set this for hosted deployments.
+- `SECRET_DLP_STORE=memory|file`: `memory` keeps restore mappings in process memory; `file` stores encrypted mappings on disk.
+- `SECRET_DLP_FILE_DIR`: directory for `SECRET_DLP_STORE=file`. If unset and Railway exposes `RAILWAY_VOLUME_MOUNT_PATH`, CLIProxyAPI uses `$RAILWAY_VOLUME_MOUNT_PATH/secret_dlp`.
+- `SECRET_DLP_TTL_SECONDS`: restore mapping lifetime.
+- `SECRET_DLP_DRAIN_SECONDS`: shutdown drain timeout for pending mapping writes.
+- `SECRET_DLP_STORE_FAIL_CLOSED=true`: reject requests if the mapping store fails instead of degrading.
 - `SECRET_DLP_SCANNER=betterleaks`: scanner backend; this is the default.
+- `SECRET_DLP_HIGH_ENTROPY=true`: opt into generic high-entropy detection. Explicit credential shapes are detected without this.
+- `SECRET_DLP_MAX_FINDINGS`, `SECRET_DLP_MIN_VALUE_LENGTH`, `SECRET_DLP_REDACT_THRESHOLD`, `SECRET_DLP_BETTERLEAKS_CONFIDENCE`: scanner tuning knobs.
+- `SECRET_DLP_FAIL_CLOSED=true`: reject requests if scan/redaction fails.
 - `SECRET_DLP_LOG_EVENTS=true`: logs detection/redaction events without logging raw secret values.
 - `SECRET_DLP_DEFAULT_PROVIDER_POLICY=enabled|disabled`: global default for upstream redaction.
 - `SECRET_DLP_PROVIDER_OVERRIDES=example-provider=disabled,other-provider=enabled`: per-provider overrides.
