@@ -982,12 +982,14 @@ func (e *ManagedProviderExecutor) hasUsableStreamBootstrapFallback(creds managed
 	for _, transport := range available {
 		record := managedProviderHealth.records[managedProviderHealthKey(e.Identifier(), model, transport)]
 		if record == nil {
-			return true
+			continue
 		}
 		if record.UnsupportedUntil.After(now) || record.CooldownUntil.After(now) {
 			continue
 		}
-		return true
+		if !record.LastSuccessAt.IsZero() {
+			return true
+		}
 	}
 	return false
 }

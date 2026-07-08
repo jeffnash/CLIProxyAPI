@@ -736,8 +736,17 @@ func TestManagedProviderStreamBootstrapFallbackIgnoresCooledFallbacks(t *testing
 	if got := strings.Join(plan.Transports, ","); got != managedProviderTransportOpenAI+","+managedProviderTransportClaude {
 		t.Fatalf("transports=%s, want openai,claude", got)
 	}
+	if exec.hasUsableStreamBootstrapFallback(creds, "qwen3.7-max", plan.Transports[1:]) {
+		t.Fatalf("unknown fallback should not enable stream bootstrap timeout")
+	}
+
+	recordManagedProviderTransportHealth(cfg, provider, "example-provider", "qwen3.7-max", managedProviderTransportClaude, managedProviderHealthOutcome{
+		Success:    true,
+		StatusCode: http.StatusOK,
+		Latency:    10 * time.Millisecond,
+	})
 	if !exec.hasUsableStreamBootstrapFallback(creds, "qwen3.7-max", plan.Transports[1:]) {
-		t.Fatalf("fallback should be usable before health marks it cooled")
+		t.Fatalf("successful fallback health should enable stream bootstrap timeout")
 	}
 
 	recordManagedProviderTransportHealth(cfg, provider, "example-provider", "qwen3.7-max", managedProviderTransportClaude, managedProviderHealthOutcome{
@@ -754,7 +763,7 @@ func TestManagedProviderStreamBootstrapFallbackIgnoresCooledFallbacks(t *testing
 		Latency:    10 * time.Millisecond,
 	})
 	if !exec.hasUsableStreamBootstrapFallback(creds, "qwen3.7-max", plan.Transports[1:]) {
-		t.Fatalf("successful fallback health should re-enable stream bootstrap timeout")
+		t.Fatalf("recovered fallback health should re-enable stream bootstrap timeout")
 	}
 }
 
