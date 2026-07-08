@@ -68,8 +68,9 @@ type ModelInfo struct {
 	Thinking *ThinkingSupport `json:"thinking,omitempty"`
 
 	// UserDefined indicates this model was defined through config file's models[]
-	// array (e.g., openai-compatibility.*.models[], *-api-key.models[]).
-	// UserDefined models have thinking configuration passed through without validation.
+	// array (e.g., openai-compatibility.*.models[], *-api-key.models[]) or was
+	// discovered from a managed provider. UserDefined models have thinking
+	// configuration passed through without validation.
 	UserDefined bool `json:"-"`
 
 	// UpstreamID is the provider-native model identifier used for execution when

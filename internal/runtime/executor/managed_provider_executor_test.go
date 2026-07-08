@@ -148,6 +148,51 @@ func TestManagedProviderExecutorOpenAISourceUsesChatCompletionsEndpoint(t *testi
 	}
 }
 
+func TestManagedProviderExecutorOpenAIReasoningEffortPassesThroughDiscoveredModel(t *testing.T) {
+	clearManagedProviderStateForTest(t)
+	var sawChat bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"qwen3.7-max","object":"model"}]}`))
+		case "/v1/chat/completions":
+			sawChat = true
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if got := body["reasoning_effort"]; got != "high" {
+				t.Fatalf("reasoning_effort=%v, want high; body=%#v", got, body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := managedProviderTestConfig(srv.URL + "/v1")
+	exec := NewManagedProviderExecutor("example-provider", cfg)
+	models := exec.FetchModels(context.Background(), nil, cfg)
+	registry.GetGlobalRegistry().RegisterClient("managed-provider-thinking-test", "example-provider", models)
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient("managed-provider-thinking-test")
+	})
+
+	_, err := exec.Execute(context.Background(), managedProviderTestAuth(srv.URL+"/v1"), cliproxyexecutor.Request{
+		Model:   "qwen3.7-max",
+		Payload: []byte(`{"model":"qwen3.7-max","reasoning_effort":"high","messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, ResponseFormat: sdktranslator.FormatOpenAI})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if !sawChat {
+		t.Fatal("server did not receive chat request")
+	}
+}
+
 func TestManagedProviderExecutorOpenAIStreamNormalizesSSEFrames(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
@@ -212,6 +257,15 @@ func TestManagedProviderExecutorFetchModelsGeneratesExplicitAliases(t *testing.T
 		!hasModelID(models, "anthropic-example-glm-5.2") || !hasModelID(models, "openai-example-glm-5.2") {
 		t.Fatalf("expected base and alias models, got %#v", modelIDs(models))
 	}
+	for _, id := range []string{"glm-5.2", "example-glm-5.2", "anthropic-example-glm-5.2", "openai-example-glm-5.2"} {
+		model := findModel(models, id)
+		if model == nil {
+			t.Fatalf("missing model %q", id)
+		}
+		if !model.UserDefined {
+			t.Fatalf("model %q must be UserDefined so managed-provider thinking controls pass through", id)
+		}
+	}
 	for _, alias := range []string{"example-glm-5.2", "anthropic-example-glm-5.2", "openai-example-glm-5.2"} {
 		if got := resolveManagedProviderModel("example-provider", "example-", alias); got != "glm-5.2" {
 			t.Fatalf("resolveManagedProviderModel(%q)=%q, want glm-5.2", alias, got)
@@ -268,12 +322,16 @@ func mustMarshalJSON(t *testing.T, v any) []byte {
 }
 
 func hasModelID(models []*registry.ModelInfo, id string) bool {
+	return findModel(models, id) != nil
+}
+
+func findModel(models []*registry.ModelInfo, id string) *registry.ModelInfo {
 	for _, model := range models {
 		if model != nil && model.ID == id {
-			return true
+			return model
 		}
 	}
-	return false
+	return nil
 }
 
 func modelIDs(models []*registry.ModelInfo) []string {

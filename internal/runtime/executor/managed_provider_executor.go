@@ -705,6 +705,7 @@ func processManagedProviderModels(providerName, prefix string, raw []managedProv
 			SupportedInputModalities:  m.SupportedInputModalities,
 			SupportedOutputModalities: m.SupportedOutputModalities,
 			UpstreamID:                id,
+			UserDefined:               true,
 		}
 		aliases[id] = id
 		if prefix != "" {

@@ -116,6 +116,7 @@ func GetManagedProviderFallbackModels(providerName, prefix, label string, modelI
 			MaxCompletionTokens: DefaultClaudeMaxOutputTokens,
 			SupportedParameters: baseParams,
 			UpstreamID:          id,
+			UserDefined:         true,
 		})
 	}
 	return GenerateManagedProviderAliases(baseModels, prefix, label)

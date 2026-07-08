@@ -27,6 +27,7 @@ func TestGenerateManagedProviderProtocolAliases(t *testing.T) {
 
 func TestGetManagedProviderFallbackModelsIncludesRequestedFallbacksAndAliases(t *testing.T) {
 	models := GetManagedProviderFallbackModels("example-provider", "example-", "Example Provider", []string{"glm-5.2", "qwen3.7-max"})
+	models = GenerateManagedProviderProtocolAliases(models, "example-", "Example Provider", ManagedProviderAnthropicProtocolPrefix, ManagedProviderOpenAIProtocolPrefix)
 	for _, id := range []string{"glm-5.2", "qwen3.7-max"} {
 		if !hasManagedProviderModelID(models, id) {
 			t.Fatalf("missing fallback model %q", id)
@@ -34,14 +35,27 @@ func TestGetManagedProviderFallbackModelsIncludesRequestedFallbacksAndAliases(t 
 		if !hasManagedProviderModelID(models, "example-"+id) {
 			t.Fatalf("missing fallback alias %q", "example-"+id)
 		}
+		for _, modelID := range []string{id, "example-" + id, "anthropic-example-" + id, "openai-example-" + id} {
+			model := findManagedProviderModel(models, modelID)
+			if model == nil {
+				t.Fatalf("missing fallback model %q", modelID)
+			}
+			if !model.UserDefined {
+				t.Fatalf("fallback model %q must be UserDefined so managed-provider thinking controls pass through", modelID)
+			}
+		}
 	}
 }
 
 func hasManagedProviderModelID(models []*ModelInfo, id string) bool {
+	return findManagedProviderModel(models, id) != nil
+}
+
+func findManagedProviderModel(models []*ModelInfo, id string) *ModelInfo {
 	for _, model := range models {
 		if model != nil && model.ID == id {
-			return true
+			return model
 		}
 	}
-	return false
+	return nil
 }
