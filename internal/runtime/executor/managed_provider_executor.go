@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,6 +35,8 @@ const (
 	managedProviderTransportClaude     = "claude"
 	managedProviderTransportOpenAI     = "openai"
 	managedProviderTransportResponses  = "openai-response"
+	managedProviderRouteIntentAuto     = "auto"
+	managedProviderRouteIntentOpenAI   = "openai-family"
 	managedProviderDefaultMaxRetries   = 4
 	managedProviderDefaultDisplayLabel = "Managed"
 )
@@ -79,6 +82,30 @@ type managedProviderRemoteModel struct {
 	SupportedOutputModalities []string `json:"supportedOutputModalities"`
 }
 
+type managedProviderTransportPlan struct {
+	Intent           string
+	Transports       []string
+	DynamicSelection bool
+}
+
+type managedProviderTransportResult struct {
+	Data       []byte
+	Headers    http.Header
+	StatusCode int
+	Latency    time.Duration
+	Body       []byte
+	Timeout    bool
+}
+
+type managedProviderStreamBootstrap struct {
+	Response   *http.Response
+	Scanner    *bufio.Scanner
+	FirstLine  []byte
+	StatusCode int
+	Latency    time.Duration
+	Body       []byte
+}
+
 type ManagedProviderExecutor struct {
 	provider string
 	cfg      *config.Config
@@ -102,98 +129,70 @@ func (e *ManagedProviderExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, fmt.Errorf("%s executor: missing api key", e.Identifier())
 	}
 
-	transport := e.selectTransport(auth, opts)
-	prepared, err := e.prepareRequestBody(ctx, auth, req, opts, transport, false)
-	if err != nil {
-		return resp, err
+	plan := e.transportPlan(auth, req, opts)
+	if len(plan.Transports) == 0 {
+		return resp, fmt.Errorf("%s executor: no available managed-provider transports", e.Identifier())
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), prepared.baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
-	reporter.SetTranslatedReasoningEffort(prepared.body, prepared.targetFormat.String())
-
-	endpoint := e.endpointURL(creds, transport)
-	if endpoint == "" {
-		return resp, fmt.Errorf("%s executor: missing upstream endpoint for transport %s", e.Identifier(), transport)
-	}
-	attempts := e.maxRetries(auth) + 1
-	if attempts < 1 {
-		attempts = 1
-	}
-
-	var data []byte
-	var headers http.Header
-	for attempt := 0; attempt < attempts; attempt++ {
-		start := time.Now()
-		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(prepared.body))
-		if errReq != nil {
-			return resp, errReq
+	var lastErr error
+	var lastResult managedProviderTransportResult
+	for idx, transport := range plan.Transports {
+		prepared, errPrepare := e.prepareRequestBody(ctx, auth, req, opts, transport, false)
+		if errPrepare != nil {
+			return resp, errPrepare
 		}
-		e.applyHeaders(httpReq, auth, creds.apiKey, transport, false)
-		e.recordRequest(ctx, auth, endpoint, prepared.body, httpReq.Header)
+		reporter := helps.NewUsageReporter(ctx, e.Identifier(), prepared.baseModel, auth)
+		reporter.SetTranslatedReasoningEffort(prepared.body, prepared.targetFormat.String())
 
-		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, e.Identifier())
-		httpResp, errDo := httpClient.Do(httpReq)
-		if errDo != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-			if attempt < attempts-1 {
-				if errWait := e.waitForRetry(ctx, auth, attempt, prepared.baseModel, 0); errWait != nil {
-					return resp, errWait
-				}
-				continue
+		result, errTransport := e.executeNonStreamTransport(ctx, auth, creds, prepared, transport)
+		if errTransport == nil {
+			if len(result.Data) == 0 {
+				result.Data = []byte("{}")
 			}
-			return resp, errDo
+			if prepared.targetFormat == sdktranslator.FormatClaude {
+				reporter.Publish(ctx, helps.ParseClaudeUsage(result.Data))
+			} else {
+				reporter.Publish(ctx, helps.ParseOpenAIUsage(result.Data))
+			}
+			reporter.EnsurePublished(ctx)
+			recordManagedProviderTransportHealth(e.cfg, creds.provider, e.Identifier(), prepared.baseModel, transport, managedProviderHealthOutcome{
+				Success:    true,
+				StatusCode: result.StatusCode,
+				Latency:    result.Latency,
+				Body:       result.Data,
+			})
+			e.maybeProbeAlternateTransports(ctx, auth, creds, prepared.baseModel, transport, plan.Transports, plan.DynamicSelection)
+			out := e.translateNonStream(ctx, prepared, req, opts, result.Data)
+			return cliproxyexecutor.Response{Payload: out, Headers: result.Headers}, nil
 		}
 
-		headers = httpResp.Header.Clone()
-		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, headers)
-		data, _ = io.ReadAll(httpResp.Body)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("%s executor: close response body error: %v", e.Identifier(), errClose)
-		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-
-		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+		reporter.PublishFailure(ctx, errTransport)
+		lastErr = errTransport
+		lastResult = result
+		recordManagedProviderTransportHealth(e.cfg, creds.provider, e.Identifier(), prepared.baseModel, transport, managedProviderHealthOutcome{
+			StatusCode: result.StatusCode,
+			Latency:    result.Latency,
+			Timeout:    result.Timeout,
+			Err:        errTransport,
+			Body:       result.Body,
+		})
+		if idx < len(plan.Transports)-1 {
 			log.WithFields(log.Fields{
-				"provider":  e.Identifier(),
-				"attempt":   attempt + 1,
-				"status":    httpResp.StatusCode,
-				"duration":  time.Since(start).String(),
-				"transport": transport,
-			}).Info("managed provider: upstream ok")
-			break
-		}
-
-		log.WithFields(log.Fields{
-			"provider":  e.Identifier(),
-			"attempt":   attempt + 1,
-			"status":    httpResp.StatusCode,
-			"duration":  time.Since(start).String(),
-			"transport": transport,
-			"body":      sanitizeResponseBody(data),
-		}).Info("managed provider: upstream non-2xx")
-
-		if managedProviderRetryableStatusCodes[httpResp.StatusCode] && attempt < attempts-1 {
-			if errWait := e.waitForRetry(ctx, auth, attempt, prepared.baseModel, httpResp.StatusCode); errWait != nil {
-				return resp, errWait
-			}
+				"provider":       e.Identifier(),
+				"model":          prepared.baseModel,
+				"intent":         plan.Intent,
+				"failed":         transport,
+				"next_transport": plan.Transports[idx+1],
+				"status":         result.StatusCode,
+				"error_summary":  managedProviderSafeErrorSummary(result.StatusCode, errTransport, result.Body),
+			}).Warn("managed provider: falling back to next transport")
 			continue
 		}
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(data)}
 	}
-
-	if len(data) == 0 {
-		data = []byte("{}")
+	if lastErr != nil {
+		return resp, lastErr
 	}
-	if prepared.targetFormat == sdktranslator.FormatClaude {
-		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
-	} else {
-		reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
-	}
-	reporter.EnsurePublished(ctx)
-
-	out := e.translateNonStream(ctx, prepared, req, opts, data)
-	return cliproxyexecutor.Response{Payload: out, Headers: headers}, nil
+	return resp, statusErr{code: lastResult.StatusCode, msg: string(lastResult.Body)}
 }
 
 func (e *ManagedProviderExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
@@ -202,67 +201,63 @@ func (e *ManagedProviderExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, fmt.Errorf("%s executor: missing api key", e.Identifier())
 	}
 
-	transport := e.selectTransport(auth, opts)
-	prepared, err := e.prepareRequestBody(ctx, auth, req, opts, transport, true)
-	if err != nil {
-		return nil, err
+	plan := e.transportPlan(auth, req, opts)
+	if len(plan.Transports) == 0 {
+		return nil, fmt.Errorf("%s executor: no available managed-provider transports", e.Identifier())
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), prepared.baseModel, auth)
-	defer reporter.TrackFailure(ctx, &err)
-	reporter.SetTranslatedReasoningEffort(prepared.body, prepared.targetFormat.String())
-
-	endpoint := e.endpointURL(creds, transport)
-	if endpoint == "" {
-		return nil, fmt.Errorf("%s executor: missing upstream endpoint for transport %s", e.Identifier(), transport)
-	}
-	attempts := e.maxRetries(auth) + 1
-	if attempts < 1 {
-		attempts = 1
-	}
-
-	var httpResp *http.Response
-	for attempt := 0; attempt < attempts; attempt++ {
-		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(prepared.body))
-		if errReq != nil {
-			return nil, errReq
+	var prepared managedProviderPreparedRequest
+	var reporter *helps.UsageReporter
+	var bootstrap *managedProviderStreamBootstrap
+	var selectedTransport string
+	var lastErr error
+	for idx, transport := range plan.Transports {
+		var errPrepare error
+		prepared, errPrepare = e.prepareRequestBody(ctx, auth, req, opts, transport, true)
+		if errPrepare != nil {
+			return nil, errPrepare
 		}
-		e.applyHeaders(httpReq, auth, creds.apiKey, transport, true)
-		e.recordRequest(ctx, auth, endpoint, prepared.body, httpReq.Header)
+		reporter = helps.NewUsageReporter(ctx, e.Identifier(), prepared.baseModel, auth)
+		reporter.SetTranslatedReasoningEffort(prepared.body, prepared.targetFormat.String())
 
-		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, e.Identifier())
-		resp, errDo := httpClient.Do(httpReq)
-		if errDo != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-			if attempt < attempts-1 {
-				if errWait := e.waitForRetry(ctx, auth, attempt, prepared.baseModel, 0); errWait != nil {
-					return nil, errWait
-				}
-				continue
-			}
-			return nil, errDo
-		}
-
-		helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			httpResp = resp
+		var errTransport error
+		bootstrap, errTransport = e.openStreamTransport(ctx, auth, creds, prepared, transport, idx < len(plan.Transports)-1)
+		if errTransport == nil {
+			selectedTransport = transport
+			recordManagedProviderTransportHealth(e.cfg, creds.provider, e.Identifier(), prepared.baseModel, transport, managedProviderHealthOutcome{
+				Success:    true,
+				StatusCode: bootstrap.StatusCode,
+				Latency:    bootstrap.Latency,
+			})
+			e.maybeProbeAlternateTransports(ctx, auth, creds, prepared.baseModel, transport, plan.Transports, plan.DynamicSelection)
 			break
 		}
-
-		data, _ := io.ReadAll(resp.Body)
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("%s executor: close response body error: %v", e.Identifier(), errClose)
-		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-		if managedProviderRetryableStatusCodes[resp.StatusCode] && attempt < attempts-1 {
-			if errWait := e.waitForRetry(ctx, auth, attempt, prepared.baseModel, resp.StatusCode); errWait != nil {
-				return nil, errWait
-			}
+		reporter.PublishFailure(ctx, errTransport)
+		lastErr = errTransport
+		recordManagedProviderTransportHealth(e.cfg, creds.provider, e.Identifier(), prepared.baseModel, transport, managedProviderHealthOutcome{
+			StatusCode: bootstrapStatus(bootstrap),
+			Latency:    bootstrapLatency(bootstrap),
+			Timeout:    errors.Is(errTransport, errManagedProviderFirstStreamEventTimeout),
+			Err:        errTransport,
+			Body:       bootstrapBody(bootstrap),
+		})
+		if idx < len(plan.Transports)-1 {
+			log.WithFields(log.Fields{
+				"provider":       e.Identifier(),
+				"model":          prepared.baseModel,
+				"intent":         plan.Intent,
+				"failed":         transport,
+				"next_transport": plan.Transports[idx+1],
+				"status":         bootstrapStatus(bootstrap),
+				"error_summary":  managedProviderSafeErrorSummary(bootstrapStatus(bootstrap), errTransport, bootstrapBody(bootstrap)),
+			}).Warn("managed provider: stream bootstrap falling back to next transport")
 			continue
 		}
-		return nil, statusErr{code: resp.StatusCode, msg: string(data)}
 	}
-	if httpResp == nil {
+	if bootstrap == nil || bootstrap.Response == nil {
+		if lastErr != nil {
+			return nil, lastErr
+		}
 		return nil, fmt.Errorf("%s executor: missing response", e.Identifier())
 	}
 
@@ -270,16 +265,14 @@ func (e *ManagedProviderExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	go func() {
 		defer close(out)
 		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
+			if errClose := bootstrap.Response.Body.Close(); errClose != nil {
 				log.Errorf("%s executor: close response body error: %v", e.Identifier(), errClose)
 			}
 		}()
 
-		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, 52_428_800)
+		scanner := bootstrap.Scanner
 		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
+		emitLine := func(line []byte) bool {
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if prepared.targetFormat == sdktranslator.FormatClaude {
 				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
@@ -292,13 +285,27 @@ func (e *ManagedProviderExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunk}:
 				case <-ctx.Done():
-					return
+					return false
 				}
+			}
+			return true
+		}
+		if len(bootstrap.FirstLine) > 0 && !emitLine(bootstrap.FirstLine) {
+			return
+		}
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if !emitLine(line) {
+				return
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
+			recordManagedProviderTransportHealth(e.cfg, creds.provider, e.Identifier(), prepared.baseModel, selectedTransport, managedProviderHealthOutcome{
+				StatusCode: bootstrap.StatusCode,
+				Err:        errScan,
+			})
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
@@ -318,7 +325,7 @@ func (e *ManagedProviderExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		reporter.EnsurePublished(ctx)
 	}()
 
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: bootstrap.Response.Header.Clone(), Chunks: out}, nil
 }
 
 func (e *ManagedProviderExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
@@ -356,6 +363,250 @@ func (e *ManagedProviderExecutor) CountTokens(ctx context.Context, auth *cliprox
 	usageJSON := helps.BuildOpenAIUsageJSON(count)
 	translated := sdktranslator.TranslateTokenCount(ctx, prepared.targetFormat, prepared.responseFormat, count, usageJSON)
 	return cliproxyexecutor.Response{Payload: []byte(translated)}, nil
+}
+
+func (e *ManagedProviderExecutor) executeNonStreamTransport(ctx context.Context, auth *cliproxyauth.Auth, creds managedProviderCredentials, prepared managedProviderPreparedRequest, transport string) (managedProviderTransportResult, error) {
+	endpoint := e.endpointURL(creds, transport)
+	if endpoint == "" {
+		return managedProviderTransportResult{}, fmt.Errorf("%s executor: missing upstream endpoint for transport %s", e.Identifier(), transport)
+	}
+	attempts := e.maxRetries(auth) + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var result managedProviderTransportResult
+	for attempt := 0; attempt < attempts; attempt++ {
+		start := time.Now()
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(prepared.body))
+		if errReq != nil {
+			return result, errReq
+		}
+		e.applyHeaders(httpReq, auth, creds.apiKey, transport, false)
+		e.recordRequest(ctx, auth, endpoint, prepared.body, httpReq.Header)
+
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, e.Identifier())
+		httpResp, errDo := httpClient.Do(httpReq)
+		result.Latency = time.Since(start)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			result.Timeout = ctx.Err() != nil
+			if attempt < attempts-1 {
+				if errWait := e.waitForRetry(ctx, auth, attempt, prepared.baseModel, 0); errWait != nil {
+					return result, errWait
+				}
+				continue
+			}
+			return result, errDo
+		}
+
+		result.Headers = httpResp.Header.Clone()
+		result.StatusCode = httpResp.StatusCode
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, result.Headers)
+		data, _ := io.ReadAll(httpResp.Body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("%s executor: close response body error: %v", e.Identifier(), errClose)
+		}
+		result.Data = data
+		result.Body = data
+		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			log.WithFields(log.Fields{
+				"provider":  e.Identifier(),
+				"attempt":   attempt + 1,
+				"status":    httpResp.StatusCode,
+				"duration":  result.Latency.String(),
+				"transport": transport,
+			}).Info("managed provider: upstream ok")
+			return result, nil
+		}
+
+		log.WithFields(log.Fields{
+			"provider":      e.Identifier(),
+			"attempt":       attempt + 1,
+			"status":        httpResp.StatusCode,
+			"duration":      result.Latency.String(),
+			"transport":     transport,
+			"error_summary": managedProviderSafeErrorSummary(httpResp.StatusCode, nil, data),
+		}).Info("managed provider: upstream non-2xx")
+
+		if managedProviderRetryableStatusCodes[httpResp.StatusCode] && attempt < attempts-1 {
+			if errWait := e.waitForRetry(ctx, auth, attempt, prepared.baseModel, httpResp.StatusCode); errWait != nil {
+				return result, errWait
+			}
+			continue
+		}
+		return result, statusErr{code: httpResp.StatusCode, msg: string(data)}
+	}
+	return result, fmt.Errorf("%s executor: missing response", e.Identifier())
+}
+
+func (e *ManagedProviderExecutor) openStreamTransport(ctx context.Context, auth *cliproxyauth.Auth, creds managedProviderCredentials, prepared managedProviderPreparedRequest, transport string, hasFallback bool) (*managedProviderStreamBootstrap, error) {
+	endpoint := e.endpointURL(creds, transport)
+	if endpoint == "" {
+		return nil, fmt.Errorf("%s executor: missing upstream endpoint for transport %s", e.Identifier(), transport)
+	}
+	attempts := e.maxRetries(auth) + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		start := time.Now()
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(prepared.body))
+		if errReq != nil {
+			return nil, errReq
+		}
+		e.applyHeaders(httpReq, auth, creds.apiKey, transport, true)
+		e.recordRequest(ctx, auth, endpoint, prepared.body, httpReq.Header)
+
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0, e.Identifier())
+		resp, errDo := httpClient.Do(httpReq)
+		latency := time.Since(start)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			if attempt < attempts-1 {
+				if errWait := e.waitForRetry(ctx, auth, attempt, prepared.baseModel, 0); errWait != nil {
+					return &managedProviderStreamBootstrap{Latency: latency}, errWait
+				}
+				continue
+			}
+			return &managedProviderStreamBootstrap{Latency: latency}, errDo
+		}
+
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+		bootstrap := &managedProviderStreamBootstrap{
+			Response:   resp,
+			StatusCode: resp.StatusCode,
+			Latency:    latency,
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			data, _ := io.ReadAll(resp.Body)
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Errorf("%s executor: close response body error: %v", e.Identifier(), errClose)
+			}
+			bootstrap.Body = data
+			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+			log.WithFields(log.Fields{
+				"provider":      e.Identifier(),
+				"attempt":       attempt + 1,
+				"status":        resp.StatusCode,
+				"duration":      latency.String(),
+				"transport":     transport,
+				"error_summary": managedProviderSafeErrorSummary(resp.StatusCode, nil, data),
+			}).Info("managed provider: stream upstream non-2xx")
+			if managedProviderRetryableStatusCodes[resp.StatusCode] && attempt < attempts-1 {
+				if errWait := e.waitForRetry(ctx, auth, attempt, prepared.baseModel, resp.StatusCode); errWait != nil {
+					return bootstrap, errWait
+				}
+				continue
+			}
+			return bootstrap, statusErr{code: resp.StatusCode, msg: string(data)}
+		}
+
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(nil, 52_428_800)
+		bootstrap.Scanner = scanner
+		bootstrap.Latency = time.Since(start)
+		firstEventTimeout := managedProviderFirstEventTimeout(creds.provider)
+		if hasFallback && firstEventTimeout > 0 {
+			firstLine, errFirst := readFirstManagedProviderStreamLine(ctx, resp, scanner, firstEventTimeout)
+			if errFirst != nil {
+				if errClose := resp.Body.Close(); errClose != nil {
+					log.WithError(errClose).Debug("managed provider: close stream body after bootstrap failure")
+				}
+				return bootstrap, errFirst
+			}
+			bootstrap.FirstLine = firstLine
+			bootstrap.Latency = time.Since(start)
+		}
+		log.WithFields(log.Fields{
+			"provider":            e.Identifier(),
+			"attempt":             attempt + 1,
+			"status":              resp.StatusCode,
+			"duration":            bootstrap.Latency.String(),
+			"transport":           transport,
+			"first_event_checked": hasFallback && firstEventTimeout > 0,
+		}).Info("managed provider: stream upstream ok")
+		return bootstrap, nil
+	}
+	return nil, fmt.Errorf("%s executor: missing response", e.Identifier())
+}
+
+var errManagedProviderFirstStreamEventTimeout = errors.New("managed provider first stream event timeout")
+
+func readFirstManagedProviderStreamLine(ctx context.Context, resp *http.Response, scanner *bufio.Scanner, timeout time.Duration) ([]byte, error) {
+	if timeout <= 0 {
+		return nil, nil
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		type scanResult struct {
+			ok   bool
+			line []byte
+			err  error
+		}
+		resultCh := make(chan scanResult, 1)
+		go func() {
+			ok := scanner.Scan()
+			result := scanResult{ok: ok}
+			if ok {
+				result.line = bytes.Clone(scanner.Bytes())
+			} else {
+				result.err = scanner.Err()
+			}
+			resultCh <- result
+		}()
+		select {
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+			return nil, ctx.Err()
+		case <-deadline.C:
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("%w after %s", errManagedProviderFirstStreamEventTimeout, timeout)
+		case result := <-resultCh:
+			if result.err != nil {
+				return nil, result.err
+			}
+			if !result.ok {
+				return nil, io.ErrUnexpectedEOF
+			}
+			if managedProviderMeaningfulStreamLine(result.line) {
+				return result.line, nil
+			}
+		}
+	}
+}
+
+func managedProviderMeaningfulStreamLine(line []byte) bool {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 {
+		return false
+	}
+	return !bytes.HasPrefix(trimmed, []byte(":"))
+}
+
+func bootstrapStatus(bootstrap *managedProviderStreamBootstrap) int {
+	if bootstrap == nil {
+		return 0
+	}
+	return bootstrap.StatusCode
+}
+
+func bootstrapLatency(bootstrap *managedProviderStreamBootstrap) time.Duration {
+	if bootstrap == nil {
+		return 0
+	}
+	return bootstrap.Latency
+}
+
+func bootstrapBody(bootstrap *managedProviderStreamBootstrap) []byte {
+	if bootstrap == nil {
+		return nil
+	}
+	return bootstrap.Body
 }
 
 func (e *ManagedProviderExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
@@ -451,7 +702,11 @@ func (e *ManagedProviderExecutor) FetchModels(ctx context.Context, auth *cliprox
 }
 
 func (e *ManagedProviderExecutor) RequestToFormat(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) sdktranslator.Format {
-	return managedProviderTransportFormat(e.selectTransport(nil, opts))
+	plan := e.transportPlan(nil, req, opts)
+	if len(plan.Transports) == 0 {
+		return managedProviderTransportFormat(e.selectTransport(nil, opts))
+	}
+	return managedProviderTransportFormat(plan.Transports[0])
 }
 
 type managedProviderPreparedRequest struct {
@@ -529,6 +784,14 @@ func (e *ManagedProviderExecutor) prepareRequestBody(ctx context.Context, auth *
 }
 
 func (e *ManagedProviderExecutor) selectTransport(auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) string {
+	plan := e.transportPlan(auth, cliproxyexecutor.Request{}, opts)
+	if len(plan.Transports) > 0 {
+		return plan.Transports[0]
+	}
+	return managedProviderTransportClaude
+}
+
+func (e *ManagedProviderExecutor) transportPlan(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) managedProviderTransportPlan {
 	creds := e.creds(auth)
 	mode := managedProviderTransportAuto
 	defaultTransport := managedProviderTransportClaude
@@ -539,7 +802,7 @@ func (e *ManagedProviderExecutor) selectTransport(auth *cliproxyauth.Auth, opts 
 		defaultTransport = normalizeManagedProviderTransport(creds.provider.DefaultTransport)
 	}
 	if auth != nil && auth.Attributes != nil {
-		if v := normalizeManagedProviderTransport(auth.Attributes["transport_mode"]); v != "" {
+		if v := strings.TrimSpace(auth.Attributes["transport_mode"]); v != "" {
 			mode = v
 		}
 		if v := normalizeManagedProviderTransport(auth.Attributes["default_transport"]); v != "" {
@@ -547,42 +810,107 @@ func (e *ManagedProviderExecutor) selectTransport(auth *cliproxyauth.Auth, opts 
 		}
 	}
 	if opts.Metadata != nil {
-		if v := normalizeManagedProviderTransport(metadataValueString(opts.Metadata[cliproxyexecutor.ManagedProviderTransportMetadataKey])); v != "" {
+		if v := strings.TrimSpace(metadataValueString(opts.Metadata[cliproxyexecutor.ManagedProviderTransportMetadataKey])); v != "" {
 			mode = v
 		}
 	}
-	switch normalizeManagedProviderTransport(mode) {
-	case managedProviderTransportClaude, managedProviderTransportOpenAI, managedProviderTransportResponses:
-		return normalizeManagedProviderTransport(mode)
+	intent := normalizeManagedProviderRouteIntent(mode)
+	baseModel := strings.TrimSpace(thinking.ParseSuffix(req.Model).ModelName)
+	if intent == "" || intent == managedProviderTransportAuto {
+		intent = managedProviderRouteIntentAuto
 	}
-	switch opts.SourceFormat {
-	case sdktranslator.FormatOpenAIResponse:
-		if strings.TrimSpace(creds.openAIResponsePath) != "" {
-			return managedProviderTransportResponses
-		}
-		if creds.openAIBaseURL != "" {
-			return managedProviderTransportOpenAI
-		}
-		return managedProviderTransportClaude
-	case sdktranslator.FormatOpenAI:
-		if creds.openAIBaseURL != "" {
-			return managedProviderTransportOpenAI
-		}
-		return managedProviderTransportClaude
-	case sdktranslator.FormatClaude:
-		if creds.claudeBaseURL != "" {
-			return managedProviderTransportClaude
-		}
-		return managedProviderTransportOpenAI
+
+	plan := managedProviderTransportPlan{Intent: intent}
+	demoteCooldown := false
+	switch intent {
+	case managedProviderTransportResponses:
+		plan.Transports = e.availableTransports(creds, managedProviderTransportResponses, managedProviderTransportOpenAI, managedProviderTransportClaude)
+	case managedProviderTransportOpenAI:
+		plan.Transports = e.availableTransports(creds, managedProviderTransportOpenAI, managedProviderTransportResponses, managedProviderTransportClaude)
+	case managedProviderRouteIntentOpenAI:
+		openAITransports := e.availableTransports(creds, managedProviderTransportResponses, managedProviderTransportOpenAI)
+		openAITransports = rankManagedProviderTransports(e.cfg, creds.provider, e.Identifier(), baseModel, openAITransports, opts.SourceFormat)
+		plan.Transports = append(openAITransports, e.availableTransports(creds, managedProviderTransportClaude)...)
+		plan.DynamicSelection = true
+		demoteCooldown = true
+	case managedProviderTransportClaude:
+		plan.Transports = e.availableTransports(creds, managedProviderTransportClaude, managedProviderTransportResponses, managedProviderTransportOpenAI)
 	default:
-		if defaultTransport == managedProviderTransportOpenAI && creds.openAIBaseURL != "" {
-			return managedProviderTransportOpenAI
-		}
-		if defaultTransport == managedProviderTransportResponses && strings.TrimSpace(creds.openAIResponsePath) != "" {
-			return managedProviderTransportResponses
-		}
-		return managedProviderTransportClaude
+		transports := e.availableTransports(creds, managedProviderDefaultTransportOrder(defaultTransport)...)
+		plan.Transports = rankManagedProviderTransports(e.cfg, creds.provider, e.Identifier(), baseModel, transports, opts.SourceFormat)
+		plan.DynamicSelection = true
+		demoteCooldown = true
 	}
+	plan.Transports = demoteUnavailableManagedProviderTransports(e.cfg, creds.provider, e.Identifier(), baseModel, plan.Transports, demoteCooldown)
+	plan.Transports = uniqueManagedProviderTransports(plan.Transports)
+	log.WithFields(log.Fields{
+		"provider":          e.Identifier(),
+		"model":             baseModel,
+		"intent":            plan.Intent,
+		"transports":        strings.Join(plan.Transports, ","),
+		"dynamic_selection": plan.DynamicSelection,
+		"source_format":     opts.SourceFormat.String(),
+		"response_format":   cliproxyexecutor.ResponseFormatOrSource(opts).String(),
+		"default_transport": defaultTransport,
+	}).Info("managed provider: selected transport plan")
+	return plan
+}
+
+func managedProviderDefaultTransportOrder(defaultTransport string) []string {
+	switch normalizeManagedProviderTransport(defaultTransport) {
+	case managedProviderTransportResponses:
+		return []string{managedProviderTransportResponses, managedProviderTransportOpenAI, managedProviderTransportClaude}
+	case managedProviderTransportOpenAI:
+		return []string{managedProviderTransportOpenAI, managedProviderTransportResponses, managedProviderTransportClaude}
+	case managedProviderTransportClaude:
+		return []string{managedProviderTransportClaude, managedProviderTransportResponses, managedProviderTransportOpenAI}
+	}
+	return []string{managedProviderTransportResponses, managedProviderTransportOpenAI, managedProviderTransportClaude}
+}
+
+func (e *ManagedProviderExecutor) availableTransports(creds managedProviderCredentials, transports ...string) []string {
+	out := make([]string, 0, len(transports))
+	for _, transport := range transports {
+		transport = normalizeManagedProviderTransport(transport)
+		if transport == "" || !e.transportAvailable(creds, transport) {
+			continue
+		}
+		out = append(out, transport)
+	}
+	return uniqueManagedProviderTransports(out)
+}
+
+func (e *ManagedProviderExecutor) transportAvailable(creds managedProviderCredentials, transport string) bool {
+	switch normalizeManagedProviderTransport(transport) {
+	case managedProviderTransportResponses:
+		return strings.TrimSpace(creds.openAIBaseURL) != "" && strings.TrimSpace(creds.openAIResponsePath) != ""
+	case managedProviderTransportOpenAI:
+		return strings.TrimSpace(creds.openAIBaseURL) != "" && strings.TrimSpace(creds.openAIChatPath) != ""
+	case managedProviderTransportClaude:
+		return strings.TrimSpace(creds.claudeBaseURL) != "" && strings.TrimSpace(creds.claudePath) != ""
+	default:
+		return false
+	}
+}
+
+func uniqueManagedProviderTransports(transports []string) []string {
+	if len(transports) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(transports))
+	out := make([]string, 0, len(transports))
+	for _, transport := range transports {
+		transport = normalizeManagedProviderTransport(transport)
+		if transport == "" {
+			continue
+		}
+		if _, ok := seen[transport]; ok {
+			continue
+		}
+		seen[transport] = struct{}{}
+		out = append(out, transport)
+	}
+	return out
 }
 
 func (e *ManagedProviderExecutor) endpointURL(creds managedProviderCredentials, transport string) string {
@@ -739,8 +1067,16 @@ func managedProviderFilterSet(values []string, prefix string) map[string]bool {
 
 func resolveManagedProviderModel(providerName, prefix, modelID string) string {
 	stripped := modelID
-	for _, protocolPrefix := range []string{registry.ManagedProviderAnthropicProtocolPrefix, registry.ManagedProviderOpenAIProtocolPrefix} {
-		stripped = strings.TrimPrefix(stripped, protocolPrefix)
+	for _, protocolPrefix := range []string{
+		registry.ManagedProviderOpenAIResponsesProtocolPrefix,
+		registry.ManagedProviderOpenAICompletionsProtocolPrefix,
+		registry.ManagedProviderAnthropicProtocolPrefix,
+		registry.ManagedProviderOpenAIProtocolPrefix,
+	} {
+		if strings.HasPrefix(stripped, protocolPrefix) {
+			stripped = strings.TrimPrefix(stripped, protocolPrefix)
+			break
+		}
 	}
 	if prefix != "" {
 		stripped = strings.TrimPrefix(stripped, prefix)
@@ -868,12 +1204,18 @@ func (e *ManagedProviderExecutor) creds(auth *cliproxyauth.Auth) managedProvider
 }
 
 func (c managedProviderCredentials) protocolAliasPrefixes() []string {
-	prefixes := make([]string, 0, 2)
+	prefixes := make([]string, 0, 4)
 	if strings.TrimSpace(c.claudeBaseURL) != "" && strings.TrimSpace(c.claudePath) != "" {
 		prefixes = append(prefixes, registry.ManagedProviderAnthropicProtocolPrefix)
 	}
-	if strings.TrimSpace(c.openAIBaseURL) != "" && strings.TrimSpace(c.openAIChatPath) != "" {
+	if strings.TrimSpace(c.openAIBaseURL) != "" && (strings.TrimSpace(c.openAIChatPath) != "" || strings.TrimSpace(c.openAIResponsePath) != "") {
 		prefixes = append(prefixes, registry.ManagedProviderOpenAIProtocolPrefix)
+	}
+	if strings.TrimSpace(c.openAIBaseURL) != "" && strings.TrimSpace(c.openAIResponsePath) != "" {
+		prefixes = append(prefixes, registry.ManagedProviderOpenAIResponsesProtocolPrefix)
+	}
+	if strings.TrimSpace(c.openAIBaseURL) != "" && strings.TrimSpace(c.openAIChatPath) != "" {
+		prefixes = append(prefixes, registry.ManagedProviderOpenAICompletionsProtocolPrefix)
 	}
 	return prefixes
 }
@@ -1010,7 +1352,24 @@ func normalizeManagedProviderTransport(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "claude", "anthropic":
 		return managedProviderTransportClaude
-	case "openai", "openai-chat", "chat":
+	case "openai", "openai-chat", "chat", "openai-completions", "openai-chat-completions", "chat-completions":
+		return managedProviderTransportOpenAI
+	case "responses", "openai-response", "openai-responses":
+		return managedProviderTransportResponses
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}
+
+func normalizeManagedProviderRouteIntent(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", managedProviderTransportAuto:
+		return managedProviderTransportAuto
+	case "claude", "anthropic":
+		return managedProviderTransportClaude
+	case "openai":
+		return managedProviderRouteIntentOpenAI
+	case "openai-chat", "chat", "openai-completions", "openai-chat-completions", "chat-completions":
 		return managedProviderTransportOpenAI
 	case "responses", "openai-response", "openai-responses":
 		return managedProviderTransportResponses

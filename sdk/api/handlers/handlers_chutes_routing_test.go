@@ -69,6 +69,8 @@ func TestGetRequestDetails_ManagedProviderProtocolPrefixRouting(t *testing.T) {
 	}{
 		{requested: "anthropic-example-glm-5.2", transport: "anthropic"},
 		{requested: "openai-example-qwen3.7-max", transport: "openai"},
+		{requested: "openai-responses-example-qwen3.7-max", transport: "openai-responses"},
+		{requested: "openai-completions-example-qwen3.7-max", transport: "openai-completions"},
 	} {
 		providers, model, metadata, err := handler.getRequestDetailsWithOptions(tc.requested, false)
 		if err != nil {
@@ -78,7 +80,7 @@ func TestGetRequestDetails_ManagedProviderProtocolPrefixRouting(t *testing.T) {
 			t.Fatalf("providers=%v, want [example-provider]", providers)
 		}
 		wantModel := "glm-5.2"
-		if tc.transport == "openai" {
+		if tc.transport != "anthropic" {
 			wantModel = "qwen3.7-max"
 		}
 		if model != wantModel {

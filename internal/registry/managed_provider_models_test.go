@@ -14,8 +14,8 @@ func TestGenerateManagedProviderAliases(t *testing.T) {
 
 func TestGenerateManagedProviderProtocolAliases(t *testing.T) {
 	models := GenerateManagedProviderAliases([]*ModelInfo{{ID: "glm-5.2", DisplayName: "GLM 5.2", Description: "base"}}, "example-", "example-provider")
-	models = GenerateManagedProviderProtocolAliases(models, "example-", "example-provider", ManagedProviderAnthropicProtocolPrefix, ManagedProviderOpenAIProtocolPrefix)
-	for _, id := range []string{"anthropic-example-glm-5.2", "openai-example-glm-5.2"} {
+	models = GenerateManagedProviderProtocolAliases(models, "example-", "example-provider", ManagedProviderAnthropicProtocolPrefix, ManagedProviderOpenAIProtocolPrefix, ManagedProviderOpenAIResponsesProtocolPrefix, ManagedProviderOpenAICompletionsProtocolPrefix)
+	for _, id := range []string{"anthropic-example-glm-5.2", "openai-example-glm-5.2", "openai-responses-example-glm-5.2", "openai-completions-example-glm-5.2"} {
 		if !hasManagedProviderModelID(models, id) {
 			t.Fatalf("missing protocol alias %q", id)
 		}
@@ -27,7 +27,7 @@ func TestGenerateManagedProviderProtocolAliases(t *testing.T) {
 
 func TestGetManagedProviderFallbackModelsIncludesRequestedFallbacksAndAliases(t *testing.T) {
 	models := GetManagedProviderFallbackModels("example-provider", "example-", "Example Provider", []string{"glm-5.2", "qwen3.7-max"})
-	models = GenerateManagedProviderProtocolAliases(models, "example-", "Example Provider", ManagedProviderAnthropicProtocolPrefix, ManagedProviderOpenAIProtocolPrefix)
+	models = GenerateManagedProviderProtocolAliases(models, "example-", "Example Provider", ManagedProviderAnthropicProtocolPrefix, ManagedProviderOpenAIProtocolPrefix, ManagedProviderOpenAIResponsesProtocolPrefix, ManagedProviderOpenAICompletionsProtocolPrefix)
 	for _, id := range []string{"glm-5.2", "qwen3.7-max"} {
 		if !hasManagedProviderModelID(models, id) {
 			t.Fatalf("missing fallback model %q", id)
@@ -35,7 +35,7 @@ func TestGetManagedProviderFallbackModelsIncludesRequestedFallbacksAndAliases(t 
 		if !hasManagedProviderModelID(models, "example-"+id) {
 			t.Fatalf("missing fallback alias %q", "example-"+id)
 		}
-		for _, modelID := range []string{id, "example-" + id, "anthropic-example-" + id, "openai-example-" + id} {
+		for _, modelID := range []string{id, "example-" + id, "anthropic-example-" + id, "openai-example-" + id, "openai-responses-example-" + id, "openai-completions-example-" + id} {
 			model := findManagedProviderModel(models, modelID)
 			if model == nil {
 				t.Fatalf("missing fallback model %q", modelID)

@@ -132,6 +132,7 @@ type ManagedProviderConfig struct {
 	OpenAIResponsesPath   string                              `yaml:"openai-responses-path,omitempty" json:"openai-responses-path,omitempty"`
 	TransportMode         string                              `yaml:"transport-mode,omitempty" json:"transport-mode,omitempty"`
 	DefaultTransport      string                              `yaml:"default-transport,omitempty" json:"default-transport,omitempty"`
+	RouteHealth           ManagedProviderRouteHealthConfig    `yaml:"route-health,omitempty" json:"route-health,omitempty"`
 	ModelDiscovery        ManagedProviderModelDiscoveryConfig `yaml:"model-discovery,omitempty" json:"model-discovery,omitempty"`
 	Models                []string                            `yaml:"models,omitempty" json:"models,omitempty"`
 	ModelsExclude         []string                            `yaml:"models-exclude,omitempty" json:"models-exclude,omitempty"`
@@ -155,4 +156,17 @@ type ManagedProviderModelDiscoveryConfig struct {
 	Path    string `yaml:"path,omitempty" json:"path,omitempty"`
 	Format  string `yaml:"format,omitempty" json:"format,omitempty"`
 	TTL     string `yaml:"ttl,omitempty" json:"ttl,omitempty"`
+}
+
+// ManagedProviderRouteHealthConfig controls backend transport health tracking and probing.
+type ManagedProviderRouteHealthConfig struct {
+	Enabled             *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	ProbeEnabled        *bool  `yaml:"probe-enabled,omitempty" json:"probe-enabled,omitempty"`
+	StatePath           string `yaml:"state-path,omitempty" json:"state-path,omitempty"`
+	ProbeInterval       string `yaml:"probe-interval,omitempty" json:"probe-interval,omitempty"`
+	ProbeTimeout        string `yaml:"probe-timeout,omitempty" json:"probe-timeout,omitempty"`
+	FirstEventTimeout   string `yaml:"first-event-timeout,omitempty" json:"first-event-timeout,omitempty"`
+	Cooldown            string `yaml:"cooldown,omitempty" json:"cooldown,omitempty"`
+	UnsupportedTTL      string `yaml:"unsupported-ttl,omitempty" json:"unsupported-ttl,omitempty"`
+	MaxConcurrentProbes int    `yaml:"max-concurrent-probes,omitempty" json:"max-concurrent-probes,omitempty"`
 }

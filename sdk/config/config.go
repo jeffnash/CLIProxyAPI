@@ -20,6 +20,7 @@ type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
 type ManagedProviderConfig = internalconfig.ManagedProviderConfig
 type ManagedProviderModelDiscoveryConfig = internalconfig.ManagedProviderModelDiscoveryConfig
+type ManagedProviderRouteHealthConfig = internalconfig.ManagedProviderRouteHealthConfig
 
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey

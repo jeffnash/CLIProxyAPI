@@ -10,8 +10,10 @@ const (
 	ManagedProviderSecretRedactionEnabled  = "enabled"
 	ManagedProviderSecretRedactionDisabled = "disabled"
 
-	ManagedProviderProtocolAnthropic = "anthropic"
-	ManagedProviderProtocolOpenAI    = "openai"
+	ManagedProviderProtocolAnthropic         = "anthropic"
+	ManagedProviderProtocolOpenAI            = "openai"
+	ManagedProviderProtocolOpenAIResponses   = "openai-responses"
+	ManagedProviderProtocolOpenAICompletions = "openai-completions"
 )
 
 // MergeManagedProviders merges provider entries by name, with later entries replacing earlier ones.
@@ -69,6 +71,12 @@ func NormalizeManagedProviders(providers []ManagedProviderConfig) []ManagedProvi
 		provider.ModelDiscovery.Path = normalizeManagedProviderPath(provider.ModelDiscovery.Path)
 		provider.ModelDiscovery.Format = strings.ToLower(strings.TrimSpace(provider.ModelDiscovery.Format))
 		provider.ModelDiscovery.TTL = strings.TrimSpace(provider.ModelDiscovery.TTL)
+		provider.RouteHealth.StatePath = strings.TrimSpace(provider.RouteHealth.StatePath)
+		provider.RouteHealth.ProbeInterval = strings.TrimSpace(provider.RouteHealth.ProbeInterval)
+		provider.RouteHealth.ProbeTimeout = strings.TrimSpace(provider.RouteHealth.ProbeTimeout)
+		provider.RouteHealth.FirstEventTimeout = strings.TrimSpace(provider.RouteHealth.FirstEventTimeout)
+		provider.RouteHealth.Cooldown = strings.TrimSpace(provider.RouteHealth.Cooldown)
+		provider.RouteHealth.UnsupportedTTL = strings.TrimSpace(provider.RouteHealth.UnsupportedTTL)
 		out = append(out, provider)
 	}
 	if len(out) == 0 {
@@ -139,6 +147,8 @@ func FindManagedProviderByProtocolPrefix(cfg *SDKConfig, model string) (ManagedP
 		prefix   string
 		protocol string
 	}{
+		{ManagedProviderProtocolOpenAIResponses + "-", ManagedProviderProtocolOpenAIResponses},
+		{ManagedProviderProtocolOpenAICompletions + "-", ManagedProviderProtocolOpenAICompletions},
 		{ManagedProviderProtocolAnthropic + "-", ManagedProviderProtocolAnthropic},
 		{ManagedProviderProtocolOpenAI + "-", ManagedProviderProtocolOpenAI},
 	} {

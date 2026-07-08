@@ -6,8 +6,10 @@ import (
 )
 
 const (
-	ManagedProviderAnthropicProtocolPrefix = "anthropic-"
-	ManagedProviderOpenAIProtocolPrefix    = "openai-"
+	ManagedProviderAnthropicProtocolPrefix         = "anthropic-"
+	ManagedProviderOpenAIProtocolPrefix            = "openai-"
+	ManagedProviderOpenAIResponsesProtocolPrefix   = "openai-responses-"
+	ManagedProviderOpenAICompletionsProtocolPrefix = "openai-completions-"
 )
 
 // GenerateManagedProviderAliases creates provider-prefixed aliases for explicit routing.
