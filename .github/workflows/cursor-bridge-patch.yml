@@ -32,21 +32,29 @@ jobs:
         run: |
           node -e '
             const { createRequire } = require("module");
+            const path = require("path");
             const req = createRequire(process.cwd() + "/cursor-agent-bridge.mjs");
             const p = req.resolve("@cursor/sdk");
             if (!p.endsWith("dist/cjs/index.js")) { console.error("resolved non-cjs:", p); process.exit(1); }
             const fs = require("fs");
-            const src = fs.readFileSync(p, "latin1");
+            const indexSrc = fs.readFileSync(p, "latin1");
+            if (!indexSrc.includes("cursor-composer-clienttools-eager-v1")) {
+              console.error("MISSING index eager-load marker:", p);
+              process.exit(1);
+            }
+            const chunk = path.join(path.dirname(p), "973.js");
+            const src = fs.readFileSync(chunk, "latin1");
             for (const m of ["cursor-composer-clienttools-patched-v1", "__CC_EXEC_U", "__CC_EXEC_S", "__CC_GET_ADVERTISE__", "__CC_ALLOW_NATIVE", "__CC_SELFTEST_DISPATCH_U", "__CC_SELFTEST_DISPATCH_S"]) {
               if (!src.includes(m)) { console.error("MISSING patch marker:", m); process.exit(1); }
             }
-            console.log("patched bundle verified:", p);
+            console.log("patched bundle verified:", chunk);
           '
       - name: Run bridge fail-closed self-tests against the patched bundle
         run: npm run selftest
       - name: node --check patched bundle + bridge + patcher
         run: |
           node --check node_modules/@cursor/sdk/dist/cjs/index.js
+          node --check node_modules/@cursor/sdk/dist/cjs/973.js
           node --check cursor-agent-bridge.mjs
           node -c scripts/apply-clienttools-patch.cjs
       - name: Idempotency (re-run patcher is a no-op)
