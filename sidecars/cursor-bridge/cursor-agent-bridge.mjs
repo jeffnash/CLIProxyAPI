@@ -29,13 +29,27 @@ import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { readFileSync, writeFileSync, mkdirSync, accessSync, constants, writeSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import path from "node:path";
 import {
   ToolRound,
   ToolRoundError,
   RoundState,
   CallState,
+  DeferredInputState,
   TerminalReason,
   createRoundInfrastructure,
   probeStateRoot,
@@ -44,6 +58,7 @@ import {
 import { SseWriter } from "./sse-writer.mjs";
 import {
   ToolContractRegistry,
+  ToolContractNormalizationError,
   normalizeToolArguments,
   normalizeToolResultEnvelope,
   clientToolFamily,
@@ -107,6 +122,8 @@ const EMPTY_CWD = path.join(STATE_ROOT, ".empty");
 // inventory from surviving the redesign without making cwd/workspace part of
 // routing.
 const DURABLE_AGENT_CONTEXT_EPOCH = "ct5";
+const CLIENT_TOOL_CONTRACT_VERSION = 2;
+const INTERNAL_ATTEMPT_MAX_BYTES = 4 << 20;
 // PENDING_TIMEOUT_MS / SESSION_TTL_MS must be POSITIVE (a 0 watchdog would reap a tool the instant it is
 // emitted; a 0 TTL would evict a session immediately) — floor them at 1ms via min:1.
 const PENDING_TIMEOUT_MS = envInt("CURSOR_AGENT_PENDING_TIMEOUT_MS", 600000, { min: 1 });
@@ -141,11 +158,11 @@ const COMPOSER_DEBUG = process.env.CURSOR_COMPOSER_DEBUG === "1" || process.env.
 // The /mcp route is dialed by the in-process SDK runtime over loopback only.
 const MCP_SHIM_RAW = String(process.env.CURSOR_COMPOSER_MCP_SHIM ?? "").trim().toLowerCase();
 const MCP_SHIM_ENABLED = !(MCP_SHIM_RAW === "0" || MCP_SHIM_RAW === "false");
-// EX3 (clean image path): a tool-result IMAGE is folded into the proto McpToolResult as McpImageContent, so the
+// EX3 (clean image path): a tool-result IMAGE is encoded in the proto McpToolResult as McpImageContent, so the
 // model sees it on RESUME — no fresh-send side-channel, and multi-tool/partial batches need no special handling
 // (each tool's image rides its OWN dispatchMcp result). ON by default — VERIFIED end-to-end that Cursor forwards
 // McpImageContent to composer-2.5 (composer read a token image returned this way). Set
-// CURSOR_COMPOSER_MCP_IMAGE_RESULTS=0 to fall back to the fresh-send fold (kept intact as the escape hatch, and
+// CURSOR_COMPOSER_MCP_IMAGE_RESULTS=0 to fall back to a separate recovery send (kept as the escape hatch, and
 // always used for url-form images, which McpImageContent's base64 `data` field cannot carry). Read at call time
 // (not a load-time const) so tests can exercise both paths.
 function mcpImageResultsEnabled() {
@@ -184,6 +201,15 @@ const MAX_QUEUE_DEPTH = envInt("CURSOR_AGENT_MAX_QUEUE_DEPTH", 32, { min: 1 });
 // ADD-64: generalized to the shared envInt guard (was a bespoke Number.isFinite check); min:1 so a 0/blank
 // can never disable the OOM bound (it falls back to the 64 MB default).
 const MAX_AGENT_TURN_BYTES = envInt("MAX_AGENT_TURN_BYTES", 64 * 1024 * 1024, { min: 1 });
+// Shared with Go's bufio.Scanner. The extra MiB covers `data:` framing and
+// JSON envelope overhead above the largest accepted request body. If an
+// operator raises MAX_AGENT_TURN_BYTES, they must raise this shared contract
+// too; accepting bytes that Go cannot read back is a startup configuration
+// error, not a runtime 502 surprise.
+const MAX_SSE_FRAME_BYTES = envInt("CURSOR_COMPOSER_MAX_SSE_FRAME_BYTES", 65 * 1024 * 1024, { min: 1 << 20 });
+if (MAX_SSE_FRAME_BYTES < MAX_AGENT_TURN_BYTES + (1 << 20)) {
+  throw new Error("CURSOR_COMPOSER_MAX_SSE_FRAME_BYTES must be at least MAX_AGENT_TURN_BYTES + 1048576 bytes");
+}
 // Per-response SSE output-queue cap. When a client/proxy applies sustained backpressure, SseWriter queues only
 // later frames that have not reached res.write. This bounds the queue so a slow/stuck client cannot OOM the sidecar. Past the
 // cap the turn is cancelled with a typed transport error (never a fake success). This is a MEMORY bound, NOT a
@@ -228,8 +254,8 @@ const RUN_AS_MAIN = process.argv[1] === fileURLToPath(import.meta.url);
 // Loading is lazy (loadSdk) so this module can be imported for unit tests without pulling the SDK's
 // heavy/native deps; the real server calls loadSdk() at startup (fail-closed) BEFORE it accepts traffic.
 const require = createRequire(import.meta.url);
-const SDK_PATCH_DESCRIPTOR_VERSION = 3;
-const SDK_PATCHER_VERSION = 4;
+const SDK_PATCH_DESCRIPTOR_VERSION = 4;
+const SDK_PATCHER_VERSION = 5;
 const SDK_PRISTINE_BUNDLE_SHA256 = "829ced604bb88908e49fcf5cd31eb22bce4e57d32074b2846d86a6c5afa26881";
 const SDK_PRISTINE_INDEX_SHA256 = "3157e86833e5033ce7b870cfd9810edc4b1e9c0637b93170779d6cbb3feba022";
 const SDK_PINNED_VERSION = "1.0.23";
@@ -241,6 +267,7 @@ const SDK_PATCH_SEAMS = {
   mcpArtifactSpillPolicy: 1,
   mcpMetaToolPolicy: 1,
   localExecutorLoader: 1,
+  localSendRequestId: 1,
   moduleExport: 1,
 };
 
@@ -278,6 +305,7 @@ function assertPatched(p) {
     descriptor?.nativeExecutionDefault !== "deny" ||
     descriptor?.mcpArtifactSpillThresholdBytes !== 0 ||
     descriptor?.mcpMetaToolEnabled !== false ||
+    descriptor?.localSendIdempotency !== "deterministic-request-id" ||
     descriptor?.sourceVerified !== true ||
     descriptor?.pristineBundleSha256 !== SDK_PRISTINE_BUNDLE_SHA256 ||
     descriptor?.pristineIndexSha256 !== SDK_PRISTINE_INDEX_SHA256 ||
@@ -290,7 +318,7 @@ function assertPatched(p) {
   if (descriptor.patchedBundleSha256 !== bundleHash || descriptor.patchedIndexSha256 !== indexHash) {
     throw new Error("[bridge] @cursor/sdk installed bytes do not match the patch descriptor. Refusing to start.");
   }
-  if (!chunkBytes.subarray(0, 64).toString("latin1").includes("cursor-composer-clienttools-patched-v4") || !indexBytes.toString("latin1").includes("cursor-composer-clienttools-eager-v4")) {
+  if (!chunkBytes.subarray(0, 64).toString("latin1").includes("cursor-composer-clienttools-patched-v5") || !indexBytes.toString("latin1").includes("cursor-composer-clienttools-eager-v5")) {
     throw new Error("[bridge] @cursor/sdk descriptor hashes matched but structural markers are absent. Refusing to start.");
   }
   return descriptor;
@@ -384,10 +412,9 @@ function toSdkImages(images) {
   });
 }
 
-// collectToolResultImages gathers any images carried INSIDE tool results (BR9/EX3: the executor extracts
-// image parts from a role:tool message and threads them as tr.images). The Cursor tool-result protobuf
-// shape cannot carry images, so they are folded into the C1/re-seed user send instead. Returns a flat array
-// of image maps ({data,mimeType} or {url[,mimeType]}); empty when none are present.
+// collectToolResultImages gathers compatibility image projections carried inside tool results. Base64 images
+// normally travel in the MCP result itself; URL images and recovery paths attach these projections to a
+// separate faithful SDK user send. Returns {data,mimeType} or {url[,mimeType,detail]} entries.
 function collectToolResultImages(input) {
   const out = [];
   for (const tr of (input && input.results) || []) {
@@ -407,9 +434,43 @@ function truncateLiveToolResult(content, cap = COMPOSER_LIVE_TOOL_RESULT_MAX_BYT
   if (typeof content !== "string") return content;
   const total = Buffer.byteLength(content);
   if (total <= cap) return content;
-  let kept = content.slice(0, cap);
-  while (Buffer.byteLength(kept) > cap && kept.length) kept = kept.slice(0, -1);
-  return kept + `\n[tool result truncated by proxy: kept ${Buffer.byteLength(kept)}/${total} bytes]`;
+  const bridgeMarkers = ["\n\n[BRIDGE] STILL RUNNING", "\n\n[BRIDGE] Your Workflow call FAILED"];
+  const bridgeMarker = Math.max(...bridgeMarkers.map((marker) => content.lastIndexOf(marker)));
+  const candidateSuffix = bridgeMarker >= 0 ? content.slice(bridgeMarker) : "";
+  const suffix = Buffer.byteLength(candidateSuffix) <= 16 << 10 ? candidateSuffix : "";
+  const head = suffix ? content.slice(0, bridgeMarker) : content;
+  const budget = Math.max(0, cap - Buffer.byteLength(suffix));
+  let kept = head.slice(0, budget);
+  while (Buffer.byteLength(kept) > budget && kept.length) kept = kept.slice(0, -1);
+  return kept + `\n[tool result truncated by proxy: kept ${Buffer.byteLength(kept)}/${total} bytes]` + suffix;
+}
+
+function sseFrameSizeError(payload, cap = MAX_SSE_FRAME_BYTES) {
+  const bytes = Buffer.byteLength(String(payload ?? ""), "utf8");
+  return bytes > cap ? new Error(`bridge SSE frame is ${bytes} bytes, exceeding the shared ${cap}-byte limit`) : null;
+}
+
+function blocksWithAuthoritativeContent(blocks, content) {
+  const source = Array.isArray(blocks) ? blocks : [];
+  const replacement = content === ""
+    ? null
+    : typeof content === "string"
+      ? { type: "text", text: content }
+      : { type: "json", value: content };
+  const out = [];
+  let replaced = false;
+  for (const block of source) {
+    if (block && block.type === "image") {
+      out.push(block);
+      continue;
+    }
+    if (!replaced) {
+      if (replacement) out.push(replacement);
+      replaced = true;
+    }
+  }
+  if (!replaced && replacement) out.unshift(replacement);
+  return out;
 }
 // normalizeClientToolResult gives every tool adapter one result contract (checklist section 3)
 // - Preserves failure only when isError === true (never infers from text)
@@ -417,8 +478,23 @@ function truncateLiveToolResult(content, cap = COMPOSER_LIVE_TOOL_RESULT_MAX_BYT
 // - Separates valid inline base64 images and URL images without dropping either
 // - Keeps valid structured content as object
 // - Applies Workflow/background augmentations
-function normalizeClientToolResult(content, isError, images, structuredContent, toolName) {
-  const normalized = normalizeToolResultEnvelope(content, isError, images, structuredContent);
+function normalizeClientToolResult(
+  content,
+  isError,
+  images,
+  structuredContent,
+  toolName,
+  contentBlocks = undefined,
+  structuredContentPresent = structuredContent !== undefined,
+) {
+  const normalized = normalizeToolResultEnvelope(
+    content,
+    isError,
+    images,
+    structuredContent,
+    contentBlocks,
+    structuredContentPresent,
+  );
   let normalizedContent = normalized.content;
   // Keep deterministic: don't coerce null to empty, keep as is except undefined -> ""
   // Apply augmentations here (single place)
@@ -430,7 +506,11 @@ function normalizeClientToolResult(content, isError, images, structuredContent, 
   }
   // Apply live cap to string content (bridge backstop)
   normalizedContent = truncateLiveToolResult(normalizedContent);
-  return { ...normalized, content: normalizedContent };
+  const contentChanged = !Object.is(normalizedContent, normalized.content);
+  const normalizedBlocks = contentChanged
+    ? blocksWithAuthoritativeContent(normalized.contentBlocks, normalizedContent)
+    : normalized.contentBlocks;
+  return { ...normalized, content: normalizedContent, contentBlocks: normalizedBlocks };
 }
 
 const TOOL_CHOICE_SPECIFIC_PREFIX = "specific:";
@@ -588,6 +668,7 @@ const COMPOSER_MAX_REPEAT_TOOL = envInt("CURSOR_COMPOSER_MAX_REPEAT_TOOL", 8, { 
 // forever without advancing the ordinary tool-round counter. This is a count,
 // not an upstream deadline.
 const COMPOSER_MAX_INVALID_TOOL_CALLS = envInt("CURSOR_COMPOSER_MAX_INVALID_TOOL_CALLS", 32, { min: 1 });
+const COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS = envInt("CURSOR_COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS", 8, { min: 2 });
 // Observability only: after this much silence from SDK callbacks, emit a debug
 // line on the existing SSE keepalive cadence. It never cancels or times out the
 // established Cursor stream.
@@ -618,8 +699,11 @@ function toolManifest(advertised) {
   if (truncated) lines.push("- …more client tools are available");
   return "Available client tools this turn:\n"
     + lines.join("\n")
-    + "\nCall the matching tool directly by its exact name and declared schema. "
-    + "A tool failure is real and must not be treated as success.";
+    + "\nThese are direct client capabilities executed by the calling harness on the user's machine. "
+    + "Call the matching tool by its exact advertised name and declared schema; do not invent wrapper or transport tool names. "
+    + "Invalid calls are not executed. Wait for each returned result, and treat an error result as a real failure rather than success. "
+    + "Consume returned content directly; do not create scratch files merely to relay tool output unless the user explicitly requested a file. "
+    + "When a task requires delegation and a delegation capability is advertised, call it rather than only narrating delegation.";
 }
 
 // toolManifestRule wraps the manifest text in a valid always-apply agent.v1.CursorRule for delivery via
@@ -926,22 +1010,42 @@ function typedUnavailableResult(cas) {
 // drive the SAME function the live run uses instead of a hand-retyped literal (ADD-74: a literal can drift from
 // the real shape and pass CI while the first real tool-call crashes inside fromJson). content is normalized to a
 // string exactly as the live wrap did (object content -> JSON.stringify). isError is strict-true.
-function mcpDispatchResult(content, isError, images, structuredContent) {
+function mcpStructuredProjection(structuredContent, structuredContentPresent) {
+  if (!structuredContentPresent) return { marker: null, structuredContent: undefined };
+  if (structuredContent && typeof structuredContent === "object" && !Array.isArray(structuredContent)) {
+    return { marker: null, structuredContent };
+  }
+  return { marker: `[Structured content: ${JSON.stringify(structuredContent)}]`, structuredContent: undefined };
+}
+
+function mcpDispatchResult(content, isError, images, structuredContent, contentBlocks, structuredContentPresent = structuredContent !== undefined) {
   const text = typeof content === "string" ? content : JSON.stringify(content ?? "");
   const parts = [];
-  if (Array.isArray(images)) {
+  if (Array.isArray(contentBlocks)) {
+    for (const block of contentBlocks) {
+      if (block && block.type === "text" && typeof block.text === "string") {
+        parts.push({ text: { text: block.text } });
+      } else if (block && block.type === "json") {
+        parts.push({ text: { text: JSON.stringify(block.value) } });
+      } else if (block && block.type === "image" && block.source && block.source.kind === "base64") {
+        parts.push({ image: { data: block.source.data, mimeType: block.source.mimeType } });
+      } else if (block && block.type === "image" && block.source && block.source.kind === "url") {
+        parts.push({ text: { text: `[Image URL: ${block.source.url}]` } });
+      }
+    }
+  } else if (Array.isArray(images)) {
     for (const im of images) {
       if (im && typeof im.data === "string" && im.data && typeof im.mimeType === "string" && im.mimeType) {
         parts.push({ image: { data: im.data, mimeType: im.mimeType } });
       }
     }
   }
-  if (text || parts.length === 0) parts.push({ text: { text } });
+  if (!Array.isArray(contentBlocks) && (text || parts.length === 0)) parts.push({ text: { text } });
+  if (parts.length === 0) parts.push({ text: { text: "" } });
   const result = { success: { isError: isError === true, content: parts } };
-  // Preserve structuredContent if provided (for future SDKs that support it; currently ignored in MCP shape but kept for testing parity)
-  if (structuredContent && typeof structuredContent === "object") {
-    result.success.structuredContent = structuredContent;
-  }
+  const structured = mcpStructuredProjection(structuredContent, structuredContentPresent);
+  if (structured.structuredContent !== undefined) result.success.structuredContent = structured.structuredContent;
+  if (structured.marker !== null) result.success.content.push({ text: { text: structured.marker } });
   return result;
 }
 
@@ -1064,7 +1168,7 @@ function unaryExecPreflight(cas, store) {
   // stream error. (Subagent/computerUse/etc. without a safe result shape still fall through to the reject.)
   if (TYPED_UNAVAILABLE_U.has(cas)) {
     dbg("__CC_EXEC_U typed-unavailable result (H17)", "session=" + (store && store.session && store.session.id), "cas=" + cas);
-    if (store && store.session) store.session.recordInternalToolRejection("typed-unavailable", cas);
+    if (store && store.session) store.session.recordInternalToolRejection("typed-unavailable", cas, { settleAnnounced: true });
     return Promise.resolve(typedUnavailableResult(cas));
   }
   return null;
@@ -1074,7 +1178,7 @@ function blockedNativeExecIfNeeded(store, cas, s, stream) {
   if (!store || !nativeToolBlockedByChoice(store.session.toolChoice)) return null;
   const cwd = composerWorkspaceCwd(store.session.clientEnv);
   dbg("__CC_EXEC_" + (stream ? "S" : "U") + " native tool blocked by tool_choice", "session=" + store.session.id, "cas=" + cas, "toolChoice=" + store.session.toolChoice);
-  store.session.recordInternalToolRejection("tool-choice", cas);
+  store.session.recordInternalToolRejection("tool-choice", cas, { settleAnnounced: true, input: s });
   if (stream) {
     return (async function* () { yield { __ccJson: { stdout: { data: "" } } }; yield { __ccJson: { exit: { code: 1, cwd, aborted: true, localExecutionTimeMs: 1 } } }; })();
   }
@@ -1089,7 +1193,7 @@ function blockedSyntheticNativeExecIfNeeded(store, cas, s, stream) {
   if (!failure) return null;
   const cwd = composerWorkspaceCwd(store.session.clientEnv);
   dbg("__CC_EXEC_" + (stream ? "S" : "U") + " internal artifact blocked at SDK dispatch", "session=" + store.session.id, "cas=" + cas);
-  store.session.recordInternalToolRejection("synthetic-artifact", cas);
+  store.session.recordInternalToolRejection("synthetic-artifact", cas, { settleAnnounced: true, input });
   if (stream) {
     return (async function* () {
       for (const chunk of spec.buildChunks(failure.content, true, { cwd })) yield { __ccJson: chunk };
@@ -1181,6 +1285,147 @@ function keyHash(k) { return createHash("sha256").update(String(k || "")).digest
 // the full fingerprint so two keys that collide on the first 64 bits cannot silently share a platform/account
 // + durable state — a truncated-collision-but-different-full-key is rejected in getPlatform/platformHasSession.
 function keyFingerprint(k) { return createHash("sha256").update(String(k || "")).digest("hex"); }
+
+function sdkUserTextHash(message) {
+  const text = typeof message === "string" ? message : String(message && message.text || "");
+  return createHash("sha256").update(text).digest("hex");
+}
+
+// Cursor's public Agent.messages.list() returns protobuf-derived conversation
+// turns whose exact wrapper has changed across SDK builds. Walk only the small,
+// JSON-like checkpoint object and recognize the documented user-message keys;
+// do not couple crash recovery to one generated wrapper spelling.
+function checkpointUserTexts(value, out = [], depth = 0, seen = new Set()) {
+  if (depth > 12 || value == null || typeof value !== "object" || seen.has(value)) return out;
+  seen.add(value);
+  if ((value.type === "user_message" || value.role === "user") && typeof value.text === "string") out.push(value.text);
+  for (const key of ["userMessage", "user_message"]) {
+    const user = value[key];
+    if (user && typeof user === "object" && typeof user.text === "string") out.push(user.text);
+  }
+  for (const nested of Array.isArray(value) ? value : Object.values(value)) {
+    checkpointUserTexts(nested, out, depth + 1, seen);
+  }
+  return out;
+}
+
+async function reconcileDeferredDelivery(round, deferred, cursorKey) {
+  if (!deferred || deferred.state !== DeferredInputState.DELIVERING) return false;
+  const agentId = typeof deferred.deliveryAgentId === "string" ? deferred.deliveryAgentId : "";
+  const textHash = typeof deferred.deliveryTextHash === "string" ? deferred.deliveryTextHash : "";
+  // The SDK checkpoint message API currently omits image bytes. Do not claim a
+  // match from text alone when two image-bearing sends could share the text.
+  if (!agentId || !/^[a-f0-9]{64}$/.test(textHash) || deferred.deliveryHasImages) return false;
+  try {
+    const platform = await getPlatform(cursorKey);
+    if (!platform || typeof platform.getAgentMessages !== "function") return false;
+    const messages = await platform.getAgentMessages(agentId);
+    const found = Array.isArray(messages) && messages.some((message) =>
+      checkpointUserTexts(message && message.message).some((text) => sdkUserTextHash(text) === textHash));
+    if (!found) return false;
+    round.markDeferredInputState(deferred.clientMessageId, DeferredInputState.DELIVERED, {
+      evidence: "durable_checkpoint",
+    });
+    return true;
+  } catch (error) {
+    dbg("deferred delivery checkpoint reconciliation failed", "route=" + round.route,
+      (error && error.message) || String(error));
+    return false;
+  }
+}
+
+function canonicalAttemptSignature(value) {
+  const ordered = (input) => {
+    if (Array.isArray(input)) return input.map(ordered);
+    if (input && typeof input === "object") {
+      return Object.fromEntries(Object.keys(input).sort().map((key) => [key, ordered(input[key])]));
+    }
+    return input;
+  };
+  return JSON.stringify(ordered(value)) ?? String(value);
+}
+
+function clientToolDescriptorFingerprint(descriptor) {
+  return descriptor
+    ? createHash("sha256").update(canonicalAttemptSignature(descriptor)).digest("hex")
+    : null;
+}
+
+// Hidden SDK preflight failures never receive signed executable ids, but they
+// still need a durable audit trail. Persist only schema paths, keywords,
+// transform kinds, hashes, and tool metadata—never raw argument values.
+function recordSanitizedInternalAttempt(session, {
+  kind,
+  toolName = "",
+  detail = "",
+  errors = [],
+  transforms = [],
+  input = undefined,
+}) {
+  const normalizedErrors = (Array.isArray(errors) ? errors : []).slice(0, 64).map((error) => ({
+    path: String(error && error.path || "arguments").slice(0, 512),
+    keyword: String(error && error.keyword || "contract").slice(0, 128),
+  }));
+  const transformKinds = (Array.isArray(transforms) ? transforms : []).slice(0, 64).map((transform) =>
+    String(transform && (transform.type || transform.kind || transform.action) || "transform").slice(0, 128));
+  const descriptor = session && session.toolRegistry && session.toolRegistry.find(toolName);
+  const schema = descriptor && descriptor.inputSchema;
+  const schemaFingerprint = schema ? createHash("sha256").update(safeJson(schema)).digest("hex") : null;
+  const argumentFingerprint = input === undefined
+    ? null
+    : createHash("sha256").update(canonicalAttemptSignature(input)).digest("hex");
+  const signatureSource = canonicalAttemptSignature({
+    kind,
+    toolName,
+    detail,
+    errors: normalizedErrors,
+    transformKinds,
+    schemaFingerprint,
+    argumentFingerprint,
+    toolInventoryEpoch: session && session.toolInventoryEpoch || null,
+  });
+  const record = {
+    attemptId: randomUUID(),
+    at: nowMs(),
+    sessionIdHash: createHash("sha256").update(String(session && session.id || "")).digest("hex"),
+    canonicalToolName: String(toolName || "").slice(0, 512),
+    category: String(kind || "contract").slice(0, 128),
+    schemaFingerprint,
+    argumentFingerprint,
+    toolInventoryEpoch: session && session.toolInventoryEpoch || null,
+    errorSignature: createHash("sha256").update(signatureSource).digest("hex"),
+    errors: normalizedErrors,
+    transforms: transformKinds,
+    executed: false,
+  };
+  const dir = STATE_ROOT;
+  const file = path.join(dir, "internal-tool-attempts.jsonl");
+  const previous = `${file}.previous`;
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      if (statSync(file).size >= INTERNAL_ATTEMPT_MAX_BYTES) {
+        rmSync(previous, { force: true });
+        renameSync(file, previous);
+      }
+    } catch (error) {
+      if (!error || error.code !== "ENOENT") throw error;
+    }
+    const fd = openSync(file, "a", 0o600);
+    try {
+      writeSync(fd, `${JSON.stringify(record)}\n`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch (error) {
+    // Diagnostics cannot make a valid turn unavailable.
+    dbg("failed to persist sanitized internal tool attempt", "session=" + (session && session.id),
+      "kind=" + kind, (error && error.message) || String(error));
+  }
+  return record;
+}
+
 function platformStateRoot(h) { return MULTI_TENANT ? path.join(STATE_ROOT, "k_" + h) : STATE_ROOT; }
 // PlatformKeyCollisionError marks a 64-bit truncated-hash collision between two DIFFERENT Cursor keys (ADD-53);
 // handleTurn maps it to a 500 rather than running under the wrong account.
@@ -1376,6 +1621,9 @@ class Session {
     this.cursorKey = cursorKey || API_KEY; // the Cursor key whose platform this session runs on
     this.agent = null; this.agentPromise = null; this.run = null;
     this.activeRes = null; this.responseWriter = null;
+    this.sendPending = false;
+    this.activeClientMessageId = "";
+    this.activeDeferredInputId = "";
     this.currentRound = null; this.roundSeq = 0;
     // When a continuation lands after the paused callback process is gone, the
     // replacement run keeps this terminal source round attached until it
@@ -1401,6 +1649,7 @@ class Session {
                                   // tool calls are journaled by ToolRound). Cleared at clearTurnState.
     this.pendingDeltaBytes = 0;   // running byte size of pendingDeltas (bounded like outQueue)
     this.toolRegistry = new AdvertisedToolRegistry();
+    this.toolInventoryEpoch = null;
     // Exact MCP server keys passed to the current SDK agent handle. The
     // generic key is always included and absorbs tools whose natural server
     // appears only after the durable agent's fixed mcpServers map was built.
@@ -1439,6 +1688,8 @@ class Session {
     this.waiters = 0;                // new-user turns queued but not yet running (single source of truth for depth-cap + eviction safety)
     this.writeFailed = false;
     this._logicalDone = [];          // resolvers fired when the live run TRULY completes (onRunComplete/onRunError/cancel), NOT at a tool-pause
+    this._turnDone = [];
+    this.lastSettledTurnToken = 0;
     this.runEpoch = 0;               // bumped per run + on cancel; a run.wait() callback ignores its result if the epoch advanced (the run was superseded/cancelled and a new turn may already own the session)
     // ADD-106 (Comment 3): per-LOGICAL-RUN agentic-loop bound counters. Reset by resetLoopBounds() when a fresh
     // send starts a new logical run; advanced once per tool-result round (pauseForTools). loopTripped latches so
@@ -1447,6 +1698,8 @@ class Session {
     this.lastToolSig = null;         // signature (name+args) of the SOLE tool in the last single-tool round, or null
     this.repeatToolCount = 0;        // consecutive single-tool rounds whose signature equals lastToolSig
     this.invalidToolCalls = 0;       // schema-rejected calls handled inside the bridge (no client round allocated)
+    this.internalRejectionCounts = new Map();
+    this.internalRejectionSignatures = new Map();
     this.loopTripped = false;        // latched true once a loop bound trips, so we terminate the run only once
   }
 
@@ -1538,8 +1791,12 @@ class Session {
   hasQueuedWaiters() { return this.waiters > 0; }
   resetSeedState() { this.seeded = false; this.seededSystem = ""; this.historyFingerprint = null; }
   async finishRotationCancel() { await this.cancel(); this.done = false; }
-  whenLogicalDone() { if (!this.run) return Promise.resolve(); return new Promise((r) => this._logicalDone.push(r)); }
+  whenLogicalDone() { if (!this.run && !this.sendPending) return Promise.resolve(); return new Promise((r) => this._logicalDone.push(r)); }
   notifyLogicalDone() { const ws = this._logicalDone; this._logicalDone = []; for (const w of ws) { try { w(); } catch {} } }
+  whenTurnSettled(token = this.turnToken) {
+    if (this.lastSettledTurnToken >= token) return Promise.resolve();
+    return new Promise((resolve) => this._turnDone.push({ token, resolve }));
+  }
   beginResponse(res) {
     this.activeRes = res;
     this.writeFailed = false;
@@ -1568,6 +1825,13 @@ class Session {
       handedToNode.catch(() => {});
       return { queued: false, handedToNode, ok: false };
     }
+    const frameError = sseFrameSizeError(payload);
+    if (frameError) {
+      this.responseWriter.fail(frameError);
+      const handedToNode = Promise.reject(frameError);
+      handedToNode.catch(() => {});
+      return { queued: false, handedToNode, ok: false };
+    }
     return this.responseWriter.write(payload);
   }
   failWrite(reason) {
@@ -1587,35 +1851,94 @@ class Session {
     return normalized;
   }
 
-  validateClientToolInput(name, input, transforms = []) {
+  settleAnnouncedToolAttempt() {
+    const handed = this.activeToolBatch().length;
+    if (this.stepToolStarted > handed) this.stepToolStarted--;
+  }
+
+  internalContractFailure(name, error) {
+    return {
+      content: `Client tool '${name}' was not executed because its arguments were ambiguous or malformed: ${error.message}`,
+      isError: true,
+      structuredContent: {
+        code: error.code || "client_tool_normalization_failed",
+        tool: name,
+        path: error.path || "arguments",
+        executed: false,
+      },
+    };
+  }
+
+  validateClientToolInput(name, input, transforms = [], { settleAnnounced = false } = {}) {
     const failure = this.toolRegistry.validate(name, input, transforms);
     if (!failure) return null;
-    this.recordInternalToolRejection("schema", name);
+    this.recordInternalToolRejection("schema", name, {
+      settleAnnounced,
+      toolName: name,
+      errors: failure.structuredContent && failure.structuredContent.errors,
+      transforms,
+      input,
+    });
     dbg("client tool schema preflight rejected before handoff", "session=" + this.id,
       "name=" + name, "invalidCalls=" + this.invalidToolCalls,
       "errors=" + safeJson(failure.structuredContent && failure.structuredContent.errors));
     if (this.loopTripped) {
-      const reason = `composer run exceeded the invalid client-tool call bound (${COMPOSER_MAX_INVALID_TOOL_CALLS}); aborting a likely schema-retry loop`;
+      const reason = this.lastRunError || "client_tool_contract_mismatch: repeated invalid client-tool call";
       failure.content += `\n${reason}`;
       failure.structuredContent.limitExceeded = true;
     }
     return failure;
   }
 
-  recordInternalToolRejection(kind, detail = "") {
+  recordInternalToolRejection(kind, detail = "", {
+    settleAnnounced = false,
+    toolName = detail,
+    errors = [],
+    transforms = [],
+    input = undefined,
+  } = {}) {
     if (this.loopTripped) return true;
+    if (settleAnnounced) this.settleAnnouncedToolAttempt();
+    const attempt = recordSanitizedInternalAttempt(this, { kind, toolName, detail, errors, transforms, input });
     this.invalidToolCalls++;
+    const categoryCount = (this.internalRejectionCounts.get(kind) || 0) + 1;
+    this.internalRejectionCounts.set(kind, categoryCount);
+    // A repetition is identical only when tool, schema epoch, normalized
+    // error, transforms, and the privacy-safe argument fingerprint all match.
+    // The old kind+detail signature collapsed every `_grep:ambiguous_alias`
+    // correction into one bucket and killed unrelated OMP subagent attempts.
+    const signature = attempt.errorSignature;
+    const signatureCount = (this.internalRejectionSignatures.get(signature) || 0) + 1;
+    this.internalRejectionSignatures.set(signature, signatureCount);
     dbg("internal client-tool rejection", "session=" + this.id, "kind=" + kind,
-      "detail=" + detail, "count=" + this.invalidToolCalls);
-    if (this.invalidToolCalls >= COMPOSER_MAX_INVALID_TOOL_CALLS) {
-      this.tripLoopBound(`composer run exceeded the internal client-tool rejection bound (${COMPOSER_MAX_INVALID_TOOL_CALLS}); aborting a likely retry loop (${kind})`);
+      "detail=" + detail, "total=" + this.invalidToolCalls, "category=" + categoryCount, "signature=" + signatureCount);
+    if (signatureCount >= COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS || categoryCount >= COMPOSER_MAX_INVALID_TOOL_CALLS) {
+      const reason = signatureCount >= COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS
+        ? `client_tool_contract_mismatch: composer repeated the same internally rejected client-tool call (${kind}:${detail}); the tool was not executed`
+        : `client_tool_contract_mismatch: composer run exceeded the ${kind} client-tool rejection bound (${COMPOSER_MAX_INVALID_TOOL_CALLS}); the tool was not executed`;
+      this.tripLoopBound(reason, { error_code: "client_tool_contract_mismatch", executed: false });
       return true;
     }
     return false;
   }
 
   openClientTool({ source, rawToolCallId, name, input, resultAdapter }) {
-    const normalized = this.normalizeClientToolInput(name, input);
+    const settleAnnounced = source === "http-mcp"
+      || (typeof source === "string" && source.startsWith("patched-"));
+    let normalized;
+    try {
+      normalized = this.normalizeClientToolInput(name, input);
+    } catch (error) {
+      if (!(error instanceof ToolContractNormalizationError)) throw error;
+      this.recordInternalToolRejection("normalization", `${name}:${error.code}`, {
+        settleAnnounced,
+        toolName: name,
+        errors: [{ path: error.path || "arguments", keyword: error.code || "normalization" }],
+        input,
+      });
+      const failure = this.internalContractFailure(name, error);
+      return Promise.resolve(resultAdapter ? resultAdapter(failure) : failure);
+    }
     input = normalized.value;
     if (normalized.transforms.length) {
       dbg("client tool contract translated SDK arguments", "session=" + this.id,
@@ -1624,10 +1947,10 @@ class Session {
     const syntheticFailure = this.syntheticArtifactFailure(name, input);
     if (syntheticFailure) {
       dbg("synthetic agent-tools artifact blocked", "session=" + this.id, "source=" + source, "name=" + name);
-      this.recordInternalToolRejection("synthetic-artifact", name);
+      this.recordInternalToolRejection("synthetic-artifact", name, { settleAnnounced, toolName: name, input });
       return Promise.resolve(resultAdapter ? resultAdapter(syntheticFailure) : syntheticFailure);
     }
-    const validationFailure = this.validateClientToolInput(name, input, normalized.transforms);
+    const validationFailure = this.validateClientToolInput(name, input, normalized.transforms, { settleAnnounced });
     if (validationFailure) {
       return Promise.resolve(resultAdapter ? resultAdapter(validationFailure) : validationFailure);
     }
@@ -1655,8 +1978,16 @@ class Session {
         },
       };
       try {
-        const call = round.openCall({ source, rawToolCallId, name, input, callback });
-        this.emitToolUse(call.wireId, name, input);
+        const call = round.openCall({
+          source,
+          rawToolCallId,
+          name,
+          input,
+          callback,
+          inventoryEpoch: this.toolInventoryEpoch,
+          descriptorFingerprint: clientToolDescriptorFingerprint(this.toolRegistry.find(name)),
+        });
+        if (call.newlyRegistered) this.emitToolUse(call.wireId, name, input);
       } catch (error) {
         reject(error);
       }
@@ -1684,7 +2015,10 @@ class Session {
     if (!clientTool) {
       const detail = `no advertised client tool safely matches Cursor's native '${spec.ccTool}' capability`;
       dbg("native client tool unavailable", "session=" + this.id, "name=" + spec.ccTool);
-      this.recordInternalToolRejection("native-unmatched", spec.ccTool);
+      this.recordInternalToolRejection("native-unmatched", spec.ccTool, {
+        settleAnnounced: true,
+        input: ccArgsFor(cas, s),
+      });
       return Promise.resolve({ __ccJson: spec.buildResult(detail, s, true, ctx) });
     }
     return this.openClientTool({
@@ -1703,7 +2037,10 @@ class Session {
       if (!clientTool) {
         const detail = `no advertised client tool safely matches Cursor's native '${spec.ccTool}' capability`;
         dbg("native streaming client tool unavailable", "session=" + self.id, "name=" + spec.ccTool);
-        self.recordInternalToolRejection("native-unmatched", spec.ccTool);
+        self.recordInternalToolRejection("native-unmatched", spec.ccTool, {
+          settleAnnounced: true,
+          input: ccArgsFor(cas, s),
+        });
         for (const chunk of spec.buildChunks(detail, true, ctx)) yield { __ccJson: chunk };
         return;
       }
@@ -1733,7 +2070,7 @@ class Session {
       const eff = this.advertiseForGating();
       const names = eff.map((t) => t.toolName || t.name).join(", ");
       dbg("dispatchMcp TOOL NOT AVAILABLE", "want=" + want, "advertisedCount=" + eff.length, "advertised=" + names);
-      this.recordInternalToolRejection("mcp-unmatched", want);
+      this.recordInternalToolRejection("mcp-unmatched", want, { settleAnnounced: true, input });
       return Promise.resolve({ __ccJson: mcpDispatchResult(`Tool '${want}' is not available. Available tools: ${names || "(none)"}.`, true) });
     }
     return this.openClientTool({
@@ -1742,11 +2079,26 @@ class Session {
       name: ccName,
       input,
       resultAdapter: (result) => {
-        const norm = normalizeClientToolResult(result.content, result.isError, result.images, result.structuredContent, ccName);
+        const norm = normalizeClientToolResult(
+          result.content,
+          result.isError,
+          result.images,
+          result.structuredContent,
+          ccName,
+          result.contentBlocks,
+          result.structuredContentPresent,
+        );
         this.rememberLargeMcpResult(norm.content, ccName);
         const imgs = mcpImageResultsEnabled() && norm.inlineImages ? norm.inlineImages : null;
         if (imgs) dbg("EX3 dispatchMcp folding image into McpToolResult (path A)", "session=" + this.id, "name=" + ccName, "images=" + imgs.length);
-        return { __ccJson: mcpDispatchResult(norm.content, norm.isError, imgs, norm.structuredContent) };
+        return { __ccJson: mcpDispatchResult(
+          norm.content,
+          norm.isError,
+          imgs,
+          norm.structuredContent,
+          norm.contentBlocks,
+          norm.structuredContentPresent,
+        ) };
       },
     });
   }
@@ -1829,8 +2181,76 @@ class Session {
     const batch = this.queuedToolCalls();
     if (!batch.length || !this.activeRes || this.writeFailed) return false;
     dbg("flushJournaledCalls", "session=" + this.id, "count=" + batch.length, "ids=" + safeJson(batch.map((call) => call.wireId)));
-    for (const call of batch) this.emitToolUse(call.wireId, call.name, call.input, { handJournaled: true });
-    return true;
+    const round = this.currentRound;
+    const refused = [];
+    const executable = [];
+    for (const call of batch) {
+      const descriptor = this.toolRegistry.find(call.name);
+      if (!descriptor) {
+        refused.push({
+          toolCallId: call.wireId,
+          content: `Client tool '${call.name}' was removed before its queued call reached the harness. The tool was not executed.`,
+          isError: true,
+          structuredContent: {
+            code: "client_tool_unavailable",
+            executed: false,
+            openedInventoryEpoch: call.inventoryEpoch,
+            currentInventoryEpoch: this.toolInventoryEpoch,
+            tool: call.name,
+          },
+        });
+        continue;
+      }
+      const currentDescriptorFingerprint = clientToolDescriptorFingerprint(descriptor);
+      if (call.descriptorFingerprint && call.descriptorFingerprint !== currentDescriptorFingerprint) {
+        refused.push({
+          toolCallId: call.wireId,
+          content: `Client tool '${call.name}' changed its descriptor before its queued call reached the harness. The tool was not executed.`,
+          isError: true,
+          structuredContent: {
+            code: "client_tool_schema_changed",
+            executed: false,
+            openedInventoryEpoch: call.inventoryEpoch,
+            currentInventoryEpoch: this.toolInventoryEpoch,
+            tool: call.name,
+          },
+        });
+        continue;
+      }
+      const failure = this.toolRegistry.validate(call.name, call.input);
+      if (failure) {
+        refused.push({
+          toolCallId: call.wireId,
+          content: `Client tool '${call.name}' changed schema before its queued call reached the harness. The tool was not executed.`,
+          isError: true,
+          structuredContent: {
+            code: "client_tool_schema_changed",
+            errors: failure.structuredContent && failure.structuredContent.errors || [],
+            executed: false,
+            openedInventoryEpoch: call.inventoryEpoch,
+            currentInventoryEpoch: this.toolInventoryEpoch,
+            tool: call.name,
+          },
+        });
+        continue;
+      }
+      executable.push(call);
+    }
+    let acted = false;
+    if (refused.length) {
+      const committed = round.commitResults(refused, { allowRegisteredReceipt: true });
+      round.applyCommittedResults([...committed.additions, ...committed.duplicates]);
+      this.lastSdkActivityAt = nowMs();
+      acted = true;
+    }
+    if (round.state !== RoundState.TERMINAL) {
+      for (const call of executable) {
+        if (call.state !== CallState.REGISTERED) continue;
+        this.emitToolUse(call.wireId, call.name, call.input, { handJournaled: true });
+        acted = true;
+      }
+    }
+    return acted;
   }
   // When the SDK has announced more tools for this step than the durable round has handed to the response,
   // wait one more debounce window for the rest of the
@@ -1870,12 +2290,30 @@ class Session {
       this.settle();
     }).catch(() => {});
   }
-  settle() { const f = this.settleTurn; this.settleTurn = null; if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; } if (f) f(); }
+  settle() {
+    const f = this.settleTurn;
+    this.settleTurn = null;
+    if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
+    this.lastSettledTurnToken = Math.max(this.lastSettledTurnToken, this.turnToken);
+    const ready = this._turnDone.filter((waiter) => waiter.token <= this.lastSettledTurnToken);
+    this._turnDone = this._turnDone.filter((waiter) => waiter.token > this.lastSettledTurnToken);
+    for (const waiter of ready) { try { waiter.resolve(); } catch {} }
+    if (f) f();
+  }
 
   // resetLoopBounds clears the per-logical-run agentic-loop counters (ADD-106). Called when a FRESH send starts a
   // new logical run (driveUserSend) — NOT on a tool_results resume, which continues the SAME logical run and so
   // keeps accumulating rounds. A cancel/supersession also resets them via the next fresh send.
-  resetLoopBounds() { this.toolRounds = 0; this.lastToolSig = null; this.repeatToolCount = 0; this.invalidToolCalls = 0; this.loopTripped = false; this.stashedToolResultImages = []; }
+  resetLoopBounds() {
+    this.toolRounds = 0;
+    this.lastToolSig = null;
+    this.repeatToolCount = 0;
+    this.invalidToolCalls = 0;
+    this.internalRejectionCounts.clear();
+    this.internalRejectionSignatures.clear();
+    this.loopTripped = false;
+    this.stashedToolResultImages = [];
+  }
 
   // checkLoopBound (ADD-106) counts ONE tool-result round (the batch about to be delivered in pauseForTools) and
   // enforces the per-logical-run bounds. Returns true when a bound TRIPPED (the run was terminated as an error
@@ -1913,14 +2351,14 @@ class Session {
   // — a typed loop-bound error the model/client sees — NEVER a clean end_turn/[DONE] (a false success). It also
   // cancels the live SDK run so the upstream stops producing, and bumps runEpoch (via cancel) so the superseded
   // run's late wait()/stream callbacks cannot leak into a successor turn.
-  tripLoopBound(reason) {
+  tripLoopBound(reason, terminalDetails = null) {
     if (this.loopTripped) return;
     this.loopTripped = true;
     this.lastRunError = reason; // BR2: a later tool_results that finds the run gone surfaces this real error
     dbg("tripLoopBound", "session=" + this.id, "rounds=" + this.toolRounds,
       "repeat=" + this.repeatToolCount, "invalid=" + this.invalidToolCalls, reason);
     this.rejectAllPending(reason, TerminalReason.LOOP_BOUND);
-    this.sse({ type: "turn_end", stop_reason: "error", error: reason });
+    this.sse({ type: "turn_end", stop_reason: "error", error: reason, ...(terminalDetails || {}) });
     this.settle();
     // cancel() tears down the live run/agent, rejects every pending, bumps runEpoch (epoch-gating the dead run's
     // callbacks), and fires notifyLogicalDone so a queued new-user turn is admitted. done=true short-circuits any
@@ -1930,11 +2368,14 @@ class Session {
 
   onRunComplete(res) {
     if (this.done) return;
-    this.done = true; this.run = null;
+    this.done = true; this.run = null; this.sendPending = false;
+    this.activeClientMessageId = ""; this.activeDeferredInputId = "";
+    const runError = res && res.error != null ? res.error : null;
     // BR2: a non-"finished" terminal means the upstream run failed; remember it so a tool_results turn that
     // finds nothing to resume surfaces the real error instead of a false-success empty turn.
-    if (res && res.status !== "finished") this.lastRunError = (res && res.error) || "run did not finish";
-    dbg("onRunComplete", "session=" + this.id, "status=" + (res && res.status), "error=" + safeJson(res && res.error),
+    if (res && res.status !== "finished") this.lastRunError = runError || "run did not finish";
+    dbg("onRunComplete", "session=" + this.id, "status=" + (res && res.status),
+      "error=" + (runError == null ? "(none)" : safeJson(runError)),
       "streamedTextLen=" + this.streamedText.length, "resultLen=" + ((res && res.result) || "").length);
     // text-delta deltas already streamed the full text incrementally. Only fall back to the
     // res.result lump if NO deltas fired this run (non-streaming edge) — otherwise we'd duplicate.
@@ -1957,8 +2398,8 @@ class Session {
     let turnError = unresolvedTools
       ? "composer run completed while client tools remained unresolved"
       : finished
-      ? (producedOutput ? (res && res.error) : "composer run finished with no output (empty turn)")
-      : ((res && res.error) || "composer run did not finish");
+      ? (producedOutput ? runError : "composer run finished with no output (empty turn)")
+      : (runError || "composer run did not finish");
     if (stopReason === "end_turn" && this.recoverySourceRound) {
       try {
         const prior = this.recoverySourceRound.recovery || {};
@@ -1994,14 +2435,17 @@ class Session {
     // the upstream connection is healthy.
     if (stopReason === "end_turn") closeBreaker(keyHash(this.cursorKey));
     this.rejectAllPending("run completed while client tools remained unresolved", TerminalReason.RUN_ERROR);
-    this.sse({ type: "turn_end", stop_reason: stopReason, status: res && res.status, error: turnError, usage: (res && res.usage) || {} });
+    const terminal = { type: "turn_end", stop_reason: stopReason, status: res && res.status, usage: (res && res.usage) || {} };
+    if (turnError != null && turnError !== "") terminal.error = turnError;
+    this.sse(terminal);
     this.clearTurnState();
     this.settle();
     this.notifyLogicalDone(); // real completion -> admit the next queued new-user turn
   }
   onRunError(err) {
     if (this.done) return;
-    this.done = true; this.run = null;
+    this.done = true; this.run = null; this.sendPending = false;
+    this.activeClientMessageId = ""; this.activeDeferredInputId = "";
     const msg = (err && err.message) || String(err);
     this.lastRunError = msg; // BR2: a tool_results turn that finds the run gone surfaces this real error
     if (this.recoverySourceRound) {
@@ -2138,6 +2582,9 @@ class Session {
     try { await (this.run && this.run.cancel && this.run.cancel()); } catch {}
     try { await (this.agent && this.agent.close && this.agent.close()); } catch {}
     this.run = null;
+    this.sendPending = false;
+    this.activeClientMessageId = "";
+    this.activeDeferredInputId = "";
     // Null the closed agent handle so a surviving queued waiter (the session is kept when waiters remain)
     // re-resumes/recreates a live agent via ensureAgent instead of reusing this dead one.
     this.agent = null; this.agentPromise = null;
@@ -2534,7 +2981,7 @@ async function mcpDispatch(msg, sessionId, serverKey) {
         dbg("mcp tools/call reconciled", "session=" + sessionId, "want=" + want, "reconciled=" + (ccName || "<UNAVAILABLE>"));
         if (!ccName) {
           const names = scopedTools.map((t) => t.toolName || t.name).join(", ");
-          session.recordInternalToolRejection("http-mcp-unmatched", want);
+          session.recordInternalToolRejection("http-mcp-unmatched", want, { settleAnnounced: true, input });
           return mcpResult(id, { content: [{ type: "text", text: `Tool '${want}' is not available. Available tools: ${names || "(none)"}.` }], isError: true });
         }
         try {
@@ -2548,21 +2995,36 @@ async function mcpDispatch(msg, sessionId, serverKey) {
             resultAdapter: (result) => result,
           });
           // Normalize once via shared helper (checklist 3)
-          const norm = normalizeClientToolResult(out.content, out.isError, out.images, out.structuredContent, ccName);
+          const norm = normalizeClientToolResult(
+            out.content,
+            out.isError,
+            out.images,
+            out.structuredContent,
+            ccName,
+            out.contentBlocks,
+            out.structuredContentPresent,
+          );
           session.rememberLargeMcpResult(norm.content, ccName);
           const parts = [];
-          // Inline base64 images
-          if (mcpImageResultsEnabled() && norm.inlineImages) {
-            for (const im of norm.inlineImages) {
-              parts.push({ type: "image", data: im.data, mimeType: im.mimeType });
+          for (const block of norm.contentBlocks) {
+            if (block && block.type === "text") parts.push({ type: "text", text: block.text });
+            else if (block && block.type === "json") parts.push({ type: "text", text: JSON.stringify(block.value) });
+            else if (block && block.type === "image" && block.source && block.source.kind === "base64" && mcpImageResultsEnabled()) {
+              parts.push({ type: "image", data: block.source.data, mimeType: block.source.mimeType });
+            } else if (block && block.type === "image" && block.source && block.source.kind === "url") {
+              parts.push({
+                type: "resource_link",
+                uri: block.source.url,
+                name: "tool-result image",
+                ...(block.source.mimeType ? { mimeType: block.source.mimeType } : {}),
+              });
             }
           }
-          // URL images fallback as text? Keep as text reference for now, plus preserve data
-          // For URL images, we include them as text if no inline, but also keep url-image fallback data
-          const text = typeof norm.content === "string" ? norm.content : JSON.stringify(norm.content ?? "");
-          if (text || parts.length === 0) parts.push({ type: "text", text });
+          if (parts.length === 0) parts.push({ type: "text", text: "" });
           const result = { content: parts, isError: norm.isError };
-          if (norm.structuredContent && typeof norm.structuredContent === "object") result.structuredContent = norm.structuredContent;
+          const structured = mcpStructuredProjection(norm.structuredContent, norm.structuredContentPresent);
+          if (structured.structuredContent !== undefined) result.structuredContent = structured.structuredContent;
+          if (structured.marker !== null) result.content.push({ type: "text", text: structured.marker });
           return mcpResult(id, result);
         } catch (rejErr) {
           return mcpResult(id, { content: [{ type: "text", text: (rejErr && rejErr.message) || String(rejErr) }], isError: true });
@@ -2580,8 +3042,16 @@ async function mcpDispatch(msg, sessionId, serverKey) {
 }
 
 async function dispatchMcpBatch(messages, sessionId, serverKey) {
-  const responses = await Promise.all(messages.map((message) => mcpDispatch(message, sessionId, serverKey)));
-  return responses.filter((response) => response !== null);
+  const responses = [];
+  // A JSON-RPC batch permits concurrent execution, but real agent clients
+  // routinely send initialize/activation/call sequences in one array. Ordered
+  // dispatch preserves those causal semantics and matches the pre-redesign
+  // behavior; batches are small enough that correctness dominates latency.
+  for (const message of messages) {
+    const response = await mcpDispatch(message, sessionId, serverKey);
+    if (response !== null) responses.push(response);
+  }
+  return responses;
 }
 
 // handleMcp serves the /mcp/<sessionId>[/<serverKey>] streamable-http endpoint. POST carries a single
@@ -2636,7 +3106,7 @@ async function handleMcp(req, res, sessionId, serverKey) {
   res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(result));
 }
 
-function streamCallbacks(session, ep) {
+function streamCallbacks(session, ep, onUserMessageAppended = null) {
   // #13: EPOCH-GATE the producer. A superseded/cancelled run (cancel() bumps runEpoch) or a completed session
   // must never write text/reasoning into a SUCCESSOR turn's activeRes or mutate its buffers — that is the
   // cross-run output leak. ep is captured at agent.send; every callback no-ops once the epoch advances or the
@@ -2649,7 +3119,9 @@ function streamCallbacks(session, ep) {
         session.lastSdkActivityAt = nowMs();
         const ty = update && (update.type || update.case);
         const txt = update && (update.text != null ? update.text : (update.value && update.value.text));
-        if (ty === "text-delta" && txt) {
+        if (ty === "user-message-appended") {
+          if (typeof onUserMessageAppended === "function") onUserMessageAppended(update.userMessage || null);
+        } else if (ty === "text-delta" && txt) {
           session.streamedText += txt;
           // #14: if no response is open (the run outlived the turn), BUFFER the text in order rather than
           // dropping it. sse() returns false in exactly that case (no activeRes / write dead).
@@ -3089,16 +3561,22 @@ class PayloadTooLargeError extends Error { constructor(msg) { super(msg); this.c
 // MAX_AGENT_TURN_BYTES (M26), so a runaway body can never be fully buffered into memory. Byte length (not
 // char length) is tracked so multibyte/base64 payloads are bounded accurately. Returns the raw string.
 async function readBodyBounded(req) {
-  let raw = "";
+  const chunks = [];
   let bytes = 0;
   for await (const c of req) {
-    bytes += Buffer.byteLength(c);
+    const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+    bytes += chunk.length;
     if (bytes > MAX_AGENT_TURN_BYTES) {
       throw new PayloadTooLargeError(`request body exceeds MAX_AGENT_TURN_BYTES (${MAX_AGENT_TURN_BYTES} bytes)`);
     }
-    raw += c;
+    chunks.push(chunk);
   }
-  return raw;
+  // HTTP chunk boundaries are arbitrary and may split one UTF-8 code point.
+  // Decoding each chunk independently inserts U+FFFD, which changes the
+  // byte-exact tool inventory snapshot and used to create a false epoch 422.
+  // Concatenate bytes first and reject genuinely invalid UTF-8 instead of
+  // silently repairing it into different JSON.
+  return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, bytes));
 }
 
 async function writeShortSse(res, terminal) {
@@ -3109,34 +3587,157 @@ async function writeShortSse(res, terminal) {
   await writer.endAfter("data: [DONE]\n\n");
 }
 
+// A stateless harness may retry the same mixed continuation while the first
+// HTTP response is still inside agent.send(). Replace the abandoned response
+// sink and keep streaming the SAME SDK turn instead of returning a permanent
+// 409 or starting a duplicate send. The turn token prevents the handoff from
+// waiting on a later turn that happens to reuse the Session.
+async function handoffActiveTurn(req, res, session, round, committed, clientMessageId) {
+  const token = session.turnToken;
+  res.writeHead(200, SSE_HEADERS);
+  const previousWriter = session.responseWriter;
+  const writer = session.beginResponse(res);
+  if (previousWriter && previousWriter !== writer) {
+    // beginResponse installed the replacement first, so the prior writer's
+    // failure callback observes that it no longer owns the Session and cannot
+    // cancel the live run.
+    previousWriter.fail(new Error("response superseded by an idempotent retry"));
+  }
+  session.writePayload(formatSseData({
+    type: "session",
+    sessionId: session.id,
+    continuationReceipt: {
+      ...(round
+        ? continuationReceipt(round, committed, {
+          clientMessageId,
+          userInputStatus: String(round.deferredInput(clientMessageId)?.state || "").toLowerCase(),
+        })
+        : { contractVersion: CLIENT_TOOL_CONTRACT_VERSION, clientMessageId, userInputStatus: "active" }),
+      receipt: "active_turn_handoff",
+    },
+  }));
+  if (session.pendingDeltas.length > 0) session.flushPendingDeltas();
+  else if (session.streamedText) session.writePayload(formatSseData({ type: "text", delta: session.streamedText }));
+
+  let closed = false;
+  const onClose = () => {
+    if (closed || session.activeRes !== res) return;
+    session.failWrite("replacement response closed");
+  };
+  res.on("close", onClose);
+  try {
+    await session.whenTurnSettled(token);
+  } finally {
+    closed = true;
+    res.off("close", onClose);
+    if (session.activeRes === res) {
+      try { await session.finishResponse(); }
+      finally { session.activeRes = null; session.responseWriter = null; }
+    }
+  }
+}
+
+// If the original fresh-turn response was lost after its tool calls were
+// durably handed off, replay those same signed calls. This is a response replay,
+// not a second SDK send: callbacks and watchdog ownership remain on the
+// existing ToolRound.
+async function replayPausedFreshTurn(res, session, clientMessageId) {
+  const round = session.currentRound;
+  const calls = round ? round.fifo.map((id) => round.calls.get(id)).filter((call) =>
+    call && call.state === CallState.HANDED_TO_TRANSPORT && !call.receipt) : [];
+  if (calls.length === 0) return false;
+  res.writeHead(200, SSE_HEADERS);
+  const writer = new SseWriter(res, { maxQueueBytes: COMPOSER_OUT_QUEUE_MAX_BYTES });
+  const write = async (value) => {
+    const receipt = writer.write(formatSseData(value));
+    if (!receipt.ok) throw new Error("paused-turn replay transport failed");
+    await receipt.handedToNode;
+  };
+  await write({
+    type: "session",
+    sessionId: session.id,
+    continuationReceipt: {
+      contractVersion: CLIENT_TOOL_CONTRACT_VERSION,
+      clientMessageId,
+      receipt: "paused_turn_replay",
+    },
+  });
+  if (session.streamedText) await write({ type: "text", delta: session.streamedText });
+  for (const call of calls) {
+    await write({ type: "tool_call", id: call.wireId, name: call.name, input: call.input });
+  }
+  await write({ type: "turn_end", stop_reason: "tool_use", tool_calls: calls.map((call) => call.wireId) });
+  await writer.endAfter("data: [DONE]\n\n");
+  return true;
+}
+
 function continuationFailure(res, status, code, message, details = null) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: { code, message, ...(details ? { details } : {}) } }));
 }
 
+function durableRecoveryResults(round, input) {
+  return (input.results || []).map((submitted) => {
+    const call = round.calls.get(submitted.toolCallId);
+    if (!call || !call.receipt || !call.receipt.result) {
+      throw new ToolRoundError(
+        "missing_durable_receipt",
+        `tool result ${submitted.toolCallId || "<missing>"} has no durable recovery receipt`,
+        500,
+      );
+    }
+    return { toolCallId: submitted.toolCallId, ...call.receipt.result };
+  });
+}
+
 function recoveryResultSummary(round, input) {
-  return (input.results || []).map((result) => {
+  return durableRecoveryResults(round, input).map((result) => {
     const call = round.calls.get(result.toolCallId);
     const images = Array.isArray(result.images)
-      ? result.images.map((image) => ({ mimeType: image && image.mimeType, url: image && image.url, attached: !!(image && image.data) }))
+      ? result.images.map((image) => ({
+        mimeType: image && image.mimeType,
+        url: image && image.url,
+        detail: image && image.detail,
+        attached: !!(image && image.data),
+      }))
       : [];
     return {
       toolCallId: result.toolCallId,
       toolName: call ? call.name : "",
       content: result.content,
+      ...(Array.isArray(result.contentBlocks) ? {
+        contentBlocks: result.contentBlocks.map((block) => {
+          if (block && block.type === "image") {
+            const image = block.image || block.source || block;
+            return {
+              type: "image",
+              mimeType: image && (image.mimeType || image.media_type),
+              url: image && image.url,
+              detail: image && image.detail,
+              attached: !!(image && image.data),
+            };
+          }
+          return block;
+        }),
+      } : {}),
       isError: result.isError === true,
-      structuredContent: result.structuredContent ?? null,
+      structuredContentPresent: result.structuredContentPresent === true
+        || Object.prototype.hasOwnProperty.call(result, "structuredContent"),
+      ...(result.structuredContentPresent === true || Object.prototype.hasOwnProperty.call(result, "structuredContent")
+        ? { structuredContent: result.structuredContent ?? null }
+        : {}),
       images,
     };
   });
 }
 
-function buildRestartRecoveryInput(round, input) {
+function buildResultRecoveryInput(round, input, { requireHistory = false } = {}) {
   const history = typeof input.history === "string" ? input.history.trim() : "";
-  if (!history) return null;
+  if (requireHistory && !history) return null;
   const summary = recoveryResultSummary(round, input);
+  const receiptedInput = { ...input, results: durableRecoveryResults(round, input) };
   const recovered = [
-    "[Recovered client-tool round after a proxy restart]",
+    "[Recovered client-tool round]",
     "These are the exact results returned by the user-machine harness for tool calls already present in the prior conversation:",
     JSON.stringify(summary),
     "Continue the original task from the previous conversation. Do not treat the recovered results as a new unrelated request.",
@@ -3146,7 +3747,60 @@ function buildRestartRecoveryInput(round, input) {
     ...input,
     type: "user",
     text: trailing ? `${recovered}\n\n${trailing}` : recovered,
-    images: [...(Array.isArray(input.images) ? input.images : []), ...collectToolResultImages(input)],
+    images: [...(Array.isArray(input.images) ? input.images : []), ...collectToolResultImages(receiptedInput)],
+  };
+}
+
+function buildRestartRecoveryInput(round, input) {
+  return buildResultRecoveryInput(round, input, { requireHistory: true });
+}
+
+function continuationHasDeferredInput(input) {
+  return !!input && ((typeof input.userText === "string" && input.userText.length > 0)
+    || (Array.isArray(input.images) && input.images.length > 0));
+}
+
+function deferredUserInput(round, item, input) {
+  const stored = item && item.input ? item.input : {};
+  const context = round && round.recoveryContext ? round.recoveryContext : {};
+  return {
+    ...input,
+    type: "user",
+    text: typeof stored.text === "string" ? stored.text : "",
+    images: Array.isArray(stored.images) ? stored.images : [],
+    system: typeof context.system === "string" ? context.system : "",
+    history: typeof context.history === "string" ? context.history : "",
+    historyFingerprint: typeof context.historyFingerprint === "string" ? context.historyFingerprint : "",
+  };
+}
+
+function continuationReceipt(round, committed, extra = {}) {
+  const resultDispositions = committed && Array.isArray(committed.dispositions) ? committed.dispositions : [];
+  const toolEpochState = round.toolEpochState();
+  return {
+    contractVersion: CLIENT_TOOL_CONTRACT_VERSION,
+    resultDispositions,
+    acknowledgedToolResultIds: resultDispositions.map((result) => result.toolCallId),
+    toolEpoch: toolEpochState,
+    toolEpochState,
+    ...(committed && committed.inventoryWarning ? {
+      toolInventory: { status: "rejected", error: committed.inventoryWarning },
+    } : {}),
+    ...(committed && committed.deferredReceipt ? {
+      clientMessage: committed.deferredReceipt,
+    } : {}),
+    ...extra,
+  };
+}
+
+function deferredErrorDetails(round, clientMessageId, details = null) {
+  const item = round && clientMessageId ? round.deferredInput(clientMessageId) : null;
+  return {
+    ...(details || {}),
+    ...(item ? {
+      clientMessageId,
+      userInputStatus: String(item.state || "").toLowerCase(),
+    } : {}),
   };
 }
 
@@ -3158,7 +3812,7 @@ function continuationTenantMismatch(round, cursorKey, multiTenant = MULTI_TENANT
 
 // `/agent/continue` is the sole continuation ingress. It routes by the signed tool-call ids, validates and
 // journals the complete batch before writing SSE headers, and only then settles the paused SDK callbacks.
-async function handleContinue(req, res, body, cursorKey) {
+async function handleContinue(req, res, body, cursorKey, casAttempt = 0, historicalDispositions = []) {
   const input = body && body.input;
   if (body && !validClientEnv(body.clientEnv)) body.clientEnv = { workspaceUnknown: true };
   const results = input && input.type === "tool_results" && Array.isArray(input.results) ? input.results : null;
@@ -3167,47 +3821,338 @@ async function handleContinue(req, res, body, cursorKey) {
     return;
   }
   let preparedToolRegistry;
+  let inventoryWarning = "";
+  let deferredRound = null;
+  let deferredInputId = "";
+  let routedRound = null;
   try {
-    // Validate the replacement registry before touching a durable result
-    // receipt. A malformed schema must never create the crash boundary
-    // "result committed, callback not resumed".
+    // A replacement inventory governs the *next* model step; it is not part of
+    // the already-executed tool result. Validate it independently so a client
+    // adding or changing one malformed tool cannot strand an owed callback.
     preparedToolRegistry = prepareAdvertisedToolRegistry(body);
   } catch (error) {
-    continuationFailure(res, 422, "invalid_advertised_tools", (error && error.message) || String(error));
-    return;
+    inventoryWarning = (error && error.message) || String(error);
+    preparedToolRegistry = undefined;
+    dbg("continuation replacement inventory rejected; preserving prior registry", inventoryWarning);
   }
   try {
     const { codec, journal } = getRoundInfrastructure();
     const parsed = results.map((result) => codec.parse(result && result.toolCallId));
     const route = parsed[0].route;
     if (parsed.some((token) => token.route !== route)) {
-      throw new ToolRoundError("mixed_tool_rounds", "tool-result batch spans multiple rounds", 409);
+      const grouped = new Map();
+      for (let index = 0; index < parsed.length; index++) {
+        const group = grouped.get(parsed[index].route) || [];
+        group.push(results[index]);
+        grouped.set(parsed[index].route, group);
+      }
+      const loaded = [...grouped].map(([groupRoute, groupResults]) => {
+        const groupRound = liveToolRounds.get(groupRoute) || ToolRound.load(journal, codec, groupRoute);
+        if (!groupRound) throw new ToolRoundError("round_lost", `signed tool round ${groupRoute} is absent`, 410);
+        if (continuationTenantMismatch(groupRound, cursorKey)) {
+          throw new ToolRoundError("tenant_mismatch", "a signed tool round belongs to a different Cursor credential", 403);
+        }
+        return { groupRoute, groupResults, groupRound };
+      });
+      // Validate every route before mutating any journal. A stateless harness
+      // may project old and current tool results into one request; terminal or
+      // process-orphaned routes can be receipted independently and recovered
+      // later. Only two *in-memory callback-owning* rounds are fundamentally
+      // ambiguous because one HTTP response cannot carry two SDK continuations.
+      for (const group of loaded) {
+        group.groupRound.preflightResults(group.groupResults, {
+          allowRegisteredReceipt: !liveToolRounds.has(group.groupRoute),
+          preferDurableReceipt: true,
+        });
+      }
+      const live = loaded.filter(({ groupRoute, groupRound }) =>
+        groupRound.state !== RoundState.TERMINAL && liveToolRounds.get(groupRoute) === groupRound);
+      if (live.length > 1) {
+        await writeShortSse(res, {
+          type: "turn_end",
+          stop_reason: "error",
+          receipt: "multiple_live_tool_rounds_deferred",
+          retryable: true,
+          error: "the request combines results from multiple simultaneously live conversations; no result was consumed, so each conversation can retry independently",
+          routes: live.map(({ groupRoute }) => groupRoute),
+        });
+        return;
+      }
+      const active = loaded.filter(({ groupRound }) => groupRound.state !== RoundState.TERMINAL);
+      const bodyMatches = active.filter(({ groupRound }) => body && body.sessionId === groupRound.sessionId);
+      const primary = live[0] || (bodyMatches.length === 1 ? bodyMatches[0] : active.at(-1)) || loaded.at(-1);
+      const acknowledged = [];
+      for (const group of loaded) {
+        if (group === primary) continue;
+        const terminal = group.groupRound.state === RoundState.TERMINAL;
+        const committedGroup = group.groupRound.commitResults(group.groupResults, {
+          allowTerminalReceipt: terminal,
+          allowRegisteredReceipt: true,
+          preferDurableReceipt: true,
+        });
+        if (!terminal) {
+          group.groupRound.terminalize(
+            TerminalReason.RESTART_LOST,
+            "tool result was receipted from a mixed-route stateless replay; a separate retry may faithfully resume it",
+          );
+          group.groupRound.recordRecovery({
+            at: nowMs(),
+            decision: "awaiting_separate_resume",
+            reason: "one HTTP response can stream only the selected primary route",
+          });
+        }
+        acknowledged.push(...committedGroup.dispositions.map((disposition) => ({
+          ...disposition,
+          status: terminal
+            ? "historical_receipt_acknowledged"
+            : "orphaned_route_receipted_for_separate_resume",
+        })));
+      }
+      const nextBody = { ...body, input: { ...input, results: primary.groupResults } };
+      return handleContinue(req, res, nextBody, cursorKey, casAttempt, [
+        ...historicalDispositions,
+        ...acknowledged,
+      ]);
     }
     let round = liveToolRounds.get(route);
     const hasLiveCallbacks = !!round;
     if (!round) round = ToolRound.load(journal, codec, route);
     if (!round) throw new ToolRoundError("round_lost", "the signed tool round is not present in the durable journal", 410);
+    routedRound = round;
     if (continuationTenantMismatch(round, cursorKey)) {
       throw new ToolRoundError("tenant_mismatch", "the signed tool round belongs to a different Cursor credential", 403);
     }
 
     const wasTerminal = round.state === RoundState.TERMINAL;
+    const hasDeferredInput = continuationHasDeferredInput(input);
+    if (hasDeferredInput) {
+      deferredRound = round;
+      deferredInputId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+    }
     // A restart can occur after Node accepted the tool_call frame but before the
     // handoff timestamp reached the journal. A signed result from the same
     // authenticated tenant is proof the client saw that registered call, so a
     // non-live round may durably accept it and then recover/refuse faithfully.
     const committed = round.commitResults(results, {
       allowTerminalReceipt: !hasLiveCallbacks && wasTerminal,
-      allowRegisteredReceipt: !hasLiveCallbacks,
+      // Possession of a valid tenant-bound signed call id is stronger evidence
+      // than the local handedAt timestamp: the process can crash or the SSE
+      // writer can advance just before that metadata write. Accept it in both
+      // warm and cold paths; the HMAC prevents an unseen id from being guessed.
+      allowRegisteredReceipt: true,
+      // Persistence is the exactly-once boundary even while sibling callbacks
+      // remain live. A later stateless projection can be acknowledged but can
+      // never replace the stored value or reach the SDK callback.
+      preferDurableReceipt: true,
+      // Result validation and optional user-intent journaling share one CAS
+      // write. Invalid results cannot append poison entries or enlarge the
+      // journal before returning an error.
+      deferredInputId,
+      deferredInput: hasDeferredInput ? input : null,
     });
+    // A buggy client may reuse one clientMessageId for different immutable
+    // intent. ToolRound preserves the original receipt and deterministically
+    // rekeys the new intent; every subsequent delivery decision must use that
+    // actual durable id rather than looking up the conflicting requested id.
+    if (committed.deferredReceipt && committed.deferredReceipt.clientMessageId) {
+      deferredInputId = committed.deferredReceipt.clientMessageId;
+    }
+    committed.inventoryWarning = inventoryWarning;
+    if (historicalDispositions.length > 0) {
+      committed.dispositions = [...historicalDispositions, ...committed.dispositions];
+    }
     const committedIds = [...new Set([...committed.additions, ...committed.duplicates])];
+    const deferred = deferredInputId ? round.deferredInput(deferredInputId) : null;
+
+    if (deferred && deferred.state === DeferredInputState.SUPERSEDED) {
+      const uncertain = typeof deferred.supersedeReason === "string"
+        && deferred.supersedeReason.startsWith("delivery_uncertain");
+      await writeShortSse(res, {
+        type: "turn_end",
+        stop_reason: uncertain ? "error" : "end_turn",
+        receipt: uncertain ? "user_input_delivery_unknown" : "user_input_superseded",
+        ...(uncertain ? {
+          error: "the prior bridge process ended during SDK delivery; the durable checkpoint could not prove whether this input ran",
+        } : {}),
+        ...continuationReceipt(round, committed, {
+          clientMessageId: deferredInputId,
+          userInputStatus: "superseded",
+        }),
+      });
+      return;
+    }
+
+    const activeDeferredSession = deferred ? sessions.get(round.sessionId) : null;
+    if (deferred
+        && (deferred.state === DeferredInputState.QUEUED
+          || deferred.state === DeferredInputState.DELIVERING
+          || deferred.state === DeferredInputState.DELIVERED)
+        && activeDeferredSession
+        && activeDeferredSession.activeDeferredInputId === deferredInputId
+        && activeDeferredSession.activeRes
+        && activeDeferredSession.lastSettledTurnToken < activeDeferredSession.turnToken) {
+      await handoffActiveTurn(req, res, activeDeferredSession, round, committed, deferredInputId);
+      return;
+    }
+    if (deferred
+        && activeDeferredSession
+        && activeDeferredSession.activeDeferredInputId === deferredInputId
+        && activeDeferredSession.run
+        && await replayPausedFreshTurn(res, activeDeferredSession, deferredInputId)) {
+      return;
+    }
+
+    // `DELIVERING` is the deliberate crash boundary around agent.send. First
+    // reconcile against the SDK's durable conversation checkpoint. If neither
+    // a live turn nor a checkpoint can prove delivery, retire this one message
+    // with an explicit error receipt. It must never poison the whole session
+    // with an unbounded 409 loop, and it must never be blindly re-executed.
+    if (deferred && deferred.state === DeferredInputState.DELIVERING) {
+      if (!(await reconcileDeferredDelivery(round, deferred, cursorKey))) {
+        round.markDeferredInputState(deferredInputId, DeferredInputState.SUPERSEDED, {
+          reason: "delivery_uncertain_retired",
+        });
+        await writeShortSse(res, {
+          type: "turn_end",
+          stop_reason: "error",
+          error: "the prior bridge process ended during SDK delivery; the durable checkpoint could not prove whether this input ran",
+          receipt: "user_input_delivery_unknown",
+          ...continuationReceipt(round, committed, {
+            clientMessageId: deferredInputId,
+            userInputStatus: "superseded",
+          }),
+        });
+        return;
+      }
+    }
+    if (deferred && deferred.state === DeferredInputState.DELIVERED) {
+      await writeShortSse(res, {
+        type: "turn_end",
+        stop_reason: "end_turn",
+        receipt: "user_input_already_delivered",
+        ...continuationReceipt(round, committed, {
+          clientMessageId: deferredInputId,
+          userInputStatus: "delivered",
+        }),
+      });
+      return;
+    }
+
+    // A mixed tool-result + genuine user turn is two durable facts, not one
+    // overloaded callback payload. Terminate the paused callback run, then
+    // send an exact recovery summary plus the separately journaled user input
+    // as a fresh SDK user message. On an in-process Session the durable agent
+    // already owns the conversation, so bounded history is not required; on a
+    // cold restart it is required before a new agent id may be seeded.
+    if (deferred && deferred.state === DeferredInputState.QUEUED) {
+      const existing = sessions.get(round.sessionId);
+      const completedReceipt = wasTerminal && (
+        (round.terminal && round.terminal.reason === TerminalReason.COMPLETED)
+        || (round.recovery && round.recovery.decision === "completed")
+      );
+      let session = existing || null;
+      let freshInput;
+      let isRecovery = !completedReceipt;
+
+      if (session && session.currentRound && session.currentRound !== round) {
+        if (session.currentRound.route !== round.route && !completedReceipt) {
+          // A stateless client can replay an older receipted round while a
+          // newer round is active. The signed source round still owns its
+          // result; the newest user input is an interruption. Let the common
+          // cancellation/recovery path below terminal-resolve the newer round
+          // and continue from durable receipts instead of permanently 409ing.
+          dbg("deferred source round differs from active round -> interrupt and recover",
+            "session=" + session.id, "source=" + round.route, "active=" + session.currentRound.route);
+        }
+        if (session.currentRound.route === round.route) {
+          // The live-map terminal callback removes completed rounds, so a later
+          // request reloads the same route as a new object. Adopt that newer
+          // journal revision instead of treating object identity as ownership.
+          session.currentRound = round;
+        }
+      }
+      if (session && keyFingerprint(session.cursorKey) !== keyFingerprint(cursorKey)) {
+        throw new ToolRoundError("tenant_mismatch", "the active Session belongs to a different Cursor credential", 403);
+      }
+
+      if (completedReceipt) {
+        freshInput = deferredUserInput(round, deferred, input);
+      } else if (session) {
+        freshInput = buildResultRecoveryInput(round, input);
+      } else {
+        freshInput = buildRestartRecoveryInput(round, input);
+        if (!freshInput) {
+          round.recordRecovery({ at: nowMs(), decision: "refused", reason: "bounded conversation history is absent" });
+          throw new ToolRoundError(
+            "round_lost",
+            "the paused SDK callback process is gone and this continuation has no bounded history for a faithful recovery",
+            410,
+          );
+        }
+      }
+
+      if (!session) {
+        if (!sessionCapHasRoomForNew()) throw new ToolRoundError("session_capacity", "session capacity is full", 429);
+        session = new Session(round.sessionId, cursorKey);
+        if (isRecovery) {
+          session.agentId = `${round.agentId || round.sessionId}_ctrecover_${round.route.slice(0, 10)}`;
+          session.resetSeedState();
+        } else if (round.agentId) {
+          session.agentId = round.agentId;
+        }
+        sessions.set(session.id, session);
+      } else if (session.run || (session.currentRound && session.currentRound.state !== RoundState.TERMINAL)) {
+        await session.cancel({ terminalReason: TerminalReason.INTERRUPTED, detail: "superseded by durable deferred user input" });
+      }
+
+      refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
+      if (isRecovery) {
+        if (round.state !== RoundState.TERMINAL) {
+          round.terminalize(TerminalReason.INTERRUPTED, "tool results and trailing user input redirected to a fresh SDK send");
+        }
+        round.recordRecovery({
+          at: nowMs(),
+          decision: existing ? "in_process_redirect" : "faithful_reseed",
+          replacementAgentId: session.agentId,
+          clientMessageId: deferredInputId,
+          resultHashes: results.map((result) => round.calls.get(result.toolCallId).resultHash),
+        });
+        session.recoverySourceRound = round;
+      }
+      const constraints = {
+        toolChoice: body.toolChoice || "",
+        responseFormat: body.responseFormat,
+        stop: body.stop,
+        maxTokens: body.maxTokens,
+        unsupportedHardGuarantees: body.unsupportedHardGuarantees,
+      };
+      return enqueueTurn(req, res, session, body.model || round.model || "composer-2.5", freshInput, constraints, {
+        round,
+        committedIds,
+        deferredInputId,
+        deferredReceipt: committed.deferredReceipt,
+        dispositions: committed.dispositions,
+      });
+    }
 
     if (hasLiveCallbacks) {
       const session = sessions.get(round.sessionId);
       if (!session || session.currentRound !== round) {
         try { round.terminalize(TerminalReason.RESTART_LOST, "live round lost its owning Session"); } catch {}
       } else {
-        refreshSessionFromBody(session, body, preparedToolRegistry);
+        const callbacksAnswered = committedIds.filter((id) => round.callbacks.has(id)).length;
+        const completesLogicalToolRound = Math.max(0, round.pendingCount - callbacksAnswered) === 0;
+        // A tool inventory is a logical-turn contract, not mutable metadata on
+        // each partial HTTP receipt. Applying partial snapshots lets delayed
+        // continuations reorder schema updates or resurrect removed tools.
+        // Freeze the registry until the final callback batch; that final
+        // continuation defines the next model step's complete client surface.
+        if (completesLogicalToolRound) {
+          refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
+        } else if (!inventoryWarning && body.toolInventoryEpoch !== session.toolInventoryEpoch) {
+          dbg("deferred tool inventory refresh until logical ToolRound boundary",
+            "session=" + session.id, "current=" + session.toolInventoryEpoch, "submitted=" + body.toolInventoryEpoch);
+        }
         const constraints = {
           toolChoice: body.toolChoice || "",
           responseFormat: body.responseFormat,
@@ -3221,6 +4166,7 @@ async function handleContinue(req, res, body, cursorKey) {
             type: "turn_end",
             stop_reason: round.pendingCount > 0 ? "tool_use" : "end_turn",
             receipt: "duplicate_or_concurrent",
+            ...continuationReceipt(round, committed),
           });
           return;
         }
@@ -3233,11 +4179,15 @@ async function handleContinue(req, res, body, cursorKey) {
     // A completed round may be retried after its response was lost. Its durable receipt is authoritative; an
     // identical retry is acknowledged without rerunning either the harness tool or an SDK callback.
     if (wasTerminal && round.terminal && round.terminal.reason === TerminalReason.COMPLETED && committed.additions.length === 0) {
-      await writeShortSse(res, { type: "turn_end", stop_reason: "end_turn", receipt: "already_applied" });
+      await writeShortSse(res, {
+        type: "turn_end", stop_reason: "end_turn", receipt: "already_applied", ...continuationReceipt(round, committed),
+      });
       return;
     }
     if (wasTerminal && round.recovery && round.recovery.decision === "completed" && committed.additions.length === 0) {
-      await writeShortSse(res, { type: "turn_end", stop_reason: "end_turn", receipt: "already_recovered" });
+      await writeShortSse(res, {
+        type: "turn_end", stop_reason: "end_turn", receipt: "already_recovered", ...continuationReceipt(round, committed),
+      });
       return;
     }
 
@@ -3251,16 +4201,38 @@ async function handleContinue(req, res, body, cursorKey) {
         410,
       );
     }
-    if (sessions.has(round.sessionId)) {
-      throw new ToolRoundError("recovery_session_conflict", "the recovery session id is already active", 409);
+    let session = sessions.get(round.sessionId) || null;
+    if (session && keyFingerprint(session.cursorKey) !== keyFingerprint(cursorKey)) {
+      throw new ToolRoundError("tenant_mismatch", "the active Session belongs to a different Cursor credential", 403);
     }
-    if (!sessionCapHasRoomForNew()) throw new ToolRoundError("session_capacity", "session capacity is full", 429);
-    const session = new Session(round.sessionId, cursorKey);
+    if (session) {
+      // A stale in-memory Session is not a routing conflict. Terminal-resolve
+      // whatever it still owns and reuse the stable conversation slot for the
+      // durable source round. Returning 409 here made every retry deterministic
+      // failure until process restart.
+      if (session.activeRes) {
+        session.sse({
+          type: "turn_end",
+          stop_reason: "error",
+          error: "turn interrupted by durable client-tool recovery",
+        });
+      }
+      await session.cancel({
+        terminalReason: TerminalReason.INTERRUPTED,
+        detail: "superseded by durable client-tool recovery",
+      });
+      session.done = false;
+      session.model = null;
+      session.currentRound = null;
+    } else {
+      if (!sessionCapHasRoomForNew()) throw new ToolRoundError("session_capacity", "session capacity is full", 429);
+      session = new Session(round.sessionId, cursorKey);
+      sessions.set(session.id, session);
+    }
     session.agentId = `${round.agentId || round.sessionId}_ctrecover_${round.route.slice(0, 10)}`;
     session.recoverySourceRound = round;
     session.resetSeedState();
-    sessions.set(session.id, session);
-    refreshSessionFromBody(session, body, preparedToolRegistry);
+    refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
     round.recordRecovery({
       at: nowMs(),
       decision: "faithful_reseed",
@@ -3282,7 +4254,65 @@ async function handleContinue(req, res, body, cursorKey) {
       return;
     }
     if (error instanceof ToolRoundError) {
-      continuationFailure(res, error.status, error.code, error.message, error.details);
+      if (error.code === "journal_revision_conflict" && casAttempt < 3) {
+        if (routedRound && liveToolRounds.get(routedRound.route) === routedRound) {
+          liveToolRounds.delete(routedRound.route);
+          const staleSession = sessions.get(routedRound.sessionId);
+          if (staleSession && staleSession.currentRound === routedRound) {
+            const fenced = new Error("durable ToolRound ownership advanced in another bridge process");
+            for (const call of routedRound.calls.values()) {
+              routedRound.clearTimer(call);
+              for (const callback of [call.callback, ...(call.waiters || [])].filter(Boolean)) {
+                try { callback.reject(fenced); } catch {}
+              }
+              call.callback = null;
+              call.waiters = [];
+            }
+            routedRound.callbacks.clear();
+            staleSession.currentRound = null;
+            staleSession.lastRunError = fenced.message;
+            staleSession.sse({ type: "turn_end", stop_reason: "error", error: fenced.message });
+            staleSession.settle();
+            staleSession.runEpoch++;
+            const staleRun = staleSession.run;
+            staleSession.run = null;
+            staleSession.agent = null;
+            staleSession.agentPromise = null;
+            staleSession.notifyLogicalDone();
+            try { void (staleRun && staleRun.cancel && staleRun.cancel()); } catch {}
+            sessions.delete(staleSession.id);
+          }
+        }
+        dbg("continuation CAS changed concurrently -> reload and retry",
+          "attempt=" + (casAttempt + 1), (error && error.message) || String(error));
+        return handleContinue(req, res, body, cursorKey, casAttempt + 1, historicalDispositions);
+      }
+      // A continuation conflict must never become a transport-level 409 loop.
+      // Known replay conflicts are resolved above; this is the fail-safe for a
+      // residual state-machine race. Return a normal SSE terminal without
+      // consuming any additional client intent, preserving the durable round
+      // for an independent retry and keeping generic harnesses operational.
+      if (error.status === 409) {
+        dbg("contained residual continuation conflict as typed SSE receipt",
+          "code=" + error.code, (error && error.message) || String(error));
+        await writeShortSse(res, {
+          type: "turn_end",
+          stop_reason: "error",
+          receipt: "continuation_conflict_contained",
+          retryable: true,
+          errorCode: error.code,
+          error: error.message,
+          ...(routedRound ? { toolEpochState: routedRound.toolEpochState() } : {}),
+        });
+        return;
+      }
+      continuationFailure(
+        res,
+        error.code === "journal_revision_conflict" ? 503 : error.status,
+        error.code,
+        error.message,
+        deferredErrorDetails(deferredRound, deferredInputId, error.details),
+      );
       return;
     }
     continuationFailure(res, 500, "continue_failed", (error && error.message) || String(error));
@@ -3364,6 +4394,19 @@ async function handleTurn(req, res, body, cursorKey) {
       await session.rotateForKeyChange(cursorKey);
     }
   }
+  const incomingClientMessageId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+  if (incomingClientMessageId
+      && session.activeClientMessageId === incomingClientMessageId
+      && (session.run || session.sendPending)) {
+    if (session.activeRes && session.lastSettledTurnToken < session.turnToken) {
+      await handoffActiveTurn(req, res, session, null, null, incomingClientMessageId);
+      return;
+    }
+    if (await replayPausedFreshTurn(res, session, incomingClientMessageId)) return;
+    // No response and no handed tool call means the prior transport vanished
+    // before a replayable boundary. Fall through to the ordinary interrupt +
+    // resend path using the same SDK idempotency key.
+  }
   refreshSessionFromBody(session, body, preparedToolRegistry);
   // ADD-37 (extended by ADD-106): a plain NEW-USER turn that arrives while a run is still LIVE on this session
   // is an INTERRUPTION, not a concurrent generation — the user is steering, so the old run must yield to the
@@ -3386,16 +4429,10 @@ async function handleTurn(req, res, body, cursorKey) {
   // distinct EPHEMERAL sessionId (mintComposerSessionID) BEFORE the bridge sees it, so it lands in a separate
   // Session and can never cancel this real stream. (Verified: deriveSessionID in cursor_composer_clienttools.go.)
   //
-  // ADD-37 vs ADD-36 — WHY cancel-and-REPLACE (not synthesize-cancellations-then-RESUME) for sub-case (a):
-  // ADD-36 (the concurrent path above, gated on `session.activeRes`) synthesizes MODEL-VISIBLE cancellations for
-  // the unanswered pendings so the EXISTING live run RESUMES and consumes user text the executor folded into a
-  // matched tool result — it has a run that is mid-stream and a result to ride on. A paused-interrupt has NEITHER:
-  // no tool result matched and no streaming run to resume; the new instruction drives a FRESH logical send
-  // (enqueueTurn -> runTurn -> driveUserSend). If we instead resolved the old run's pendings here (ADD-36 style),
-  // its wait() callback would fire onRunComplete and the OLD run would resume against the OLD context, then
-  // COLLIDE with the fresh turn enqueueTurn is about to drive on the same durable agent — exactly the ADD-90
-  // double-send race the cancel-then-enqueue ordering exists to prevent. So cancel-and-replace is the correct
-  // primitive for a genuine new-user interrupt; a synthesize-then-resume would be WRONG here, not merely redundant.
+  // A genuine user interruption is always cancel-and-replace. Tool results and mixed trailing user input arrive
+  // through /agent/continue, where each is journaled independently; this /agent/turn path never mutates or rides
+  // a user instruction on a tool callback. Resolving old pendings and starting a new send concurrently would let
+  // the superseded run collide with its successor on the same durable agent.
   // The interrupted (unanswered) tool-call INTENT is NOT lost to the redirected turn: cancel() keeps session.agentId
   // + session.seeded, so the fresh send's ensureAgent resumeAgent()s the DURABLE Cursor agent, which holds the prior
   // assistant tool-call turn server-side (ensureAgent: a successful resume implies prior turns -> seeded, no
@@ -3415,7 +4452,7 @@ async function handleTurn(req, res, body, cursorKey) {
 // waits EVENT-DRIVEN for the prior turn's run to truly complete (session.tail + whenLogicalDone — no
 // wall-clock timer), then runs in-order on the same session. A queued waiter's disconnect removes ONLY that
 // waiter; it never tears down the session (which would kill the active turn + other waiters).
-function enqueueTurn(req, res, session, model, input, constraints) {
+function enqueueTurn(req, res, session, model, input, constraints, continuation = null) {
   session.waiters++;
   session.touch();
   res.writeHead(200, SSE_HEADERS);
@@ -3455,16 +4492,57 @@ function enqueueTurn(req, res, session, model, input, constraints) {
     session.waiters = Math.max(0, session.waiters - 1);
     if (canceled) { try { res.end(); } catch {} return; }
     try {
-      await runTurn(req, res, session, model, input, constraints);
+      await runTurn(req, res, session, model, input, constraints, continuation);
       await session.whenLogicalDone();
     } catch (e) { dbg("enqueueTurn run error", "session=" + session.id, (e && e.message) || String(e)); }
   }).finally(() => { releaseNext(); });
 }
 
 function prepareAdvertisedToolRegistry(body) {
-  if (!Array.isArray(body && body.tools)) return undefined;
+  let tools = body && body.tools;
+  if (body && Object.prototype.hasOwnProperty.call(body, "contractVersion")) {
+    if (body.contractVersion !== CLIENT_TOOL_CONTRACT_VERSION) {
+      throw new Error(`unsupported client-tool contractVersion ${String(body.contractVersion)}`);
+    }
+    if (body.toolsAuthoritative !== true) {
+      throw new Error("client-tool contract v2 requires toolsAuthoritative:true");
+    }
+    if (typeof body.toolInventoryEpoch !== "string" || !/^cti1_[0-9a-f]{32}$/.test(body.toolInventoryEpoch)) {
+      throw new Error("client-tool contract v2 requires a valid toolInventoryEpoch");
+    }
+    if (typeof body.toolInventoryJSON !== "string") {
+      throw new Error("client-tool contract v2 requires an authoritative toolInventoryJSON snapshot");
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "tools")) {
+      throw new Error("client-tool contract v2 accepts exactly one authoritative tool inventory representation");
+    }
+    if (Buffer.byteLength(body.toolInventoryJSON, "utf8") > MAX_AGENT_TURN_BYTES) {
+      throw new Error("client-tool contract v2 toolInventoryJSON exceeds the request byte limit");
+    }
+    const expectedEpoch = "cti1_" + createHash("sha256")
+      .update(body.toolInventoryJSON, "utf8")
+      .digest("hex")
+      .slice(0, 32);
+    if (body.toolInventoryEpoch !== expectedEpoch) {
+      throw new Error("toolInventoryEpoch does not match the authoritative tools snapshot");
+    }
+    try {
+      tools = JSON.parse(body.toolInventoryJSON);
+    } catch {
+      throw new Error("client-tool contract v2 toolInventoryJSON is not valid JSON");
+    }
+    if (!Array.isArray(tools)) {
+      throw new Error("client-tool contract v2 toolInventoryJSON must encode a tools array");
+    }
+    // From this point onward every bridge consumer reads the one verified
+    // snapshot. Do not mutate body by materializing a second `tools` field:
+    // preparation must be idempotent and there must remain exactly one wire
+    // representation whose key order, number formatting, or escaping can be
+    // checked.
+  }
+  if (!Array.isArray(tools)) return undefined;
   const registry = new AdvertisedToolRegistry();
-  registry.replace(body.tools.map((t) => {
+  registry.replace(tools.map((t) => {
     let aliases = [];
     if (t.aliases !== undefined) {
       if (!Array.isArray(t.aliases) || t.aliases.length > 64
@@ -3495,9 +4573,12 @@ function prepareAdvertisedToolRegistry(body) {
   return registry;
 }
 
-function refreshSessionFromBody(session, body, preparedToolRegistry = undefined) {
-  if (Array.isArray(body.tools)) {
+function refreshSessionFromBody(session, body, preparedToolRegistry = undefined, { ignoreToolInventory = false } = {}) {
+  const hasAuthoritativeSnapshot = body && body.contractVersion === CLIENT_TOOL_CONTRACT_VERSION
+    && typeof body.toolInventoryJSON === "string";
+  if (!ignoreToolInventory && (Array.isArray(body && body.tools) || hasAuthoritativeSnapshot)) {
     session.toolRegistry = preparedToolRegistry || prepareAdvertisedToolRegistry(body);
+    session.toolInventoryEpoch = typeof body.toolInventoryEpoch === "string" ? body.toolInventoryEpoch : null;
     session.toolChoice = typeof body.toolChoice === "string" ? body.toolChoice : "";
     if (session.activeAdvertise !== null) {
       session.activeAdvertise = effectiveAdvertise(session.advertise, session.toolChoice);
@@ -3517,6 +4598,23 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   let resolveTurn;
   const turnSettled = new Promise((resolve) => { resolveTurn = resolve; });
   const settleOnce = () => { if (!settled) { settled = true; resolveTurn(); } };
+  const deferredRound = continuation && continuation.round;
+  const deferredInputId = continuation && continuation.deferredInputId;
+  const clientMessageId = typeof input?.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+  const markDeferred = (state, metadata = null) => {
+    if (!deferredRound || !deferredInputId) return;
+    deferredRound.markDeferredInputState(deferredInputId, state, metadata);
+  };
+  // Install retry ownership before the first await. A duplicate HTTP request
+  // arriving while ensureAgent/agent.send is still starting can attach to this
+  // response instead of queuing a second send for the same client message.
+  if (clientMessageId) {
+    session.activeClientMessageId = clientMessageId;
+    session.sendPending = true;
+  }
+  if (deferredInputId) {
+    session.activeDeferredInputId = deferredInputId;
+  }
   // If the client/proxy disconnects MID-turn, settle this turn (so the finally runs and keepalive clears)
   // and cancel the live run. cancel() fires notifyLogicalDone(), advancing the FIFO to the next waiter. A
   // close that arrives AFTER the turn already settled is a normal end-of-turn socket close and must NOT
@@ -3524,13 +4622,12 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   // otherwise a queued turn on the same conversation would be stranded by the active turn's disconnect.
   const onClose = () => {
     if (settled) return;
+    // A same-message retry may have atomically handed this live turn to a new
+    // response sink. The superseded socket no longer owns cancellation.
+    if (session.activeRes !== res) return;
     settleOnce();
     // Reject receipts before clearing queue on close (transport failure path)
-    if (session.activeRes === res) {
-      session.failWrite("response closed");
-    } else {
-      void session.cancel({ terminalReason: TerminalReason.TRANSPORT_ERROR, detail: "response closed" });
-    }
+    session.failWrite("response closed");
     if (!session.hasQueuedWaiters()) sessions.delete(session.id);
   };
   let keepalive = null;
@@ -3541,7 +4638,25 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     session.settleTurn = settleOnce;
     res.on("close", onClose);
     // Use writer receipt for session frame to get truthful delivery signal
-    session.writePayload(formatSseData({ type: "session", sessionId: session.id }));
+    session.writePayload(formatSseData({
+      type: "session",
+      sessionId: session.id,
+      ...(continuation ? {
+        continuationReceipt: {
+          contractVersion: CLIENT_TOOL_CONTRACT_VERSION,
+          resultDispositions: Array.isArray(continuation.dispositions) ? continuation.dispositions : [],
+          acknowledgedToolResultIds: Array.isArray(continuation.dispositions)
+            ? continuation.dispositions.map((result) => result.toolCallId)
+            : [],
+          toolEpochState: continuation.round ? continuation.round.toolEpochState() : null,
+          ...(continuation.deferredInputId ? {
+            clientMessageId: continuation.deferredInputId,
+            userInputStatus: String(continuation.round?.deferredInput(continuation.deferredInputId)?.state || "").toLowerCase(),
+          } : {}),
+          ...(continuation.deferredReceipt ? { clientMessage: continuation.deferredReceipt } : {}),
+        },
+      } : {}),
+    }));
     session.flushPendingDeltas();
 
     // Keepalive through same writer (truthful signal), skip if blocked handled inside sse
@@ -3638,9 +4753,30 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       "msgTextLen=" + (typeof msg === "string" ? msg.length : (msg.text || "").length),
       "images=" + allImages.length, "effAdvertise=" + session.advertise.length, "model=" + model);
     const ep = ++session.runEpoch; // this run's epoch; its completion callback must ignore a result if cancel() (or a later run) advanced it
-    await als.run({ session }, async () => {
+    const expectedUserTextHash = sdkUserTextHash(msg);
+    markDeferred(DeferredInputState.DELIVERING, {
+      agentId: session.agentId,
+      textHash: expectedUserTextHash,
+      hasImages: allImages.length > 0,
+    });
+    const observeUserMessage = (userMessage) => {
+      // Ignore an unrelated or structurally drifted SDK update. agent.send's
+      // successful return remains a second acceptance signal below.
+      if (sdkUserTextHash(userMessage) !== expectedUserTextHash) {
+        dbg("user-message-appended hash mismatch", "session=" + session.id);
+        return;
+      }
+      markDeferred(DeferredInputState.DELIVERED, { evidence: "user_message_appended" });
+    };
+    const sendCallbacks = {
+      ...streamCallbacks(session, ep, observeUserMessage),
+      ...(clientMessageId ? { idempotencyKey: clientMessageId } : {}),
+    };
+    try {
+      await als.run({ session }, async () => {
       try {
-        session.run = await agent.send(msg, streamCallbacks(session, ep));
+        session.run = await agent.send(msg, sendCallbacks);
+        session.sendPending = false;
       } catch (sendErr) {
         // ADD-115: a RESUMED durable agent can be wedged on a PRIOR run that died abnormally (e.g. a
         // mid-tool-call drop + bridge restart): the SDK refuses the new send with "already has active run".
@@ -3651,7 +4787,8 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         if (stuckRun) {
           try {
             dbg("runTurn agent.send stuck on a prior run -> retry with local.force=true", "session=" + session.id, (sendErr && sendErr.message) || String(sendErr));
-            session.run = await agent.send(msg, { ...streamCallbacks(session, ep), local: { force: true } });
+            session.run = await agent.send(msg, { ...sendCallbacks, local: { force: true } });
+            session.sendPending = false;
           } catch (forceErr) {
             session.seeded = seededBefore;
             session.seededSystem = seededSystemBefore;
@@ -3686,7 +4823,15 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       session.run.wait()
         .then((r) => { if (ep === session.runEpoch) session.onRunComplete(r); })
         .catch((e) => { if (ep === session.runEpoch) session.onRunError(e); });
-    });
+      });
+    } catch (error) {
+      session.sendPending = false;
+      // Once agent.send starts, a transport rejection cannot prove the remote
+      // durable agent did not accept the message. Keep DELIVERING as an
+      // explicit uncertain state; retrying automatically could duplicate work.
+      throw error;
+    }
+    markDeferred(DeferredInputState.DELIVERED, { evidence: "agent_send_resolved" });
   };
 
   // cancelStaleRun cancels a superseded run WITHOUT settling THIS turn. cancel() calls settle(), which fires
@@ -3799,7 +4944,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       for (const id of resultIds) if (round.callbacks.has(id)) answeredLive++;
       const remainingAfterApply = Math.max(0, round.pendingCount - answeredLive);
       const systemChanged = !!(input.system && input.system !== session.seededSystem);
-      const requiresFreshRecovery = fallbackImages.length > 0 || systemChanged || ((hasUserText || hasUserImages) && remainingAfterApply > 0);
+      const requiresFreshRecovery = fallbackImages.length > 0 || systemChanged || hasUserText || hasUserImages;
 
       if (requiresFreshRecovery) {
         const detail = "tool continuation redirected to a faithful fresh send because the paused run could not accept all new payload";
@@ -3807,10 +4952,8 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         await cancelStaleRun(TerminalReason.INTERRUPTED, detail);
         session.agentId = `${session.id}_redirect_${round.route.slice(0, 10)}`;
         session.resetSeedState();
-        const recoveryText = hasUserText
-          ? input.userText
-          : (fallbackImages.length ? "(The attached image is the output of a tool call from the prior conversation.)" : "");
-        await driveUserSend(recoveryText, fallbackImages);
+        const redirected = buildResultRecoveryInput(round, input);
+        await driveUserSend(redirected.text, allResultImages);
       } else {
         const applied = round.applyCommittedResults(committedIds);
         if (applied.length > 0) session.lastSdkActivityAt = nowMs();
@@ -3876,6 +5019,13 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       void session.cancel({ terminalReason: TerminalReason.RUN_ERROR, detail: "failed first turn" });
     }
   } finally {
+    session.sendPending = false;
+    if (session.run === null && session.activeDeferredInputId === deferredInputId) {
+      session.activeDeferredInputId = "";
+    }
+    if (session.run === null && session.activeClientMessageId === clientMessageId) {
+      session.activeClientMessageId = "";
+    }
     clearInterval(keepalive);
     res.off("close", onClose);
     if (session.activeRes === res) {
@@ -4291,5 +5441,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, buildRestartRecoveryInput, continuationTenantMismatch, sessions, liveToolRounds, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, buildRestartRecoveryInput, continuationTenantMismatch, sessions, liveToolRounds, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

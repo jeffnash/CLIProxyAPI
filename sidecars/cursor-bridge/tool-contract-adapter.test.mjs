@@ -3,11 +3,13 @@ import test from "node:test";
 
 import {
   ToolContractRegistry,
+  ToolContractNormalizationError,
   acceptanceSchemaFor,
   clientToolFamily,
   normalizeToolArguments,
   normalizeToolResultEnvelope,
   resolveClientToolName,
+  toolContractCacheStats,
 } from "./tool-contract-adapter.mjs";
 
 const intentProperty = { type: "string", description: "concise intent" };
@@ -139,7 +141,96 @@ test("native argument keys map to unique client schema keys without overwriting 
   const exactWins = normalizeToolArguments({ path: "/correct", filePath: "/wrong", old_string: "a", new_string: "b" }, schema);
   assert.equal(exactWins.value.path, "/correct");
   assert.equal(Object.hasOwn(exactWins.value, "filePath"), false);
-  assert.ok(exactWins.transforms.some((entry) => entry.kind === "drop-shadowed-alias" && entry.source === "filePath"));
+  assert.ok(exactWins.transforms.some((entry) => entry.kind === "discard-conflicting-alias" && entry.source === "filePath"));
+  const equalAliases = normalizeToolArguments({ path: "/same", filePath: { value: "/same" }, old_string: "a", new_string: "b" }, schema);
+  assert.equal(equalAliases.value.path, "/same");
+  assert.equal(Object.hasOwn(equalAliases.value, "filePath"), false);
+  assert.ok(equalAliases.transforms.some((entry) => entry.kind === "deduplicate-alias" && entry.source === "filePath"));
+});
+
+test("exact OMP grep fields win over redundant Cursor aliases without weakening the client schema", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      i: { type: "string", description: "concise intent" },
+      pattern: { type: "string" },
+      path: { type: "string" },
+      selector: { type: "string" },
+      case: { type: "boolean" },
+      gitignore: { type: "boolean" },
+      skip: { type: ["number", "null"] },
+    },
+    required: ["i", "pattern"],
+    additionalProperties: false,
+  };
+  const registry = registryFor("_grep", schema);
+  const normalized = registry.normalize("_grep", {
+    i: "Find turn lifecycle symbols",
+    pattern: "_active_turns\\[",
+    query: "different native search wording",
+    path: "omnigent/runner/app.py",
+    filePath: "/incorrect/native/path",
+    head_limit: 100,
+    output_mode: "content",
+    limit: 20,
+  });
+  assert.deepEqual(normalized.value, {
+    i: "Find turn lifecycle symbols",
+    pattern: "_active_turns\\[",
+    path: "omnigent/runner/app.py",
+  });
+  assert.equal(registry.validate("_grep", normalized.value, normalized.transforms), null);
+  assert.deepEqual(
+    normalized.transforms.filter((entry) => entry.kind === "discard-conflicting-alias").map((entry) => entry.source).sort(),
+    ["filePath", "query"],
+  );
+  assert.deepEqual(
+    normalized.transforms.filter((entry) => entry.kind === "strip-presentation").map((entry) => entry.path).sort(),
+    ["head_limit", "limit", "output_mode"],
+  );
+
+  const clientOwnedLimit = registryFor("_grep", {
+    ...schema,
+    properties: { ...schema.properties, limit: { type: "integer" } },
+  }).normalize("_grep", { i: "Limit results", pattern: "x", limit: 3 });
+  assert.equal(clientOwnedLimit.value.limit, 3, "a field declared by the client is never stripped");
+
+  assert.throws(
+    () => normalizeToolArguments({ query: "one", regex: "two" }, schema),
+    (error) => error instanceof ToolContractNormalizationError && error.code === "ambiguous_alias",
+    "two aliases without an exact client field remain unsafe to guess",
+  );
+});
+
+test("prototype-named client fields remain own JSON properties and inherited values never satisfy schemas", () => {
+  const schema = JSON.parse(`{"type":"object","properties":{"__proto__":{"type":"string"},"constructor":{"type":"string"}},"required":["__proto__","constructor"],"additionalProperties":false}`);
+  const registry = registryFor("prototype-fields", schema);
+  const input = JSON.parse(`{"__proto__":"safe","constructor":"also-safe"}`);
+  const normalized = registry.normalize("prototype-fields", input);
+  assert.equal(Object.hasOwn(normalized.value, "__proto__"), true);
+  assert.equal(normalized.value.__proto__, "safe");
+  assert.equal(normalized.value.constructor, "also-safe");
+  assert.equal(registry.validate("prototype-fields", normalized.value), null);
+
+  const inheritedOnly = Object.create(Object.fromEntries([
+    ["__proto__", "inherited"],
+    ["constructor", "inherited"],
+  ]));
+  const failure = registry.validate("prototype-fields", inheritedOnly);
+  assert.deepEqual(failure.structuredContent.errors.map((error) => error.path).sort(), ["__proto__", "constructor"]);
+
+  const composed = registryFor("prototype-allof", {
+    type: "object",
+    allOf: [{
+      properties: JSON.parse(`{"__proto__":{"type":"string"}}`),
+      required: ["__proto__"],
+    }],
+    additionalProperties: true,
+  });
+  const composedValue = composed.normalize("prototype-allof", JSON.parse(`{"__proto__":{"stringValue":"safe"}}`));
+  assert.equal(Object.hasOwn(composedValue.value, "__proto__"), true);
+  assert.equal(composedValue.value.__proto__, "safe");
+  assert.equal(composed.validate("prototype-allof", composedValue.value), null);
 });
 
 test("native read/write/shell keys adapt to Claude-style and other client spellings", () => {
@@ -348,6 +439,35 @@ test("description-pruned intent is relaxed only when the whole inventory corrobo
   assert.equal(single.validate("real-pruned-i", { value: "semantic" }).structuredContent.errors[0].path, "i");
 });
 
+test("description-pruned intent detection ignores semantically irrelevant property and required ordering", () => {
+  const registry = new ToolContractRegistry();
+  registry.replace([
+    {
+      name: "_write",
+      description: "",
+      inputSchema: {
+        type: "object",
+        // This is the order produced by Go's sorted map-key encoder.
+        properties: { command: { type: "string" }, i: { type: "string" } },
+        required: ["i", "command"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "_read",
+      description: "",
+      inputSchema: {
+        type: "object",
+        properties: { file_path: { type: "string" }, i: { type: "string" } },
+        required: ["file_path", "i"],
+        additionalProperties: false,
+      },
+    },
+  ]);
+  assert.equal(registry.validate("_write", { command: "pwd" }), null);
+  assert.equal(registry.validate("_read", { file_path: "/repo/a" }), null);
+});
+
 test("explicit client-decoration extension works for any harness and field name", () => {
   const schema = {
     type: "object",
@@ -391,7 +511,7 @@ test("result adapter keeps errors, structured content, and both image envelopes 
   const result = normalizeToolResultEnvelope(
     { rows: 2 },
     true,
-    [{ data: "base64", mimeType: "image/png" }, { url: "https://example.test/a.png" }, { data: "broken" }],
+    [{ url: "https://example.test/a.png" }, { data: "base64", mimeType: "image/png" }],
     { code: "failed" },
   );
   assert.deepEqual(result.content, { rows: 2 });
@@ -399,5 +519,119 @@ test("result adapter keeps errors, structured content, and both image envelopes 
   assert.equal(result.inlineImages.length, 1);
   assert.equal(result.urlImages.length, 1);
   assert.equal(result.images.length, 2);
+  assert.equal(result.images[0].url, "https://example.test/a.png", "mixed image envelopes retain wire order");
   assert.deepEqual(result.structuredContent, { code: "failed" });
+  assert.equal(result.structuredContentPresent, true);
+  assert.throws(
+    () => normalizeToolResultEnvelope("bad", false, [{ data: "broken" }], undefined),
+    (error) => error.code === "invalid_result_image",
+  );
+});
+
+test("protobuf Value and JSON-encoded scalar wrappers normalize structurally", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      op: { type: "string", enum: ["get"] },
+      count: { type: "integer" },
+      flags: { type: "array", items: { type: "boolean" } },
+      config: { type: "object", additionalProperties: { type: "string" } },
+    },
+    required: ["op", "count", "flags", "config"],
+    additionalProperties: false,
+  };
+  const normalized = normalizeToolArguments({
+    op: { kind: { case: "stringValue", value: "get" } },
+    count: { numberValue: 2 },
+    flags: { listValue: { values: [{ boolValue: true }, { boolValue: false }] } },
+    config: { structValue: { fields: { mode: { stringValue: "safe" } } } },
+  }, schema);
+  assert.deepEqual(normalized.value, { op: "get", count: 2, flags: [true, false], config: { mode: "safe" } });
+  assert.deepEqual(normalizeToolArguments({ op: '"get"' }, {
+    type: "object", properties: { op: { type: "string", enum: ["get"] } }, required: ["op"], additionalProperties: false,
+  }).value, { op: "get" });
+});
+
+test("numeric coercion accepts JSON numbers but rejects JavaScript-only spellings", () => {
+  const schema = { type: "object", properties: { count: { type: "number" } }, required: ["count"] };
+  assert.deepEqual(normalizeToolArguments({ count: { value: "1.25e2" } }, schema).value, { count: 125 });
+  assert.deepEqual(normalizeToolArguments({ count: { value: "0x10" } }, schema).value, { count: { value: "0x10" } });
+
+  const integerSchema = { type: "object", properties: { count: { type: "integer" } }, required: ["count"] };
+  assert.deepEqual(normalizeToolArguments({ count: { value: "9007199254740991" } }, integerSchema).value,
+    { count: 9007199254740991 });
+  for (const unsafe of ["9007199254740992", "9007199254740993", "-9007199254740992", "1e20"]) {
+    assert.throws(
+      () => normalizeToolArguments({ count: { value: unsafe } }, integerSchema),
+      (error) => error instanceof ToolContractNormalizationError && error.code === "unsafe_integer",
+      `unsafe integer ${unsafe} must not be rounded into an executable client call`,
+    );
+  }
+  assert.throws(
+    () => normalizeToolArguments({ count: 9007199254740992 }, integerSchema),
+    (error) => error instanceof ToolContractNormalizationError && error.code === "unsafe_integer" && error.path === "arguments.count",
+  );
+});
+
+test("root null is never fabricated into an empty invocation", () => {
+  const objectSchema = { type: "object", properties: {}, additionalProperties: false };
+  assert.equal(normalizeToolArguments(null, objectSchema).value, null);
+  assert.deepEqual(normalizeToolArguments(undefined, objectSchema).value, {});
+});
+
+test("pattern and additional-property schemas normalize dynamic values recursively", () => {
+  const schema = {
+    type: "object",
+    patternProperties: { "^n_": { type: "integer" } },
+    additionalProperties: { type: "boolean" },
+  };
+  assert.deepEqual(normalizeToolArguments({ n_count: { value: "3" }, enabled: { value: "true" } }, schema).value,
+    { n_count: 3, enabled: true });
+});
+
+test("only explicitly annotated advisory fields are stripped", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      query: { type: "string" },
+      limit: { type: "integer", "x-cliproxy-advisory-ignored": true },
+    },
+    required: ["query", "limit"],
+    additionalProperties: false,
+  };
+  const registry = registryFor("search", schema);
+  const normalized = registry.normalize("search", { query: "x", limit: 100 });
+  assert.deepEqual(normalized.value, { query: "x" });
+  assert.equal(registry.validate("search", normalized.value, normalized.transforms), null);
+  assert.ok(normalized.transforms.some((entry) => entry.kind === "strip-advisory"));
+});
+
+test("conflicting nested and outer envelope fields fail closed", () => {
+  const schema = { type: "object", properties: { query: { type: "string" } }, required: ["query"], additionalProperties: false };
+  assert.throws(
+    () => normalizeToolArguments({ arguments: { query: "inner" }, query: "outer" }, schema),
+    (error) => error.code === "ambiguous_envelope",
+  );
+});
+
+test("schema validator caches remain byte- and entry-bounded under dynamic MCP churn", () => {
+  const registry = new ToolContractRegistry();
+  for (let generation = 0; generation < 96; generation++) {
+    registry.replace([{
+      name: `dynamic_${generation}`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: { type: "string", description: `${generation}:${"x".repeat(32 << 10)}` },
+        },
+        required: ["value"],
+        additionalProperties: false,
+      },
+    }]);
+  }
+  const stats = toolContractCacheStats();
+  for (const cache of Object.values(stats)) {
+    assert.ok(cache.entries <= cache.maxEntries, JSON.stringify(cache));
+    assert.ok(cache.bytes <= cache.maxBytes, JSON.stringify(cache));
+  }
 });

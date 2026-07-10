@@ -35,6 +35,38 @@ func TestComposerBridgeRateLimitStatusError(t *testing.T) {
 	if !strings.Contains(other, "status 502") {
 		t.Fatalf("502 Error() = %q, missing generic status text", other)
 	}
+
+	conflict := (&composerBridgeStatusError{
+		status:      http.StatusConflict,
+		correlation: "c4",
+		bridgeCode:  "client_message_delivery_uncertain",
+	}).Error()
+	for _, want := range []string{"status 409", "client_message_delivery_uncertain", "c4"} {
+		if !strings.Contains(conflict, want) {
+			t.Fatalf("409 Error() = %q, missing %q", conflict, want)
+		}
+	}
+}
+
+func TestParseComposerBridgeErrorCode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "typed continuation conflict", body: `{"error":{"code":"result_conflict","message":"details stay private"}}`, want: "result_conflict"},
+		{name: "missing", body: `{"error":{"message":"no code"}}`, want: ""},
+		{name: "uppercase rejected", body: `{"error":{"code":"RESULT_CONFLICT"}}`, want: ""},
+		{name: "punctuation rejected", body: `{"error":{"code":"result conflict; secret"}}`, want: ""},
+		{name: "oversize rejected", body: `{"error":{"code":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`, want: ""},
+		{name: "malformed json", body: `{`, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseComposerBridgeErrorCode([]byte(tc.body)); got != tc.want {
+				t.Fatalf("parseComposerBridgeErrorCode() = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestComposerBridgeRateLimitRetryAfter(t *testing.T) {

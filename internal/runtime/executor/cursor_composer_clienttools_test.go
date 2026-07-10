@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -227,6 +229,20 @@ func TestComposerInputClassification(t *testing.T) {
 	}
 }
 
+func TestComposerFreshUserTurnHasRetryStableMessageID(t *testing.T) {
+	request := []byte(`{"messages":[{"role":"system","content":"S"},{"role":"user","content":"do one thing"}]}`)
+	first := composerInput(request)
+	retry := composerInput(request)
+	id, _ := first["clientMessageId"].(string)
+	if !strings.HasPrefix(id, "ccm2_") || retry["clientMessageId"] != id {
+		t.Fatalf("fresh request retries need one stable message id: %v vs %v", first["clientMessageId"], retry["clientMessageId"])
+	}
+	changed := composerInput([]byte(`{"messages":[{"role":"system","content":"S"},{"role":"user","content":"do a different thing"}]}`))
+	if changed["clientMessageId"] == id {
+		t.Fatalf("distinct active user intent reused message id %q", id)
+	}
+}
+
 func TestComposerInputHistoryAndImages(t *testing.T) {
 	// Multi-turn first contact: prior turns rendered as history; last user is the new text.
 	in := composerInput([]byte(`{"messages":[
@@ -267,7 +283,10 @@ func TestComposerTurnBody(t *testing.T) {
 	// tool_choice=none path: caller passes advertise=nil => an explicit empty
 	// inventory clears any tools cached by a reused bridge session.
 	none := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "user", "text": "x"}, nil, "none", nil, nil)
-	if tools := gjson.GetBytes(none, "tools"); !tools.Exists() || !tools.IsArray() || len(tools.Array()) != 0 {
+	if gjson.GetBytes(none, "tools").Exists() {
+		t.Fatalf("tool inventory must not be serialized twice: %s", none)
+	}
+	if tools := gjson.Parse(gjson.GetBytes(none, "toolInventoryJSON").String()); !tools.IsArray() || len(tools.Array()) != 0 {
 		t.Fatalf("tool_choice=none must send an explicit empty inventory: %s", none)
 	}
 	if gjson.GetBytes(none, "toolChoice").String() != "none" {
@@ -277,7 +296,7 @@ func TestComposerTurnBody(t *testing.T) {
 	adv := []map[string]any{{"name": "Read", "toolName": "Read"}}
 	full := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "user", "text": "x"}, adv, "auto", map[string]any{"shell": "zsh"},
 		map[string]any{"responseFormat": map[string]any{"type": "json_object"}, "stop": []string{"STOP"}, "maxTokens": 256})
-	if gjson.GetBytes(full, "tools.0.name").String() != "Read" {
+	if gjson.Parse(gjson.GetBytes(full, "toolInventoryJSON").String()).Get("0.name").String() != "Read" {
 		t.Fatalf("advertised tool missing: %s", full)
 	}
 	if gjson.GetBytes(full, "clientEnv.shell").String() != "zsh" {
@@ -455,11 +474,10 @@ func TestResolveCursorModelAlias(t *testing.T) {
 	}
 }
 
-// A mixed tool_results+text turn (Claude Code bundles tool_results AND a new user message when you interrupt
-// a tool or background a task and then type) must NEVER error — erroring 500s a routine client turn. Instead
-// the trailing user text is FOLDED into the last tool result's content so the model answers both in one turn.
-// A pure tool_results turn (no trailing text) is left exactly as-is.
-func TestComposerMixedTurnFoldsTrailingText(t *testing.T) {
+// A mixed tool_results+text turn is two independent facts: an immutable tool
+// receipt and a separately identified user message. The bridge journals and
+// delivers the latter without corrupting the former's idempotency hash.
+func TestComposerMixedTurnSeparatesTrailingText(t *testing.T) {
 	mixed := composerInput([]byte(`{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},{"role":"tool","tool_call_id":"tc_1","content":"R"},{"role":"user","content":"also do X"}]}`))
 	if mixed["type"] != "tool_results" {
 		t.Fatalf("mixed turn must classify as tool_results, got %v", mixed["type"])
@@ -468,11 +486,14 @@ func TestComposerMixedTurnFoldsTrailingText(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("expected 1 tool result, got %d", len(results))
 	}
-	if content, _ := results[len(results)-1]["content"].(string); !strings.Contains(content, "R") || !strings.Contains(content, "also do X") {
-		t.Fatalf("trailing user text must be folded into the last tool result content (no error), got %q", content)
+	if content, _ := results[len(results)-1]["content"].(string); content != "R" {
+		t.Fatalf("tool result receipt must remain immutable, got %q", content)
 	}
-	if _, hasTrailing := mixed["trailingText"]; hasTrailing {
-		t.Fatalf("trailingText must not be exposed as a separate signal once folded, got %v", mixed["trailingText"])
+	if mixed["userText"] != "also do X" || mixed["interruptRequested"] != true {
+		t.Fatalf("trailing user input must be first-class and interrupt-capable, got %#v", mixed)
+	}
+	if id, _ := mixed["clientMessageId"].(string); !strings.HasPrefix(id, "ccm2_") {
+		t.Fatalf("mixed input needs a stable client message id, got %q", id)
 	}
 	// A pure tool_results turn (no trailing text) must NOT be modified.
 	pure := composerInput([]byte(`{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},{"role":"tool","tool_call_id":"tc_1","content":"R"}]}`))
@@ -482,6 +503,47 @@ func TestComposerMixedTurnFoldsTrailingText(t *testing.T) {
 	}
 	if c, _ := pres[0]["content"].(string); c != "R" {
 		t.Fatalf("a pure tool_results turn must NOT be modified, got content %q", c)
+	}
+}
+
+func TestComposerClientMessageIDIsRetryStableAndTurnDistinct(t *testing.T) {
+	request := []byte(`{"messages":[
+		{"role":"assistant","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
+		{"role":"tool","tool_call_id":"tc_1","content":"R"},
+		{"role":"user","content":"same text"}
+	]}`)
+	first := composerInput(request)
+	retry := composerInput(request)
+	if first["clientMessageId"] == "" || first["clientMessageId"] != retry["clientMessageId"] {
+		t.Fatalf("exact request retries need one stable message id: %v vs %v", first["clientMessageId"], retry["clientMessageId"])
+	}
+	distinct := composerInput([]byte(`{"messages":[
+		{"role":"user","content":"earlier turn"},
+		{"role":"assistant","tool_calls":[{"id":"tc_2","function":{"name":"Read"}}]},
+		{"role":"tool","tool_call_id":"tc_2","content":"R"},
+		{"role":"user","content":"same text"}
+	]}`))
+	if first["clientMessageId"] == distinct["clientMessageId"] {
+		t.Fatalf("same text in distinct turns must have distinct ids: %v", first["clientMessageId"])
+	}
+
+	reencoded := composerInput([]byte(`{
+		"messages" : [
+			{"tool_calls":[{"function":{"name":"Read"},"id":"tc_1"}],"role":"assistant"},
+			{"content":"R","tool_call_id":"tc_1","role":"tool"},
+			{"content":"same \u0074ext","role":"user"}
+		]
+	}`))
+	if first["clientMessageId"] != reencoded["clientMessageId"] {
+		t.Fatalf("semantic retry changed id after harmless JSON reserialization: %v vs %v", first["clientMessageId"], reencoded["clientMessageId"])
+	}
+	singleID := composerClientMessageID([]map[string]any{{"toolCallId": "tc_1"}}, "same text", nil)
+	duplicateID := composerClientMessageID([]map[string]any{
+		{"toolCallId": "tc_1"},
+		{"toolCallId": "tc_1"},
+	}, "same text", nil)
+	if singleID != duplicateID {
+		t.Fatalf("idempotent duplicate result ids changed client message identity: %q vs %q", singleID, duplicateID)
 	}
 }
 
@@ -535,6 +597,74 @@ func TestExecuteComposerStreamBridgeErrorSurfaces(t *testing.T) {
 	}
 	if !sawErr {
 		t.Fatalf("a bridge turn_end{error} must surface as a stream error, not a clean/empty success")
+	}
+}
+
+func TestExecuteComposerContainedConflictIsNormalRetryableTurn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"type\":\"turn_end\",\"stop_reason\":\"error\",\"receipt\":\"multiple_live_tool_rounds_deferred\",\"retryable\":true,\"error\":\"each conversation must retry independently\"}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "contained", Attributes: map[string]string{
+		"api_key":                          "k",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "composer-2.5",
+		Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Read"}}]}`),
+	}
+
+	resp, err := e.executeComposer(context.Background(), auth, "k", req, composerExecOpts("openai", "contained-nonstream"))
+	if err != nil {
+		t.Fatalf("contained non-stream conflict must not be an API error: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.finish_reason").String(); got != "stop" {
+		t.Fatalf("contained non-stream finish_reason = %q, want stop: %s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); !strings.Contains(got, "No tool results were consumed") {
+		t.Fatalf("contained non-stream explanation missing: %s", resp.Payload)
+	}
+
+	stream, err := e.executeComposerStream(context.Background(), auth, "k", req, composerExecOpts("openai", "contained-stream"))
+	if err != nil {
+		t.Fatalf("contained stream setup must succeed: %v", err)
+	}
+	var wire strings.Builder
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("contained stream conflict must not emit an API error: %v", chunk.Err)
+		}
+		wire.Write(chunk.Payload)
+	}
+	if got := wire.String(); !strings.Contains(got, "No tool results were consumed") || !strings.Contains(got, `"finish_reason":"stop"`) {
+		t.Fatalf("contained stream must emit explanatory text plus a normal stop: %s", got)
+	}
+}
+
+func TestComposerContainedConflictMessageIsStrictlyAllowlisted(t *testing.T) {
+	for name, raw := range map[string]string{
+		"allowed":       `{"stop_reason":"error","receipt":"continuation_conflict_contained","retryable":true,"error":"retry"}`,
+		"not retryable": `{"stop_reason":"error","receipt":"continuation_conflict_contained","retryable":false,"error":"fatal"}`,
+		"unknown":       `{"stop_reason":"error","receipt":"some_future_error","retryable":true,"error":"fatal"}`,
+		"not error":     `{"stop_reason":"stop","receipt":"continuation_conflict_contained","retryable":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			message, ok := composerContainedConflictMessage(gjson.Parse(raw))
+			if name == "allowed" {
+				if !ok || !strings.Contains(message, "retry") {
+					t.Fatalf("allowed receipt not recognized: ok=%v message=%q", ok, message)
+				}
+				return
+			}
+			if ok || message != "" {
+				t.Fatalf("non-allowlisted error was contained: ok=%v message=%q", ok, message)
+			}
+		})
 	}
 }
 
@@ -909,16 +1039,22 @@ func TestComposerToolResultsExtractionCount(t *testing.T) {
 			t.Fatalf("n=%d: expected tool_results with %d results, got type=%v count=%d", n, n, inp["type"], len(results))
 		}
 	}
-	// Mixed: tool_results + trailing text must still classify as tool_results (Comment 4), not a fresh user
-	// turn, and the trailing text must be FOLDED into the last result (carried, never dropped, never an error).
+	// Mixed: tool_results + trailing text remains a continuation, but the user
+	// message is carried independently and never changes a result receipt.
 	oai := sdktranslator.TranslateRequest(from, to, "composer-2.5", mk(2, true), false)
 	inp := composerInput(oai)
 	results, _ := inp["results"].([]map[string]any)
 	if inp["type"] != "tool_results" || len(results) != 2 {
 		t.Fatalf("mixed tool_result+text must classify as tool_results with 2 results, got type=%v count=%d", inp["type"], len(results))
 	}
-	if c, _ := results[len(results)-1]["content"].(string); !strings.Contains(c, "continue") {
-		t.Fatalf("mixed turn must fold the trailing user text into the last result content, got %q", c)
+	if c, _ := results[len(results)-1]["content"].(string); c != "result 1" {
+		t.Fatalf("mixed turn must not mutate the last result content, got %q", c)
+	}
+	if inp["userText"] != "also please continue" || inp["interruptRequested"] != true {
+		t.Fatalf("mixed turn must carry user input separately, got %#v", inp)
+	}
+	if id, _ := inp["clientMessageId"].(string); !strings.HasPrefix(id, "ccm2_") {
+		t.Fatalf("mixed turn must carry a stable client message id, got %q", id)
 	}
 }
 
@@ -945,12 +1081,30 @@ func TestCallerCredentialForms(t *testing.T) {
 
 // Per-request response id must be unique so clients never conflate unrelated responses.
 func TestComposerResponseIDUnique(t *testing.T) {
-	a, b := composerResponseID(), composerResponseID()
+	const (
+		apiKey    = "cursor-key"
+		tenant    = "tenant-a"
+		sessionID = "sess_1234567890abcdef"
+	)
+	a, b := composerResponseID(apiKey, tenant, sessionID), composerResponseID(apiKey, tenant, sessionID)
 	if a == b {
 		t.Fatalf("response ids must differ per request: %s == %s", a, b)
 	}
-	if !strings.HasPrefix(a, "chatcmpl-composer-") {
+	if !strings.HasPrefix(a, composerRoutedResponseIDPrefix) {
 		t.Fatalf("unexpected response id prefix: %s", a)
+	}
+	if got := composerSessionFromResponseID(tenant, apiKey, a); got != sessionID {
+		t.Fatalf("routed response id decoded to %q, want %q", got, sessionID)
+	}
+	if got := composerSessionFromResponseID("tenant-b", apiKey, a); got != "" {
+		t.Fatalf("cross-tenant response id decoded to %q", got)
+	}
+	if got := composerSessionFromResponseID(tenant, "different-key", a); got != "" {
+		t.Fatalf("cross-key response id decoded to %q", got)
+	}
+	tampered := a[:len(a)-1] + map[bool]string{true: "A", false: "B"}[a[len(a)-1] != 'A']
+	if got := composerSessionFromResponseID(tenant, apiKey, tampered); got != "" {
+		t.Fatalf("tampered response id decoded to %q", got)
 	}
 }
 
@@ -993,10 +1147,64 @@ func TestComposerTurnBodyNeutralWorkspaceNeverInventsSentinel(t *testing.T) {
 	if !gjson.GetBytes(body, "clientEnv.workspaceUnknown").Bool() {
 		t.Fatalf("neutral workspace marker missing: %s", body)
 	}
+	if gjson.GetBytes(body, "contractVersion").Int() != 2 || !gjson.GetBytes(body, "toolsAuthoritative").Bool() {
+		t.Fatalf("client-tool v2 authority contract missing: %s", body)
+	}
+	if epoch := gjson.GetBytes(body, "toolInventoryEpoch").String(); !strings.HasPrefix(epoch, "cti1_") || len(epoch) != len("cti1_")+32 {
+		t.Fatalf("authoritative tool inventory epoch missing or malformed: %q body=%s", epoch, body)
+	}
 	for _, forbidden := range []string{"/workspace", "/app", `"processWorkingDirectory":"."`} {
 		if strings.Contains(string(body), forbidden) {
 			t.Fatalf("headerless request invented forbidden workspace %q: %s", forbidden, body)
 		}
+	}
+}
+
+func TestComposerToolInventoryEpochMatchesBridgeCanonicalContract(t *testing.T) {
+	tools := []map[string]any{{
+		"name":        "T",
+		"description": "<&>\u2028",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"0":    map[string]any{"type": "number", "minimum": json.Number("-0")},
+				"huge": map[string]any{"type": "integer", "maximum": json.Number("9007199254740993")},
+			},
+		},
+	}}
+	const wantJSON = `[{"description":"\u003c\u0026\u003e\u2028","inputSchema":{"properties":{"0":{"minimum":-0,"type":"number"},"huge":{"maximum":9007199254740993,"type":"integer"}},"type":"object"},"name":"T"}]`
+	const wantEpoch = "cti1_2bb750689a0806d0a1f5b6e984f6a7d0"
+	gotJSON, gotEpoch := composerToolInventorySnapshot(tools)
+	if gotJSON != wantJSON {
+		t.Fatalf("Go inventory snapshot drifted:\n got %q\nwant %q", gotJSON, wantJSON)
+	}
+	if gotEpoch != wantEpoch {
+		t.Fatalf("Go/bridge inventory fingerprint contract drifted: got %q want %q", gotEpoch, wantEpoch)
+	}
+	if got := composerToolInventoryEpoch(tools); got != wantEpoch {
+		t.Fatalf("Go/bridge inventory fingerprint contract drifted: got %q want %q", got, wantEpoch)
+	}
+	body := composerTurnBody("s1", "cursor-grok-4.5", map[string]any{"type": "user", "text": "x"}, tools, "auto", nil, nil)
+	if got := gjson.GetBytes(body, "toolInventoryJSON").String(); got != wantJSON {
+		t.Fatalf("outer turn envelope changed the authoritative snapshot:\n got %q\nwant %q", got, wantJSON)
+	}
+	if got := gjson.GetBytes(body, "toolInventoryEpoch").String(); got != wantEpoch {
+		t.Fatalf("outer turn envelope changed the authoritative epoch: got %q want %q", got, wantEpoch)
+	}
+}
+
+func TestComposerAdvertisePreservesJSONNumberLexemesUntilAuthoritativeSnapshot(t *testing.T) {
+	oai := []byte(`{"tools":[{"type":"function","function":{"name":"T","parameters":{"type":"object","properties":{"n":{"type":"integer","minimum":-0,"maximum":9007199254740993}}}}}]}`)
+	tools := composerAdvertise(oai)
+	gotJSON, gotEpoch := composerToolInventorySnapshot(tools)
+	const wantJSON = `[{"description":"","inputSchema":{"properties":{"n":{"maximum":9007199254740993,"minimum":-0,"type":"integer"}},"type":"object"},"name":"T"}]`
+	if gotJSON != wantJSON {
+		t.Fatalf("tool-schema JSON numbers changed before the authoritative snapshot:\n got %s\nwant %s", gotJSON, wantJSON)
+	}
+	sum := sha256.Sum256([]byte(wantJSON))
+	wantEpoch := "cti1_" + hex.EncodeToString(sum[:16])
+	if gotEpoch != wantEpoch {
+		t.Fatalf("snapshot epoch mismatch: got %q want %q", gotEpoch, wantEpoch)
 	}
 }
 
@@ -1007,12 +1215,132 @@ func TestComposerToolResultEntryPreservesExplicitStructuredContent(t *testing.T)
 		t.Fatalf("text content changed: %#v", got["content"])
 	}
 	structured, ok := got["structuredContent"].(map[string]any)
-	if !ok || structured["count"] != float64(2) || structured["ok"] != true {
+	if !ok || structured["count"] != json.Number("2") || structured["ok"] != true {
 		t.Fatalf("structured content not preserved: %#v", got["structuredContent"])
 	}
 	textOnly := composerToolResultEntry(gjson.Parse(`{"role":"tool","tool_call_id":"call_2","content":"{\"not\":\"promoted\"}"}`))
 	if _, exists := textOnly["structuredContent"]; exists {
 		t.Fatal("JSON-looking text must not be promoted to structured content")
+	}
+}
+
+func TestComposerToolResultEntryPreservesOrderedBlocksAndStrictSemantics(t *testing.T) {
+	m := gjson.Parse(`{
+		"role":"tool",
+		"tool_call_id":"call_blocks",
+		"isError":true,
+		"content":[
+			{"type":"text","text":"first"},
+			{"type":"image","source":{"type":"base64","media_type":"IMAGE/PNG","data":"QUJD"}},
+			{"type":"text","text":"second"},
+			{"type":"image_url","image_url":{"url":"https://example.test/a.png","detail":"high"}}
+		],
+		"structured_content":null
+	}`)
+	got := composerToolResultEntry(m)
+	if got["content"] != "first\n\nsecond" || got["isError"] != true {
+		t.Fatalf("text/error semantics changed: %#v", got)
+	}
+	if got["structuredContentPresent"] != true {
+		t.Fatalf("explicit structured null presence was lost: %#v", got)
+	}
+	if value, exists := got["structuredContent"]; !exists || value != nil {
+		t.Fatalf("explicit structured null was not retained: %#v", got)
+	}
+	blocks, ok := got["contentBlocks"].([]map[string]any)
+	if !ok || len(blocks) != 4 {
+		t.Fatalf("ordered content blocks lost: %#v", got["contentBlocks"])
+	}
+	if blocks[0]["type"] != "text" || blocks[1]["type"] != "image" || blocks[2]["type"] != "text" || blocks[3]["type"] != "image" {
+		t.Fatalf("text/image interleaving changed: %#v", blocks)
+	}
+	images, ok := got["images"].([]map[string]any)
+	if !ok || len(images) != 2 || images[1]["detail"] != "high" {
+		t.Fatalf("image compatibility envelopes lost fidelity: %#v", got["images"])
+	}
+
+	conflict := composerToolResultEntry(gjson.Parse(`{"role":"tool","tool_call_id":"c","content":"x","is_error":true,"isError":false}`))
+	if conflict["contractError"] == nil || conflict["isError"] != true {
+		t.Fatalf("conflicting error aliases must become a typed contract error: %#v", conflict)
+	}
+	malformed := composerToolResultEntry(gjson.Parse(`{"role":"tool","tool_call_id":"c","content":[{"type":"image","source":{"type":"base64","data":"***"}}]}`))
+	if malformed["contractError"] == nil || malformed["isError"] != true {
+		t.Fatalf("malformed image must become a typed contract error: %#v", malformed)
+	}
+	equalAliases := composerToolResultEntry(gjson.Parse(`{"role":"tool","tool_call_id":"c","content":"x","structured_content":{"a":1,"b":2},"structuredContent":{"b":2,"a":1}}`))
+	if equalAliases["contractError"] != nil || equalAliases["structuredContentPresent"] != true {
+		t.Fatalf("equivalent structured aliases should deduplicate: %#v", equalAliases)
+	}
+	conflictingAliases := composerToolResultEntry(gjson.Parse(`{"role":"tool","tool_call_id":"c","content":"x","structured_content":1,"structuredContent":2}`))
+	if conflictingAliases["contractError"] == nil || conflictingAliases["isError"] != true {
+		t.Fatalf("conflicting structured aliases must fail closed: %#v", conflictingAliases)
+	}
+	numericAliases := composerToolResultEntry(gjson.Parse(`{"role":"tool","tool_call_id":"c","content":"x","structured_content":1,"structuredContent":1.0}`))
+	if numericAliases["contractError"] != nil {
+		t.Fatalf("equivalent JSON number spellings must not conflict: %#v", numericAliases)
+	}
+}
+
+func TestComposerToolResultTruncationPreservesAuthoritativeImageBlocks(t *testing.T) {
+	huge := strings.Repeat("x", composerLiveToolResultMaxBytes+1024)
+	raw, err := json.Marshal(map[string]any{
+		"role":         "tool",
+		"tool_call_id": "images-after-truncate",
+		"content": []any{
+			map[string]any{"type": "text", "text": huge},
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.test/a.png", "detail": "high"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := composerToolResultEntry(gjson.ParseBytes(raw))
+	blocks, ok := got["contentBlocks"].([]map[string]any)
+	if !ok || len(blocks) != 3 || blocks[0]["type"] != "text" || blocks[1]["type"] != "image" || blocks[2]["type"] != "image" {
+		t.Fatalf("truncation dropped authoritative images: %#v", got["contentBlocks"])
+	}
+	if !strings.Contains(blocks[0]["text"].(string), "truncated by proxy") {
+		t.Fatalf("oversized text was not visibly truncated: %#v", blocks[0])
+	}
+	if images, ok := got["images"].([]map[string]any); !ok || len(images) != 2 {
+		t.Fatalf("compatibility image projection changed: %#v", got["images"])
+	}
+}
+
+func TestComposerToolResultUnsafeNumbersBecomeTypedFailuresWithoutHTTPContractErrors(t *testing.T) {
+	for _, raw := range []string{
+		`{"role":"tool","tool_call_id":"unsafe","content":9007199254740993}`,
+		`{"role":"tool","tool_call_id":"unsafe","content":"ok","structured_content":{"n":1e20}}`,
+	} {
+		got := composerToolResultEntry(gjson.Parse(raw))
+		if got["contractError"] != nil || got["isError"] != true {
+			t.Fatalf("unrepresentable number must become an accepted typed tool failure, not a 422 contract error: %#v", got)
+		}
+		structured, _ := got["structuredContent"].(map[string]any)
+		if structured["code"] != "client_tool_result_unrepresentable" || structured["executed"] != true || structured["applied"] != false {
+			t.Fatalf("missing typed unrepresentable-number receipt: %#v", got)
+		}
+	}
+	oversizedRaw, err := json.Marshal(map[string]any{
+		"role":               "tool",
+		"tool_call_id":       "oversized-structured",
+		"content":            "executed",
+		"structured_content": map[string]any{"blob": strings.Repeat("x", composerLiveToolResultMaxBytes+1)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversized := composerToolResultEntry(gjson.ParseBytes(oversizedRaw))
+	if oversized["contractError"] != nil || oversized["isError"] != true {
+		t.Fatalf("oversized structured output must become an accepted typed failure rather than a retrying 422: %#v", oversized)
+	}
+
+	safe := composerToolResultEntry(gjson.Parse(`{"role":"tool","tool_call_id":"safe","content":{"max":9007199254740991,"negativeZero":-0}}`))
+	blocks := safe["contentBlocks"].([]map[string]any)
+	value := blocks[0]["value"].(map[string]any)
+	if value["max"] != json.Number("9007199254740991") || value["negativeZero"] != json.Number("-0") {
+		t.Fatalf("safe integer or negative-zero lexeme changed in Go: %#v", value)
 	}
 }
 
@@ -1042,8 +1370,8 @@ func TestComposerMixedTurnSystemReminderFraming(t *testing.T) {
 		t.Fatalf("real trailing user message must set userText, got %v", real["userText"])
 	}
 	results, _ := real["results"].([]map[string]any)
-	if c, _ := results[len(results)-1]["content"].(string); !strings.Contains(c, "their latest instruction") || !strings.Contains(c, "also do X") {
-		t.Fatalf("real trailing message must use instruction framing: %q", c)
+	if c, _ := results[len(results)-1]["content"].(string); c != "R" {
+		t.Fatalf("real trailing message must not mutate the result receipt: %q", c)
 	}
 
 	// M30: an AUTO-INJECTED reminder (the SAME block recurs verbatim earlier in the transcript as context)
@@ -1059,12 +1387,11 @@ func TestComposerMixedTurnSystemReminderFraming(t *testing.T) {
 		t.Fatalf("an auto-injected (recurring) system-reminder must NOT set userText, got %v", rem["userText"])
 	}
 	rres, _ := rem["results"].([]map[string]any)
-	c, _ := rres[len(rres)-1]["content"].(string)
-	if !strings.Contains(c, "[System reminder accompanying these tool results:]") {
-		t.Fatalf("auto-injected system-reminder must use neutral framing, got %q", c)
+	if c, _ := rres[len(rres)-1]["content"].(string); c != "R" {
+		t.Fatalf("auto-injected reminder must not mutate the result receipt, got %q", c)
 	}
-	if strings.Contains(c, "their latest instruction") {
-		t.Fatalf("auto-injected system-reminder must NOT be labeled as the user's instruction, got %q", c)
+	if system, _ := rem["system"].(string); !strings.Contains(system, "The file changed on disk") {
+		t.Fatalf("auto-injected reminder must travel through system context, got %q", system)
 	}
 
 	// M30: a FIRST-occurrence (user-authored) <system-reminder> as the trailing message is NOT auto-injected
@@ -1078,9 +1405,8 @@ func TestComposerMixedTurnSystemReminderFraming(t *testing.T) {
 		t.Fatalf("a literal first-occurrence user <system-reminder> must set userText (M30), got %v", lit["userText"])
 	}
 	lres, _ := lit["results"].([]map[string]any)
-	lc, _ := lres[len(lres)-1]["content"].(string)
-	if !strings.Contains(lc, "their latest instruction") {
-		t.Fatalf("a literal user reminder must use instruction framing (M30), got %q", lc)
+	if lc, _ := lres[len(lres)-1]["content"].(string); lc != "R" {
+		t.Fatalf("a literal user reminder must not mutate the result receipt (M30), got %q", lc)
 	}
 
 	// isAutoInjectedReminder unit checks: a single occurrence is user text (false); a recurrence is synthetic.
@@ -1102,6 +1428,28 @@ func TestComposerMixedTurnSystemReminderFraming(t *testing.T) {
 	}
 	if isPureSystemReminder("just a normal message") {
 		t.Fatalf("plain text must not be a system reminder")
+	}
+}
+
+func TestComposerMixedTurnUsesLatestUnresolvedUserSnapshot(t *testing.T) {
+	inp := composerInput([]byte(`{"messages":[
+		{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
+		{"role":"tool","tool_call_id":"tc_1","content":"R"},
+		{"role":"user","content":[{"type":"text","text":"first failed retry"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]},
+		{"role":"user","content":[{"type":"text","text":"latest current instruction"},{"type":"image_url","image_url":{"url":"data:image/png;base64,REVG"}}]}
+	]}`))
+	if inp["type"] != "tool_results" {
+		t.Fatalf("unresolved retry transcript must remain a continuation, got %v", inp["type"])
+	}
+	if inp["userText"] != "latest current instruction" {
+		t.Fatalf("only the latest unresolved user snapshot is current, got %q", inp["userText"])
+	}
+	imgs, _ := inp["images"].([]map[string]any)
+	if len(imgs) != 1 || imgs[0]["data"] != "REVG" {
+		t.Fatalf("only latest-snapshot images may be forwarded, got %#v", imgs)
+	}
+	if strings.Contains(inp["userText"].(string), "first failed retry") {
+		t.Fatalf("failed retry history was concatenated into current intent: %q", inp["userText"])
 	}
 }
 
@@ -1397,25 +1745,25 @@ func TestRenderComposerHistoryImagePlaceholder(t *testing.T) {
 
 // ---- all-35 principal-eng audit regression tests (executor-owned findings) ----
 
-// H10 (C-CONTINUATION-TOOLS): composerTurnBody must attach `tools` on EVERY turn when advertised, not only
-// on a new-user turn — the bridge refreshes its advertise set from body.tools on tool_results turns too, so
-// dropping tools on a continuation left a stale advertise set. tool_choice=none
+// H10 (C-CONTINUATION-TOOLS): composerTurnBody must attach the authoritative tool snapshot on EVERY turn when
+// advertised, not only on a new-user turn. The bridge refreshes its registry from toolInventoryJSON on
+// tool_results turns too, so dropping the snapshot on a continuation left a stale advertise set. tool_choice=none
 // sends an explicit empty snapshot so a reused bridge clears old tools.
 func TestComposerTurnBodyToolsOnContinuation(t *testing.T) {
 	adv := []map[string]any{{"name": "Read", "toolName": "Read"}}
 	// A tool_results continuation MUST still carry the current tool inventory.
 	cont := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "tool_results", "results": []any{}}, adv, "auto", nil, nil)
-	if gjson.GetBytes(cont, "tools.0.name").String() != "Read" {
+	if gjson.Parse(gjson.GetBytes(cont, "toolInventoryJSON").String()).Get("0.name").String() != "Read" {
 		t.Fatalf("H10: continuation turn must include the current tools array, got %s", cont)
 	}
 	// A new-user turn still carries tools (unchanged behavior).
 	user := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "user", "text": "x"}, adv, "auto", nil, nil)
-	if gjson.GetBytes(user, "tools.0.name").String() != "Read" {
+	if gjson.Parse(gjson.GetBytes(user, "toolInventoryJSON").String()).Get("0.name").String() != "Read" {
 		t.Fatalf("H10: user turn must include tools, got %s", user)
 	}
 	// tool_choice=none gating (advertise=nil) still wins and explicitly clears.
 	none := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "tool_results", "results": []any{}}, nil, "none", nil, nil)
-	if tools := gjson.GetBytes(none, "tools"); !tools.IsArray() || len(tools.Array()) != 0 {
+	if tools := gjson.Parse(gjson.GetBytes(none, "toolInventoryJSON").String()); !tools.IsArray() || len(tools.Array()) != 0 {
 		t.Fatalf("H10: tool_choice=none must clear tools even on a continuation, got %s", none)
 	}
 }
@@ -1506,6 +1854,27 @@ func TestDeriveComposerSessionID_PreviousResponseIDResumes(t *testing.T) {
 	}
 	if got != prior {
 		t.Fatalf("H16: previous_response_id must resume the durable session %s, got %s", prior, got)
+	}
+	// New response ids are self-routing. Clear the compatibility cache to
+	// model a full Go process restart and prove a Responses-only client still
+	// reaches the exact durable session with no conversation id or history.
+	routed := composerResponseID("cursorkey", tenant, prior)
+	composerResponseSessionMu.Lock()
+	savedSessions := composerResponseSessions
+	savedOrder := composerResponseSessionOrder
+	composerResponseSessions = make(map[string]string)
+	composerResponseSessionOrder = nil
+	composerResponseSessionMu.Unlock()
+	defer func() {
+		composerResponseSessionMu.Lock()
+		composerResponseSessions = savedSessions
+		composerResponseSessionOrder = savedOrder
+		composerResponseSessionMu.Unlock()
+	}()
+	routedFollowup := cliproxyexecutor.Options{OriginalRequest: []byte(fmt.Sprintf(`{"previous_response_id":%q,"input":"after restart"}`, routed))}
+	gotRouted, errRouted := deriveComposerSessionID(auth, "cursorkey", []byte(`{"messages":[{"role":"user","content":"after restart"}]}`), routedFollowup)
+	if errRouted != nil || gotRouted != prior {
+		t.Fatalf("self-routing previous_response_id must survive restart (id=%q err=%v), want %q", gotRouted, errRouted, prior)
 	}
 	// Unknown previous_response_id (bridge restart / eviction) must degrade gracefully (mint), not error.
 	miss := cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"chatcmpl-composer-UNKNOWN","input":"hi"}`)}
@@ -2102,6 +2471,24 @@ func TestADD65_ResponsesChainedContinuationIsToolResults(t *testing.T) {
 	}
 }
 
+func TestADD65_ResponsesChainedContinuationIgnoresHistoricalToolRoutes(t *testing.T) {
+	oai := []byte(`{"previous_response_id":"resp_latest","messages":[
+		{"role":"user","content":"old request"},
+		{"role":"tool","tool_call_id":"cct1_old_route_0_signature","content":"historical result"},
+		{"role":"user","content":"intermediate request"},
+		{"role":"tool","tool_call_id":"cct1_current_route_0_signature","content":"current result"},
+		{"role":"user","content":"latest instruction"}
+	]}`)
+	inp := composerInput(oai)
+	results, _ := inp["results"].([]map[string]any)
+	if len(results) != 1 || results[0]["toolCallId"] != "cct1_current_route_0_signature" {
+		t.Fatalf("only the current contiguous result batch may be forwarded, got %#v", results)
+	}
+	if inp["userText"] != "latest instruction" {
+		t.Fatalf("latest chained user instruction was not preserved: %v", inp["userText"])
+	}
+}
+
 // ADD-62: the external session id must be derived from tenant+conversation ONLY, never the model, so a model
 // change on the same conversation keeps the same session id (the bridge then rotates the durable agent).
 func TestADD62_SessionIDStableAcrossModelChange(t *testing.T) {
@@ -2145,9 +2532,11 @@ func TestADD36_PartialParallelToolResultsCarriesUserText(t *testing.T) {
 	if len(results) != 1 || results[0]["toolCallId"] != "tc_A" {
 		t.Fatalf("ADD-36: only the returned tool result (A) is present; the bridge owns B/C, got %v", results)
 	}
-	// The trailing text is also folded into A's content so a resuming run reads it inline.
-	if c, _ := results[0]["content"].(string); !strings.Contains(c, "A done") || !strings.Contains(c, "stop and summarize") {
-		t.Fatalf("ADD-36: trailing user text must also be folded into the last result content, got %q", c)
+	if c, _ := results[0]["content"].(string); c != "A done" {
+		t.Fatalf("ADD-36: trailing user text must not mutate the result receipt, got %q", c)
+	}
+	if id, _ := mixed["clientMessageId"].(string); !strings.HasPrefix(id, "ccm2_") {
+		t.Fatalf("ADD-36: mixed user input needs a stable message id, got %q", id)
 	}
 }
 
@@ -2300,7 +2689,7 @@ func TestADD89_TrailingTextNotFoldedIntoErrorResult(t *testing.T) {
 		t.Fatalf("ADD-89: trailing user text must remain first-class userText, got %v", mixed["userText"])
 	}
 
-	// Control: when a NON-error result is also present, the text folds into the LAST NON-ERROR result, not the error one.
+	// Control: no result is mutated, regardless of whether another result succeeded.
 	mixed2 := composerInput([]byte(`{"messages":[
 		{"role":"assistant","tool_calls":[{"id":"tc_ok","function":{"name":"Read"}},{"id":"tc_err","function":{"name":"Bash"}}]},
 		{"role":"tool","tool_call_id":"tc_ok","content":"OK OUTPUT"},
@@ -2311,8 +2700,8 @@ func TestADD89_TrailingTextNotFoldedIntoErrorResult(t *testing.T) {
 	if len(res2) != 2 {
 		t.Fatalf("ADD-89: expected 2 results, got %d", len(res2))
 	}
-	if c, _ := res2[0]["content"].(string); !strings.Contains(c, "OK OUTPUT") || !strings.Contains(c, "now summarize") {
-		t.Fatalf("ADD-89: trailing text must fold into the last NON-error result, got %q", c)
+	if c, _ := res2[0]["content"].(string); c != "OK OUTPUT" {
+		t.Fatalf("ADD-89: non-error result must remain unmodified, got %q", c)
 	}
 	if c, _ := res2[1]["content"].(string); c != "failed" {
 		t.Fatalf("ADD-89: the error result must remain unmodified, got %q", c)
@@ -2389,6 +2778,10 @@ func TestADD104_NonObjectToolInputPreserved(t *testing.T) {
 	_, argsNum := mapComposerToolCall("Read", gjson.Parse(`5`), defs, nil)
 	if gjson.Get(argsNum, "input").Int() != 5 {
 		t.Fatalf("ADD-104: a number input must be preserved under {\"input\":...}, got %s", argsNum)
+	}
+	_, argsUnsafe := mapComposerToolCall("Read", gjson.Parse(`9007199254740993`), defs, nil)
+	if got := gjson.Get(argsUnsafe, "input").Raw; got != "9007199254740993" {
+		t.Fatalf("ADD-104: Go must preserve an unsafe integer lexeme for the bridge's typed refusal, got %s", argsUnsafe)
 	}
 	// Array input.
 	_, argsArr := mapComposerToolCall("Read", gjson.Parse(`[1,2,3]`), defs, nil)

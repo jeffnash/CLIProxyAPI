@@ -7,16 +7,19 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -55,12 +58,24 @@ const (
 	composerAgentContinuePath = "/agent/continue"
 )
 
-// composerSSEMaxLineBytes bounds a single bridge SSE "data:" line for bufio.Scanner (ADD-68). The prior
-// 52 MB bound tore down the whole stream/nonstream with bufio.ErrTooLong when Cursor emitted one large
-// data: frame (a big tool-call argument, a large generated chunk, a JSON-encoded result/error). Raised to
-// align with the bridge's 64 MB request-body cap (CURSOR_AGENT_MAX_AGENT_TURN_BYTES) so any frame the
-// bridge would accept can also be read back — a BOUNDED byte limit, NOT a wall-clock timeout (AGENTS.md).
-const composerSSEMaxLineBytes = 64 << 20
+// composerSSEMaxLineBytes bounds one bridge SSE data line. Node enforces the
+// same CURSOR_COMPOSER_MAX_SSE_FRAME_BYTES contract before writing, so a frame
+// can never be accepted by one side and fail later as bufio.ErrTooLong on the
+// other. The default is one MiB above MAX_AGENT_TURN_BYTES for JSON/SSE framing
+// overhead. This is a memory bound, not a wall-clock timeout.
+var composerSSEMaxLineBytes = func() int {
+	const defaultLimit = 65 << 20
+	raw := strings.TrimSpace(os.Getenv("CURSOR_COMPOSER_MAX_SSE_FRAME_BYTES"))
+	if raw == "" {
+		return defaultLimit
+	}
+	value, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || value < 1<<20 {
+		log.Warnf("cursor composer: invalid CURSOR_COMPOSER_MAX_SSE_FRAME_BYTES=%q; using %d", raw, defaultLimit)
+		return defaultLimit
+	}
+	return int(value)
+}()
 
 // composerBridgeMaxErrorBodyBytes bounds how much of a bridge non-2xx body is read before
 // redaction/logging (ADD-46): a faulty or hostile bridge could return a multi-megabyte error page
@@ -140,6 +155,26 @@ func composerEventIsBenignTelemetry(eventType string) bool {
 	}
 }
 
+// composerContainedConflictMessage recognizes bridge errors that are deliberately contained before any tool
+// result is consumed. They are terminal for this malformed combined request, but they are not an upstream
+// failure and must not poison either underlying conversation with a client-visible 5xx. Keep this allowlist
+// narrow: every other turn_end{stop_reason:"error"} still surfaces as a real API error.
+func composerContainedConflictMessage(ev gjson.Result) (string, bool) {
+	if ev.Get("stop_reason").String() != "error" || !ev.Get("retryable").Bool() {
+		return "", false
+	}
+	switch ev.Get("receipt").String() {
+	case "multiple_live_tool_rounds_deferred", "continuation_conflict_contained":
+		message := strings.TrimSpace(ev.Get("error").String())
+		if message == "" {
+			message = "the submitted tool results were not consumed; retry each conversation independently"
+		}
+		return "No tool results were consumed: " + message, true
+	default:
+		return "", false
+	}
+}
+
 // composerBridgeStatusError is a typed executor error that preserves the bridge's HTTP status so the
 // conductor (sdk/cliproxy/auth/conductor.go reads cliproxyexecutor.StatusError) sets rerr.HTTPStatus and
 // the API handler (sdk/api/handlers/handlers.go) maps it to the client response status — ADD-59 /
@@ -151,6 +186,7 @@ type composerBridgeStatusError struct {
 	status      int
 	correlation string
 	retryAfter  *time.Duration
+	bridgeCode  string
 }
 
 func (e *composerBridgeStatusError) Error() string {
@@ -164,7 +200,10 @@ func (e *composerBridgeStatusError) Error() string {
 		return fmt.Sprintf("cursor composer: upstream is rate-limiting this account or the proxy is at capacity; "+
 			"back off and retry in a few seconds — rapid retries make it worse (correlation %s)", e.correlation)
 	}
-	return fmt.Sprintf("cursor composer: bridge /agent/turn failed with status %d (correlation %s)", e.status, e.correlation)
+	if e.bridgeCode != "" {
+		return fmt.Sprintf("cursor composer: bridge request failed with status %d (%s; correlation %s)", e.status, e.bridgeCode, e.correlation)
+	}
+	return fmt.Sprintf("cursor composer: bridge request failed with status %d (correlation %s)", e.status, e.correlation)
 }
 
 // StatusCode implements cliproxyexecutor.StatusError so the conductor/handler preserve the bridge status
@@ -176,6 +215,19 @@ func (e *composerBridgeStatusError) StatusCode() int { return e.status }
 func (e *composerBridgeStatusError) RetryAfter() *time.Duration { return e.retryAfter }
 
 var composerRetryInPattern = regexp.MustCompile(`(?i)retry\s+in\s+~?\s*(\d+)\s*s`)
+var composerBridgeErrorCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+
+// parseComposerBridgeErrorCode retains only the bridge's bounded symbolic code
+// for the client-facing typed error. The raw JSON body and message stay in the
+// redacted server log, so arguments, credentials, and upstream text cannot be
+// reflected through the API error response.
+func parseComposerBridgeErrorCode(body []byte) string {
+	code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	if !composerBridgeErrorCodePattern.MatchString(code) {
+		return ""
+	}
+	return code
+}
 
 func parseComposerRetryAfterHeader(h http.Header, now time.Time) *time.Duration {
 	raw := strings.TrimSpace(h.Get("Retry-After"))
@@ -409,13 +461,14 @@ func composerContinuationHintFor(_ string, oai []byte) composerContinuationHint 
 // turn) -> the bridge session that produced it. H16: a Responses/Codex follow-up that carries
 // `previous_response_id` and no tools must resume the DURABLE agent, not get diverted to an ephemeral
 // one-shot (utility) or hashed as a "stable conv id" (a previous_response_id changes every turn, so it is
-// NOT stable). deriveComposerSessionID consults this map before any conv-id hash. Bounded (FIFO) so it
-// cannot grow without limit. Key shape: tenant + "\x00resp:" + outwardResponseID.
+// NOT stable). New IDs authenticate their session route directly; this bounded
+// FIFO map is compatibility for IDs emitted before that contract. Key shape:
+// tenant + "\x00resp:" + outwardResponseID.
 //
-// This map is process-local. A
-// previous_response_id follow-up that lands on a different replica than the one that emitted that response id
-// MISSES here and falls through to the stable-conv hash / fresh mint (degrade-safe, never a wrong-session
-// route). Tool-result routing never depends on it; signed ids always go to the bridge journal.
+// A legacy ID can still miss after restart and fall through to stable-
+// conversation recovery. Newly emitted IDs do not depend on process memory.
+// Tool-result routing never depends on either mechanism; signed ids always go
+// to the bridge journal.
 var (
 	composerResponseSessionMu    sync.Mutex
 	composerResponseSessions     = make(map[string]string)
@@ -429,6 +482,9 @@ const composerResponseSessionCap = 20000
 func recordComposerResponseSession(tenant, outwardResponseID, sessionID string) {
 	if outwardResponseID == "" || sessionID == "" {
 		return
+	}
+	if strings.HasPrefix(outwardResponseID, composerRoutedResponseIDPrefix) {
+		return // the authenticated ID is its own bounded routing record
 	}
 	key := tenant + "\x00resp:" + outwardResponseID
 	composerResponseSessionMu.Lock()
@@ -444,11 +500,18 @@ func recordComposerResponseSession(tenant, outwardResponseID, sessionID string) 
 	composerResponseSessions[key] = sessionID
 }
 
-// lookupComposerResponseSession returns the session id recorded for a tenant-scoped outward response id, or
-// "" when unknown (bridge restart / eviction / cross-instance) — in which case the caller degrades gracefully.
-func lookupComposerResponseSession(tenant, outwardResponseID string) string {
+// lookupComposerResponseSession verifies a restart-safe route embedded in a
+// new response ID, then falls back to the legacy process-local map.
+func lookupComposerResponseSession(tenant, apiKey, outwardResponseID string) string {
 	if outwardResponseID == "" {
 		return ""
+	}
+	// New composer response ids carry an authenticated opaque session route.
+	// This is the restart/multi-replica authority; the bounded process-local
+	// map below remains only as backward compatibility for response ids emitted
+	// before the routed-id contract existed.
+	if sid := composerSessionFromResponseID(tenant, apiKey, outwardResponseID); sid != "" {
+		return sid
 	}
 	composerResponseSessionMu.Lock()
 	defer composerResponseSessionMu.Unlock()
@@ -531,7 +594,8 @@ func stableConversationID(opts cliproxyexecutor.Options) string {
 	// turns and never derived from message content. Never derive from message text. H16: previous_response_id
 	// is DELIBERATELY EXCLUDED here — it is NOT stable across a conversation (it changes every turn), so
 	// hashing it would mint a NEW session every turn and lose context. It is instead resolved via the
-	// response-id->sessionID map in deriveComposerSessionID (recordComposerResponseSession).
+	// authenticated routed response id in deriveComposerSessionID; the map is a
+	// compatibility fallback for IDs emitted by an older process.
 	//
 	// ADD-78: prompt_cache_key is DELIBERATELY EXCLUDED too. It is a cache-locality HINT, not a conversation
 	// identity: clients reuse a single coarse cache key across SEPARATE tasks that merely share a system
@@ -1442,7 +1506,7 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 	// `/agent/continue` resolves the actual paused round from the opaque signed tool-call ids.
 	if _, _, isCont := composerToolResultsHinted(gjson.GetBytes(oai, "messages").Array(), contHint); isCont {
 		if pid := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, "previous_response_id").String()); pid != "" {
-			if mapped := lookupComposerResponseSession(tenant, pid); mapped != "" {
+			if mapped := lookupComposerResponseSession(tenant, apiKey, pid); mapped != "" {
 				return mapped, nil
 			}
 		}
@@ -1453,12 +1517,12 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 	}
 
 	// H16 (C-RESPID): a Responses/Codex follow-up that carries previous_response_id resumes the DURABLE agent
-	// via the response-id->sessionID map (recorded outward in executeComposer/executeComposerStream). This is
+	// via its authenticated embedded route (or the legacy response-id map). This is
 	// BEFORE the stable-conv hash because previous_response_id is intentionally NOT in stableConversationID's
-	// list (it is not stable — it changes every turn). On a map miss (bridge restart / eviction) we fall
+	// list (it is not stable — it changes every turn). On an unknown legacy ID we fall
 	// through to the stable-conv hash and finally to a fresh mint, so a routine follow-up never errors.
 	if pid := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, "previous_response_id").String()); pid != "" {
-		if sid := lookupComposerResponseSession(tenant, pid); sid != "" {
+		if sid := lookupComposerResponseSession(tenant, apiKey, pid); sid != "" {
 			composerDebugf("[composer] deriveSessionID BRANCH=previous_response_id(durable resume) -> sessionID=%s", sid)
 			return sid, nil
 		}
@@ -1535,7 +1599,7 @@ func deriveComposerSessionIDLive(auth *cliproxyauth.Auth, apiKey string, oai []b
 		return sid, 0, nil // /agent/continue is bridge-routed and owns no Go fresh-turn lease
 	}
 	if pid := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, "previous_response_id").String()); pid != "" {
-		if lookupComposerResponseSession(tenant, pid) != "" {
+		if lookupComposerResponseSession(tenant, apiKey, pid) != "" {
 			// P0-5: a previous_response_id resume starts a NEW logical run on a durable session — it must take part
 			// in the lease, not bypass it. Without a claim, two concurrent resumes of the SAME response id both land
 			// on the pinned session and the bridge rejects the second concurrent turn (serial session -> 500), the
@@ -1679,8 +1743,7 @@ func extractComposerSystem(messages []gjson.Result) string {
 
 // isPureSystemReminder reports whether the trailing text is ONLY auto-injected <system-reminder> block(s)
 // (with no other non-whitespace content). Such a block is context that accompanies tool results, not the
-// user's own instruction — so the mixed-turn fold must NOT label it as "the user's latest instruction"
-// (EX1), and it must NOT drive a fresh C1 userText send.
+// user's own instruction, so it travels as system context and must not create a deferred user send.
 func isPureSystemReminder(s string) bool {
 	t := strings.TrimSpace(s)
 	if !strings.HasPrefix(t, "<system-reminder>") {
@@ -1838,6 +1901,61 @@ func composerHistoryFingerprint(messages []gjson.Result) string {
 // emitted in the SDK inline shape {data, mimeType} (C4); an http(s) URL is emitted in the SDK URL shape
 // {url[, mimeType]} (C4) so non-base64 images survive to the SDK. Degenerate entries (empty data, empty
 // mime on the inline form, or empty url) are skipped so one bad attachment never fails the whole turn (EX12).
+func composerImageFromPart(part gjson.Result) (map[string]any, bool) {
+	// OpenAI image_url accepts both object and scalar forms.
+	iu := part.Get("image_url")
+	u := iu.Get("url").String()
+	if u == "" && iu.Type == gjson.String {
+		u = iu.String()
+	}
+	if u == "" {
+		u = part.Get("url").String()
+	}
+	if strings.HasPrefix(u, "data:") {
+		idx := strings.Index(u, ",")
+		if idx <= 5 {
+			return nil, false
+		}
+		meta, data := u[5:idx], u[idx+1:]
+		mime := meta
+		if semi := strings.Index(meta, ";"); semi >= 0 {
+			mime = meta[:semi]
+		}
+		if strings.TrimSpace(data) == "" || strings.TrimSpace(mime) == "" {
+			return nil, false
+		}
+		return map[string]any{"data": data, "mimeType": mime}, true
+	}
+	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		img := map[string]any{"url": u}
+		if mime := imageMimeFromURL(u); mime != "" {
+			img["mimeType"] = mime
+		}
+		if detail := part.Get("image_url.detail").String(); detail != "" {
+			img["detail"] = detail
+		} else if detail := part.Get("detail").String(); detail != "" {
+			img["detail"] = detail
+		}
+		return img, true
+	}
+	// Anthropic base64 image source and the bridge's internal image envelope.
+	data := part.Get("source.data").String()
+	if data == "" {
+		data = part.Get("data").String()
+	}
+	mime := part.Get("source.media_type").String()
+	if mime == "" {
+		mime = part.Get("source.mimeType").String()
+	}
+	if mime == "" {
+		mime = part.Get("mimeType").String()
+	}
+	if data != "" && mime != "" {
+		return map[string]any{"data": data, "mimeType": mime}, true
+	}
+	return nil, false
+}
+
 func extractComposerImages(m gjson.Result) []map[string]any {
 	c := m.Get("content")
 	if !c.IsArray() {
@@ -1845,46 +1963,142 @@ func extractComposerImages(m gjson.Result) []map[string]any {
 	}
 	var out []map[string]any
 	for _, part := range c.Array() {
-		// ADD-55: accept both the object form {"image_url":{"url":"…"}} AND the scalar form
-		// {"image_url":"…"} (some clients / translated shapes send a bare string). A file_id-only image part
-		// has no fetchable url here, so it yields "" and is treated as a degenerate/unsupported image (ADD-56
-		// then makes it model-visible or rejects an image-only turn) — never an empty image URL part.
-		iu := part.Get("image_url")
-		u := iu.Get("url").String()
-		if u == "" && iu.Type == gjson.String {
-			u = iu.String()
-		}
-		if u == "" {
-			u = part.Get("source.data").String()
-		}
-		if strings.HasPrefix(u, "data:") {
-			idx := strings.Index(u, ",")
-			if idx <= 0 {
-				continue
-			}
-			meta, data := u[5:idx], u[idx+1:]
-			mime := meta
-			if semi := strings.Index(meta, ";"); semi >= 0 {
-				mime = meta[:semi]
-			}
-			// EX12: never append an inline image with an empty data or mime field (toSdkImages would throw).
-			if strings.TrimSpace(data) == "" || strings.TrimSpace(mime) == "" {
-				continue
-			}
-			out = append(out, map[string]any{"data": data, "mimeType": mime})
-			continue
-		}
-		// C4: an http(s) URL is carried as a URL-form image. mimeType is best-effort from a trailing
-		// .png/.jpg/... extension; omit the key when unknown.
-		if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
-			img := map[string]any{"url": u}
-			if mime := imageMimeFromURL(u); mime != "" {
-				img["mimeType"] = mime
-			}
-			out = append(out, img)
+		if image, ok := composerImageFromPart(part); ok {
+			out = append(out, image)
 		}
 	}
 	return out
+}
+
+func decodeComposerJSON(raw string) (any, error) {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func composerJSONUnsafeNumber(value any) bool {
+	switch typed := value.(type) {
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+			return true
+		}
+		return math.Trunc(parsed) == parsed && math.Abs(parsed) > 9007199254740991
+	case []any:
+		for _, child := range typed {
+			if composerJSONUnsafeNumber(child) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, child := range typed {
+			if composerJSONUnsafeNumber(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func composerJSONComparable(value any) any {
+	switch typed := value.(type) {
+	case json.Number:
+		parsed, _ := typed.Float64()
+		return parsed
+	case []any:
+		out := make([]any, len(typed))
+		for index, child := range typed {
+			out[index] = composerJSONComparable(child)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			out[key] = composerJSONComparable(child)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func composerJSONEquivalent(left, right any) bool {
+	return reflect.DeepEqual(composerJSONComparable(left), composerJSONComparable(right))
+}
+
+func composerToolResultHasMalformedImage(m gjson.Result) bool {
+	content := m.Get("content")
+	if !content.IsArray() {
+		return false
+	}
+	for _, part := range content.Array() {
+		kind := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+		looksLikeImage := kind == "image" || kind == "image_url"
+		if !looksLikeImage {
+			looksLikeImage = part.Get("image_url").Exists() || part.Get("source").Exists()
+		}
+		if looksLikeImage {
+			if _, ok := composerImageFromPart(part); !ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func composerToolResultBlocks(m gjson.Result) ([]map[string]any, string) {
+	content := m.Get("content")
+	if content.Type == gjson.String {
+		return []map[string]any{{"type": "text", "text": content.String()}}, ""
+	}
+	if !content.IsArray() {
+		if !content.Exists() {
+			return []map[string]any{{"type": "text", "text": ""}}, ""
+		}
+		if value, err := decodeComposerJSON(content.Raw); err == nil {
+			if composerJSONUnsafeNumber(value) {
+				return nil, "typed tool result contains an integer that cannot be represented safely by the SDK runtime"
+			}
+			return []map[string]any{{"type": "json", "value": value}}, ""
+		}
+		return []map[string]any{{"type": "text", "text": content.String()}}, ""
+	}
+	blocks := make([]map[string]any, 0, len(content.Array()))
+	for _, part := range content.Array() {
+		if text := part.Get("text"); text.Exists() {
+			blocks = append(blocks, map[string]any{"type": "text", "text": text.String()})
+			continue
+		}
+		if image, ok := composerImageFromPart(part); ok {
+			blocks = append(blocks, map[string]any{"type": "image", "image": image})
+			continue
+		}
+		if part.Raw != "" {
+			if value, err := decodeComposerJSON(part.Raw); err == nil {
+				if composerJSONUnsafeNumber(value) {
+					return nil, "typed tool result contains an integer that cannot be represented safely by the SDK runtime"
+				}
+				blocks = append(blocks, map[string]any{"type": "json", "value": value})
+			}
+		}
+	}
+	return blocks, ""
+}
+
+func composerToolResultText(blocks []map[string]any) string {
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if block["type"] == "text" {
+			if text, ok := block["text"].(string); ok {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // imageMimeFromURL derives a best-effort image MIME type from a URL's trailing file extension, or "" when
@@ -2222,7 +2436,13 @@ func extractComposerResponseFormat(oai []byte) map[string]any {
 		return nil
 	}
 	var out map[string]any
-	if err := json.Unmarshal([]byte(rf.Raw), &out); err != nil {
+	decoded, err := decodeComposerJSON(rf.Raw)
+	if err != nil {
+		return nil
+	}
+	var ok bool
+	out, ok = decoded.(map[string]any)
+	if !ok {
 		return nil
 	}
 	return out
@@ -2441,36 +2661,154 @@ func truncateCursorToolResultLive(text string) string {
 }
 
 // composerToolResultEntry builds one bridge wire tool-result entry from a role:tool message (ADD-95/EX3/C5).
+func composerStrictBooleanField(m gjson.Result, key string) (present bool, value bool, valid bool) {
+	field := m.Get(key)
+	if !field.Exists() {
+		return false, false, true
+	}
+	switch strings.TrimSpace(field.Raw) {
+	case "true":
+		return true, true, true
+	case "false":
+		return true, false, true
+	default:
+		return true, false, false
+	}
+}
+
+func composerToolResultErrorFlag(m gjson.Result) (bool, string) {
+	snakePresent, snakeValue, snakeValid := composerStrictBooleanField(m, "is_error")
+	camelPresent, camelValue, camelValid := composerStrictBooleanField(m, "isError")
+	if !snakeValid || !camelValid {
+		return true, "tool result error flags must be JSON booleans"
+	}
+	if snakePresent && camelPresent && snakeValue != camelValue {
+		return true, "tool result is_error and isError flags conflict"
+	}
+	if snakePresent {
+		return snakeValue, ""
+	}
+	if camelPresent {
+		return camelValue, ""
+	}
+	return false, ""
+}
+
+func composerToolResultStructuredContent(m gjson.Result) (present bool, value any, contractError string) {
+	snake := m.Get("structured_content")
+	camel := m.Get("structuredContent")
+	snakePresent := snake.Exists()
+	camelPresent := camel.Exists()
+	if !snakePresent && !camelPresent {
+		return false, nil, ""
+	}
+	decode := func(field gjson.Result) (any, string) {
+		if len(field.Raw) > composerLiveToolResultMaxBytes {
+			return nil, "structured tool result exceeds the proxy byte limit and was not applied"
+		}
+		decoded, err := decodeComposerJSON(field.Raw)
+		if err != nil {
+			return nil, "structured tool result is not valid JSON"
+		}
+		if composerJSONUnsafeNumber(decoded) {
+			return nil, "structured tool result contains an integer that cannot be represented safely by the SDK runtime"
+		}
+		return decoded, ""
+	}
+	if snakePresent {
+		var errText string
+		value, errText = decode(snake)
+		if errText != "" {
+			return true, nil, errText
+		}
+	}
+	if camelPresent {
+		camelValue, errText := decode(camel)
+		if errText != "" {
+			return true, nil, errText
+		}
+		if snakePresent {
+			if !composerJSONEquivalent(value, camelValue) {
+				return true, nil, "tool result structured_content and structuredContent fields conflict"
+			}
+		} else {
+			value = camelValue
+		}
+	}
+	return true, value, ""
+}
+
 func composerToolResultEntry(m gjson.Result) map[string]any {
 	// ADD-95: cap the LIVE tool-result content (authoritative executor-side bound; the bridge has a slightly
 	// higher backstop cap so this one normally wins). A huge live result would otherwise flow unbounded into
 	// Cursor and trip ERROR_CONVERSATION_TOO_LONG with no graceful marker.
-	r := map[string]any{"toolCallId": m.Get("tool_call_id").String(), "content": truncateCursorToolResultLive(cursorMessageText(m))}
-	// C5: a client tool the inbound marked failed must reach the model as a failure, not a clean success.
-	if m.Get("is_error").Bool() {
+	blocks, representationError := composerToolResultBlocks(m)
+	content := composerToolResultText(blocks)
+	truncated := truncateCursorToolResultLive(content)
+	if truncated != content {
+		// Keep the byte cap authoritative without dropping non-text payloads.
+		// contentBlocks is authoritative in Node, so relying on the compatibility
+		// `images` projection here silently discarded images after truncation.
+		truncatedBlocks := []map[string]any{{"type": "text", "text": truncated}}
+		for _, block := range blocks {
+			if block["type"] == "image" {
+				truncatedBlocks = append(truncatedBlocks, block)
+			}
+		}
+		blocks = truncatedBlocks
+	}
+	r := map[string]any{
+		"toolCallId":    m.Get("tool_call_id").String(),
+		"content":       truncated,
+		"contentBlocks": blocks,
+	}
+	isError, contractError := composerToolResultErrorFlag(m)
+	if contractError == "" && composerToolResultHasMalformedImage(m) {
+		contractError = "tool result contains a malformed image block"
+	}
+	if isError {
 		r["isError"] = true
+	}
+	if contractError != "" {
+		r["isError"] = true
+		r["contractError"] = contractError
 	}
 	// EX3: an image embedded inside a tool_result must not be dropped.
 	if imgs := extractComposerImages(m); len(imgs) > 0 {
 		r["images"] = imgs
 	}
-	// Preserve explicitly typed structured results. Do not promote JSON-looking text: only these dedicated
-	// fields participate, so ordinary stdout remains ordinary text.
-	structured := m.Get("structured_content")
-	if !structured.Exists() {
-		structured = m.Get("structuredContent")
+	// Preserve explicitly typed structured results. Do not promote JSON-looking
+	// text: only these dedicated fields participate, and alias conflicts fail.
+	structuredPresent, structuredValue, structuredError := composerToolResultStructuredContent(m)
+	if structuredError != "" && (strings.Contains(structuredError, "exceeds the proxy byte limit") ||
+		strings.Contains(structuredError, "cannot be represented safely")) {
+		representationError = structuredError
+	} else if structuredError != "" {
+		r["isError"] = true
+		r["contractError"] = structuredError
+		r["content"] = structuredError
+		r["contentBlocks"] = []map[string]any{{"type": "text", "text": structuredError}}
+		r["structuredContentPresent"] = false
+	} else if structuredPresent {
+		r["structuredContent"] = structuredValue
+		r["structuredContentPresent"] = true
 	}
-	if structured.Exists() && structured.IsObject() {
-		raw := structured.Raw
-		if len(raw) <= composerLiveToolResultMaxBytes {
-			var value map[string]any
-			if json.Unmarshal([]byte(raw), &value) == nil {
-				r["structuredContent"] = value
-			}
-		} else {
-			r["isError"] = true
-			r["content"] = "structured tool result exceeds the proxy byte limit and was not applied"
+	if representationError != "" {
+		// The tool executed, but the SDK/bridge cannot preserve this result
+		// faithfully. Convert it into an ordinary typed tool failure so the model
+		// can recover; do not emit contractError, which would turn a successful
+		// client continuation into a retry-looping HTTP 422.
+		r["content"] = representationError
+		r["contentBlocks"] = []map[string]any{{"type": "text", "text": representationError}}
+		r["isError"] = true
+		r["structuredContent"] = map[string]any{
+			"applied":  false,
+			"code":     "client_tool_result_unrepresentable",
+			"executed": true,
 		}
+		r["structuredContentPresent"] = true
+		delete(r, "contractError")
+		delete(r, "images")
 	}
 	return r
 }
@@ -2480,6 +2818,31 @@ func lastAssistantToolCallsIdx(messages []gjson.Result) int {
 	for i := len(messages) - 1; i >= 0; i-- {
 		m := messages[i]
 		if m.Get("role").String() == "assistant" && m.Get("tool_calls").Exists() {
+			return i
+		}
+	}
+	return -1
+}
+
+// trailingContinuationUserIdx returns the final role:user message after the
+// final role:tool result in the unresolved continuation region. Stateless
+// clients resend the whole transcript after an HTTP failure; concatenating
+// every unanswered user entry makes each retry a larger, different message
+// and can permanently poison idempotency. The final user entry is the current
+// turn; earlier unanswered entries are superseded request snapshots.
+func trailingContinuationUserIdx(messages []gjson.Result, start int) int {
+	lastTool := -1
+	for i := start; i < len(messages); i++ {
+		if messages[i].Get("role").String() == "tool" {
+			lastTool = i
+		}
+	}
+	if lastTool < 0 {
+		return -1
+	}
+	for i := len(messages) - 1; i > lastTool; i-- {
+		if messages[i].Get("role").String() == "user" &&
+			(cursorMessageText(messages[i]) != "" || messageHasImageParts(messages[i])) {
 			return i
 		}
 	}
@@ -2505,26 +2868,22 @@ func composerToolResultsHinted(messages []gjson.Result, hint composerContinuatio
 	// results + trailing user text) classify as a continuation instead of a fresh user turn (Comment 4).
 	lastTC := lastAssistantToolCallsIdx(messages)
 	if lastTC >= 0 {
-		var sb strings.Builder
 		res := make([]map[string]any, 0)
 		replied := false
 		for i := lastTC + 1; i < len(messages); i++ {
 			switch messages[i].Get("role").String() {
 			case "tool":
 				res = append(res, composerToolResultEntry(messages[i]))
-			case "user":
-				if t := cursorMessageText(messages[i]); t != "" {
-					if sb.Len() > 0 {
-						sb.WriteString("\n")
-					}
-					sb.WriteString(t)
-				}
 			case "assistant":
 				replied = true
 			}
 		}
 		if len(res) > 0 && !replied {
-			return res, sb.String(), true
+			trailing := ""
+			if index := trailingContinuationUserIdx(messages, lastTC+1); index >= 0 {
+				trailing = cursorMessageText(messages[index])
+			}
+			return res, trailing, true
 		}
 	}
 	// (b) Fallback: a turn that simply ENDS with a contiguous run of role:tool messages (truncated history,
@@ -2561,40 +2920,64 @@ func composerToolResultsHinted(messages []gjson.Result, hint composerContinuatio
 				break
 			}
 		}
-		var sb strings.Builder
 		res := make([]map[string]any, 0)
 		signedIDSignal := false
-		seenTool := false
-		for i := lastAssistant + 1; i < len(messages); i++ {
-			switch messages[i].Get("role").String() {
-			case "tool":
-				seenTool = true
-				tr := composerToolResultEntry(messages[i])
-				res = append(res, tr)
-				if hint.hasClientToolID != nil {
-					if id, _ := tr["toolCallId"].(string); strings.TrimSpace(id) != "" && hint.hasClientToolID(id) {
-						signedIDSignal = true
-					}
-				}
-			case "user":
-				// Only the user text that TRAILS the tool results is the new instruction (C1/userText). User text
-				// BEFORE the first tool result is prior-turn history, not the trailing instruction.
-				if !seenTool {
-					continue
-				}
-				if t := cursorMessageText(messages[i]); t != "" {
-					if sb.Len() > 0 {
-						sb.WriteString("\n")
-					}
-					sb.WriteString(t)
+		// A server-side-chained request carries the current contiguous result
+		// batch immediately before its optional trailing user message. Older
+		// tool messages are replayed history and may belong to different signed
+		// routes; forwarding all of them creates a false mixed-round conflict.
+		end := len(messages)
+		if trailingIndex := trailingContinuationUserIdx(messages, lastAssistant+1); trailingIndex >= 0 {
+			end = trailingIndex
+		}
+		start := end
+		for start > lastAssistant+1 && messages[start-1].Get("role").String() == "tool" {
+			start--
+		}
+		for i := start; i < end; i++ {
+			tr := composerToolResultEntry(messages[i])
+			res = append(res, tr)
+			if hint.hasClientToolID != nil {
+				if id, _ := tr["toolCallId"].(string); strings.TrimSpace(id) != "" && hint.hasClientToolID(id) {
+					signedIDSignal = true
 				}
 			}
 		}
 		if len(res) > 0 && (hint.hasPreviousResponseID || signedIDSignal) {
-			return res, sb.String(), true
+			trailing := ""
+			if index := trailingContinuationUserIdx(messages, lastAssistant+1); index >= 0 {
+				trailing = cursorMessageText(messages[index])
+			}
+			return res, trailing, true
 		}
 	}
 	return nil, "", false
+}
+
+func composerClientMessageID(results []map[string]any, userText string, images []map[string]any) string {
+	toolCallIDSet := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		if id, ok := result["toolCallId"].(string); ok && strings.TrimSpace(id) != "" {
+			toolCallIDSet[id] = struct{}{}
+		}
+	}
+	// A tool-result batch is a set for continuation routing. Result ordering,
+	// JSON key order, whitespace, and escape spellings are serialization
+	// details and must not generate a second durable user-input identity.
+	toolCallIDs := make([]string, 0, len(toolCallIDSet))
+	for id := range toolCallIDSet {
+		toolCallIDs = append(toolCallIDs, id)
+	}
+	sort.Strings(toolCallIDs)
+	payload := map[string]any{
+		"images":      images,
+		"text":        userText,
+		"toolCallIds": toolCallIDs,
+		"version":     2,
+	}
+	encoded, _ := json.Marshal(payload)
+	sum := sha256.Sum256(encoded)
+	return "ccm2_" + base64.RawURLEncoding.EncodeToString(sum[:18])
 }
 
 // composerInput is the back-compat entry that classifies a turn with a BODY-ONLY hint (previous_response_id).
@@ -2616,14 +2999,11 @@ func composerInputHinted(oai []byte, hint composerContinuationHint) map[string]a
 	// user text; carry that text intentionally.
 	if results, trailing, ok := composerToolResultsHinted(messages, hint); ok {
 		inp := map[string]any{"type": "tool_results", "results": results}
-		// A continuation. A MIXED turn carries tool_results AND a trailing user message in the SAME turn — this
-		// is normal client behavior (e.g. Claude Code when you interrupt a running tool, or background a task,
-		// and then type a new message; it bundles the results for what finished WITH your new text). Anthropic
-		// answers both in a SINGLE assistant turn. The @cursor/sdk has no mid-resume user-message seam, so fold
-		// the user's message into the LAST tool result's content (clearly delimited) so the model reads it when
-		// it resumes — AND carry it as a first-class userText (C1) so the bridge can still answer it when no
-		// pending matched / the run was torn down. We must NEVER error here: erroring 500s a routine turn.
-		if t := strings.TrimSpace(trailing); t != "" && len(results) > 0 {
+		// Tool results are immutable receipts. A trailing user message is a
+		// separate durable input and must never be folded into a receipted result
+		// under the same signed id.
+		reminderText := ""
+		if t := strings.TrimSpace(trailing); t != "" {
 			// EX1/M30: a trailing block that is purely an AUTO-INJECTED <system-reminder> is context, not the
 			// user's instruction — frame it neutrally and do NOT set userText (a reminder must not drive a fresh
 			// send). M30: but a user who LITERALLY types text starting with <system-reminder> must still be
@@ -2632,44 +3012,33 @@ func composerInputHinted(oai []byte, hint composerContinuationHint) map[string]a
 			// recurs verbatim in the transcript (Claude Code re-injects it as context), whereas a first-occurrence
 			// user-authored <system-reminder> does not. When in doubt (a first occurrence) treat it as the user's
 			// instruction so the turn is answerable. Documented best-effort edge-case limitation.
-			reminder := isAutoInjectedReminder(t, messages)
-			// ADD-89: choose the fold target = the last NON-error tool result. NEVER fold genuine trailing user
-			// text into a result whose isError==true: the resumed run would read the instruction as part of a
-			// FAILED tool's output and answer the failure instead of the instruction. If every result is an error
-			// (or there is none to safely fold into), skip the inline fold entirely and rely solely on userText —
-			// which we ALWAYS keep first-class (the bridge's C1 fresh-send carries it). The reminder framing is
-			// likewise only applied to a non-error result; a reminder alongside an all-error batch is dropped from
-			// the inline fold (it must never label a failed result, and a reminder never drives a fresh send).
-			foldIdx := -1
-			for i := len(results) - 1; i >= 0; i-- {
-				if isErr, _ := results[i]["isError"].(bool); !isErr {
-					foldIdx = i
-					break
-				}
-			}
-			if reminder {
-				if foldIdx >= 0 {
-					prev, _ := results[foldIdx]["content"].(string)
-					results[foldIdx]["content"] = strings.TrimRight(prev, "\n") + "\n\n[System reminder accompanying these tool results:]\n" + t
-				}
+			if isAutoInjectedReminder(t, messages) {
+				reminderText = t
 			} else {
-				if foldIdx >= 0 {
-					prev, _ := results[foldIdx]["content"].(string)
-					results[foldIdx]["content"] = strings.TrimRight(prev, "\n") + "\n\n[The user also sent the following message alongside these tool results — treat it as their latest instruction:]\n" + t
-				}
-				// C1 (EX2)/ADD-89: a real trailing user message is ALWAYS first-class — even when every result is
-				// an error and nothing was folded inline, so it is never lost.
 				inp["userText"] = t
 			}
 		}
 		// EX4/EX14: carry any image attachments from the trailing user message(s) of this continuation so the
-		// bridge's fresh send (or tool-result fold) can attach them. Re-scan the messages after the last
+		// bridge's separate fresh send can attach them. Re-scan the messages after the last
 		// assistant tool_calls turn for role:user image parts (keeps composerToolResults text-only/focused).
-		if imgs := trailingContinuationImages(messages); len(imgs) > 0 {
-			inp["images"] = imgs
+		trailingImages := trailingContinuationImages(messages)
+		if len(trailingImages) > 0 {
+			inp["images"] = trailingImages
+		}
+		if _, hasText := inp["userText"]; hasText || len(trailingImages) > 0 {
+			userText, _ := inp["userText"].(string)
+			inp["clientMessageId"] = composerClientMessageID(results, userText, trailingImages)
+			inp["interruptRequested"] = true
 		}
 		// EX8 (C3): a system-prompt swap (e.g. post-ExitPlanMode) on a continuation must reach the model.
-		if sys := extractComposerSystem(messages); sys != "" {
+		if sys := extractComposerSystem(messages); sys != "" || reminderText != "" {
+			if reminderText != "" {
+				sys = strings.TrimSpace(sys)
+				if sys != "" {
+					sys += "\n\n"
+				}
+				sys += reminderText
+			}
 			inp["system"] = sys
 		}
 		// EX10: carry rendered history so the bridge can seed a fresh session before applying these results
@@ -2691,12 +3060,14 @@ func composerInputHinted(oai []byte, hint composerContinuationHint) map[string]a
 		}
 	}
 	inp := map[string]any{"type": "user", "text": ""}
+	var currentImages []map[string]any
 	if lastUserIdx >= 0 {
 		m := messages[lastUserIdx]
 		text := cursorMessageText(m)
 		imgs := extractComposerImages(m)
 		if len(imgs) > 0 {
 			inp["images"] = imgs
+			currentImages = imgs
 		} else if messageHasImageParts(m) {
 			// ADD-56: the turn had image part(s) but none survived extraction (malformed/unsupported). Never let
 			// it become a silent empty turn. A pure image-only-invalid turn is rejected upstream by the executor
@@ -2709,6 +3080,13 @@ func composerInputHinted(oai []byte, hint composerContinuationHint) map[string]a
 			}
 		}
 		inp["text"] = text
+		if text != "" || len(currentImages) > 0 {
+			// Fresh turns need the same transport-retry identity as mixed
+			// continuations. The bridge keeps this id only for the active logical
+			// run, so a later intentional repeat remains a new turn after the
+			// prior run has completed.
+			inp["clientMessageId"] = composerClientMessageID(nil, text, currentImages)
+		}
 	}
 	if sys := extractComposerSystem(messages); sys != "" {
 		inp["system"] = sys
@@ -2737,9 +3115,10 @@ func continuationHistoryBound(messages []gjson.Result) int {
 	return len(messages)
 }
 
-// trailingContinuationImages collects image parts from the role:user message(s) that trail the last
-// assistant tool_calls turn of a continuation (EX4/EX14) — the new user text that was bundled with the
-// tool results. Empty when there is no trailing user image.
+// trailingContinuationImages collects image parts from the final role:user
+// message after the final tool result. It deliberately mirrors
+// composerToolResultsHinted's latest-snapshot rule so failed HTTP retries do
+// not accumulate images from every unanswered user entry.
 func trailingContinuationImages(messages []gjson.Result) []map[string]any {
 	lastTC := -1
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -2749,14 +3128,10 @@ func trailingContinuationImages(messages []gjson.Result) []map[string]any {
 			break
 		}
 	}
-	var out []map[string]any
-	for i := lastTC + 1; i < len(messages); i++ {
-		if messages[i].Get("role").String() != "user" {
-			continue
-		}
-		out = append(out, extractComposerImages(messages[i])...)
+	if index := trailingContinuationUserIdx(messages, lastTC+1); index >= 0 {
+		return extractComposerImages(messages[index])
 	}
-	return out
+	return nil
 }
 
 // composerFunctionDefs returns the function definitions the request exposes, as gjson objects with
@@ -2789,7 +3164,9 @@ func composerAdvertise(oai []byte) []map[string]any {
 		entry := map[string]any{"name": fn.Get("name").String(), "description": fn.Get("description").String()}
 		if params := fn.Get("parameters"); params.Exists() {
 			var schema any
-			if err := json.Unmarshal([]byte(params.Raw), &schema); err == nil {
+			decoder := json.NewDecoder(strings.NewReader(params.Raw))
+			decoder.UseNumber()
+			if err := decoder.Decode(&schema); err == nil {
 				entry["inputSchema"] = schema
 			}
 		}
@@ -2949,7 +3326,8 @@ func mapComposerToolCall(name string, input gjson.Result, defs []cursorToolDefin
 		if !input.Exists() {
 			return name, "{}"
 		}
-		b, _ := json.Marshal(map[string]any{"input": input.Value()})
+		value, _ := decodeComposerJSON(input.Raw)
+		b, _ := json.Marshal(map[string]any{"input": value})
 		return name, string(b)
 	}
 	spec := resolveToolSpec(name, defs, overrides)
@@ -2961,12 +3339,17 @@ func mapComposerToolCall(name string, input gjson.Result, defs []cursorToolDefin
 		// Non-object input: wrap the RAW value verbatim under 'input' so its semantics survive to the client.
 		// Skip schema normalization (which is keyed on an object matching the tool schema) — there is no object
 		// to reconcile, and reshaping a primitive would lose it.
-		b, _ := json.Marshal(map[string]any{"input": input.Value()})
+		value, _ := decodeComposerJSON(input.Raw)
+		b, _ := json.Marshal(map[string]any{"input": value})
 		return outName, string(b)
 	}
 	args := map[string]any{}
 	if input.Exists() && input.IsObject() {
-		_ = json.Unmarshal([]byte(input.Raw), &args)
+		if value, err := decodeComposerJSON(input.Raw); err == nil {
+			if object, ok := value.(map[string]any); ok {
+				args = object
+			}
+		}
 	}
 	if spec == nil {
 		b, _ := json.Marshal(args)
@@ -3032,10 +3415,31 @@ func prepareComposerAdvertise(oai []byte, defs []cursorToolDefinition, toolAlias
 // composerTurnBody builds the JSON body for a POST /agent/turn. constraints carries the enforced
 // response constraints (responseFormat/stop/maxTokens) as explicit top-level fields; the bridge
 // converts them (and toolChoice) into model instructions and tool-advertisement gating.
+func composerToolInventorySnapshot(advertise []map[string]any) (string, string) {
+	// composerAdvertise constructs this tree exclusively from JSON values plus
+	// proxy-owned strings/bools, so Marshal cannot encounter channels,
+	// functions, cycles, NaN, or infinities. UseNumber above also preserves the
+	// client's valid JSON number spelling until this one authoritative encoding.
+	raw, _ := json.Marshal(advertise)
+	sum := sha256.Sum256(raw)
+	return string(raw), "cti1_" + hex.EncodeToString(sum[:16])
+}
+
+func composerToolInventoryEpoch(advertise []map[string]any) string {
+	_, epoch := composerToolInventorySnapshot(advertise)
+	return epoch
+}
+
 func composerTurnBody(sessionID, model string, input map[string]any, advertise []map[string]any, toolChoice string, clientEnv map[string]any, constraints map[string]any) []byte {
-	body := map[string]any{"sessionId": sessionID, "model": model, "input": input}
+	body := map[string]any{
+		"sessionId":          sessionID,
+		"model":              model,
+		"input":              input,
+		"contractVersion":    2,
+		"toolsAuthoritative": true,
+	}
 	// H10 (C-CONTINUATION-TOOLS): attach the current tool inventory on EVERY turn when advertised, not only
-	// on a new-user turn. The bridge refreshes session.advertise from body.tools on tool_results turns too, so
+	// on a new-user turn. The bridge refreshes session.advertise from the authoritative snapshot on tool_results turns too, so
 	// dropping tools on a continuation left the bridge with a STALE advertise set (removed/added tools, plan-mode
 	// ExitPlanMode, MCP availability changes). The tool_choice=none gating in executeComposer/executeComposerStream
 	// runs BEFORE this (advertise=nil there), so `none` still sends no tools — that ordering is intentional.
@@ -3043,11 +3447,18 @@ func composerTurnBody(sessionID, model string, input map[string]any, advertise [
 	// array explicitly clears a reused bridge session; omitting the field left
 	// stale tools executable after tool_choice:none, allowed-tools narrowing, or
 	// dynamic client-tool removal.
-	if advertise == nil {
-		body["tools"] = []map[string]any{}
-	} else {
-		body["tools"] = advertise
+	tools := advertise
+	if tools == nil {
+		tools = []map[string]any{}
 	}
+	// Serialize the authoritative tool inventory exactly once. The bridge
+	// verifies the epoch over these same UTF-8 bytes before parsing the snapshot.
+	// Re-serializing independently in JavaScript is not equivalent for every
+	// valid JSON number/key shape (for example integers above 2^53 or -0), and
+	// previously caused valid dynamic OMP/MCP inventories to fail with 422.
+	toolInventoryJSON, toolInventoryEpoch := composerToolInventorySnapshot(tools)
+	body["toolInventoryJSON"] = toolInventoryJSON
+	body["toolInventoryEpoch"] = toolInventoryEpoch
 	if toolChoice != "" {
 		body["toolChoice"] = toolChoice
 	}
@@ -3063,8 +3474,68 @@ func composerTurnBody(sessionID, model string, input map[string]any, advertise [
 
 // composerResponseID returns a unique id per request. Clients that correlate streaming chunks to their
 // non-stream counterpart (or dedupe by id) must not see the same id across unrelated responses.
-func composerResponseID() string {
-	return "chatcmpl-composer-" + composerRandHex(16)
+const composerRoutedResponseIDPrefix = "chatcmpl-composer-cr1_"
+
+var composerRoutedSessionIDPattern = regexp.MustCompile(`^sess_[A-Za-z0-9_-]{8,240}$`)
+
+func composerResponseRouteMAC(apiKey, tenant, sessionID, nonce string) []byte {
+	key := []byte(apiKey)
+	if len(key) == 0 {
+		// A resolved Cursor key is present on every production composer request.
+		// Retain a process-local authenticated fallback for tests or malformed
+		// internal calls; it deliberately cannot claim restart durability.
+		key = serverSecret[:]
+	}
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte("cursor-composer-response-route-v1\x00"))
+	_, _ = mac.Write([]byte(tenant))
+	_, _ = mac.Write([]byte{'\x00'})
+	_, _ = mac.Write([]byte(sessionID))
+	_, _ = mac.Write([]byte{'\x00'})
+	_, _ = mac.Write([]byte(nonce))
+	return mac.Sum(nil)[:16]
+}
+
+// composerResponseID emits an OpenAI-compatible opaque id that authenticates
+// the durable bridge session route. A Responses client may return only this id
+// after a Go restart; no process-local map or replayed history is required.
+func composerResponseID(apiKey, tenant, sessionID string) string {
+	nonce := composerRandHex(8)
+	sid := base64.RawURLEncoding.EncodeToString([]byte(sessionID))
+	sig := base64.RawURLEncoding.EncodeToString(composerResponseRouteMAC(apiKey, tenant, sessionID, nonce))
+	// Dot is outside the base64url and hexadecimal alphabets, so parsing never
+	// depends on whether an opaque encoded component happens to contain '_'.
+	return composerRoutedResponseIDPrefix + sid + "." + nonce + "." + sig
+}
+
+func composerSessionFromResponseID(tenant, apiKey, responseID string) string {
+	if !strings.HasPrefix(responseID, composerRoutedResponseIDPrefix) {
+		return ""
+	}
+	parts := strings.Split(strings.TrimPrefix(responseID, composerRoutedResponseIDPrefix), ".")
+	if len(parts) != 3 || len(parts[1]) != 16 || len(parts[2]) != 22 {
+		return ""
+	}
+	if _, err := hex.DecodeString(parts[1]); err != nil {
+		return ""
+	}
+	rawSession, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil || !utf8.Valid(rawSession) || base64.RawURLEncoding.EncodeToString(rawSession) != parts[0] {
+		return ""
+	}
+	sessionID := string(rawSession)
+	if !composerRoutedSessionIDPattern.MatchString(sessionID) {
+		return ""
+	}
+	supplied, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || len(supplied) != 16 || base64.RawURLEncoding.EncodeToString(supplied) != parts[2] {
+		return ""
+	}
+	expected := composerResponseRouteMAC(apiKey, tenant, sessionID, parts[1])
+	if !hmac.Equal(supplied, expected) {
+		return ""
+	}
+	return sessionID
 }
 
 // oaiChunk wraps an OpenAI chat.completion.chunk choice delta as an SSE "data:" line.
@@ -3267,7 +3738,6 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	var err error
 	turn.clientEnv = validatedComposerClientEnv(opts)
 	turn.model = resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
-	turn.responseID = composerResponseID()
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	turn.oai = sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
@@ -3283,6 +3753,7 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	if err != nil {
 		return turn, err
 	}
+	turn.responseID = composerResponseID(apiKey, turn.tenant, turn.sessionID)
 	return turn, nil
 }
 
@@ -3327,7 +3798,12 @@ func composerValidateAgentTurnPreStream(resp *http.Response, responseID string, 
 		} else {
 			log.Errorf("[composer %s] bridge NON-2xx corr=%s status=%d body=%s", responseID, corr, resp.StatusCode, sanitizeBridgeBody(errBody))
 		}
-		return &composerBridgeStatusError{status: resp.StatusCode, correlation: corr, retryAfter: retryAfter}
+		return &composerBridgeStatusError{
+			status:      resp.StatusCode,
+			correlation: corr,
+			retryAfter:  retryAfter,
+			bridgeCode:  parseComposerBridgeErrorCode(errBody),
+		}
 	}
 	if !composerResponseIsSSE(resp) {
 		ctHdr := resp.Header.Get("Content-Type")
@@ -3513,8 +3989,22 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 				}
 				// The bridge reports upstream Cursor failures (auth/quota/network/run error) as
 				// turn_end{stop_reason:"error"}. Propagate them as a real stream error instead of
-				// masking them as a successful empty/partial "stop".
+				// masking them as a successful empty/partial "stop". The one exception is an
+				// explicitly receipted, retryable containment event: the bridge consumed nothing,
+				// so return a normal explanatory turn and let each conversation retry independently.
 				if ev.Get("stop_reason").String() == "error" {
+					if containedMessage, contained := composerContainedConflictMessage(ev); contained {
+						completionChars += len(containedMessage)
+						contentChoice := map[string]any{"index": 0, "delta": map[string]any{"content": containedMessage}}
+						contentLine := oaiChunk(responseID, model, contentChoice)
+						contentChunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), oai, contentLine, &param)
+						if !emit(contentChunks) {
+							return
+						}
+						started = true
+						choice = map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}
+						break
+					}
 					emsg := ev.Get("error").String()
 					if emsg == "" {
 						emsg = "upstream Cursor run failed"
@@ -3806,7 +4296,14 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 			case "tool_use":
 				finish = "tool_calls"
 			case "error":
-				// Surface upstream Cursor failures instead of returning an empty "success".
+				// A narrowly typed containment receipt means the bridge atomically consumed nothing.
+				// Render that as an ordinary explanatory assistant turn so neither live conversation
+				// becomes permanently broken. Every genuine upstream Cursor failure still propagates.
+				if containedMessage, contained := composerContainedConflictMessage(ev); contained {
+					text.WriteString(containedMessage)
+					finish = "stop"
+					break
+				}
 				emsg := ev.Get("error").String()
 				if emsg == "" {
 					emsg = "upstream Cursor run failed"

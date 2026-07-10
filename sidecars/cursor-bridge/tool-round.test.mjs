@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   CallState,
+  DeferredInputState,
   RoundJournal,
   RoundState,
   RoutingTokenCodec,
@@ -15,7 +16,9 @@ import {
   createRoundInfrastructure,
   createTestRound,
   hashClientToolResult,
+  hashLegacyClientToolResult,
   loadOrCreateRoutingKey,
+  MAX_DEFERRED_INPUT_RECORDS,
   probeStateRoot,
   terminalizeOrphanedRounds,
 } from "./tool-round.mjs";
@@ -52,12 +55,65 @@ test("canonical JSON sorts object keys recursively and preserves array order", (
   );
 });
 
+test("canonical JSON preserves prototype-named own keys and hashes them distinctly", () => {
+  const first = JSON.parse(`{"content":{"__proto__":"one","constructor":"first"}}`);
+  const second = JSON.parse(`{"content":{"__proto__":"two","constructor":"first"}}`);
+  assert.equal(canonicalJSONString(first), `{"content":{"__proto__":"one","constructor":"first"}}`);
+  assert.notEqual(hashClientToolResult(first), hashClientToolResult(second));
+});
+
 test("canonical result hash includes error, structured content, and images", () => {
   const base = { content: "same", isError: false, images: [], structuredContent: null };
   assert.notEqual(hashClientToolResult(base), hashClientToolResult({ ...base, isError: true }));
   assert.notEqual(hashClientToolResult(base), hashClientToolResult({ ...base, structuredContent: { ok: true } }));
   assert.notEqual(hashClientToolResult(base), hashClientToolResult({ ...base, images: [{ data: "AA==", mimeType: "image/png" }] }));
   assert.throws(() => hashClientToolResult({ content: { nope: undefined } }), (error) => error.code === "non_json_result");
+});
+
+test("semantic V2 result identity is transport-neutral but order-sensitive", () => {
+  assert.equal(
+    hashClientToolResult({ content: [{ type: "text", text: "first" }, { type: "text", text: "second" }] }),
+    hashClientToolResult({ content: "first\n\nsecond" }),
+  );
+  assert.equal(
+    hashClientToolResult({ content: "failed", is_error: true }),
+    hashClientToolResult({ contentBlocks: [{ type: "text", text: "failed" }], isError: true }),
+  );
+  assert.equal(
+    hashClientToolResult({ content: "image", images: [{ data: "QUJD", mimeType: "image/png" }] }),
+    hashClientToolResult({ contentBlocks: [
+      { type: "text", text: "image" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
+    ] }),
+  );
+  assert.equal(
+    hashClientToolResult({ content: "image", images: [{ data: "Q Q\n==", mimeType: "IMAGE/PNG; charset=binary" }] }),
+    hashClientToolResult({ content: "image", images: [{ data: "QQ==", mimeType: "image/png" }] }),
+  );
+  assert.notEqual(
+    hashClientToolResult({ contentBlocks: [{ type: "text", text: "a" }, { data: "QUJD", mimeType: "image/png" }] }),
+    hashClientToolResult({ contentBlocks: [{ data: "QUJD", mimeType: "image/png" }, { type: "text", text: "a" }] }),
+  );
+  assert.notEqual(
+    hashClientToolResult({ content: "ok" }),
+    hashClientToolResult({ content: "ok", structuredContent: null }),
+  );
+  assert.notEqual(
+    hashClientToolResult({ contentBlocks: [{ type: "image_url", image_url: { url: "https://example.test/a.png", detail: "low" } }] }),
+    hashClientToolResult({ contentBlocks: [{ type: "image_url", image_url: { url: "https://example.test/a.png", detail: "high" } }] }),
+  );
+  assert.throws(
+    () => hashClientToolResult({ content: "bad", isError: true, is_error: false }),
+    (error) => error.code === "invalid_tool_result",
+  );
+  assert.throws(
+    () => hashClientToolResult({ contentBlocks: [{ type: "image", data: "missing-mime" }] }),
+    (error) => error.code === "invalid_tool_result",
+  );
+  assert.throws(
+    () => hashClientToolResult({ contentBlocks: [{ type: "image", data: "***", mimeType: "image/png" }] }),
+    (error) => error.code === "invalid_tool_result",
+  );
 });
 
 test("signed routing tokens round-trip and reject tampering", () => {
@@ -173,16 +229,77 @@ test("ToolRound persists registration before exposing a call", (t) => {
   assert.equal(saved.calls[0].state, CallState.REGISTERED);
 });
 
-test("raw SDK id reuse is idempotent only for the same call", () => {
+test("raw SDK id may refine registered arguments but freezes at transport handoff", () => {
   const round = createTestRound();
   const first = round.openCall({ rawToolCallId: "raw", name: "Read", input: { path: "/a" } });
   const again = round.openCall({ rawToolCallId: "raw", name: "Read", input: { path: "/a" } });
   assert.equal(again.wireId, first.wireId);
   assert.equal(round.calls.size, 1);
+  const refined = round.openCall({ rawToolCallId: "raw", name: "Read", input: { path: "/a", limit: 20 } });
+  assert.equal(refined.wireId, first.wireId);
+  assert.deepEqual(refined.input, { limit: 20, path: "/a" });
   assert.throws(
     () => round.openCall({ rawToolCallId: "raw", name: "Write", input: { path: "/a" } }),
     (error) => error.code === "raw_tool_id_conflict",
   );
+  round.markHanded(first.wireId);
+  assert.throws(
+    () => round.openCall({ rawToolCallId: "raw", name: "Read", input: { path: "/different" } }),
+    (error) => error.code === "raw_tool_id_conflict",
+  );
+});
+
+test("raw SDK id reuse compares the same JSON transport value and never strands a late waiter", () => {
+  const log = [];
+  const round = createTestRound();
+  const a = round.openCall({
+    rawToolCallId: "raw-a",
+    name: "Read",
+    input: { path: "/a", offset: undefined, marker: -0 },
+    callback: callbackLog(log, "a-primary"),
+  });
+  const b = openHanded(round, log, "raw-b");
+  round.markHanded(a.wireId);
+  round.markAwaitingResults();
+  round.applyResults([{ toolCallId: a.wireId, content: "A" }]);
+
+  const duplicate = round.openCall({
+    rawToolCallId: "raw-a",
+    name: "Read",
+    input: { marker: -0, offset: undefined, path: "/a" },
+    callback: callbackLog(log, "a-late"),
+  });
+  assert.equal(duplicate.wireId, a.wireId);
+  assert.equal(duplicate.newlyRegistered, false);
+  assert.deepEqual(duplicate.input, { marker: 0, path: "/a" });
+  assert.equal(round.outbound.includes(a.wireId), false, "a receipted duplicate must not be emitted again");
+  assert.deepEqual(log.filter((entry) => entry[0] === "resolve").map((entry) => entry[1]), ["a-primary", "a-late"]);
+
+  round.applyResults([{ toolCallId: b.wireId, content: "B" }]);
+  assert.equal(round.terminal.reason, TerminalReason.COMPLETED);
+});
+
+test("parallel callbacks sharing one raw SDK id all resolve from one durable receipt", () => {
+  const log = [];
+  const round = createTestRound();
+  const first = round.openCall({
+    rawToolCallId: "shared",
+    name: "Read",
+    input: { path: "/a" },
+    callback: callbackLog(log, "first"),
+  });
+  const second = round.openCall({
+    rawToolCallId: "shared",
+    name: "Read",
+    input: { path: "/a" },
+    callback: callbackLog(log, "second"),
+  });
+  assert.equal(second.wireId, first.wireId);
+  assert.equal(round.calls.size, 1);
+  round.markHanded(first.wireId);
+  round.markAwaitingResults();
+  round.applyResults([{ toolCallId: first.wireId, content: "once" }]);
+  assert.deepEqual(log.filter((entry) => entry[0] === "resolve").map((entry) => entry[1]), ["first", "second"]);
 });
 
 test("full-batch conflict preflight mutates no call", () => {
@@ -222,7 +339,10 @@ test("results are durably receipted before callbacks run", (t) => {
   round.markAwaitingResults();
   round.applyResults([{ toolCallId: call.wireId, content: "ok" }]);
   assert.deepEqual(observed, [CallState.RESULT_RECEIVED]);
-  assert.equal(journal.read(round.route).terminal.reason, TerminalReason.COMPLETED);
+  const saved = journal.read(round.route);
+  assert.equal(saved.terminal.reason, TerminalReason.COMPLETED);
+  assert.equal(Object.hasOwn(saved.calls[0].receipt, "semanticResult"), false,
+    "new receipts must not persist a second full copy of large semantic content");
 });
 
 test("partial parallel batches leave only unanswered callbacks open", () => {
@@ -259,6 +379,152 @@ test("identical duplicate is idempotent and conflicting duplicate is rejected", 
     () => round.applyResults([{ toolCallId: call.wireId, content: "different", isError: false }]),
     (error) => error.code === "result_conflict" && error.status === 409,
   );
+});
+
+test("legacy V1 receipts migrate lazily to semantic V2 identity without rewriting history", (t) => {
+  const dir = withTempDir(t);
+  const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 21) });
+  const round = new ToolRound({ sessionId: "legacy", journal, codec });
+  const call = openHanded(round, [], "legacy-call");
+  round.markAwaitingResults();
+
+  const legacyResult = { content: "first\n\nsecond", images: [], isError: false, structuredContent: null };
+  const legacyHash = hashLegacyClientToolResult(legacyResult);
+  const record = journal.read(round.route);
+  record.state = RoundState.APPLYING_RESULTS;
+  record.calls[0].state = CallState.RESULT_RECEIVED;
+  record.calls[0].resultHash = legacyHash;
+  record.calls[0].resultHashVersion = null;
+  record.calls[0].semanticResultHash = null;
+  record.calls[0].receipt = { acceptedAt: 10, result: legacyResult };
+  journal.save(record, round.revision);
+
+  const recovered = ToolRound.load(journal, codec, round.route);
+  const committed = recovered.commitResults([{
+    toolCallId: call.wireId,
+    contentBlocks: [{ type: "text", text: "first" }, { type: "text", text: "second" }],
+    is_error: false,
+  }]);
+  assert.deepEqual(committed.additions, []);
+  assert.deepEqual(committed.duplicates, [call.wireId]);
+  const saved = journal.read(round.route).calls[0];
+  assert.equal(saved.resultHash, legacyHash, "the immutable V1 receipt hash is retained");
+  assert.equal(saved.resultHashVersion, 1);
+  assert.equal(saved.semanticResultHash, hashClientToolResult({ content: "first\n\nsecond" }));
+  assert.deepEqual(saved.receipt, { acceptedAt: 10, result: legacyResult });
+});
+
+test("deferred user input is journaled independently and advances exactly once", (t) => {
+  const dir = withTempDir(t);
+  const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 22) });
+  const round = new ToolRound({ sessionId: "deferred", runEpoch: 7, roundSeq: 3, journal, codec });
+  const input = {
+    userText: "continue with the corrected result",
+    images: [{ data: "QUJD", mimeType: "image/png" }],
+    history: "bounded history",
+    interruptRequested: true,
+  };
+  assert.deepEqual(round.queueDeferredInput("ccm1_message", input), {
+    clientMessageId: "ccm1_message", duplicate: false, status: "queued",
+  });
+  assert.deepEqual(round.queueDeferredInput("ccm1_message", {
+    ...input,
+    system: "refreshed system prompt",
+    history: "compacted history",
+    historyFingerprint: "new-fingerprint",
+    interruptRequested: false,
+  }), {
+    clientMessageId: "ccm1_message", duplicate: true, status: "queued",
+  }, "mutable recovery context must not conflict with the same immutable user input");
+  const rekeyed = round.queueDeferredInput("ccm1_message", { ...input, userText: "different" });
+  assert.equal(rekeyed.rekeyed, true);
+  assert.equal(rekeyed.requestedClientMessageId, "ccm1_message");
+  assert.equal(rekeyed.status, "rekeyed_queued");
+  assert.notEqual(rekeyed.clientMessageId, "ccm1_message");
+  assert.deepEqual(
+    round.queueDeferredInput("ccm1_message", { ...input, userText: "different" }),
+    { ...rekeyed, duplicate: true, status: "rekeyed_duplicate" },
+    "a retry of the conflicting intent must resolve to the same deterministic durable id",
+  );
+
+  let recovered = ToolRound.load(journal, codec, round.route);
+  assert.equal(recovered.deferredInput("ccm1_message").state, DeferredInputState.SUPERSEDED);
+  assert.equal(recovered.deferredInput(rekeyed.clientMessageId).state, DeferredInputState.QUEUED);
+  recovered.markDeferredInputState(rekeyed.clientMessageId, DeferredInputState.DELIVERING);
+  recovered = ToolRound.load(journal, codec, round.route);
+  assert.equal(recovered.deferredInput(rekeyed.clientMessageId).state, DeferredInputState.DELIVERING);
+  recovered.markDeferredInputState(rekeyed.clientMessageId, DeferredInputState.DELIVERED);
+  assert.equal(ToolRound.load(journal, codec, round.route).deferredInput(rekeyed.clientMessageId).state, DeferredInputState.DELIVERED);
+  assert.throws(
+    () => recovered.markDeferredInputState(rekeyed.clientMessageId, DeferredInputState.QUEUED),
+    (error) => error.code === "client_message_state_conflict",
+  );
+  assert.deepEqual(recovered.toolEpochState(), {
+    route: recovered.route,
+    runEpoch: 7,
+    roundSeq: 3,
+    roundState: RoundState.COLLECTING,
+    pending: [],
+    receipted: [],
+    applied: [],
+    terminalReason: null,
+  });
+});
+
+test("deferred snapshots keep one recovery context, supersede stale intent, and stay bounded", (t) => {
+  const dir = withTempDir(t);
+  const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 23) });
+  const round = new ToolRound({ sessionId: "bounded-deferred", journal, codec });
+  const history = "history:" + "x".repeat(128 * 1024);
+  round.queueDeferredInput("message-0", { userText: "intent 0", history });
+  round.markDeferredInputState("message-0", DeferredInputState.DELIVERING, {
+    agentId: "agent-0",
+    textHash: "a".repeat(64),
+    hasImages: false,
+  });
+  round.queueDeferredInput("message-1", { userText: "intent 1", history: "latest context" });
+
+  const first = round.deferredInput("message-0");
+  assert.equal(first.state, DeferredInputState.SUPERSEDED);
+  assert.equal(first.supersedeReason, "delivery_uncertain_superseded");
+  assert.equal(first.input, null);
+  // Definitive late SDK evidence may still upgrade an uncertain tombstone.
+  round.markDeferredInputState("message-0", DeferredInputState.DELIVERED, {
+    evidence: "user_message_appended",
+  });
+
+  // A delayed replay of an old delivered id cannot roll shared recovery
+  // context back to the large historical snapshot.
+  round.queueDeferredInput("message-0", { userText: "intent 0", history });
+  assert.equal(round.recoveryContext.history, "latest context");
+
+  for (let index = 2; index < 100; index++) {
+    round.queueDeferredInput(`message-${index}`, {
+      userText: `intent ${index}`,
+      history: `context ${index}`,
+    });
+  }
+  const saved = journal.read(round.route);
+  const queued = saved.deferredInputs.filter((entry) => entry.state === DeferredInputState.QUEUED);
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].clientMessageId, "message-99");
+  assert.ok(saved.deferredInputs.length <= MAX_DEFERRED_INPUT_RECORDS + 1);
+  assert.equal(saved.recoveryContext.history, "context 99");
+  const serialized = JSON.stringify(saved);
+  assert.equal(serialized.includes(history), false, "superseded history must not remain duplicated in tombstones");
+});
+
+test("terminal cleanup retains a round while deferred input is still owed", (t) => {
+  const dir = withTempDir(t);
+  const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 24), now: () => 10_000 });
+  const round = new ToolRound({ sessionId: "owed-deferred", journal, codec });
+  round.queueDeferredInput("owed-message", { userText: "do not delete me" });
+  round.terminalize(TerminalReason.COMPLETED);
+  assert.deepEqual(journal.cleanupTerminal({ ttlMs: 0, maxTerminal: 0 }), { removed: 0, retained: 0 });
+  assert.ok(journal.read(round.route));
+  round.markDeferredInputState("owed-message", DeferredInputState.SUPERSEDED, { reason: "test_cleanup" });
+  assert.deepEqual(journal.cleanupTerminal({ ttlMs: 0, maxTerminal: 0 }), { removed: 1, retained: 0 });
+  assert.equal(journal.read(round.route), null);
 });
 
 test("mixed signed routes are rejected before any receipt", () => {

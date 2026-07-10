@@ -24,6 +24,22 @@ import path from "node:path";
 
 export const ROUND_JOURNAL_VERSION = 1;
 export const ROUTING_TOKEN_VERSION = "cct1";
+export const TOOL_RESULT_CANONICAL_VERSION = 2;
+
+export const DeferredInputState = Object.freeze({
+  QUEUED: "QUEUED",
+  DELIVERING: "DELIVERING",
+  DELIVERED: "DELIVERED",
+  SUPERSEDED: "SUPERSEDED",
+});
+
+// A continuation journal is rewritten atomically on each transition. Keep the
+// mutable user-intent portion small and store the large replay context once per
+// round; otherwise a retry loop multiplies a 500 KiB history into an ever
+// larger fsync on every request.
+export const MAX_DEFERRED_INPUT_RECORDS = 64;
+export const MAX_DEFERRED_INTENT_BYTES = 1 << 20;
+export const MAX_DEFERRED_CONTEXT_BYTES = 2 << 20;
 
 export const RoundState = Object.freeze({
   COLLECTING: "COLLECTING",
@@ -73,12 +89,15 @@ function jsonValue(value, at = "$") {
   }
   if (Array.isArray(value)) return value.map((item, index) => jsonValue(item, `${at}[${index}]`));
   if (typeof value === "object") {
-    const out = {};
+    const entries = [];
     for (const key of Object.keys(value).sort()) {
       if (value[key] === undefined) throw new ToolRoundError("non_json_result", `undefined value at ${at}.${key}`, 422);
-      out[key] = jsonValue(value[key], `${at}.${key}`);
+      entries.push([key, jsonValue(value[key], `${at}.${key}`)]);
     }
-    return out;
+    // Object.fromEntries defines own data properties even for `__proto__`;
+    // assignment into `{}` would invoke the legacy prototype setter, drop the
+    // JSON member, and make distinct durable results hash identically.
+    return Object.fromEntries(entries);
   }
   throw new ToolRoundError("non_json_result", `unsupported ${typeof value} at ${at}`, 422);
 }
@@ -87,19 +106,393 @@ export function canonicalJSONString(value) {
   return JSON.stringify(jsonValue(value));
 }
 
+const own = (value, key) => !!value && Object.prototype.hasOwnProperty.call(value, key);
+
+function strictBooleanAlias(value, camel, snake, label) {
+  const camelPresent = own(value, camel);
+  const snakePresent = own(value, snake);
+  const camelValue = camelPresent ? value[camel] : undefined;
+  const snakeValue = snakePresent ? value[snake] : undefined;
+  if (camelPresent && typeof camelValue !== "boolean") {
+    throw new ToolRoundError("invalid_tool_result", `${label}.${camel} must be a boolean`, 422);
+  }
+  if (snakePresent && typeof snakeValue !== "boolean") {
+    throw new ToolRoundError("invalid_tool_result", `${label}.${snake} must be a boolean`, 422);
+  }
+  if (camelPresent && snakePresent && camelValue !== snakeValue) {
+    throw new ToolRoundError("invalid_tool_result", `${label}.${camel} conflicts with ${label}.${snake}`, 422);
+  }
+  return camelPresent ? camelValue : snakePresent ? snakeValue : false;
+}
+
+function parseDataURL(url) {
+  if (typeof url !== "string" || !url.startsWith("data:")) return null;
+  const comma = url.indexOf(",");
+  if (comma <= 5) return null;
+  const metadata = url.slice(5, comma);
+  const parts = metadata.split(";");
+  const mimeType = parts[0];
+  if (!parts.slice(1).some((part) => part.toLowerCase() === "base64")) return null;
+  const data = url.slice(comma + 1);
+  if (!mimeType || !data) return null;
+  return { data, mimeType };
+}
+
+function canonicalMimeType(value, at) {
+  if (typeof value !== "string") {
+    throw new ToolRoundError("invalid_tool_result", `image MIME type at ${at} must be a string`, 422);
+  }
+  const token = value.split(";", 1)[0].trim().toLowerCase();
+  if (!/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(token)) {
+    throw new ToolRoundError("invalid_tool_result", `image MIME type at ${at} is malformed`, 422);
+  }
+  return token;
+}
+
+function canonicalBase64(value, at) {
+  if (typeof value !== "string") {
+    throw new ToolRoundError("invalid_tool_result", `image base64 data at ${at} must be a string`, 422);
+  }
+  const compact = value.replace(/[\t\n\r ]/g, "");
+  if (!compact || !/^[A-Za-z0-9+/]*={0,2}$/.test(compact) || compact.length % 4 === 1) {
+    throw new ToolRoundError("invalid_tool_result", `image base64 data at ${at} is malformed`, 422);
+  }
+  const unpadded = compact.replace(/=+$/, "");
+  const padded = unpadded + "=".repeat((4 - (unpadded.length % 4)) % 4);
+  const decoded = Buffer.from(padded, "base64");
+  const canonical = decoded.toString("base64");
+  if (canonical.replace(/=+$/, "") !== unpadded) {
+    throw new ToolRoundError("invalid_tool_result", `image base64 data at ${at} is non-canonical`, 422);
+  }
+  return canonical;
+}
+
+function canonicalImage(value, at) {
+  const image = value && value.image && typeof value.image === "object" ? value.image : value;
+  const source = image && image.source && typeof image.source === "object" ? image.source : null;
+  const imageURL = image && image.image_url;
+  let url = image && typeof image.url === "string" ? image.url : "";
+  if (!url && typeof imageURL === "string") url = imageURL;
+  if (!url && imageURL && typeof imageURL.url === "string") url = imageURL.url;
+  if (!url && source && typeof source.url === "string") url = source.url;
+  const dataURL = parseDataURL(url);
+  if (dataURL) {
+    return {
+      type: "image",
+      source: {
+        kind: "base64",
+        data: canonicalBase64(dataURL.data, `${at}.data`),
+        mimeType: canonicalMimeType(dataURL.mimeType, `${at}.mimeType`),
+      },
+    };
+  }
+  if (url.startsWith("data:")) {
+    throw new ToolRoundError("invalid_tool_result", `malformed base64 data URL at ${at}`, 422);
+  }
+  if (url) {
+    const out = { kind: "url", url };
+    const mimeType = (image && (image.mimeType || image.media_type || image.mediaType))
+      || (source && (source.mimeType || source.media_type || source.mediaType));
+    const detail = (imageURL && typeof imageURL === "object" && imageURL.detail)
+      || (image && image.detail)
+      || (source && source.detail);
+    if (typeof mimeType === "string" && mimeType) out.mimeType = canonicalMimeType(mimeType, `${at}.mimeType`);
+    if (typeof detail === "string" && detail) out.detail = detail;
+    return { type: "image", source: out };
+  }
+  const data = (image && image.data) || (source && source.data);
+  const mimeType = (image && (image.mimeType || image.media_type || image.mediaType))
+    || (source && (source.mimeType || source.media_type || source.mediaType));
+  if (typeof data === "string" && data && typeof mimeType === "string" && mimeType) {
+    return {
+      type: "image",
+      source: {
+        kind: "base64",
+        data: canonicalBase64(data, `${at}.data`),
+        mimeType: canonicalMimeType(mimeType, `${at}.mimeType`),
+      },
+    };
+  }
+  throw new ToolRoundError("invalid_tool_result", `malformed image content at ${at}`, 422);
+}
+
+function appendCanonicalBlock(blocks, block) {
+  if (block.type === "text" && blocks.length && blocks.at(-1).type === "text") {
+    const prior = blocks.at(-1).text;
+    blocks.at(-1).text = `${prior}\n\n${block.text}`;
+    return;
+  }
+  blocks.push(block);
+}
+
+function canonicalContentBlock(value, at) {
+  if (typeof value === "string") return { type: "text", text: value };
+  if (value && typeof value === "object") {
+    if (value.type === "json" && own(value, "value")) {
+      return { type: "json", value: jsonValue(value.value, `${at}.value`) };
+    }
+    if (value.type === "text" || own(value, "text")) {
+      if (typeof value.text !== "string") {
+        throw new ToolRoundError("invalid_tool_result", `text content at ${at} must be a string`, 422);
+      }
+      return { type: "text", text: value.text };
+    }
+    if (value.type === "image" || value.type === "image_url" || value.image || value.source
+        || value.image_url || own(value, "data") || own(value, "url")) {
+      return canonicalImage(value, at);
+    }
+  }
+  return { type: "json", value: jsonValue(value, at) };
+}
+
+function canonicalContentBlocks(result) {
+  const blocks = [];
+  const hasBlocks = own(result, "contentBlocks");
+  if (hasBlocks && !Array.isArray(result.contentBlocks)) {
+    throw new ToolRoundError("invalid_tool_result", "contentBlocks must be an array", 422);
+  }
+  const content = hasBlocks
+    ? result.contentBlocks
+    : own(result, "content") && Array.isArray(result.content)
+      ? result.content
+      : [own(result, "content") ? result.content : ""];
+  for (let index = 0; index < content.length; index++) {
+    appendCanonicalBlock(blocks, canonicalContentBlock(content[index], `$.contentBlocks[${index}]`));
+  }
+  // contentBlocks is authoritative. `images` is the compatibility projection
+  // of those same blocks and must not be counted a second time.
+  if (!hasBlocks && Array.isArray(result && result.images)) {
+    for (let index = 0; index < result.images.length; index++) {
+      appendCanonicalBlock(blocks, canonicalImage(result.images[index], `$.images[${index}]`));
+    }
+  }
+  return blocks;
+}
+
+function canonicalStructuredContent(result) {
+  const explicitPresence = own(result, "structuredContentPresent");
+  if (explicitPresence && typeof result.structuredContentPresent !== "boolean") {
+    throw new ToolRoundError("invalid_tool_result", "structuredContentPresent must be a boolean", 422);
+  }
+  const camelPresent = own(result, "structuredContent");
+  const snakePresent = own(result, "structured_content");
+  if (camelPresent && snakePresent
+      && canonicalJSONString(result.structuredContent) !== canonicalJSONString(result.structured_content)) {
+    throw new ToolRoundError("invalid_tool_result", "structuredContent conflicts with structured_content", 422);
+  }
+  const present = explicitPresence
+    ? result.structuredContentPresent
+    : camelPresent || snakePresent;
+  if (!present) return { present: false };
+  const value = camelPresent ? result.structuredContent : snakePresent ? result.structured_content : null;
+  return { present: true, value: jsonValue(value, "$.structuredContent") };
+}
+
+// V2 defines result identity by semantic content, not by the incidental
+// OpenAI/Anthropic envelope that carried it. Adjacent text blocks coalesce with
+// the same paragraph separator, image order stays significant, error aliases
+// are strict, and structured-content presence is retained separately from null.
 export function canonicalResult(result) {
+  const value = result && typeof result === "object" ? result : {};
+  if (typeof value.contractError === "string" && value.contractError) {
+    throw new ToolRoundError("invalid_tool_result", value.contractError, 422);
+  }
   return {
-    content: result && Object.prototype.hasOwnProperty.call(result, "content") ? result.content : "",
+    canonicalVersion: TOOL_RESULT_CANONICAL_VERSION,
+    blocks: canonicalContentBlocks(value),
+    isError: strictBooleanAlias(value, "isError", "is_error", "toolResult"),
+    structuredContent: canonicalStructuredContent(value),
+    transformPolicy: "tool-result-v2",
+    truncationPolicy: "live-result-v1",
+  };
+}
+
+export function legacyCanonicalResult(result) {
+  return {
+    content: result && own(result, "content") ? result.content : "",
     images: result && Array.isArray(result.images) ? result.images : [],
     isError: !!(result && result.isError === true),
-    structuredContent: result && Object.prototype.hasOwnProperty.call(result, "structuredContent")
-      ? result.structuredContent
-      : null,
+    structuredContent: result && own(result, "structuredContent") ? result.structuredContent : null,
   };
+}
+
+export function hashLegacyClientToolResult(result) {
+  return createHash("sha256").update(canonicalJSONString(legacyCanonicalResult(result))).digest("hex");
 }
 
 export function hashClientToolResult(result) {
   return createHash("sha256").update(canonicalJSONString(canonicalResult(result))).digest("hex");
+}
+
+function hashCanonicalResult(semantic) {
+  return createHash("sha256").update(canonicalJSONString(semantic)).digest("hex");
+}
+
+function deliveryResultFromSemantic(semantic) {
+  const projectedImages = semantic.blocks
+    .filter((block) => block.type === "image")
+    .map((block) => block.source.kind === "url"
+      ? {
+        url: block.source.url,
+        ...(block.source.mimeType ? { mimeType: block.source.mimeType } : {}),
+        ...(block.source.detail ? { detail: block.source.detail } : {}),
+      }
+      : { data: block.source.data, mimeType: block.source.mimeType });
+  const nonImageBlocks = semantic.blocks.filter((block) => block.type !== "image");
+  const content = nonImageBlocks.length === 1 && nonImageBlocks[0].type === "json"
+    ? nonImageBlocks[0].value
+    : nonImageBlocks.map((block) => block.type === "text" ? block.text : canonicalJSONString(block.value)).join("\n\n");
+  return {
+    content,
+    contentBlocks: jsonValue(semantic.blocks, "$.contentBlocks"),
+    images: projectedImages,
+    isError: semantic.isError,
+    structuredContent: semantic.structuredContent.present ? semantic.structuredContent.value : null,
+    structuredContentPresent: semantic.structuredContent.present,
+  };
+}
+
+function deliveryResult(result) {
+  const value = result && typeof result === "object" ? result : {};
+  return deliveryResultFromSemantic(canonicalResult(value));
+}
+
+function canonicalDeferredInput(input) {
+  const value = input && typeof input === "object" ? input : {};
+  const text = typeof value.userText === "string"
+    ? value.userText
+    : typeof value.text === "string" ? value.text : "";
+  const images = Array.isArray(value.images) ? jsonValue(value.images, "$.images") : [];
+  return { text, images };
+}
+
+function canonicalDeferredContext(input) {
+  const value = input && typeof input === "object" ? input : {};
+  return {
+    system: typeof value.system === "string" ? value.system : "",
+    history: typeof value.history === "string" ? value.history : "",
+    historyFingerprint: typeof value.historyFingerprint === "string" ? value.historyFingerprint : "",
+  };
+}
+
+function jsonBytes(value) {
+  return Buffer.byteLength(canonicalJSONString(value), "utf8");
+}
+
+function validateDeferredSizes(intent, context) {
+  const intentBytes = jsonBytes(intent);
+  if (intentBytes > MAX_DEFERRED_INTENT_BYTES) {
+    throw new ToolRoundError(
+      "deferred_input_too_large",
+      `deferred user input exceeds ${MAX_DEFERRED_INTENT_BYTES} bytes`,
+      413,
+    );
+  }
+  const contextBytes = jsonBytes(context);
+  if (contextBytes > MAX_DEFERRED_CONTEXT_BYTES) {
+    throw new ToolRoundError(
+      "deferred_context_too_large",
+      `deferred recovery context exceeds ${MAX_DEFERRED_CONTEXT_BYTES} bytes`,
+      413,
+    );
+  }
+  return { intentBytes, contextBytes };
+}
+
+function compactDeferredState(record) {
+  const source = Array.isArray(record.deferredInputs) ? record.deferredInputs : [];
+  let recoveryContext = record.recoveryContext && typeof record.recoveryContext === "object"
+    ? canonicalDeferredContext(record.recoveryContext)
+    : null;
+  // Legacy records duplicated system/history inside every entry. The newest
+  // copy is the authoritative stateless request snapshot.
+  if (!recoveryContext) {
+    for (let index = source.length - 1; index >= 0; index--) {
+      const input = source[index] && source[index].input;
+      if (input && typeof input === "object") {
+        recoveryContext = canonicalDeferredContext(input);
+        break;
+      }
+    }
+  }
+  recoveryContext ||= canonicalDeferredContext(null);
+
+  const normalized = source.map((entry) => {
+    const state = Object.values(DeferredInputState).includes(entry && entry.state)
+      ? entry.state
+      : DeferredInputState.QUEUED;
+    const actionable = state === DeferredInputState.QUEUED || state === DeferredInputState.DELIVERING;
+    return {
+      ...entry,
+      state,
+      input: actionable ? canonicalDeferredInput(entry && entry.input) : null,
+    };
+  });
+
+  // Each HTTP request is a complete stateless snapshot. A newer QUEUED
+  // snapshot supersedes older unsent snapshots; retaining all of them both
+  // replays stale intent and creates an unbounded journal. Preserve compact
+  // tombstones so a delayed retry of an older id is acknowledged as stale.
+  const newestQueued = [...normalized].reverse().find((entry) => entry.state === DeferredInputState.QUEUED) || null;
+  if (newestQueued) {
+    for (const entry of normalized) {
+      if (entry !== newestQueued && entry.state === DeferredInputState.QUEUED) {
+        entry.state = DeferredInputState.SUPERSEDED;
+        entry.input = null;
+        entry.supersededBy = newestQueued.clientMessageId;
+        entry.supersededAt ||= newestQueued.receivedAt || record.updatedAt || Date.now();
+      }
+    }
+  }
+
+  const actionable = normalized.filter((entry) => entry.state === DeferredInputState.QUEUED
+    || entry.state === DeferredInputState.DELIVERING);
+  const tombstones = normalized.filter((entry) => entry.state !== DeferredInputState.QUEUED
+    && entry.state !== DeferredInputState.DELIVERING).slice(-MAX_DEFERRED_INPUT_RECORDS);
+  return {
+    deferredInputs: [...tombstones, ...actionable]
+      .sort((left, right) => (left.receivedAt || 0) - (right.receivedAt || 0)),
+    recoveryContext,
+  };
+}
+
+function hashDeferredInput(input) {
+  const payload = canonicalDeferredInput(input);
+  // The client message id identifies immutable user intent. Recovery context
+  // (history compaction, system refresh, and interrupt routing) may change on
+  // a byte-equivalent retry and must not turn that retry into a 409 conflict.
+  return createHash("sha256").update(canonicalJSONString(payload)).digest("hex");
+}
+
+function rekeyConflictingClientMessageId(requestedId, hash, existingEntries) {
+  const digest = createHash("sha256")
+    .update("cursor-client-message-conflict-v1\0")
+    .update(requestedId)
+    .update("\0")
+    .update(hash)
+    .digest("base64url");
+  const base = `ccm2_rekey_${digest}`;
+  let candidate = base;
+  // Do not rely on hash-collision impossibility when reading durable state.
+  // A deterministic suffix finds the first compatible slot, so every retry
+  // of the same conflicting intent resolves to the same durable message.
+  for (let suffix = 0; suffix <= existingEntries.length; suffix++) {
+    const existing = existingEntries.find((item) => item.clientMessageId === candidate);
+    if (!existing || existing.hash === hash) return { candidate, existing };
+    candidate = `${base}_${suffix + 1}`;
+  }
+  throw new ToolRoundError("journal_corrupt", "unable to allocate a deterministic client-message conflict route", 500);
+}
+
+function legacyReceiptSemanticInput(result) {
+  if (!result || typeof result !== "object") return result;
+  // V1 always materialized absent structured content as null, so an old
+  // journal cannot distinguish absent from explicitly-null. Prefer absence for
+  // migration compatibility; V2 records the presence bit and is unambiguous.
+  if (!own(result, "structuredContentPresent") && result.structuredContent === null) {
+    return { ...result, structuredContentPresent: false };
+  }
+  return result;
 }
 
 function base64url(input) {
@@ -325,7 +718,11 @@ export class RoundJournal {
       const route = entry.name.slice(0, -5);
       if (!validRoute(route)) continue;
       const record = this.read(route);
-      if (record?.state === RoundState.TERMINAL) terminal.push(record);
+      const unresolvedDeferred = Array.isArray(record?.deferredInputs)
+        && record.deferredInputs.some((item) => item && (
+          item.state === DeferredInputState.QUEUED || item.state === DeferredInputState.DELIVERING
+        ));
+      if (record?.state === RoundState.TERMINAL && !unresolvedDeferred) terminal.push(record);
     }
     terminal.sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
     const cutoff = this.now() - ttlMs;
@@ -337,7 +734,11 @@ export class RoundJournal {
       const release = this.acquire(route);
       try {
         const current = this.read(route);
-        if (current?.state !== RoundState.TERMINAL) continue;
+        const unresolvedDeferred = Array.isArray(current?.deferredInputs)
+          && current.deferredInputs.some((item) => item && (
+            item.state === DeferredInputState.QUEUED || item.state === DeferredInputState.DELIVERING
+          ));
+        if (current?.state !== RoundState.TERMINAL || unresolvedDeferred) continue;
         rmSync(this.file(route), { force: true });
         fsyncDirectory(this.dir);
         removed++;
@@ -391,11 +792,15 @@ function serializedCall(call) {
     callbackAppliedAt: call.callbackAppliedAt,
     handedAt: call.handedAt,
     input: call.input,
+    descriptorFingerprint: call.descriptorFingerprint || null,
+    inventoryEpoch: call.inventoryEpoch || null,
     name: call.name,
     ordinal: call.ordinal,
     rawIdHash: call.rawIdHash,
     receipt: call.receipt,
     resultHash: call.resultHash,
+    resultHashVersion: call.resultHashVersion || null,
+    semanticResultHash: call.semanticResultHash || null,
     source: call.source,
     state: call.state,
     terminalAt: call.terminalAt,
@@ -407,7 +812,9 @@ function callFromRecord(saved) {
   return {
     ...saved,
     callback: null,
+    newlyRegistered: false,
     timer: null,
+    waiters: [],
   };
 }
 
@@ -465,7 +872,13 @@ export class ToolRound {
       this.state = record.state;
       this.terminal = record.terminal || null;
       this.recovery = record.recovery || null;
+      const compactedDeferred = compactDeferredState(record);
+      this.deferredInputs = compactedDeferred.deferredInputs;
+      this.recoveryContext = compactedDeferred.recoveryContext;
       this.calls = new Map(record.calls.map((saved) => [saved.wireId, callFromRecord(saved)]));
+      for (const call of this.calls.values()) {
+        if (call.rawIdHash) this.rawToCall.set(call.rawIdHash, call.wireId);
+      }
       this.fifo = record.calls.slice().sort((a, b) => a.ordinal - b.ordinal).map((call) => call.wireId);
       this.outbound = this.fifo.filter((id) => this.calls.get(id).state === CallState.REGISTERED);
       this.batch = this.fifo.filter((id) => this.calls.get(id).state === CallState.HANDED_TO_TRANSPORT);
@@ -488,6 +901,8 @@ export class ToolRound {
     this.state = RoundState.COLLECTING;
     this.terminal = null;
     this.recovery = null;
+    this.deferredInputs = [];
+    this.recoveryContext = canonicalDeferredContext(null);
     this.calls = new Map();
     this.fifo = [];
     this.outbound = [];
@@ -509,6 +924,8 @@ export class ToolRound {
       agentId: this.agentId,
       calls: this.fifo.map((id) => serializedCall(this.calls.get(id))),
       createdAt: this.createdAt,
+      deferredInputs: this.deferredInputs.map((input) => ({ ...input })),
+      recoveryContext: this.recoveryContext,
       model: this.model,
       recovery: this.recovery,
       revision: this.revision,
@@ -543,7 +960,15 @@ export class ToolRound {
       : `${ROUTING_TOKEN_VERSION}_${this.route}_${ordinal.toString(36)}_${base64url(randomBytes(16))}`;
   }
 
-  openCall({ source = "sdk", rawToolCallId = null, name, input, callback = null }) {
+  openCall({
+    source = "sdk",
+    rawToolCallId = null,
+    name,
+    input,
+    callback = null,
+    inventoryEpoch = null,
+    descriptorFingerprint = null,
+  }) {
     // The SDK may dispatch the tail of one parallel wave after the bridge has
     // already handed the first batch and entered AWAITING_RESULTS. Keep that
     // tail in this same durable round; Session will journal it for the next
@@ -552,15 +977,43 @@ export class ToolRound {
       throw new ToolRoundError("round_not_collecting", `round ${this.route} cannot open calls while ${this.state}`, 409);
     }
     if (!name) throw new ToolRoundError("tool_name_required", "client tool name is required", 500);
+    // Canonicalize once for both durable storage and duplicate comparison.
+    // JSON transport intentionally drops undefined optional placeholders and
+    // normalizes -0 exactly as the SDK wire does; comparing against the raw
+    // pre-transport object caused false raw_tool_id conflicts.
+    const encodedInput = JSON.stringify(input);
+    const canonicalInput = encodedInput === undefined ? null : jsonValue(JSON.parse(encodedInput));
     const rawIdHash = rawToolCallId == null ? null : createHash("sha256").update(String(rawToolCallId)).digest("hex");
     if (rawIdHash && this.rawToCall.has(rawIdHash)) {
       const existing = this.calls.get(this.rawToCall.get(rawIdHash));
-      if (existing.name !== name || canonicalJSONString(existing.input) !== canonicalJSONString(input)) {
-        throw new ToolRoundError("raw_tool_id_conflict", "SDK reused a tool-call id with incompatible name or input", 409);
+      const inputChanged = canonicalJSONString(existing.input) !== canonicalJSONString(canonicalInput);
+      if (existing.name !== name || (inputChanged && existing.state !== CallState.REGISTERED)) {
+        throw new ToolRoundError("raw_tool_id_conflict", "SDK reused a handed tool-call id with incompatible name or input", 409);
       }
-      if (callback && !existing.callback) {
+      if (inputChanged) {
+        // Incremental SDK assembly may invoke the dispatch seam more than once
+        // for one raw id before any bytes are handed to the harness. The
+        // registered journal entry is still private and may adopt the latest
+        // complete arguments. Handoff freezes it permanently.
+        const next = this.toRecord();
+        const saved = next.calls.find((item) => item.wireId === existing.wireId);
+        saved.input = canonicalInput;
+        saved.inventoryEpoch = typeof inventoryEpoch === "string" ? inventoryEpoch : saved.inventoryEpoch;
+        saved.descriptorFingerprint = typeof descriptorFingerprint === "string"
+          ? descriptorFingerprint : saved.descriptorFingerprint;
+        this.persistRecord(next);
+        existing.input = canonicalInput;
+        existing.inventoryEpoch = saved.inventoryEpoch;
+        existing.descriptorFingerprint = saved.descriptorFingerprint;
+      }
+      existing.newlyRegistered = false;
+      if (callback && existing.receipt) {
+        callback.resolve(existing.receipt.result);
+      } else if (callback && !existing.callback) {
         existing.callback = callback;
         this.callbacks.set(existing.wireId, existing);
+      } else if (callback && callback !== existing.callback) {
+        existing.waiters.push(callback);
       }
       return existing;
     }
@@ -568,17 +1021,23 @@ export class ToolRound {
     const call = {
       callback,
       callbackAppliedAt: null,
+      descriptorFingerprint: typeof descriptorFingerprint === "string" ? descriptorFingerprint : null,
       handedAt: null,
-      input: jsonValue(input == null ? input : JSON.parse(JSON.stringify(input))),
+      input: canonicalInput,
+      inventoryEpoch: typeof inventoryEpoch === "string" ? inventoryEpoch : null,
       name: String(name),
+      newlyRegistered: true,
       ordinal,
       rawIdHash,
       receipt: null,
       resultHash: null,
+      resultHashVersion: null,
+      semanticResultHash: null,
       source: String(source || "sdk"),
       state: CallState.REGISTERED,
       terminalAt: null,
       timer: null,
+      waiters: [],
       wireId: this.nextWireId(ordinal),
     };
     const next = this.toRecord();
@@ -595,8 +1054,12 @@ export class ToolRound {
   attachCallback(wireId, callback) {
     const call = this.calls.get(wireId);
     if (!call) throw new ToolRoundError("unknown_tool_call_id", `round ${this.route} does not contain ${wireId}`, 410);
-    if (call.callback && call.callback !== callback) throw new ToolRoundError("callback_conflict", `tool ${wireId} already has a live callback`, 409);
-    call.callback = callback;
+    if (callback && call.receipt) {
+      callback.resolve(call.receipt.result);
+      return call;
+    }
+    if (call.callback && call.callback !== callback) call.waiters.push(callback);
+    else call.callback = callback;
     if (callback && call.state !== CallState.CALLBACK_APPLIED && call.state !== CallState.TERMINAL) this.callbacks.set(wireId, call);
     return call;
   }
@@ -650,7 +1113,184 @@ export class ToolRound {
     call.timer = null;
   }
 
-  preflightResults(batch, { allowRegisteredReceipt = false } = {}) {
+  prepareDeferredInput(clientMessageId, input) {
+    let id = typeof clientMessageId === "string" ? clientMessageId.trim() : "";
+    const intent = canonicalDeferredInput(input);
+    const recoveryContext = canonicalDeferredContext(input);
+    validateDeferredSizes(intent, recoveryContext);
+    if (!intent.text && intent.images.length === 0) {
+      return { existing: null, saved: null, receipt: { clientMessageId: null, status: "none" } };
+    }
+    if (!id || id.length > 256 || /[\u0000-\u001f\u007f]/.test(id)) {
+      throw new ToolRoundError("invalid_client_message_id", "mixed tool/user continuation requires a stable clientMessageId", 422);
+    }
+    const hash = hashDeferredInput(intent);
+    const requestedClientMessageId = id;
+    let existing = this.deferredInputs.find((item) => item.clientMessageId === id);
+    let rekeyed = false;
+    if (existing) {
+      if (existing.hash !== hash) {
+        const routed = rekeyConflictingClientMessageId(id, hash, this.deferredInputs);
+        id = routed.candidate;
+        existing = routed.existing || null;
+        rekeyed = true;
+      }
+      if (existing) {
+        return {
+          existing,
+          saved: null,
+          recoveryContext,
+          receipt: {
+            clientMessageId: id,
+            duplicate: true,
+            status: rekeyed ? "rekeyed_duplicate" : existing.state.toLowerCase(),
+            ...(rekeyed ? { requestedClientMessageId, rekeyed: true } : {}),
+          },
+        };
+      }
+    }
+    const saved = {
+      clientMessageId: id,
+      deliveredAt: null,
+      deliveryStartedAt: null,
+      hash,
+      input: intent,
+      ...(rekeyed ? { requestedClientMessageId } : {}),
+      receivedAt: this.clock(),
+      state: DeferredInputState.QUEUED,
+    };
+    return {
+      existing: null,
+      saved,
+      recoveryContext,
+      receipt: {
+        clientMessageId: id,
+        duplicate: false,
+        status: rekeyed ? "rekeyed_queued" : "queued",
+        ...(rekeyed ? { requestedClientMessageId, rekeyed: true } : {}),
+      },
+    };
+  }
+
+  stagePreparedDeferred(next, prepared) {
+    if (!prepared) return false;
+    // A delayed replay of an already-delivered/superseded id must not roll the
+    // round's shared recovery context back to an older stateless snapshot.
+    // Context may advance only with a new intent or with the currently
+    // actionable retry of that same intent.
+    const existingIsActionable = prepared.existing && (
+      prepared.existing.state === DeferredInputState.QUEUED
+      || prepared.existing.state === DeferredInputState.DELIVERING
+    );
+    const mayAdvanceContext = !!prepared.saved || !!existingIsActionable;
+    const targetContext = mayAdvanceContext
+      ? (prepared.recoveryContext || canonicalDeferredContext(null))
+      : (next.recoveryContext || canonicalDeferredContext(null));
+    let changed = mayAdvanceContext && canonicalJSONString(next.recoveryContext || canonicalDeferredContext(null))
+      !== canonicalJSONString(targetContext);
+    if (prepared.saved) {
+      for (const entry of next.deferredInputs) {
+        if (entry.state !== DeferredInputState.QUEUED && entry.state !== DeferredInputState.DELIVERING) continue;
+        const uncertain = entry.state === DeferredInputState.DELIVERING;
+        entry.state = DeferredInputState.SUPERSEDED;
+        entry.input = null;
+        entry.supersededAt = prepared.saved.receivedAt;
+        entry.supersededBy = prepared.saved.clientMessageId;
+        if (uncertain) entry.supersedeReason = "delivery_uncertain_superseded";
+      }
+      next.deferredInputs.push(prepared.saved);
+      changed = true;
+    }
+    if (!changed) return false;
+    next.recoveryContext = targetContext;
+    const compacted = compactDeferredState(next);
+    next.deferredInputs = compacted.deferredInputs;
+    next.recoveryContext = compacted.recoveryContext;
+    return true;
+  }
+
+  adoptDeferredRecord(record) {
+    this.deferredInputs = record.deferredInputs.map((entry) => ({ ...entry }));
+    this.recoveryContext = record.recoveryContext;
+  }
+
+  queueDeferredInput(clientMessageId, input) {
+    const prepared = this.prepareDeferredInput(clientMessageId, input);
+    const next = this.toRecord();
+    if (!this.stagePreparedDeferred(next, prepared)) return prepared.receipt;
+    this.persistRecord(next);
+    this.adoptDeferredRecord(next);
+    return prepared.receipt;
+  }
+
+  deferredInput(clientMessageId) {
+    return this.deferredInputs.find((item) => item.clientMessageId === clientMessageId) || null;
+  }
+
+  markDeferredInputState(clientMessageId, state, metadata = null) {
+    const item = this.deferredInput(clientMessageId);
+    if (!item) throw new ToolRoundError("unknown_client_message_id", `round ${this.route} does not contain client message ${clientMessageId}`, 410);
+    const meta = metadata && typeof metadata === "object" ? metadata : {};
+    if (item.state === state && Object.keys(meta).length === 0) return item;
+    const allowed = item.state === DeferredInputState.QUEUED && state === DeferredInputState.DELIVERING
+      || item.state === DeferredInputState.DELIVERING && state === DeferredInputState.DELIVERED
+      || (item.state === DeferredInputState.QUEUED || item.state === DeferredInputState.DELIVERING)
+        && state === DeferredInputState.SUPERSEDED
+      || item.state === DeferredInputState.SUPERSEDED
+        && item.supersedeReason === "delivery_uncertain_superseded"
+        && state === DeferredInputState.DELIVERED
+      // Delivery evidence can race: the SDK may emit user-message-appended
+      // immediately before agent.send resolves. Enriching the same state is
+      // idempotent and must not turn two independent success signals into a
+      // client-visible state conflict.
+      || item.state === state && (state === DeferredInputState.DELIVERING
+        || state === DeferredInputState.DELIVERED);
+    if (!allowed) {
+      throw new ToolRoundError("client_message_state_conflict", `client message ${clientMessageId} cannot transition from ${item.state} to ${state}`, 409);
+    }
+    const at = this.clock();
+    const next = this.toRecord();
+    const saved = next.deferredInputs.find((entry) => entry.clientMessageId === clientMessageId);
+    saved.state = state;
+    if (state === DeferredInputState.DELIVERING) {
+      saved.deliveryStartedAt ||= at;
+      saved.deliveryAttempts = (saved.deliveryAttempts || 0) + (item.state === DeferredInputState.DELIVERING ? 0 : 1);
+      if (typeof meta.agentId === "string" && meta.agentId) saved.deliveryAgentId = meta.agentId;
+      if (typeof meta.textHash === "string" && /^[a-f0-9]{64}$/.test(meta.textHash)) saved.deliveryTextHash = meta.textHash;
+      if (typeof meta.hasImages === "boolean") saved.deliveryHasImages = meta.hasImages;
+    }
+    if (state === DeferredInputState.DELIVERED) {
+      saved.deliveredAt ||= at;
+      if (typeof meta.evidence === "string" && meta.evidence) saved.deliveryEvidence ||= meta.evidence;
+    }
+    if (state === DeferredInputState.SUPERSEDED) {
+      saved.supersededAt = at;
+      if (typeof meta.reason === "string" && meta.reason) saved.supersedeReason = meta.reason;
+      saved.input = null;
+    }
+    this.persistRecord(next);
+    Object.assign(item, saved);
+    return item;
+  }
+
+  toolEpochState() {
+    const calls = [...this.calls.values()];
+    return {
+      route: this.route,
+      runEpoch: this.runEpoch,
+      roundSeq: this.roundSeq,
+      roundState: this.state,
+      pending: calls.filter((call) => !call.receipt).map((call) => call.wireId),
+      receipted: calls.filter((call) => !!call.receipt).map((call) => call.wireId),
+      applied: calls.filter((call) => !!call.callbackAppliedAt).map((call) => call.wireId),
+      terminalReason: this.terminal && this.terminal.reason || null,
+    };
+  }
+
+  preflightResults(batch, {
+    allowRegisteredReceipt = false,
+    preferDurableReceipt = false,
+  } = {}) {
     if (!Array.isArray(batch) || batch.length === 0) {
       throw new ToolRoundError("empty_tool_results", "continuation contains no tool results", 422);
     }
@@ -664,53 +1304,132 @@ export class ToolRound {
       }
       const call = this.calls.get(id);
       if (!call) throw new ToolRoundError("unknown_tool_call_id", `round ${this.route} does not contain ${id}`, 410);
-      const result = canonicalResult(raw);
-      const hash = hashClientToolResult(result);
+      const semanticResult = canonicalResult(raw);
+      let result = deliveryResultFromSemantic(semanticResult);
+      let hash = hashCanonicalResult(semanticResult);
+      const storedHash = call.resultHash
+        ? call.resultHashVersion === TOOL_RESULT_CANONICAL_VERSION
+          ? call.resultHash
+          : call.semanticResultHash || (call.receipt && call.receipt.result
+            ? hashClientToolResult(legacyReceiptSemanticInput(call.receipt.result))
+            : call.resultHash)
+        : null;
+      let durableReceiptRetained = false;
+      if (storedHash && storedHash !== hash) {
+        // Receipt persistence is the exactly-once boundary. Stateless
+        // OpenAI/Anthropic clients may replay the same historical tool message
+        // with a lossy or enriched envelope while parallel calls are still
+        // live. First-write wins: retain the durable value and never replace
+        // or deliver the later projection to an SDK callback.
+        if (preferDurableReceipt && call.receipt && call.receipt.result) {
+          hash = storedHash;
+          result = call.receipt.result;
+          durableReceiptRetained = true;
+        } else {
+          throw new ToolRoundError("result_conflict", `tool result ${id} conflicts with its durable receipt`, 409);
+        }
+      }
       const priorInBatch = byId.get(id);
       if (priorInBatch && priorInBatch.hash !== hash) {
+        if (preferDurableReceipt) {
+          // One HTTP projection can accidentally repeat a tool result with
+          // two incompatible envelopes. There is no safe way to apply both;
+          // preserve deterministic first-occurrence ordering, record the
+          // discrepancy in the receipt, and never turn it into a retry poison.
+          priorInBatch.sameBatchConflictIgnored = true;
+          continue;
+        }
         throw new ToolRoundError("result_conflict", `tool result ${id} occurs twice with different payloads`, 409);
-      }
-      if (call.resultHash && call.resultHash !== hash) {
-        throw new ToolRoundError("result_conflict", `tool result ${id} conflicts with its durable receipt`, 409);
       }
       if (!call.resultHash && !call.handedAt && !allowRegisteredReceipt) {
         throw new ToolRoundError("result_before_handoff", `tool result ${id} arrived before its call was handed to the client`, 409);
       }
-      byId.set(id, { call, hash, result });
+      byId.set(id, { call, hash, result, storedHash, durableReceiptRetained });
     }
     return [...byId.values()];
   }
 
-  commitResults(batch, { allowTerminalReceipt = false, allowRegisteredReceipt = false } = {}) {
-    const prepared = this.preflightResults(batch, { allowRegisteredReceipt });
+  commitResults(batch, {
+    allowTerminalReceipt = false,
+    allowRegisteredReceipt = false,
+    preferDurableReceipt = false,
+    deferredInputId = "",
+    deferredInput = null,
+  } = {}) {
+    const prepared = this.preflightResults(batch, {
+      allowRegisteredReceipt,
+      preferDurableReceipt,
+    });
+    // Validate the optional user intent before constructing or persisting any
+    // result receipt. A rejected continuation is therefore a true no-op: it
+    // cannot grow the journal while returning the same 4xx forever.
+    const preparedDeferred = deferredInput
+      ? this.prepareDeferredInput(deferredInputId, deferredInput)
+      : null;
     const additions = prepared.filter(({ call }) => !call.resultHash);
-    if (additions.length === 0) return { additions: [], duplicates: prepared.map(({ call }) => call.wireId) };
-    if (this.state !== RoundState.AWAITING_RESULTS && this.state !== RoundState.APPLYING_RESULTS
+    const migrations = prepared.filter(({ call, hash, durableReceiptRetained }) => !durableReceiptRetained && call.resultHash
+      && call.resultHashVersion !== TOOL_RESULT_CANONICAL_VERSION
+      && call.semanticResultHash !== hash);
+    const dispositionFor = ({ call, durableReceiptRetained, sameBatchConflictIgnored }) => ({
+      toolCallId: call.wireId,
+      status: sameBatchConflictIgnored
+        ? "first_batch_result_retained"
+        : durableReceiptRetained
+        ? "durable_receipt_retained"
+        : additions.some((item) => item.call === call) ? "committed" : "duplicate",
+      callbackState: call.callbackAppliedAt ? "applied" : call.callback ? "pending" : "absent",
+      ...(sameBatchConflictIgnored ? { ignoredConflictingDuplicate: true } : {}),
+    });
+    if (additions.length > 0 && this.state !== RoundState.AWAITING_RESULTS && this.state !== RoundState.APPLYING_RESULTS
       && !(allowRegisteredReceipt && this.state === RoundState.COLLECTING)
       && !(allowTerminalReceipt && this.state === RoundState.TERMINAL)) {
       throw new ToolRoundError("round_not_awaiting_results", `round ${this.route} cannot receive new results while ${this.state}`, 409);
     }
     const next = this.toRecord();
-    if (this.state !== RoundState.TERMINAL) next.state = RoundState.APPLYING_RESULTS;
+    const deferredChanged = this.stagePreparedDeferred(next, preparedDeferred);
+    if (additions.length > 0 && this.state !== RoundState.TERMINAL) next.state = RoundState.APPLYING_RESULTS;
     const durableReceipts = new Map();
     for (const { call, hash, result } of additions) {
       const saved = next.calls.find((item) => item.wireId === call.wireId);
-      saved.receipt = { acceptedAt: this.clock(), result };
+      saved.receipt = {
+        acceptedAt: this.clock(),
+        canonicalVersion: TOOL_RESULT_CANONICAL_VERSION,
+        result,
+      };
       durableReceipts.set(call.wireId, saved.receipt);
       saved.resultHash = hash;
+      saved.resultHashVersion = TOOL_RESULT_CANONICAL_VERSION;
+      saved.semanticResultHash = hash;
       saved.state = this.state === RoundState.TERMINAL ? CallState.TERMINAL : CallState.RESULT_RECEIVED;
     }
-    this.persistRecord(next);
-    if (this.state !== RoundState.TERMINAL) this.state = RoundState.APPLYING_RESULTS;
+    for (const { call, hash } of migrations) {
+      const saved = next.calls.find((item) => item.wireId === call.wireId);
+      saved.resultHashVersion = saved.resultHashVersion || 1;
+      saved.semanticResultHash = hash;
+    }
+    const needsPersist = additions.length > 0 || migrations.length > 0 || deferredChanged;
+    if (needsPersist) this.persistRecord(next);
+    if (additions.length > 0 && this.state !== RoundState.TERMINAL) this.state = RoundState.APPLYING_RESULTS;
     for (const { call, hash } of additions) {
       call.receipt = durableReceipts.get(call.wireId);
       call.resultHash = hash;
+      call.resultHashVersion = TOOL_RESULT_CANONICAL_VERSION;
+      call.semanticResultHash = hash;
       if (this.state !== RoundState.TERMINAL) call.state = CallState.RESULT_RECEIVED;
       this.clearTimer(call);
     }
+    for (const { call, hash } of migrations) {
+      call.resultHashVersion = call.resultHashVersion || 1;
+      call.semanticResultHash = hash;
+    }
+    if (deferredChanged) this.adoptDeferredRecord(next);
     return {
       additions: additions.map(({ call }) => call.wireId),
       duplicates: prepared.filter(({ call }) => !!call.resultHash && !additions.some((item) => item.call === call)).map(({ call }) => call.wireId),
+      retainedConflicts: prepared.filter(({ durableReceiptRetained }) => durableReceiptRetained).map(({ call }) => call.wireId),
+      ignoredSameBatchConflicts: prepared.filter(({ sameBatchConflictIgnored }) => sameBatchConflictIgnored).map(({ call }) => call.wireId),
+      dispositions: prepared.map(dispositionFor),
+      deferredReceipt: preparedDeferred ? preparedDeferred.receipt : null,
     };
   }
 
@@ -720,19 +1439,26 @@ export class ToolRound {
     for (const id of this.fifo) {
       if (wanted && !wanted.has(id)) continue;
       const call = this.calls.get(id);
-      if (!call || !call.receipt || call.callbackAppliedAt || !call.callback) continue;
+      if (!call || !call.receipt || call.callbackAppliedAt || (!call.callback && !call.waiters.length)) continue;
       this.clearTimer(call);
       try {
-        call.callback.resolve(call.receipt.result);
+        for (const callback of [call.callback, ...call.waiters].filter(Boolean)) {
+          callback.resolve(call.receipt.result);
+        }
       } catch (error) {
-        try { call.callback.reject(error); } catch {}
+        for (const callback of [call.callback, ...call.waiters].filter(Boolean)) {
+          try { callback.reject(error); } catch {}
+        }
         call.callback = null;
+        call.waiters = [];
         this.callbacks.delete(id);
         this.terminalize(TerminalReason.RUN_ERROR, `callback application failed for ${id}: ${error.message}`);
         throw new ToolRoundError("callback_apply_failed", `failed to apply tool result ${id}: ${error.message}`, 500);
       }
       call.callbackAppliedAt = this.clock();
       call.state = CallState.CALLBACK_APPLIED;
+      call.callback = null;
+      call.waiters = [];
       this.callbacks.delete(id);
       applied.push(id);
     }
@@ -779,6 +1505,13 @@ export class ToolRound {
       if (call.state !== CallState.CALLBACK_APPLIED && call.callback) {
         try { call.callback.reject(new Error(`[bridge] ${reason}${detail ? `: ${detail}` : ""}`)); } catch {}
       }
+      if (call.state !== CallState.CALLBACK_APPLIED) {
+        for (const callback of call.waiters) {
+          try { callback.reject(new Error(`[bridge] ${reason}${detail ? `: ${detail}` : ""}`)); } catch {}
+        }
+      }
+      call.callback = null;
+      call.waiters = [];
       if (call.state !== CallState.CALLBACK_APPLIED) call.state = CallState.TERMINAL;
       call.terminalAt = at;
       this.callbacks.delete(call.wireId);

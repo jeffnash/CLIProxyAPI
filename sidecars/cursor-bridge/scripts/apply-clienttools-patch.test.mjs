@@ -39,8 +39,12 @@ function bundleFixture({ names = ["U", "e", "t", "r", "n", "h"], duplicateUnary 
   ].join(";");
 }
 
-function indexFixture({ omitLoader = false } = {}) {
-  return `var a=function(){};${omitLoader ? "" : 'const loader=Promise.all([a.e(745),a.e(973)]).then(a.bind(a,"./src/agent/local-executor.ts"));'}var o={};module.exports=o;`;
+function indexFixture({ omitLoader = false, omitSendRequestId = false } = {}) {
+  return `var a=function(){};a.e=function(){return Promise.resolve()};var u=require("node:crypto");` +
+    `function helper(self,args,_unused,generator){const iterator=generator.apply(self,args);return iterator.next().value}` +
+    `${omitLoader ? "" : 'const loader=Promise.all([a.e(745),a.e(973)]).then(a.bind(a,"./src/agent/local-executor.ts"));'}` +
+    `${omitSendRequestId ? "" : 'class LocalAgent{sendImpl(e){return helper(this,arguments,void 0,(function*(e,n={}){const B=(0,u.randomUUID)();return B}))}};globalThis.__FixtureLocalAgent=LocalAgent;'}` +
+    `var o={};module.exports=o;`;
 }
 
 function patchFixture(options = {}) {
@@ -104,6 +108,8 @@ test("AST discovery identifies each semantic seam exactly once", () => {
   const index = findIndexSeams(indexFixture());
   assert.deepEqual(index.loader.chunkIds, [745, 973]);
   assert.equal(index.loader.webpackRequire, "a");
+  assert.equal(index.sendRequestId.optionsParam, "n");
+  assert.equal(index.sendRequestId.cryptoReceiver, "u");
 });
 
 test("AST discovery survives minifier identifier renames", () => {
@@ -129,6 +135,7 @@ test("missing or duplicate SDK MCP artifact policy seams fail closed", () => {
 
 test("a missing structural local-executor loader fails closed", () => {
   throwsCode(() => patchFixture({ omitLoader: true }), "structural-mismatch");
+  throwsCode(() => patchFixture({ omitSendRequestId: true }), "structural-mismatch");
 });
 
 test("patched output installs direct tools while disabling native execution, artifact spill, and MCP meta wrappers", () => {
@@ -142,11 +149,32 @@ test("patched output installs direct tools while disabling native execution, art
   assert.match(result.patchedSrc, /mcpFileOutputThresholdBytes:0/);
   assert.match(result.patchedSrc, /mcpMetaToolEnabled:false/);
   assert.match(result.patchedSrc, /__CC_GET_ADVERTISE__/);
+  assert.match(result.patchedIndexSrc, /cursor-clienttools-send/);
+  assert.match(result.patchedIndexSrc, /idempotencyKey/);
 });
 
 test("the index eager-load is derived from the loader AST", () => {
   const result = patchFixture();
   assert.match(result.patchedIndexSrc, /a\.e\(745\);a\.e\(973\);a\("\.\/src\/agent\/local-executor\.ts"\)/);
+});
+
+test("patched local send derives stable UUID-shaped request ids from idempotency keys", () => {
+  const result = patchFixture();
+  const sandbox = {};
+  const LocalAgent = new Function("require", "module", "globalThis", `${result.patchedIndexSrc};return globalThis.__FixtureLocalAgent;`)(
+    require,
+    { exports: {} },
+    sandbox,
+  );
+  const agent = new LocalAgent();
+  const first = agent.sendImpl("hello", { idempotencyKey: "message-a" });
+  const retry = agent.sendImpl("hello", { idempotencyKey: "message-a" });
+  const distinct = agent.sendImpl("hello", { idempotencyKey: "message-b" });
+  const unkeyed = agent.sendImpl("hello", {});
+  assert.equal(first, retry);
+  assert.notEqual(first, distinct);
+  assert.match(first, /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.match(unkeyed, /^[0-9a-f-]{36}$/);
 });
 
 test("descriptor records exact seam counts and patched hashes", () => {
@@ -155,6 +183,7 @@ test("descriptor records exact seam counts and patched hashes", () => {
   assert.equal(result.descriptor.nativeExecutionDefault, "deny");
   assert.equal(result.descriptor.mcpArtifactSpillThresholdBytes, 0);
   assert.equal(result.descriptor.mcpMetaToolEnabled, false);
+  assert.equal(result.descriptor.localSendIdempotency, "deterministic-request-id");
   assert.equal(result.descriptor.sourceVerified, false);
   throwsCode(
     () => validateDescriptor({ descriptor: result.descriptor, version: PINNED_VERSION, bundleSource: result.patchedSrc, indexSource: result.patchedIndexSrc }),

@@ -17,16 +17,16 @@ const crypto = require("crypto");
 const acorn = require("acorn");
 const walk = require("acorn-walk");
 
-const PATCHER_VERSION = 4;
-const DESCRIPTOR_VERSION = 3;
+const PATCHER_VERSION = 5;
+const DESCRIPTOR_VERSION = 4;
 const PINNED_VERSION = "1.0.23";
 const EXPECTED_BUNDLE_SHA256 = "829ced604bb88908e49fcf5cd31eb22bce4e57d32074b2846d86a6c5afa26881";
 const EXPECTED_INDEX_SHA256 = "3157e86833e5033ce7b870cfd9810edc4b1e9c0637b93170779d6cbb3feba022";
 const BUNDLE_REL = path.join("dist", "cjs", "973.js");
 const INDEX_REL = path.join("dist", "cjs", "index.js");
 const DESCRIPTOR_REL = ".clienttools-patch-descriptor.json";
-const MARK = "/*cursor-composer-clienttools-patched-v4*/";
-const INDEX_MARK = "/*cursor-composer-clienttools-eager-v4*/";
+const MARK = "/*cursor-composer-clienttools-patched-v5*/";
+const INDEX_MARK = "/*cursor-composer-clienttools-eager-v5*/";
 const MODULE_ID = "./src/agent/local-executor.ts";
 const SHA_OVERRIDE_ENV = ["CURSOR_CLIENTTOOLS_ALLOW_UNVERIFIED_SDK", "CURSOR_SDK_PATCH_ALLOW_SHA_MISMATCH"];
 const EXPECTED_SEAMS = Object.freeze({
@@ -37,6 +37,7 @@ const EXPECTED_SEAMS = Object.freeze({
   mcpArtifactSpillPolicy: 1,
   mcpMetaToolPolicy: 1,
   localExecutorLoader: 1,
+  localSendRequestId: 1,
   moduleExport: 1,
 });
 
@@ -236,8 +237,8 @@ function findIndexSeams(source) {
   const ast = parse(source, INDEX_REL);
   const loaders = [];
   const exports = [];
-  walk.ancestor(ast, {
-    CallExpression(node, ancestors) {
+  const sendRequestIds = [];
+  const considerLoader = (node, ancestors) => {
       if (memberName(node.callee) !== "bind" || node.arguments.length < 2) return;
       if (!node.arguments.some((arg) => arg.type === "Literal" && arg.value === MODULE_ID)) return;
       const thenCall = ancestors.slice(0, -1).reverse().find((candidate) => candidate.type === "CallExpression" && candidate.arguments.includes(node));
@@ -260,7 +261,8 @@ function findIndexSeams(source) {
       }
       if (!chunkIds.length) return;
       loaders.push({ webpackRequire, chunkIds });
-    },
+  };
+  walk.ancestor(ast, {
     AssignmentExpression(node) {
       if (
         node.operator === "=" &&
@@ -270,8 +272,31 @@ function findIndexSeams(source) {
         isIdentifier(node.left.property, "exports")
       ) exports.push(node);
     },
+    CallExpression(node, ancestors) {
+      considerLoader(node, ancestors);
+      const sequence = node.callee?.type === "SequenceExpression" ? node.callee.expressions : [];
+      const randomUUID = sequence.at(-1);
+      if (randomUUID?.type !== "MemberExpression" || memberName(randomUUID) !== "randomUUID") return;
+      const method = [...ancestors].reverse().find((candidate) => candidate.type === "MethodDefinition");
+      if (!method || propName(method) !== "sendImpl") return;
+      const generator = [...ancestors].reverse().find((candidate) =>
+        candidate.type === "FunctionExpression" && candidate.params.length >= 2
+        && candidate.params[1].type === "AssignmentPattern"
+        && candidate.params[1].left.type === "Identifier");
+      if (!generator || randomUUID.object?.type !== "Identifier") return;
+      sendRequestIds.push({
+        node,
+        original: sourceOf(source, node),
+        optionsParam: generator.params[1].left.name,
+        cryptoReceiver: randomUUID.object.name,
+      });
+    },
   });
-  return { loader: one(loaders, "local-executor loader"), moduleExport: one(exports, "module export") };
+  return {
+    loader: one(loaders, "local-executor loader"),
+    moduleExport: one(exports, "module export"),
+    sendRequestId: one(sendRequestIds, "local send request-id"),
+  };
 }
 
 function applyEdits(source, edits) {
@@ -333,6 +358,15 @@ function dispatchHarness() {
   );
 }
 
+function deterministicSendRequestId(seam) {
+  const options = seam.optionsParam;
+  const cryptoReceiver = seam.cryptoReceiver;
+  return `(${options}&&typeof ${options}.idempotencyKey==="string"&&${options}.idempotencyKey.length?` +
+    `(function(__key){var __hex=(0,${cryptoReceiver}.createHash)("sha256").update("cursor-clienttools-send\\x00"+__key).digest("hex").slice(0,32);` +
+    `return __hex.slice(0,8)+"-"+__hex.slice(8,12)+"-5"+__hex.slice(13,16)+"-a"+__hex.slice(17,20)+"-"+__hex.slice(20)}(${options}.idempotencyKey)):` +
+    `${seam.original})`;
+}
+
 function applyPatch({ src, indexSrc, version, env = {} }) {
   if (typeof src !== "string" || typeof indexSrc !== "string") {
     throw new PatchError("bad-input", "applyPatch requires latin1 bundle and index source strings");
@@ -372,6 +406,11 @@ function applyPatch({ src, indexSrc, version, env = {} }) {
   const req = indexSeams.loader.webpackRequire;
   const eager = `${INDEX_MARK}(()=>{try{${indexSeams.loader.chunkIds.map((id) => `${req}.e(${id})`).join(";")};${req}(${JSON.stringify(MODULE_ID)})}catch(__error){}})(),`;
   const patchedIndexSrc = applyEdits(indexSrc, [
+    {
+      start: indexSeams.sendRequestId.node.start,
+      end: indexSeams.sendRequestId.node.end,
+      text: deterministicSendRequestId(indexSeams.sendRequestId),
+    },
     { start: indexSeams.moduleExport.start, end: indexSeams.moduleExport.start, text: eager },
   ]);
   parse(patchedIndexSrc, `patched ${INDEX_REL}`);
@@ -391,6 +430,7 @@ function applyPatch({ src, indexSrc, version, env = {} }) {
     nativeExecutionDefault: "deny",
     mcpArtifactSpillThresholdBytes: 0,
     mcpMetaToolEnabled: false,
+    localSendIdempotency: "deterministic-request-id",
     sourceVerified: warnings.length === 0,
   };
   return { patchedSrc, patchedIndexSrc, descriptor, warnings };
@@ -409,7 +449,8 @@ function validateDescriptor({ descriptor, version, bundleSource, indexSource, al
     JSON.stringify(descriptor.seams) !== JSON.stringify(EXPECTED_SEAMS) ||
     descriptor.nativeExecutionDefault !== "deny" ||
     descriptor.mcpArtifactSpillThresholdBytes !== 0 ||
-    descriptor.mcpMetaToolEnabled !== false
+    descriptor.mcpMetaToolEnabled !== false ||
+    descriptor.localSendIdempotency !== "deterministic-request-id"
   ) {
     throw new PatchError("descriptor-invalid", "patch descriptor seam contract is incomplete");
   }

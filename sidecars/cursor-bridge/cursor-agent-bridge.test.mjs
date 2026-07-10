@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
 
 const TEST_STATE_ROOT = mkdtempSync(path.join(tmpdir(), "cursor-bridge-state-"));
@@ -11,10 +13,13 @@ process.env.CURSOR_AGENT_TOOL_BATCH_MS = "60000";
 process.env.CURSOR_AGENT_PENDING_TIMEOUT_MS = "60000";
 
 const bridge = await import("./cursor-agent-bridge.mjs");
+const { createRoundInfrastructure, ToolRound, ToolRoundError, TerminalReason } = await import("./tool-round.mjs");
 const {
   AdvertisedToolRegistry,
   CC_CASES,
   CLIENT_TOOL_PROVIDER_ID,
+  COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES,
+  COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS,
   COMPOSER_MAX_INVALID_TOOL_CALLS,
   DEFAULT_MCP_SERVER_KEY,
   Session,
@@ -42,17 +47,20 @@ const {
   isConversationTooLong,
   isLoopbackRemote,
   classifyMcpRoute,
+  keyHash,
   keyFingerprint,
   liveToolRounds,
   mcpDispatch,
   mcpDispatchResult,
   mcpServerKeyForTool,
   mcpToolsForServer,
+  sseFrameSizeError,
   nativeToolBlockedByChoice,
   parseShellContent,
   platforms,
   prepareAdvertisedToolRegistry,
   readinessBody,
+  readBodyBounded,
   reconcileExport,
   refreshSessionFromBody,
   sessions,
@@ -106,6 +114,20 @@ function request(remoteAddress = "127.0.0.1") {
 
 function neutralBody(body = {}) {
   return { ...body, clientEnv: { workspaceUnknown: true } };
+}
+
+function authoritativeRawToolsBody(toolInventoryJSON, extra = {}) {
+  return {
+    contractVersion: 2,
+    toolsAuthoritative: true,
+    toolInventoryJSON,
+    toolInventoryEpoch: "cti1_" + createHash("sha256").update(toolInventoryJSON, "utf8").digest("hex").slice(0, 32),
+    ...extra,
+  };
+}
+
+function authoritativeToolsBody(tools, extra = {}) {
+  return authoritativeRawToolsBody(JSON.stringify(tools), extra);
 }
 
 function advertised(name = "Lookup") {
@@ -295,6 +317,180 @@ test("tool inventory refresh replaces live gating, including an explicit empty c
   assert.deepEqual(session.advertiseForGating().map((tool) => tool.name), ["B", "C"]);
 });
 
+test("client-tool contract v2 hashes the one Go-emitted snapshot and rejects ambiguous representations", () => {
+  const body = authoritativeToolsBody([]);
+  const registry = prepareAdvertisedToolRegistry(body);
+  assert.deepEqual(registry.all(), []);
+  assert.equal(Object.hasOwn(body, "tools"), false, "preparation must not create a second inventory representation");
+  assert.doesNotThrow(() => prepareAdvertisedToolRegistry(body), "preparation must be idempotent");
+  assert.throws(
+    () => prepareAdvertisedToolRegistry({
+      ...body,
+      toolInventoryEpoch: "cti1_00000000000000000000000000000000",
+    }),
+    /does not match/,
+  );
+  assert.throws(
+    () => prepareAdvertisedToolRegistry({ ...body, toolsAuthoritative: false }),
+    /toolsAuthoritative:true/,
+  );
+  assert.throws(() => prepareAdvertisedToolRegistry({ ...body, tools: [] }), /exactly one authoritative/);
+  assert.throws(() => prepareAdvertisedToolRegistry(authoritativeRawToolsBody("{")), /not valid JSON/);
+  assert.throws(() => prepareAdvertisedToolRegistry(authoritativeRawToolsBody("{}")), /must encode a tools array/);
+
+  // This is a literal Go encoding/json snapshot. It intentionally contains
+  // HTML escaping, U+2028 escaping, an integer-like object key, -0, and an
+  // integer above JavaScript's exact range. Node hashes the original bytes
+  // before JSON.parse, so none of those legal representation differences can
+  // cause a false epoch mismatch/422.
+  const goSnapshot = String.raw`[{"description":"\u003c\u0026\u003e\u2028","inputSchema":{"properties":{"0":{"minimum":-0,"type":"number"},"huge":{"maximum":9007199254740993,"type":"integer"}},"type":"object"},"name":"T"}]`;
+  const crossLanguageBody = authoritativeRawToolsBody(goSnapshot);
+  assert.equal(crossLanguageBody.toolInventoryEpoch, "cti1_2bb750689a0806d0a1f5b6e984f6a7d0");
+  assert.equal(prepareAdvertisedToolRegistry(crossLanguageBody).all()[0].name, "T");
+
+  const compact = authoritativeRawToolsBody(`[{"name":"Equivalent","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}}]`);
+  const reordered = authoritativeRawToolsBody(`[
+    { "inputSchema": { "properties": { "x": { "type": "string" } }, "type": "object" }, "name": "Equivalent" }
+  ]`);
+  assert.notEqual(compact.toolInventoryEpoch, reordered.toolInventoryEpoch, "the epoch identifies bytes, not a guessed semantic canonical form");
+  assert.deepEqual(prepareAdvertisedToolRegistry(compact).all(), prepareAdvertisedToolRegistry(reordered).all(),
+    "equivalent valid snapshots are accepted even when their whitespace/key order differ");
+});
+
+test("bounded request decoding preserves UTF-8 across every network chunk boundary", async () => {
+  const raw = JSON.stringify(authoritativeToolsBody([{
+    name: "UnicodeTool",
+    description: "é 中 😀 e\u0301",
+    inputSchema: { type: "object", properties: { "clé😀": { type: "string" } } },
+  }]));
+  const encoded = Buffer.from(raw, "utf8");
+  for (let split = 1; split < encoded.length; split++) {
+    const decoded = await readBodyBounded(Readable.from([encoded.subarray(0, split), encoded.subarray(split)]));
+    assert.equal(decoded, raw, `UTF-8 body changed at byte split ${split}`);
+    const body = JSON.parse(decoded);
+    assert.doesNotThrow(() => prepareAdvertisedToolRegistry(body));
+  }
+  await assert.rejects(
+    readBodyBounded(Readable.from([Buffer.from([0x7b, 0x22, 0xc3]), Buffer.from([0x28, 0x22, 0x7d])])),
+    /encoded data was not valid|UTF-8/i,
+  );
+});
+
+test("shared SSE frame limit counts UTF-8 bytes and rejects before Go scanner overflow", () => {
+  assert.equal(sseFrameSizeError("é", 2), null);
+  assert.match(sseFrameSizeError("é", 1).message, /2 bytes/);
+  assert.equal(sseFrameSizeError("abc", 3), null);
+  assert.match(sseFrameSizeError("abc", 2).message, /shared 2-byte limit/);
+});
+
+test("MCP reconnect snapshots replace 20 tools with 28 tools and never retain stale entries", () => {
+  const session = new Session("dynamic-mcp-reconnect", "key");
+  const inventory = (count, generation) => Array.from({ length: count }, (_, index) => ({
+    name: `mcp__memory_${generation}__tool_${index}`,
+    description: `generation ${generation} tool ${index}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo_path: { type: "string" },
+        project: { type: ["string", "null"], default: null },
+        options: { type: "array", items: { type: "integer", minimum: -0 } },
+      },
+      required: ["repo_path"],
+      additionalProperties: false,
+    },
+  }));
+
+  let priorEpoch = null;
+  for (const [count, generation] of [[20, "initial"], [28, "reconnected"], [7, "reduced"], [0, "disabled"]]) {
+    const body = authoritativeToolsBody(inventory(count, generation), { toolChoice: "auto" });
+    const prepared = prepareAdvertisedToolRegistry(body);
+    refreshSessionFromBody(session, body, prepared);
+    assert.equal(session.advertise.length, count);
+    assert.equal(session.toolInventoryEpoch, body.toolInventoryEpoch);
+    if (priorEpoch != null) assert.notEqual(session.toolInventoryEpoch, priorEpoch);
+    assert.ok(session.advertise.every((tool) => tool.name.includes(generation)), "a replacement snapshot must not merge stale tools");
+    priorEpoch = session.toolInventoryEpoch;
+  }
+});
+
+test("authoritative inventory may add, remove, rename, and change MCP schemas while an older signed call completes", async () => {
+  const { session } = seedSession("dynamic-contract-v2", "key", []);
+  const initial = authoritativeToolsBody([{
+    name: "MemorySearch",
+    inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+  }], { toolChoice: "auto" });
+  refreshSessionFromBody(session, initial, prepareAdvertisedToolRegistry(initial));
+  session.activeAdvertise = effectiveAdvertise(session.advertise, "auto");
+  const firstEpoch = session.toolInventoryEpoch;
+  const opened = await openTool(session, { name: "MemorySearch", input: { query: "old schema" } });
+
+  const changed = authoritativeToolsBody([{
+    name: "GraphSearch",
+    aliases: ["MemorySearch"],
+    inputSchema: { type: "object", properties: { repo_path: { type: "string" }, project: { type: "string" } }, required: ["repo_path", "project"] },
+  }, {
+    name: "Todo",
+    inputSchema: { type: "object", properties: { op: { type: "string" } }, required: ["op"] },
+  }], { toolChoice: "auto" });
+  const continuation = new MockResponse();
+  await handleContinue(request(), continuation, continuationBody([{
+    toolCallId: opened.call.wireId,
+    content: "old call completed",
+    isError: false,
+  }], {}, changed), "key");
+
+  assert.equal(continuation.status, 200);
+  assert.notEqual(session.toolInventoryEpoch, firstEpoch);
+  assert.deepEqual(session.advertiseForGating().map((tool) => tool.name), ["GraphSearch", "Todo"]);
+  assert.equal((await opened.promise).content, "old call completed", "inventory refresh must not invalidate an already-issued signed call");
+  assert.equal(session.reconcileToolName("MemorySearch"), "GraphSearch", "renames may retain a private compatibility alias");
+
+  const removed = authoritativeToolsBody([{ name: "Todo", inputSchema: { type: "object" } }], { toolChoice: "auto" });
+  refreshSessionFromBody(session, removed, prepareAdvertisedToolRegistry(removed));
+  assert.deepEqual(session.advertiseForGating().map((tool) => tool.name), ["Todo"]);
+  assert.equal(session.reconcileToolName("MemorySearch"), null, "removed tools must not survive in stale session state");
+});
+
+test("partial continuations cannot reorder tool inventory; refresh occurs only at the logical round boundary", async () => {
+  const initial = authoritativeToolsBody(advertised("Lookup"), { toolChoice: "auto" });
+  const { session } = seedSession("inventory-boundary", "key", []);
+  refreshSessionFromBody(session, initial, prepareAdvertisedToolRegistry(initial));
+  session.activeAdvertise = effectiveAdvertise(session.advertise, "auto");
+  const first = await openTool(session, { rawId: "boundary-first", awaiting: false });
+  const secondPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "boundary-second",
+    name: "Lookup",
+    input: { q: "second" },
+    resultAdapter: (value) => value,
+  });
+  secondPromise.catch(() => {});
+  await waitFor(() => first.round.fifo.length === 2 && first.round.calls.get(first.round.fifo[1]).handedAt != null,
+    "second boundary call handoff");
+  if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
+  const second = first.round.calls.get(first.round.fifo[1]);
+  first.round.markAwaitingResults();
+
+  const premature = authoritativeToolsBody(advertised("PrematureTool"), { toolChoice: "auto" });
+  const partial = new MockResponse();
+  await handleContinue(request(), partial, continuationBody([
+    { toolCallId: first.call.wireId, content: "first" },
+  ], {}, premature), "key");
+  assert.equal(partial.status, 200);
+  assert.deepEqual(session.advertise.map((tool) => tool.name), ["Lookup"],
+    "a partial receipt must not mutate the still-open logical turn contract");
+
+  const finalInventory = authoritativeToolsBody(advertised("FinalTool"), { toolChoice: "auto" });
+  const final = new MockResponse();
+  await handleContinue(request(), final, continuationBody([
+    { toolCallId: second.wireId, content: "second" },
+  ], {}, finalInventory), "key");
+  assert.equal(final.status, 200);
+  assert.deepEqual(session.advertise.map((tool) => tool.name), ["FinalTool"]);
+  assert.equal((await first.promise).content, "first");
+  assert.equal((await secondPromise).content, "second");
+});
+
 test("boolean false tool schemas fail closed instead of widening to an executable object", () => {
   assert.throws(() => prepareAdvertisedToolRegistry({
     tools: [{ name: "Never", inputSchema: false }],
@@ -325,6 +521,41 @@ test("advertised schema validation honors declared modern JSON Schema dialects",
   }]);
   assert.equal(registry.validate("Modern", { pair: ["x", 1] }), null);
   assert.equal(registry.validate("Modern", { pair: ["x", "wrong"] }).structuredContent.errors[0].path, "pair.1");
+});
+
+test("draft-04 schemas validate and unresolved external refs defer to the authoritative harness", () => {
+  const draft04 = new AdvertisedToolRegistry();
+  draft04.replace([{
+    name: "Draft04",
+    inputSchema: {
+      $schema: "http://json-schema.org/draft-04/schema#",
+      type: "object",
+      properties: { count: { type: "number", minimum: 0, exclusiveMinimum: true } },
+      required: ["count"],
+      additionalProperties: false,
+    },
+  }]);
+  assert.equal(draft04.validate("Draft04", { count: 1 }), null);
+  const zeroFailure = draft04.validate("Draft04", { count: 0 });
+  assert.equal(zeroFailure.structuredContent.errors[0].path, "count");
+  assert.match(zeroFailure.structuredContent.errors[0].message, /must be > 0/);
+
+  const remote = new AdvertisedToolRegistry();
+  remote.replace([{
+    name: "RemoteRef",
+    inputSchema: {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      $ref: "https://schemas.example.invalid/client-tool-input.json",
+    },
+  }]);
+  assert.equal(remote.validate("RemoteRef", { client_specific: true }), null,
+    "an unresolved remote ref must reach the client harness instead of failing registration");
+
+  assert.throws(
+    () => new AdvertisedToolRegistry().replace([{ name: "InvalidSchema", inputSchema: { type: 7 } }]),
+    /invalid inputSchema|type must be JSONType/i,
+    "genuinely malformed schemas still fail closed",
+  );
 });
 
 test("patched advertisement and MCP inventory consume the same registry", () => {
@@ -471,19 +702,80 @@ test("repeated schema-invalid calls terminate the SDK run instead of spinning fo
     name: "Required",
     inputSchema: { type: "object", required: ["value"] },
   }]);
-  for (let i = 0; i < COMPOSER_MAX_INVALID_TOOL_CALLS; i++) {
+  for (let i = 0; i < COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS; i++) {
     const response = await session.dispatchMcp({ toolName: "Required", args: {}, toolCallId: `invalid-${i}` });
     assert.equal(response.__ccJson.success.isError, true);
   }
-  assert.equal(session.invalidToolCalls, COMPOSER_MAX_INVALID_TOOL_CALLS);
+  assert.equal(session.invalidToolCalls, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS);
   assert.equal(session.loopTripped, true);
-  assert.match(output.text(), /internal client-tool rejection bound/);
+  assert.match(output.text(), /repeated the same internally rejected client-tool call/);
+  assert.match(output.text(), /"error_code":"client_tool_contract_mismatch"/);
+  assert.match(output.text(), /"executed":false/);
   assert.doesNotMatch(output.text(), /"type":"tool_call"/);
+  const auditFile = path.join(TEST_STATE_ROOT, "internal-tool-attempts.jsonl");
+  const sessionHash = createHash("sha256").update(session.id).digest("hex");
+  const attempts = readFileSync(auditFile, "utf8").trim().split("\n")
+    .map((line) => JSON.parse(line))
+    .filter((attempt) => attempt.sessionIdHash === sessionHash);
+  assert.equal(attempts.length, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS);
+  assert.ok(attempts.every((attempt) => attempt.executed === false && attempt.schemaFingerprint
+    && attempt.argumentFingerprint && attempt.errorSignature));
+  assert.ok(attempts.every((attempt) => !Object.hasOwn(attempt, "arguments")));
+});
+
+test("different corrective attempts with the same validation keyword are not a false identical loop", async () => {
+  const { session } = seedSession("distinct-invalid-corrections", "key", [{
+    name: "RequiredString",
+    inputSchema: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false,
+    },
+  }]);
+  for (let i = 0; i < COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS; i++) {
+    const response = await session.dispatchMcp({
+      toolName: "RequiredString",
+      args: { value: i },
+      toolCallId: `different-invalid-${i}`,
+    });
+    assert.equal(response.__ccJson.success.isError, true);
+  }
+  assert.equal(session.invalidToolCalls, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS);
+  assert.equal(session.loopTripped, false);
+  assert.ok(session.internalRejectionSignatures.size >= COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS);
+  assert.ok(session.invalidToolCalls < COMPOSER_MAX_INVALID_TOOL_CALLS);
+});
+
+test("prototype-named rejected arguments retain distinct privacy-safe loop signatures", async () => {
+  const { session } = seedSession("prototype-attempt-signatures", "key", [{
+    name: "Strict",
+    inputSchema: {
+      type: "object",
+      properties: { value: { type: "string" } },
+      required: ["value"],
+      additionalProperties: false,
+    },
+  }]);
+  for (const marker of ["one", "two"]) {
+    const args = JSON.parse(`{"value":7,"__proto__":"${marker}"}`);
+    const response = await session.dispatchMcp({ toolName: "Strict", args, toolCallId: `prototype-${marker}` });
+    assert.equal(response.__ccJson.success.isError, true);
+  }
+  const sessionHash = createHash("sha256").update(session.id).digest("hex");
+  const attempts = readFileSync(path.join(TEST_STATE_ROOT, "internal-tool-attempts.jsonl"), "utf8").trim().split("\n")
+    .map((line) => JSON.parse(line))
+    .filter((attempt) => attempt.sessionIdHash === sessionHash);
+  assert.equal(attempts.length, 2);
+  assert.notEqual(attempts[0].argumentFingerprint, attempts[1].argumentFingerprint);
+  assert.notEqual(attempts[0].errorSignature, attempts[1].errorSignature);
+  assert.equal(session.loopTripped, false);
 });
 
 test("HTTP unknown tools and unmatched native retries share the same terminal rejection bound", async () => {
   const http = seedSession("unknown-http-loop", "key", advertised("Lookup"));
-  for (let i = 0; i < COMPOSER_MAX_INVALID_TOOL_CALLS; i++) {
+  http.session.stepToolStarted = 2;
+  for (let i = 0; i < COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS; i++) {
     const response = await mcpDispatch({
       jsonrpc: "2.0",
       id: i,
@@ -491,13 +783,15 @@ test("HTTP unknown tools and unmatched native retries share the same terminal re
       params: { name: "Missing", arguments: {} },
     }, http.session.id, DEFAULT_MCP_SERVER_KEY);
     assert.equal(response.result.isError, true);
+    if (i === 0) assert.equal(http.session.stepToolStarted, 1);
   }
   assert.equal(http.session.loopTripped, true);
+  assert.equal(http.session.stepToolStarted, 0, "HTTP MCP hidden rejections must settle announced SDK calls");
   assert.equal(http.session.currentRound, null);
-  assert.match(http.output.text(), /internal client-tool rejection bound/);
+  assert.match(http.output.text(), /repeated the same internally rejected client-tool call/);
 
   const native = seedSession("unknown-native-loop", "key", []);
-  for (let i = 0; i < COMPOSER_MAX_INVALID_TOOL_CALLS; i++) {
+  for (let i = 0; i < COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS; i++) {
     const response = await native.session.dispatchUnary("readArgs", CC_CASES.readArgs, {
       toolCallId: `missing-native-${i}`,
       path: "/repo/a",
@@ -506,7 +800,7 @@ test("HTTP unknown tools and unmatched native retries share the same terminal re
   }
   assert.equal(native.session.loopTripped, true);
   assert.equal(native.session.currentRound, null);
-  assert.match(native.output.text(), /internal client-tool rejection bound/);
+  assert.match(native.output.text(), /repeated the same internally rejected client-tool call/);
 });
 
 test("repeated synthetic artifact retries terminate without ever reaching the harness", async () => {
@@ -515,7 +809,7 @@ test("repeated synthetic artifact retries terminate without ever reaching the ha
     name: "write_file",
     inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path"] },
   }]);
-  for (let i = 0; i < COMPOSER_MAX_INVALID_TOOL_CALLS; i++) {
+  for (let i = 0; i < COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS; i++) {
     const result = await session.openClientTool({
       source: "test",
       rawToolCallId: `artifact-${i}`,
@@ -780,29 +1074,33 @@ test("signed continuation receipts are persisted before the live callback resolv
   assert.deepEqual(events, ["callback"]);
   assert.equal(res.status, 200);
   assert.match(res.text(), /duplicate_or_concurrent/);
+  assert.match(res.text(), /"contractVersion":2/);
+  assert.match(res.text(), /"acknowledgedToolResultIds":\["cct1_/);
+  assert.match(res.text(), /"toolEpochState":\{/);
   const saved = journalRecord(round.route);
   assert.ok(saved.calls[0].resultHash);
   assert.deepEqual(saved.calls[0].receipt.result.structuredContent, { ok: true });
   assert.equal(saved.terminal.reason, "completed");
 });
 
-test("invalid continuation schemas are refused before a durable result receipt", async () => {
+test("invalid replacement inventory cannot strand an already-executed tool result", async () => {
   const { session } = seedSession("invalid-continuation-schema", "cursor-key");
   const opened = await openTool(session);
   let callbackSettled = false;
   void opened.promise.then(() => { callbackSettled = true; }, () => { callbackSettled = true; });
   const res = new MockResponse();
   await handleContinue(request(), res, continuationBody([
-    { toolCallId: opened.call.wireId, content: "must-not-commit" },
+    { toolCallId: opened.call.wireId, content: "must-commit" },
   ], {}, {
     tools: [{ name: "Broken", inputSchema: { type: "not-a-json-schema-type" } }],
   }), "cursor-key");
-  assert.equal(res.status, 422);
-  assert.match(res.text(), /invalid_advertised_tools/);
-  assert.equal(callbackSettled, false);
-  assert.equal(journalRecord(opened.round.route).calls[0].resultHash, null);
-  await session.cancel({ terminalReason: "test_cleanup", detail: "invalid continuation test complete" });
-  await assert.rejects(opened.promise, /test_cleanup/);
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /"toolInventory":\{"status":"rejected"/);
+  assert.equal((await opened.promise).content, "must-commit");
+  assert.equal(callbackSettled, true);
+  assert.ok(journalRecord(opened.round.route).calls[0].resultHash);
+  assert.equal(session.advertise.some((tool) => tool.name === "Lookup"), true);
+  assert.equal(session.advertise.some((tool) => tool.name === "Broken"), false);
 });
 
 test("whole-batch token validation is atomic: one tampered id commits nothing", async () => {
@@ -829,7 +1127,88 @@ test("whole-batch token validation is atomic: one tampered id commits nothing", 
   await assert.rejects(secondPromise);
 });
 
-test("a continuation batch spanning two signed routes is rejected before either mutates", async () => {
+test("journal CAS races are reconciled internally instead of leaking a permanent 409", async () => {
+  const { session } = seedSession("cas-reconcile", "cursor-key");
+  const opened = await openTool(session);
+  const other = createRoundInfrastructure(TEST_STATE_ROOT);
+  const landedElsewhere = ToolRound.load(other.journal, other.codec, opened.round.route);
+  const result = { toolCallId: opened.call.wireId, content: "accepted elsewhere", isError: false };
+  landedElsewhere.commitResults([result], { allowRegisteredReceipt: true });
+  landedElsewhere.terminalize(TerminalReason.COMPLETED, "accepted by the lease owner");
+
+  const res = new MockResponse();
+  await handleContinue(request(), res, continuationBody([result]), "cursor-key");
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /already_applied/);
+  await assert.rejects(opened.promise, /ownership advanced/);
+});
+
+test("a residual state-machine conflict is contained as typed HTTP-200 SSE", async () => {
+  const { session } = seedSession("contained-conflict", "cursor-key");
+  const opened = await openTool(session);
+  opened.round.commitResults = () => {
+    throw new ToolRoundError("synthetic_state_race", "synthetic conflicting transition", 409);
+  };
+  const res = new MockResponse();
+  await handleContinue(request(), res, continuationBody([
+    { toolCallId: opened.call.wireId, content: "retryable" },
+  ]), "cursor-key");
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /continuation_conflict_contained/);
+  assert.match(res.text(), /synthetic_state_race/);
+  assert.equal(journalRecord(opened.round.route).calls[0].receipt, null);
+  opened.round.terminalize("client_cancelled", "cleanup");
+  await assert.rejects(opened.promise);
+});
+
+test("mixed continuation is a complete no-op when the atomic tool-result batch fails", async () => {
+  const { session } = seedSession("atomic-mixed", "cursor-key");
+  const opened = await openTool(session);
+  const unknownSameRoute = opened.round.nextWireId(99);
+  const file = path.join(TEST_STATE_ROOT, "client-tool-rounds", `${opened.round.route}.json`);
+  const before = readFileSync(file, "utf8");
+  for (let retry = 0; retry < 100; retry++) {
+    const res = new MockResponse();
+    await handleContinue(request(), res, continuationBody([
+      { toolCallId: opened.call.wireId, content: "valid but must not commit" },
+      { toolCallId: unknownSameRoute, content: "unknown" },
+    ], {
+      userText: "also continue",
+      clientMessageId: "ccm2_atomic_mixed",
+      interruptRequested: true,
+    }), "cursor-key");
+    assert.equal(res.status, 410);
+  }
+  assert.equal(readFileSync(file, "utf8"), before,
+    "one hundred rejected retries must not change the journal revision or file bytes");
+  const saved = journalRecord(opened.round.route);
+  assert.equal(saved.calls[0].resultHash, null);
+  assert.equal(saved.deferredInputs.length, 0,
+    "a rejected HTTP request must not mutate the journal or poison its later retry");
+
+  opened.round.terminalize("client_cancelled", "cleanup");
+  await assert.rejects(opened.promise);
+});
+
+test("same tool id twice with conflicting projections retains the first result and returns 200", async () => {
+  const { session } = seedSession("same-batch-first-wins", "cursor-key");
+  const opened = await openTool(session);
+  const res = new MockResponse();
+  const handling = handleContinue(request(), res, continuationBody([
+    { toolCallId: opened.call.wireId, content: "first durable projection", isError: false },
+    { toolCallId: opened.call.wireId, content: "later contradictory projection", isError: true },
+  ]), "cursor-key");
+  assert.equal((await opened.promise).content, "first durable projection");
+  await handling;
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /first_batch_result_retained/);
+  assert.match(res.text(), /ignoredConflictingDuplicate/);
+  const saved = journalRecord(opened.round.route).calls[0];
+  assert.equal(saved.receipt.result.content, "first durable projection");
+  assert.equal(saved.receipt.result.isError, false);
+});
+
+test("two genuinely live signed routes return a typed non-mutating receipt instead of HTTP 409", async () => {
   const a = seedSession("route-a", "cursor-key").session;
   const openA = await openTool(a, { rawId: "a" });
   const b = seedSession("route-b", "cursor-key").session;
@@ -839,13 +1218,38 @@ test("a continuation batch spanning two signed routes is rejected before either 
     { toolCallId: openA.call.wireId, content: "A" },
     { toolCallId: openB.call.wireId, content: "B" },
   ]), "cursor-key");
-  assert.equal(res.status, 409);
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /multiple_live_tool_rounds_deferred/);
+  assert.match(res.text(), /no result was consumed/);
   assert.equal(openA.call.resultHash, null);
   assert.equal(openB.call.resultHash, null);
   openA.round.terminalize("client_cancelled", "cleanup");
   openB.round.terminalize("client_cancelled", "cleanup");
   await assert.rejects(openA.promise);
   await assert.rejects(openB.promise);
+});
+
+test("mixed-route continuation acknowledges terminal history and applies the one live round", async () => {
+  const oldSession = seedSession("mixed-route-old", "cursor-key").session;
+  const oldCall = await openTool(oldSession, { rawId: "old" });
+  const oldResult = { toolCallId: oldCall.call.wireId, content: "old durable value", isError: false };
+  oldCall.round.applyResults([oldResult]);
+  await oldCall.promise;
+
+  const liveSession = seedSession("mixed-route-live", "cursor-key").session;
+  const liveCall = await openTool(liveSession, { rawId: "live" });
+  const liveResult = { toolCallId: liveCall.call.wireId, content: "live value", isError: false };
+  const res = new MockResponse();
+  const handling = handleContinue(request(), res, continuationBody([
+    { ...oldResult, content: "historical projection drift" },
+    liveResult,
+  ]), "cursor-key");
+  assert.equal((await liveCall.promise).content, "live value");
+  await handling;
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /historical_receipt_acknowledged/);
+  assert.match(res.text(), new RegExp(oldCall.call.wireId));
+  assert.equal(journalRecord(oldCall.round.route).calls[0].receipt.result.content, "old durable value");
 });
 
 test("signed round tenant fingerprint prevents cross-credential result injection", async () => {
@@ -867,7 +1271,7 @@ test("multi-tenant continuation refuses a round with a missing tenant fingerprin
   assert.equal(continuationTenantMismatch({ tenantFingerprint: keyFingerprint("other-key") }, "cursor-key", true), true);
 });
 
-test("result-before-handoff is rejected without creating a receipt", async () => {
+test("a valid signed result is receipted across the handoff timestamp crash window", async () => {
   const session = new Session("not-handed", "key");
   session.clientEnv = { workspaceUnknown: true };
   const round = session.ensureToolRound();
@@ -875,8 +1279,8 @@ test("result-before-handoff is rejected without creating a receipt", async () =>
   round.markAwaitingResults();
   const res = new MockResponse();
   await handleContinue(request(), res, continuationBody([{ toolCallId: call.wireId, content: "early" }]), "key");
-  assert.equal(res.status, 409);
-  assert.equal(round.calls.get(call.wireId).receipt, null);
+  assert.equal(res.status, 410, "missing recovery history is separate from accepting the signed result");
+  assert.equal(round.calls.get(call.wireId).receipt.result.content, "early");
 });
 
 test("restart without bounded history durably receipts the result then refuses faithful recovery", async () => {
@@ -956,6 +1360,7 @@ test("restart recovery preserves ids, errors, structured data, images, and trail
       images: [{ data: "QUJD", mimeType: "image/png" }, { url: "https://example.test/x.png" }],
     }],
   };
+  opened.round.commitResults(input.results);
   const recovery = buildRestartRecoveryInput(opened.round, input);
   assert.equal(recovery.type, "user");
   assert.match(recovery.text, new RegExp(opened.call.wireId));
@@ -966,7 +1371,36 @@ test("restart recovery preserves ids, errors, structured data, images, and trail
   await assert.rejects(opened.promise);
 });
 
-test("identical late retry is acknowledged from its durable terminal receipt; conflict is rejected", async () => {
+test("restart recovery is rendered only from durable receipts, never contradictory retry projections", async () => {
+  const { session } = seedSession("recovery-receipt-authority", "key");
+  const opened = await openTool(session);
+  const original = {
+    toolCallId: opened.call.wireId,
+    content: "ignored original projection",
+    contentBlocks: [{ type: "text", text: "durable authoritative text" }],
+    images: [{ data: "QUJD", mimeType: "image/png" }],
+  };
+  opened.round.commitResults([original]);
+
+  const retry = {
+    type: "tool_results",
+    history: "bounded prior conversation",
+    results: [{
+      ...original,
+      content: "contradictory unreceipted retry text",
+      images: [{ data: "RElGRkVSRU5U", mimeType: "image/png" }],
+    }],
+  };
+  const recovery = buildRestartRecoveryInput(opened.round, retry);
+  assert.match(recovery.text, /durable authoritative text/);
+  assert.doesNotMatch(recovery.text, /contradictory unreceipted retry text/);
+  assert.equal(recovery.images.length, 0, "ignored compatibility images must not bypass authoritative contentBlocks");
+
+  opened.round.terminalize("client_cancelled", "cleanup");
+  await assert.rejects(opened.promise);
+});
+
+test("terminal durable receipt is authoritative across byte-different stateless replays", async () => {
   const { session } = seedSession("late", "cursor-key");
   const opened = await openTool(session);
   const result = { toolCallId: opened.call.wireId, content: "once", isError: false };
@@ -982,8 +1416,449 @@ test("identical late retry is acknowledged from its durable terminal receipt; co
 
   const conflict = new MockResponse();
   await handleContinue(request(), conflict, continuationBody([{ ...result, content: "different" }]), "cursor-key");
-  assert.equal(conflict.status, 409);
-  assert.equal(conflict.json().error.code, "result_conflict");
+  assert.equal(conflict.status, 200);
+  assert.match(conflict.text(), /durable_receipt_retained/);
+  assert.equal(journalRecord(opened.round.route).calls[0].receipt.result.content, "once");
+});
+
+test("durable receipt remains authoritative while sibling tool callbacks are still live", async () => {
+  const { session } = seedSession("parallel-receipt-authority", "cursor-key");
+  const first = await openTool(session, { rawId: "first", awaiting: false });
+  const secondPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "second",
+    name: "Lookup",
+    input: { q: "second" },
+    resultAdapter: (value) => value,
+  });
+  secondPromise.catch(() => {});
+  await waitFor(() => first.round.fifo.length === 2, "parallel call registration");
+  session.flushJournaledCalls();
+  const second = first.round.calls.get(first.round.fifo[1]);
+  await waitFor(() => second.handedAt != null, "second call handoff");
+  first.round.markAwaitingResults();
+
+  const durable = { toolCallId: first.call.wireId, content: "first durable", isError: false };
+  const partial = new MockResponse();
+  const partialHandling = handleContinue(request(), partial, continuationBody([durable]), "cursor-key");
+  assert.equal((await first.promise).content, "first durable");
+  await partialHandling;
+
+  const final = new MockResponse();
+  const finalHandling = handleContinue(request(), final, continuationBody([
+    { ...durable, content: "first projection drift" },
+    { toolCallId: second.wireId, content: "second durable", isError: false },
+  ]), "cursor-key");
+  assert.equal((await secondPromise).content, "second durable");
+  await finalHandling;
+  assert.equal(final.status, 200);
+  assert.match(final.text(), /durable_receipt_retained/);
+  assert.equal(journalRecord(first.round.route).calls[0].receipt.result.content, "first durable");
+});
+
+test("mixed continuation retains terminal receipt and delivers new user intent exactly once", async () => {
+  const { session } = seedSession("mixed-durable-input", "cursor-key");
+  const opened = await openTool(session);
+  const accepted = { toolCallId: opened.call.wireId, content: "accepted result", isError: false };
+  opened.round.applyResults([accepted]);
+  await opened.promise;
+  assert.equal(opened.round.terminal.reason, "completed");
+
+  const mixedInput = {
+    userText: "now continue with the next task",
+    clientMessageId: "ccm1_mixed_once",
+    interruptRequested: true,
+    history: "bounded prior conversation",
+  };
+  const sent = [];
+  session.seeded = true;
+  session.agent = {
+    async send(message) {
+      sent.push(message);
+      return {
+        async wait() { return { status: "finished", result: "continued" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  const corrected = new MockResponse();
+  await handleContinue(request(), corrected, continuationBody([
+    { ...accepted, content: "conflicting replay projection" },
+  ], mixedInput), "cursor-key");
+  await waitFor(() => journalRecord(opened.round.route).deferredInputs[0].state === "DELIVERED", "deferred input delivery receipt");
+  await waitFor(() => corrected.ended, "corrected mixed continuation terminal");
+  assert.equal(corrected.status, 200);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /^now continue with the next task/);
+  assert.doesNotMatch(sent[0], /accepted result/);
+  assert.equal(journalRecord(opened.round.route).calls[0].receipt.result.content, "accepted result");
+  assert.match(corrected.text(), /durable_receipt_retained/);
+
+  const duplicate = new MockResponse();
+  await handleContinue(request(), duplicate, continuationBody([accepted], mixedInput), "cursor-key");
+  assert.equal(duplicate.status, 200);
+  assert.match(duplicate.text(), /user_input_already_delivered/);
+  assert.equal(sent.length, 1);
+
+  const reusedId = new MockResponse();
+  await handleContinue(request(), reusedId, continuationBody([accepted], {
+    ...mixedInput,
+    userText: "a genuinely different next task despite the reused client id",
+  }), "cursor-key");
+  await waitFor(() => journalRecord(opened.round.route).deferredInputs.at(-1).state === "DELIVERED", "rekeyed input delivery receipt");
+  await waitFor(() => reusedId.ended, "rekeyed input terminal");
+  assert.equal(reusedId.status, 200);
+  assert.match(reusedId.text(), /rekeyed_queued|rekeyed_duplicate/);
+  assert.equal(sent.length, 2, "different intent must be delivered once instead of rejected as a 409 conflict");
+  const deferred = journalRecord(opened.round.route).deferredInputs;
+  assert.notEqual(deferred[0].clientMessageId, deferred.at(-1).clientMessageId);
+  assert.equal(deferred.at(-1).requestedClientMessageId, mixedInput.clientMessageId);
+});
+
+test("ambiguous agent.send failure retires only that message and never bricks the session", async () => {
+  const { session } = seedSession("mixed-send-uncertain", "cursor-key");
+  const opened = await openTool(session);
+  const accepted = { toolCallId: opened.call.wireId, content: "accepted", isError: false };
+  opened.round.applyResults([accepted]);
+  await opened.promise;
+
+  let sends = 0;
+  session.seeded = true;
+  session.agent = {
+    async send() {
+      sends++;
+      throw new Error("connection closed after request write");
+    },
+    async close() {},
+  };
+  const mixedInput = {
+    userText: "perform this once",
+    clientMessageId: "ccm1_uncertain_once",
+    interruptRequested: true,
+    history: "bounded prior conversation",
+  };
+  const first = new MockResponse();
+  await handleContinue(request(), first, continuationBody([accepted], mixedInput), "cursor-key");
+  await waitFor(() => first.ended, "ambiguous send error terminal");
+  assert.equal(journalRecord(opened.round.route).deferredInputs[0].state, "DELIVERING");
+  assert.equal(sends, 1);
+
+  const retry = new MockResponse();
+  await handleContinue(request(), retry, continuationBody([accepted], mixedInput), "cursor-key");
+  assert.equal(retry.status, 200);
+  assert.match(retry.text(), /user_input_delivery_unknown/);
+  assert.match(retry.text(), /"stop_reason":"error"/);
+  assert.equal(journalRecord(opened.round.route).deferredInputs[0].state, "SUPERSEDED");
+  assert.equal(sends, 1);
+
+  const laterMessages = [];
+  session.agent = {
+    async send(message) {
+      laterMessages.push(message);
+      return {
+        async wait() { return { status: "finished", result: "recovered" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  const later = new MockResponse();
+  await handleContinue(request(), later, continuationBody([accepted], {
+    ...mixedInput,
+    userText: "a later independent message",
+    clientMessageId: "ccm1_after_uncertain",
+  }), "cursor-key");
+  await waitFor(() => later.ended, "later message terminal");
+  assert.equal(later.status, 200);
+  assert.equal(laterMessages.length, 1);
+  assert.match(laterMessages[0], /^a later independent message/);
+});
+
+test("cold retry reconciles DELIVERING from the durable SDK checkpoint", async () => {
+  const cursorKey = "checkpoint-key";
+  const { session } = seedSession("checkpoint-delivery", cursorKey);
+  const opened = await openTool(session);
+  const accepted = { toolCallId: opened.call.wireId, content: "accepted", isError: false };
+  opened.round.applyResults([accepted]);
+  await opened.promise;
+
+  const input = {
+    userText: "message already accepted before the bridge crashed",
+    clientMessageId: "ccm1_checkpoint_delivery",
+    interruptRequested: true,
+    history: "bounded history",
+  };
+  opened.round.queueDeferredInput(input.clientMessageId, input);
+  opened.round.markDeferredInputState(input.clientMessageId, "DELIVERING", {
+    agentId: session.agentId,
+    textHash: createHash("sha256").update(input.userText).digest("hex"),
+    hasImages: false,
+  });
+  sessions.delete(session.id);
+  liveToolRounds.delete(opened.round.route);
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async getAgentMessages() {
+        return [{
+          type: "user",
+          message: {
+            turn: {
+              case: "agentConversationTurn",
+              value: { userMessage: { text: input.userText }, steps: [] },
+            },
+          },
+        }];
+      },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  const retry = new MockResponse();
+  await handleContinue(request(), retry, continuationBody([accepted], input), cursorKey);
+  assert.equal(retry.status, 200);
+  assert.match(retry.text(), /user_input_already_delivered/);
+  const saved = journalRecord(opened.round.route).deferredInputs.find((entry) => entry.clientMessageId === input.clientMessageId);
+  assert.equal(saved.state, "DELIVERED");
+  assert.equal(saved.deliveryEvidence, "durable_checkpoint");
+});
+
+test("same-message retry hands off to the active SDK turn instead of sending twice", async () => {
+  const { session } = seedSession("active-delivery-handoff", "cursor-key");
+  const opened = await openTool(session);
+  const accepted = { toolCallId: opened.call.wireId, content: "accepted", isError: false };
+  opened.round.applyResults([accepted]);
+  await opened.promise;
+  session.seeded = true;
+
+  let releaseSend;
+  const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+  let sends = 0;
+  session.agent = {
+    async send() {
+      sends++;
+      await sendGate;
+      return {
+        async wait() { return { status: "finished", result: "one answer" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  const input = {
+    userText: "perform one operation",
+    clientMessageId: "ccm1_active_handoff",
+    interruptRequested: true,
+    history: "bounded history",
+  };
+  const first = new MockResponse();
+  const firstRun = handleContinue(request(), first, continuationBody([accepted], input), "cursor-key");
+  await waitFor(() => {
+    const item = journalRecord(opened.round.route).deferredInputs.find((entry) => entry.clientMessageId === input.clientMessageId);
+    return item && item.state === "DELIVERING" && session.activeDeferredInputId === input.clientMessageId;
+  }, "active deferred delivery");
+
+  const retry = new MockResponse();
+  const retryRun = handleContinue(request(), retry, continuationBody([accepted], input), "cursor-key");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sends, 1);
+  releaseSend();
+  await Promise.all([firstRun, retryRun]);
+  assert.equal(retry.status, 200);
+  assert.match(retry.text(), /active_turn_handoff/);
+  assert.match(retry.text(), /one answer/);
+  assert.equal(sends, 1);
+});
+
+test("duplicate fresh POST attaches to the active SDK send instead of interrupting itself", async () => {
+  const session = new Session("fresh-active-handoff", "cursor-key");
+  session.clientEnv = { workspaceUnknown: true };
+  session.seeded = true;
+  sessions.set(session.id, session);
+  let releaseSend;
+  const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+  let sends = 0;
+  let observedIdempotencyKey = "";
+  session.agent = {
+    async send(_message, options) {
+      sends++;
+      observedIdempotencyKey = options.idempotencyKey;
+      await sendGate;
+      return {
+        async wait() { return { status: "finished", result: "fresh answer" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  const body = neutralBody({
+    sessionId: session.id,
+    model: "cursor-grok-4.5",
+    input: { type: "user", text: "one fresh request", clientMessageId: "ccm2_fresh_active" },
+  });
+  const first = new MockResponse();
+  const firstRun = handleTurn(request(), first, body, "cursor-key");
+  await waitFor(() => sends === 1 && session.sendPending, "fresh send pending");
+  const retry = new MockResponse();
+  const retryRun = handleTurn(request(), retry, body, "cursor-key");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sends, 1);
+  releaseSend();
+  await Promise.all([firstRun, retryRun]);
+  assert.equal(observedIdempotencyKey, "ccm2_fresh_active");
+  assert.match(retry.text(), /active_turn_handoff/);
+  assert.match(retry.text(), /fresh answer/);
+  assert.equal(sends, 1);
+});
+
+test("lost fresh response replays paused signed tool calls without a second SDK send", async () => {
+  const { session } = seedSession("fresh-paused-replay", "cursor-key");
+  const opened = await openTool(session);
+  session.activeRes = null;
+  session.responseWriter = null;
+  session.activeClientMessageId = "ccm2_fresh_paused";
+  let cancels = 0;
+  session.run = { async cancel() { cancels++; } };
+
+  const replay = new MockResponse();
+  await handleTurn(request(), replay, neutralBody({
+    sessionId: session.id,
+    model: "cursor-grok-4.5",
+    input: { type: "user", text: "original request", clientMessageId: "ccm2_fresh_paused" },
+  }), "cursor-key");
+  assert.equal(replay.status, 200);
+  assert.match(replay.text(), /paused_turn_replay/);
+  assert.match(replay.text(), new RegExp(opened.call.wireId));
+  assert.match(replay.text(), /"stop_reason":"tool_use"/);
+  assert.equal(cancels, 0);
+
+  await session.cancel({ terminalReason: "test_cleanup", detail: "paused replay complete" });
+  await assert.rejects(opened.promise, /paused replay complete/);
+});
+
+test("cold restart delivers a journaled mixed user turn exactly once after faithful result recovery", async () => {
+  const cursorKey = "cursor-key";
+  const { session } = seedSession("mixed-cold-restart", cursorKey);
+  const opened = await openTool(session);
+  opened.round.terminalize("shutdown", "bridge restarted");
+  await assert.rejects(opened.promise, /shutdown/);
+  liveToolRounds.delete(opened.round.route);
+  sessions.delete(session.id);
+
+  const sent = [];
+  const agent = {
+    async send(message) {
+      sent.push(message);
+      return {
+        async wait() { return { status: "finished", result: "continued after restart" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  const platform = {
+    async resumeAgent() { throw new Error("agent not found"); },
+    async createAgent() { return agent; },
+    async getAgentMessages() { return []; },
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve(platform),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  const result = { toolCallId: opened.call.wireId, content: "durable local result", isError: false };
+  const mixedInput = {
+    history: "bounded prior conversation",
+    userText: "continue this task after restart",
+    clientMessageId: "ccm1_cold_restart_once",
+    interruptRequested: true,
+  };
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody([result], mixedInput), cursorKey);
+  await waitFor(() => response.ended, "cold restart recovery terminal");
+  await waitFor(
+    () => journalRecord(opened.round.route).deferredInputs[0].state === "DELIVERED",
+    "cold restart deferred input receipt",
+  );
+  assert.equal(response.status, 200);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /durable local result/);
+  assert.match(sent[0], /continue this task after restart/);
+  assert.match(sent[0], new RegExp(opened.call.wireId));
+
+  const duplicate = new MockResponse();
+  await handleContinue(request(), duplicate, continuationBody([result], mixedInput), cursorKey);
+  assert.equal(duplicate.status, 200);
+  assert.match(duplicate.text(), /user_input_already_delivered/);
+  assert.equal(sent.length, 1);
+});
+
+test("partial parallel results plus user input terminalize the unanswered call and recover once", async () => {
+  const cursorKey = "cursor-key";
+  const { session } = seedSession("mixed-partial-parallel", cursorKey);
+  const first = await openTool(session, { rawId: "parallel-first" });
+  const secondPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "parallel-second",
+    name: "Lookup",
+    input: { q: "second" },
+    resultAdapter: (value) => value,
+  });
+  secondPromise.catch(() => {});
+  await waitFor(() => first.round.fifo.length === 2, "second parallel call registration");
+  assert.equal(session.flushJournaledCalls(), true);
+  const second = first.round.calls.get(first.round.fifo[1]);
+  await waitFor(() => second.handedAt != null, "second parallel call handoff");
+  first.round.markAwaitingResults();
+
+  const sent = [];
+  const agent = {
+    async send(message) {
+      sent.push(message);
+      return {
+        async wait() { return { status: "finished", result: "continued after partial batch" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { return agent; },
+      async getAgentMessages() { return [{ role: "user" }]; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  const result = { toolCallId: first.call.wireId, content: "first completed locally", isError: false };
+  const mixedInput = {
+    history: "bounded prior conversation",
+    userText: "continue without the unanswered parallel call",
+    clientMessageId: "ccm1_partial_parallel_once",
+    interruptRequested: true,
+  };
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody([result], mixedInput), cursorKey);
+  await waitFor(() => response.ended, "partial parallel recovery terminal");
+  await assert.rejects(first.promise, /superseded by durable deferred user input/);
+  await assert.rejects(secondPromise, /superseded by durable deferred user input/);
+
+  const saved = journalRecord(first.round.route);
+  const savedFirst = saved.calls.find((call) => call.wireId === first.call.wireId);
+  const savedSecond = saved.calls.find((call) => call.wireId === second.wireId);
+  assert.equal(savedFirst.receipt.result.content, "first completed locally");
+  assert.equal(savedSecond.receipt, null);
+  assert.equal(savedSecond.state, "TERMINAL");
+  assert.equal(saved.deferredInputs[0].state, "DELIVERED");
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /first completed locally/);
+  assert.match(sent[0], /continue without the unanswered parallel call/);
 });
 
 test("a completed restart recovery durably acknowledges an identical lost-response retry", async () => {
@@ -1089,6 +1964,109 @@ test("a slow tail tool emitted after turn_end stays journaled in the same round 
   await assert.rejects(secondPromise);
 });
 
+test("a queued tail is resolved as a typed non-execution when its client tool is removed before handoff", async () => {
+  const { session } = seedSession("removed-slow-tail", "key");
+  const first = await openTool(session, { rawId: "removed-first" });
+  first.round.batch = [];
+  session.activeRes = null;
+  session.responseWriter = null;
+
+  const tailPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "removed-tail",
+    name: "Lookup",
+    input: { q: "tail" },
+    resultAdapter: (value) => value,
+  });
+  await waitFor(() => first.round.fifo.length === 2, "removed tail registration");
+  const changed = authoritativeToolsBody([], { toolChoice: "none" });
+  refreshSessionFromBody(session, changed, prepareAdvertisedToolRegistry(changed));
+  const nextResponse = new MockResponse();
+  session.beginResponse(nextResponse);
+  assert.equal(session.flushJournaledCalls(), true);
+  const result = await tailPromise;
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.code, "client_tool_unavailable");
+  assert.equal(result.structuredContent.executed, false);
+  assert.doesNotMatch(nextResponse.text(), /"type":"tool_call"/);
+
+  first.round.terminalize("client_cancelled", "cleanup");
+  await assert.rejects(first.promise);
+});
+
+test("a queued tail is not handed under an incompatible replacement schema", async () => {
+  const { session } = seedSession("changed-slow-tail", "key");
+  const first = await openTool(session, { rawId: "changed-first" });
+  first.round.batch = [];
+  session.activeRes = null;
+  session.responseWriter = null;
+  const tailPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "changed-tail",
+    name: "Lookup",
+    input: { q: "old shape" },
+    resultAdapter: (value) => value,
+  });
+  await waitFor(() => first.round.fifo.length === 2, "changed tail registration");
+  const changed = authoritativeToolsBody([{
+    name: "Lookup",
+    inputSchema: {
+      type: "object",
+      properties: { repo_path: { type: "string" } },
+      required: ["repo_path"],
+      additionalProperties: false,
+    },
+  }], { toolChoice: "auto" });
+  refreshSessionFromBody(session, changed, prepareAdvertisedToolRegistry(changed));
+  const nextResponse = new MockResponse();
+  session.beginResponse(nextResponse);
+  assert.equal(session.flushJournaledCalls(), true);
+  const result = await tailPromise;
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.code, "client_tool_schema_changed");
+  assert.equal(result.structuredContent.executed, false);
+  assert.doesNotMatch(nextResponse.text(), /"type":"tool_call"/);
+
+  first.round.terminalize("client_cancelled", "cleanup");
+  await assert.rejects(first.promise);
+});
+
+test("a queued tail is refused when the same tool descriptor changes but old arguments still validate", async () => {
+  const { session } = seedSession("semantic-change-slow-tail", "key");
+  const first = await openTool(session, { rawId: "semantic-first" });
+  first.round.batch = [];
+  session.activeRes = null;
+  session.responseWriter = null;
+  const tailPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "semantic-tail",
+    name: "Lookup",
+    input: { q: "still structurally valid" },
+    resultAdapter: (value) => value,
+  });
+  await waitFor(() => first.round.fifo.length === 2, "semantic tail registration");
+  const changed = authoritativeToolsBody([{
+    name: "Lookup",
+    description: "Same argument shape, but a materially different client-side operation",
+    inputSchema: {
+      type: "object",
+      properties: { q: { type: "string", description: "new semantics" } },
+      required: ["q"],
+      additionalProperties: false,
+    },
+  }], { toolChoice: "auto" });
+  refreshSessionFromBody(session, changed, prepareAdvertisedToolRegistry(changed));
+  const nextResponse = new MockResponse();
+  session.beginResponse(nextResponse);
+  assert.equal(session.flushJournaledCalls(), true);
+  const result = await tailPromise;
+  assert.equal(result.structuredContent.code, "client_tool_schema_changed");
+  assert.doesNotMatch(nextResponse.text(), /"type":"tool_call"/);
+
+  first.round.terminalize("client_cancelled", "cleanup");
+  await assert.rejects(first.promise);
+});
+
 test("new user input interrupts an awaiting round without relying on a deleted Session pending map", async () => {
   const { session } = seedSession("interrupt-path", "key");
   const opened = await openTool(session);
@@ -1110,6 +2088,13 @@ test("a finished SDK run with an unresolved callback emits an error terminal, ne
   assert.match(output.text(), /"stop_reason":"error"/);
   assert.doesNotMatch(output.text(), /"stop_reason":"end_turn"/);
   assert.equal(opened.round.terminal.reason, "run_error");
+});
+
+test("a clean finished SDK run omits the optional error field", () => {
+  const { session, output } = seedSession("finished-without-error", "key", []);
+  session.onRunComplete({ status: "finished", result: "complete" });
+  assert.match(output.text(), /"stop_reason":"end_turn"/);
+  assert.doesNotMatch(output.text(), /"error":/);
 });
 
 test("response disconnect after tool handoff terminal-resolves the round as transport_error", async () => {
@@ -1172,8 +2157,8 @@ test("HTTP MCP tools/call uses ToolRound and preserves isError, structuredConten
   assert.equal(response.result.isError, true);
   assert.deepEqual(response.result.structuredContent, { code: "E_LOOKUP" });
   assert.deepEqual(response.result.content, [
-    { type: "image", data: "QUJD", mimeType: "image/png" },
     { type: "text", text: "failed" },
+    { type: "image", data: "QUJD", mimeType: "image/png" },
   ]);
 });
 
@@ -1211,7 +2196,7 @@ test("HTTP MCP calls are server-scoped and equal JSON-RPC ids cannot collide acr
   assert.deepEqual(responses.map((response) => response.id), [1, 1]);
 });
 
-test("JSON-RPC tool batches dispatch concurrently and preserve response order", async () => {
+test("JSON-RPC tool batches dispatch sequentially and preserve response order", async () => {
   const { session } = seedSession("mcp-batch", "key", [
     { name: "A", inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
     { name: "B", inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
@@ -1220,12 +2205,19 @@ test("JSON-RPC tool batches dispatch concurrently and preserve response order", 
     { jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "A", arguments: { q: "a" } } },
     { jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "B", arguments: { q: "b" } } },
   ], session.id, DEFAULT_MCP_SERVER_KEY);
-  await waitFor(() => session.currentRound?.fifo.length === 2
-    && session.currentRound.fifo.every((wireId) => session.currentRound.calls.get(wireId).handedAt), "parallel batch handoff");
-  const round = session.currentRound;
+  await waitFor(() => session.currentRound?.fifo.length === 1
+    && session.currentRound.calls.get(session.currentRound.fifo[0]).handedAt, "first sequential batch handoff");
+  let round = session.currentRound;
   if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
   round.markAwaitingResults();
-  round.applyResults(round.fifo.map((wireId) => ({ toolCallId: wireId, content: "ok", isError: false })));
+  round.applyResults([{ toolCallId: round.fifo[0], content: "ok-a", isError: false }]);
+  const firstRound = round;
+  await waitFor(() => session.currentRound !== firstRound && session.currentRound?.fifo.length === 1
+    && session.currentRound.calls.get(session.currentRound.fifo[0]).handedAt, "second sequential batch handoff");
+  round = session.currentRound;
+  if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
+  round.markAwaitingResults();
+  round.applyResults([{ toolCallId: round.fifo[0], content: "ok-b", isError: false }]);
   const responses = await pending;
   assert.deepEqual(responses.map((response) => response.id), [11, 12]);
 });
@@ -1242,6 +2234,42 @@ test("patched MCP dispatch uses the same ToolRound adapter and result contract",
   round.applyResults([{ toolCallId: call.wireId, content: "failed", isError: true, structuredContent: { code: "E_LOOKUP" } }]);
   const response = await responsePromise;
   assert.deepEqual(response.__ccJson, mcpDispatchResult("failed", true, null, { code: "E_LOOKUP" }));
+});
+
+test("patched and HTTP MCP render the same transformed authoritative blocks and scalar structured values", async () => {
+  const run = async (transport, structuredContent) => {
+    const { session } = seedSession(`mcp-block-transform-${transport}`, "key");
+    const responsePromise = transport === "http"
+      ? mcpDispatch({ jsonrpc: "2.0", id: 41, method: "tools/call", params: { name: "Lookup", arguments: { q: "x" } } }, session.id, DEFAULT_MCP_SERVER_KEY)
+      : session.dispatchMcp({ toolName: "Lookup", args: { q: "x" }, toolCallId: `sdk-${transport}` });
+    await waitFor(() => session.currentRound?.fifo.length === 1
+      && session.currentRound.calls.get(session.currentRound.fifo[0]).handedAt, `${transport} transformed MCP handoff`);
+    if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
+    const round = session.currentRound;
+    const call = round.calls.get(round.fifo[0]);
+    round.markAwaitingResults();
+    const live = `running in background with id task_abc\n${"x".repeat(COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES + 1024)}`;
+    round.applyResults([{
+      toolCallId: call.wireId,
+      content: live,
+      contentBlocks: [{ type: "text", text: live }],
+      structuredContent,
+      structuredContentPresent: true,
+    }]);
+    return responsePromise;
+  };
+
+  const http = await run("http", null);
+  const httpText = http.result.content.map((part) => part.text || "").join("\n");
+  assert.match(httpText, /\[BRIDGE\] STILL RUNNING/);
+  assert.match(httpText, /truncated by proxy/);
+  assert.match(httpText, /\[Structured content: null\]/);
+
+  const patched = await run("patched", ["one", 2]);
+  const patchedText = patched.__ccJson.success.content.map((part) => part.text && part.text.text || "").join("\n");
+  assert.match(patchedText, /\[BRIDGE\] STILL RUNNING/);
+  assert.match(patchedText, /truncated by proxy/);
+  assert.match(patchedText, /\[Structured content: \["one",2\]\]/);
 });
 
 test("MCP missing session and unknown tool are typed errors, never fake success", async () => {

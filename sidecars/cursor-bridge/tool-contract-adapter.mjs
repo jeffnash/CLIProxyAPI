@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import Ajv from "ajv";
 import Ajv2019 from "ajv/dist/2019.js";
 import Ajv2020 from "ajv/dist/2020.js";
+import AjvDraft04 from "ajv-draft-04";
 
 // The bridge is a protocol adapter between two independently evolving tool
 // runtimes:
@@ -11,9 +13,70 @@ import Ajv2020 from "ajv/dist/2020.js";
 // emitted call remain authoritative; SDK-specific wrappers and native naming
 // habits are normalized before validation and before a ToolRound is opened.
 
-const TOOL_SCHEMA_VALIDATOR_CACHE_MAX = 2048;
-const validatorCache = new Map();
-const normalizationValidatorCache = new Map();
+const TOOL_SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES = 512;
+const TOOL_SCHEMA_VALIDATOR_CACHE_MAX_BYTES = 16 << 20;
+
+class ByteBoundedLRU {
+  constructor(maxEntries, maxBytes) {
+    this.maxEntries = maxEntries;
+    this.maxBytes = maxBytes;
+    this.bytes = 0;
+    this.values = new Map();
+  }
+  get(key) {
+    const entry = this.values.get(key);
+    if (!entry) return undefined;
+    this.values.delete(key);
+    this.values.set(key, entry);
+    return entry.value;
+  }
+  set(key, value, bytes) {
+    const size = Math.max(1024, Math.min(Number.MAX_SAFE_INTEGER, Number(bytes) || 0));
+    const prior = this.values.get(key);
+    if (prior) {
+      this.bytes -= prior.bytes;
+      this.values.delete(key);
+    }
+    if (size > this.maxBytes) return value;
+    this.values.set(key, { bytes: size, value });
+    this.bytes += size;
+    while (this.values.size > this.maxEntries || this.bytes > this.maxBytes) {
+      const oldest = this.values.keys().next().value;
+      const evicted = this.values.get(oldest);
+      this.values.delete(oldest);
+      this.bytes -= evicted.bytes;
+    }
+    return value;
+  }
+  stats() { return { bytes: this.bytes, entries: this.values.size, maxBytes: this.maxBytes, maxEntries: this.maxEntries }; }
+}
+
+const validatorCache = new ByteBoundedLRU(TOOL_SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES, TOOL_SCHEMA_VALIDATOR_CACHE_MAX_BYTES);
+const normalizationValidatorCache = new ByteBoundedLRU(TOOL_SCHEMA_VALIDATOR_CACHE_MAX_ENTRIES, TOOL_SCHEMA_VALIDATOR_CACHE_MAX_BYTES);
+
+function schemaCacheIdentity(mode, schema) {
+  const encoded = stableJSON(schema);
+  return {
+    bytes: Buffer.byteLength(encoded, "utf8") * 8,
+    key: `${mode}:${createHash("sha256").update(encoded).digest("hex")}`,
+  };
+}
+
+export function toolContractCacheStats() {
+  return {
+    contracts: validatorCache.stats(),
+    normalization: normalizationValidatorCache.stats(),
+  };
+}
+
+export class ToolContractNormalizationError extends Error {
+  constructor(code, path, message) {
+    super(message);
+    this.name = "ToolContractNormalizationError";
+    this.code = code;
+    this.path = path || "arguments";
+  }
+}
 
 const ENVELOPE_KEYS = ["arguments", "args", "input", "parameters", "params", "targeting"];
 const GENERIC_WRAPPER_KEYS = ["value", "input", "content", "data", "payload"];
@@ -106,9 +169,7 @@ function isObject(value) {
 function cloneJson(value) {
   if (Array.isArray(value)) return value.map(cloneJson);
   if (!isObject(value)) return value;
-  const out = {};
-  for (const [key, item] of Object.entries(value)) out[key] = cloneJson(item);
-  return out;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneJson(item)]));
 }
 
 function localRefTarget(rootSchema, ref) {
@@ -176,6 +237,35 @@ function jsonKind(value) {
   return typeof value === "object" ? "object" : typeof value;
 }
 
+function unsafeIntegerPath(value, path = "arguments", seen = new Set()) {
+  if (typeof value === "number") {
+    return Number.isInteger(value) && !Number.isSafeInteger(value) ? path : null;
+  }
+  if (!value || typeof value !== "object" || seen.has(value)) return null;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index++) {
+      const found = unsafeIntegerPath(value[index], `${path}.${index}`, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+  for (const key of Object.keys(value)) {
+    const found = unsafeIntegerPath(value[key], `${path}.${key}`, seen);
+    if (found) return found;
+  }
+  return null;
+}
+
+function stableJSON(value) {
+  const normalize = (item) => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!isObject(item)) return item;
+    return Object.fromEntries(Object.keys(item).sort().map((key) => [key, normalize(item[key])]));
+  };
+  return JSON.stringify(normalize(value));
+}
+
 function schemaKinds(schema) {
   if (schema === true || !isObject(schema)) return null;
   if (schema === false) return new Set();
@@ -221,14 +311,13 @@ function schemaAcceptsValue(schema, value) {
   if (schema === true) return true;
   if (schema === false) return false;
   if (!isObject(schema)) return true;
-  let key;
-  try { key = JSON.stringify(schema); } catch { return schemaAllowsKind(schema, jsonKind(value)); }
-  let validate = normalizationValidatorCache.get(key);
+  let identity;
+  try { identity = schemaCacheIdentity("normalization", schema); } catch { return schemaAllowsKind(schema, jsonKind(value)); }
+  let validate = normalizationValidatorCache.get(identity.key);
   if (!validate) {
     try { validate = compileSchema("normalization branch", schema); }
     catch { return schemaAllowsKind(schema, jsonKind(value)); }
-    if (normalizationValidatorCache.size >= TOOL_SCHEMA_VALIDATOR_CACHE_MAX) normalizationValidatorCache.clear();
-    normalizationValidatorCache.set(key, validate);
+    normalizationValidatorCache.set(identity.key, validate, identity.bytes);
   }
   return validate(value) === true;
 }
@@ -236,13 +325,46 @@ function schemaAcceptsValue(schema, value) {
 function parseContainerString(value) {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
-  if (!(trimmed.startsWith("[") || trimmed.startsWith("{"))) return undefined;
+  if (!trimmed || !/^(?:[\[{\"]|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$|true$|false$|null$)/.test(trimmed)) return undefined;
   try {
-    const parsed = JSON.parse(trimmed);
-    return parsed !== null && typeof parsed === "object" ? parsed : undefined;
+    return JSON.parse(trimmed);
   } catch {
     return undefined;
   }
+}
+
+function decodeProtobufValue(value, depth = 0) {
+  if (!isObject(value) || depth > 32) return { matched: false, value };
+  const decodeChild = (child) => {
+    const decoded = decodeProtobufValue(child, depth + 1);
+    return decoded.matched ? decoded.value : child;
+  };
+  const direct = ["nullValue", "numberValue", "stringValue", "boolValue", "structValue", "listValue"]
+    .filter((key) => Object.hasOwn(value, key));
+  if (direct.length === 1) {
+    const key = direct[0];
+    if (key === "nullValue") return { matched: true, value: null };
+    if (key === "numberValue" || key === "stringValue" || key === "boolValue") {
+      return { matched: true, value: value[key] };
+    }
+    if (key === "listValue" && isObject(value.listValue) && Array.isArray(value.listValue.values)) {
+      return { matched: true, value: value.listValue.values.map(decodeChild) };
+    }
+    if (key === "structValue" && isObject(value.structValue) && isObject(value.structValue.fields)) {
+      return { matched: true, value: Object.fromEntries(Object.entries(value.structValue.fields)
+        .map(([name, child]) => [name, decodeChild(child)])) };
+    }
+  }
+  const kind = isObject(value.kind) ? value.kind : null;
+  if (kind) {
+    const discriminator = typeof kind.case === "string" ? kind.case
+      : typeof kind.oneofKind === "string" ? kind.oneofKind : "";
+    if (["nullValue", "numberValue", "stringValue", "boolValue", "structValue", "listValue"].includes(discriminator)) {
+      const payload = Object.hasOwn(kind, "value") ? kind.value : kind[discriminator];
+      return decodeProtobufValue({ [discriminator]: payload }, depth + 1);
+    }
+  }
+  return { matched: false, value };
 }
 
 // Cursor's protobuf Value wrappers sometimes look like objects to JavaScript
@@ -271,6 +393,13 @@ function wrapperCandidates(value, propertyName, expectedKinds) {
 
   const serialized = unwrapJsonLikeObject(value);
   if (serialized !== undefined) add(serialized, "json-value");
+  const protobuf = decodeProtobufValue(value);
+  if (protobuf.matched) {
+    add(protobuf.value, "protobuf-value");
+    // A positively identified protobuf Value is itself the wrapper contract.
+    // Do not also interpret its implementation keys as generic wrappers.
+    return out;
+  }
   const parsed = parseContainerString(value);
   if (parsed !== undefined) add(parsed, "json-string");
   if (!isObject(value)) return out;
@@ -298,8 +427,11 @@ function coerceWrappedScalar(value, expectedKinds) {
   if (typeof value !== "string" || !expectedKinds) return undefined;
   const trimmed = value.trim();
   if ((expectedKinds.has("number") || expectedKinds.has("integer")) && trimmed !== "") {
+    if (!/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(trimmed)) return undefined;
     const number = Number(trimmed);
-    if (Number.isFinite(number) && (!expectedKinds.has("integer") || Number.isInteger(number))) return number;
+    if (Number.isFinite(number)
+      && (!expectedKinds.has("integer") || Number.isSafeInteger(number))
+      && (!Number.isInteger(number) || Number.isSafeInteger(number))) return number;
   }
   if (expectedKinds.has("boolean")) {
     if (trimmed === "true") return true;
@@ -377,11 +509,14 @@ function unwrapToSchema(value, schema, propertyName, path, transforms, depth = 0
 
 function schemaProperties(schema) {
   if (!isObject(schema)) return {};
-  const merged = isObject(schema.properties) ? { ...schema.properties } : {};
+  const entries = isObject(schema.properties) ? Object.entries(schema.properties) : [];
   if (Array.isArray(schema.allOf)) {
-    for (const branch of schema.allOf) Object.assign(merged, schemaProperties(branch));
+    for (const branch of schema.allOf) entries.push(...Object.entries(schemaProperties(branch)));
   }
-  return merged;
+  // Map/fromEntries preserves own JSON keys such as `__proto__`; assigning
+  // those keys into `{}` invokes the legacy prototype setter and silently
+  // removes them from the normalization view.
+  return Object.fromEntries(new Map(entries));
 }
 
 function schemaRequired(schema) {
@@ -466,6 +601,15 @@ function flattenArgumentEnvelope(value, schema, path, transforms, depth = 0) {
     if (!nestedKeys.length) continue;
     const recognized = nestedKeys.some((key) => Object.hasOwn(properties, key) || chooseAliasTarget(key, properties));
     if (!recognized) continue;
+    for (const key of nestedKeys) {
+      if (Object.hasOwn(value, key) && stableJSON(value[key]) !== stableJSON(nested[key])) {
+        throw new ToolContractNormalizationError(
+          "ambiguous_envelope",
+          path ? `${path}.${key}` : key,
+          `argument '${key}' conflicts between '${envelopeKey}' and the outer object`,
+        );
+      }
+    }
     const out = { ...nested, ...value };
     delete out[envelopeKey];
     addTransform(transforms, { kind: "flatten-envelope", path: path || "arguments", source: envelopeKey });
@@ -474,33 +618,72 @@ function flattenArgumentEnvelope(value, schema, path, transforms, depth = 0) {
   return value;
 }
 
-function normalizeObjectKeys(value, schema, path, transforms) {
+function normalizeObjectKeys(value, schema, path, transforms, depth = 0) {
   if (!isObject(value)) return value;
   const properties = schemaProperties(schema);
   if (!Object.keys(properties).length) return value;
 
-  const assignments = new Map();
+  const candidates = new Map();
   for (const source of Object.keys(value).sort()) {
     const match = Object.hasOwn(properties, source)
       ? { target: source, priority: 120 }
       : chooseAliasTarget(source, properties);
     if (!match) continue;
-    const prior = assignments.get(match.target);
-    if (!prior || match.priority > prior.priority || (match.priority === prior.priority && source < prior.source)) {
-      assignments.set(match.target, { source, priority: match.priority });
-    }
+    if (!candidates.has(match.target)) candidates.set(match.target, []);
+    candidates.get(match.target).push({ source, priority: match.priority });
   }
-  if (!assignments.size) return value;
+  if (!candidates.size) return value;
+
+  const assignments = new Map();
+  for (const [target, sources] of candidates) {
+    const childSchema = properties[target];
+    const normalized = sources.map((entry) => {
+      const candidateTransforms = [];
+      const childPath = path ? `${path}.${target}` : target;
+      const candidateValue = normalizeValue(value[entry.source], childSchema, target, childPath, candidateTransforms, depth + 1);
+      return { ...entry, candidateTransforms, candidateValue };
+    });
+    const exact = normalized.find((entry) => entry.source === target);
+    const selected = exact || normalized[0];
+    const selectedJSON = stableJSON(selected.candidateValue);
+    // The harness descriptor is authoritative. If the model supplies the
+    // exact client field plus a native/SDK alias, execute the exact field and
+    // discard the redundant alias even when its guessed value differs. The
+    // old behavior called this ambiguous and killed functional OMP grep runs
+    // that contained exact `pattern` plus Cursor's extra `query` field.
+    if (!exact && normalized.some((entry) => stableJSON(entry.candidateValue) !== selectedJSON)) {
+      throw new ToolContractNormalizationError(
+        "ambiguous_alias",
+        path ? `${path}.${target}` : target,
+        `multiple arguments map to '${target}' with different values`,
+      );
+    }
+    normalized.sort((a, b) => b.priority - a.priority || a.source.localeCompare(b.source));
+    const assignment = exact || normalized[0];
+    if (exact) {
+      for (const entry of normalized) {
+        if (entry === exact || stableJSON(entry.candidateValue) === selectedJSON) continue;
+        addTransform(transforms, {
+          kind: "discard-conflicting-alias",
+          path: path || "arguments",
+          source: entry.source,
+          target,
+        });
+      }
+    }
+    assignments.set(target, assignment);
+  }
 
   const mappedSources = new Set();
   for (const assignment of assignments.values()) mappedSources.add(assignment.source);
-  const out = {};
+  const out = Object.create(null);
   for (const [source, item] of Object.entries(value)) {
     const mapped = Object.hasOwn(properties, source) || chooseAliasTarget(source, properties);
     if (!mapped) out[source] = item;
   }
   for (const [target, assignment] of assignments) {
-    out[target] = value[assignment.source];
+    out[target] = assignment.candidateValue;
+    for (const transform of assignment.candidateTransforms) addTransform(transforms, transform);
     if (assignment.source !== target) {
       addTransform(transforms, {
         kind: "rename-key",
@@ -515,14 +698,68 @@ function normalizeObjectKeys(value, schema, path, transforms) {
     const match = Object.hasOwn(properties, source) ? { target: source } : chooseAliasTarget(source, properties);
     if (match && assignments.has(match.target)) {
       addTransform(transforms, {
-        kind: "drop-shadowed-alias",
+        kind: "deduplicate-alias",
         path: path || "arguments",
         source,
         target: match.target,
       });
     }
   }
+  return Object.fromEntries(Object.entries(out));
+}
+
+function explicitAdvisoryIgnored(propertySchema) {
+  return isObject(propertySchema) && propertySchema["x-cliproxy-advisory-ignored"] === true;
+}
+
+function stripAdvisoryFields(value, schema, path, transforms) {
+  if (!isObject(value)) return value;
+  const properties = schemaProperties(schema);
+  let out = value;
+  for (const [key, propertySchema] of Object.entries(properties)) {
+    if (!explicitAdvisoryIgnored(propertySchema) || !Object.hasOwn(value, key)) continue;
+    if (out === value) out = { ...value };
+    delete out[key];
+    addTransform(transforms, { kind: "strip-advisory", path: path ? `${path}.${key}` : key });
+  }
   return out;
+}
+
+const PRESENTATION_ONLY_FIELDS_BY_FAMILY = Object.freeze({
+  // OMP/Pi's Grep UI may add result-shaping controls that are not part of
+  // the executable grep schema. They do not change the search predicate or
+  // filesystem scope. Strip them only when the client schema explicitly
+  // rejects undeclared properties; a client that declares any of these keys
+  // keeps full ownership of it.
+  grep: new Set(["head_limit", "headLimit", "output_mode", "outputMode", "limit"]),
+});
+
+function stripKnownPresentationFields(name, value, schema, transforms) {
+  if (!isObject(value) || !isObject(schema) || schema.additionalProperties !== false) return value;
+  const family = clientToolFamily(name);
+  const known = family && PRESENTATION_ONLY_FIELDS_BY_FAMILY[family];
+  if (!known) return value;
+  const properties = schemaProperties(schema);
+  const removable = Object.keys(value).filter((key) => known.has(key) && !Object.hasOwn(properties, key));
+  if (!removable.length) return value;
+  const out = Object.fromEntries(Object.entries(value).filter(([key]) => !removable.includes(key)));
+  for (const key of removable) {
+    addTransform(transforms, { kind: "strip-presentation", path: key, family });
+  }
+  return out;
+}
+
+function dynamicPropertySchema(schema, key) {
+  if (!isObject(schema)) return null;
+  const matches = [];
+  if (isObject(schema.patternProperties)) {
+    for (const [pattern, childSchema] of Object.entries(schema.patternProperties)) {
+      try { if (new RegExp(pattern).test(key)) matches.push(childSchema); } catch {}
+    }
+  }
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) return { allOf: matches };
+  return isObject(schema.additionalProperties) ? schema.additionalProperties : null;
 }
 
 function normalizeValue(value, schema, propertyName, path, transforms, depth = 0) {
@@ -554,25 +791,27 @@ function normalizeValue(value, schema, propertyName, path, transforms, depth = 0
   if (!isObject(normalized)) return normalized;
 
   normalized = flattenArgumentEnvelope(normalized, selectedSchema, path, transforms);
-  normalized = normalizeObjectKeys(normalized, selectedSchema, path, transforms);
+  normalized = normalizeObjectKeys(normalized, selectedSchema, path, transforms, depth);
+  normalized = stripAdvisoryFields(normalized, selectedSchema, path, transforms);
   normalized = omitOptionalPlaceholders(normalized, selectedSchema, path, transforms);
   const properties = schemaProperties(selectedSchema);
   let out = normalized;
   for (const key of Object.keys(normalized)) {
-    const childSchema = properties[key];
+    const childSchema = properties[key] || dynamicPropertySchema(selectedSchema, key);
     if (!childSchema) continue;
     const childPath = path ? `${path}.${key}` : key;
     const child = normalizeValue(normalized[key], childSchema, key, childPath, transforms, depth + 1);
     if (child !== normalized[key]) {
       if (out === normalized) out = { ...normalized };
-      out[key] = child;
+      Object.defineProperty(out, key, { value: child, writable: true, enumerable: true, configurable: true });
     }
   }
   return out;
 }
 
 function normalizeRootInput(input, schema, transforms) {
-  if (input == null) return {};
+  if (input === undefined) return {};
+  if (input === null) return null;
   if (isObject(input)) {
     const serialized = unwrapJsonLikeObject(input);
     if (serialized !== undefined && jsonKind(serialized) !== "object") {
@@ -633,15 +872,13 @@ function prunedIntentInventoryMarker(tool) {
   const schema = tool && tool.inputSchema;
   if (!isObject(schema) || !isObject(schema.properties)) return false;
   if (typeof tool.description === "string" && tool.description.trim() !== "") return false;
-  const entries = Object.entries(schema.properties);
-  if (!entries.length || entries[0][0] !== "i") return false;
-  const propertySchema = entries[0][1];
+  if (!Object.hasOwn(schema.properties, "i")) return false;
+  const propertySchema = schema.properties.i;
   if (!isObject(propertySchema)
     || Object.keys(propertySchema).length !== 1
     || propertySchema.type !== "string") return false;
   return Array.isArray(schema.required)
-    && schema.required.length > 0
-    && schema.required.at(-1) === "i";
+    && schema.required.includes("i");
 }
 
 function inventoryUsesPrunedIntent(tools) {
@@ -665,10 +902,11 @@ function deriveAcceptanceSchema(schema, allowPrunedIntent = false) {
   let changed = false;
 
   if (isObject(schema.properties)) {
-    const properties = {};
+    const properties = Object.create(null);
     const decorations = new Set();
     for (const [name, propertySchema] of Object.entries(schema.properties)) {
       const decoration = explicitDecoration(propertySchema)
+        || explicitAdvisoryIgnored(propertySchema)
         || implicitIntentDecoration(name, propertySchema, allowPrunedIntent);
       properties[name] = decoration ? true : deriveAcceptanceSchema(propertySchema, allowPrunedIntent);
       if (decoration) decorations.add(name);
@@ -681,7 +919,7 @@ function deriveAcceptanceSchema(schema, allowPrunedIntent = false) {
       }
     }
     if (Object.values(properties).some((value, index) => value !== Object.values(schema.properties)[index])) {
-      out.properties = properties;
+      out.properties = Object.fromEntries(Object.entries(properties));
       changed = true;
     }
   }
@@ -722,11 +960,66 @@ function deriveAcceptanceSchema(schema, allowPrunedIntent = false) {
 
 function ajvForSchema(schema) {
   const dialect = typeof schema.$schema === "string" ? schema.$schema : "";
+  if (/draft-04/i.test(dialect)) return AjvDraft04;
   return /2020-12/i.test(dialect) ? Ajv2020 : /2019-09/i.test(dialect) ? Ajv2019 : Ajv;
+}
+
+function unresolvedSchemaReference(error) {
+  const message = String(error && error.message || error);
+  return /can't resolve reference|can't resolve schema|no schema with key or ref/i.test(message);
+}
+
+function ajvPrototypeSafeSchema(schema, seen = new WeakMap()) {
+  if (!schema || typeof schema !== "object") return schema;
+  if (seen.has(schema)) return seen.get(schema);
+  if (Array.isArray(schema)) {
+    const out = [];
+    seen.set(schema, out);
+    out.push(...schema.map((child) => ajvPrototypeSafeSchema(child, seen)));
+    return out;
+  }
+  const out = Object.fromEntries(Object.entries(schema)
+    .map(([key, child]) => [key, ajvPrototypeSafeSchema(child, seen)]));
+  seen.set(schema, out);
+  if (isObject(out.properties) && Object.hasOwn(out.properties, "__proto__")) {
+    const exactPattern = "^__proto__$";
+    const patterns = isObject(out.patternProperties) ? out.patternProperties : {};
+    const declared = out.properties.__proto__;
+    const exact = Object.hasOwn(patterns, exactPattern)
+      ? { allOf: [patterns[exactPattern], declared] }
+      : declared;
+    // Ajv's additionalProperties fast path historically looks up property
+    // names through ordinary object semantics. The exact pattern keeps this
+    // legal JSON key both evaluated and type-checked without changing the
+    // descriptor sent to Cursor or the harness.
+    out.patternProperties = Object.fromEntries([
+      ...Object.entries(patterns).filter(([key]) => key !== exactPattern),
+      [exactPattern, exact],
+    ]);
+  }
+  return out;
+}
+
+function deferredHarnessValidator(reason) {
+  const validate = () => {
+    validate.errors = null;
+    return true;
+  };
+  validate.errors = null;
+  validate.validationDeferredToHarness = String(reason || "unresolved schema reference");
+  return validate;
 }
 
 function compileSchema(name, schema) {
   if (schema.$async === true) throw new Error("asynchronous JSON Schema validation is not supported for client tools");
+  const unsafeSchemaNumber = unsafeIntegerPath(schema, "schema");
+  if (unsafeSchemaNumber) {
+    // JavaScript has already lost the original integer lexeme by this point.
+    // Do not enforce a rounded bound in the bridge; the harness validates its
+    // original schema. Executable arguments are independently refused below
+    // if they contain an unsafe integer.
+    return deferredHarnessValidator(`unsafe integer constraint at ${unsafeSchemaNumber}`);
+  }
   const AjvForDialect = ajvForSchema(schema);
   try {
     return new AjvForDialect({
@@ -737,22 +1030,28 @@ function compileSchema(name, schema) {
       useDefaults: false,
       removeAdditional: false,
       validateFormats: false,
-    }).compile(schema);
+      ownProperties: true,
+    }).compile(ajvPrototypeSafeSchema(schema));
   } catch (error) {
+    // Remote refs and uninstalled/unknown dialect metas are not proof that the
+    // client's schema is invalid. Preserve the descriptor and let the harness
+    // perform its authoritative validation instead of rejecting tool
+    // registration with a false 422. Structurally malformed schemas still fail.
+    if (unresolvedSchemaReference(error)) return deferredHarnessValidator(error && error.message);
     throw new Error(`advertised tool '${name}' has an invalid inputSchema: ${(error && error.message) || String(error)}`);
   }
 }
 
 function compiledContract(name, schema, allowPrunedIntent = false) {
-  const cacheKey = `${allowPrunedIntent ? "pruned-intent" : "strict"}:${JSON.stringify(schema)}`;
-  if (validatorCache.has(cacheKey)) return validatorCache.get(cacheKey);
+  const identity = schemaCacheIdentity(allowPrunedIntent ? "pruned-intent" : "strict", schema);
+  const cached = validatorCache.get(identity.key);
+  if (cached) return cached;
   const wireValidator = compileSchema(name, schema);
   const acceptanceSchema = deriveAcceptanceSchema(schema, allowPrunedIntent);
   const acceptanceValidator = acceptanceSchema === schema ? wireValidator : compileSchema(name, acceptanceSchema);
   const normalizationSchema = materializeLocalRefs(schema);
   const contract = Object.freeze({ schema, normalizationSchema, acceptanceSchema, wireValidator, acceptanceValidator });
-  if (validatorCache.size >= TOOL_SCHEMA_VALIDATOR_CACHE_MAX) validatorCache.clear();
-  validatorCache.set(cacheKey, contract);
+  validatorCache.set(identity.key, contract, identity.bytes);
   return contract;
 }
 
@@ -834,7 +1133,17 @@ export class ToolContractRegistry {
     const contract = this.contracts.get(name);
     const transforms = [];
     const schema = contract ? contract.normalizationSchema : { type: "object" };
-    return { value: normalizeRootInput(input, schema, transforms), transforms };
+    let value = normalizeRootInput(input, schema, transforms);
+    value = stripKnownPresentationFields(name, value, schema, transforms);
+    const unsafePath = unsafeIntegerPath(value);
+    if (unsafePath) {
+      throw new ToolContractNormalizationError(
+        "unsafe_integer",
+        unsafePath,
+        "integer cannot be represented losslessly by the JavaScript SDK runtime; encode it as a string in the client contract",
+      );
+    }
+    return { value, transforms };
   }
 
   validate(name, input, transforms = []) {
@@ -850,28 +1159,113 @@ export class ToolContractRegistry {
 
 export function normalizeToolArguments(input, schema = { type: "object" }) {
   const transforms = [];
-  return { value: normalizeRootInput(input, materializeLocalRefs(schema), transforms), transforms };
+  const value = normalizeRootInput(input, materializeLocalRefs(schema), transforms);
+  const unsafePath = unsafeIntegerPath(value);
+  if (unsafePath) {
+    throw new ToolContractNormalizationError(
+      "unsafe_integer",
+      unsafePath,
+      "integer cannot be represented losslessly by the JavaScript SDK runtime; encode it as a string in the client contract",
+    );
+  }
+  return { value, transforms };
 }
 
-export function normalizeToolResultEnvelope(content, isError, images, structuredContent) {
+function resultImageFromBlock(block, path) {
+  if (!block || block.type !== "image") return null;
+  const source = isObject(block.source) ? block.source : isObject(block.image) ? block.image : block;
+  if (source.kind === "url" || (typeof source.url === "string" && source.url)) {
+    if (typeof source.url !== "string" || !source.url) {
+      throw new ToolContractNormalizationError("invalid_result_image", path, "tool-result URL image is malformed");
+    }
+    return {
+      url: source.url,
+      ...(typeof source.mimeType === "string" && source.mimeType ? { mimeType: source.mimeType } : {}),
+      ...(typeof source.detail === "string" && source.detail ? { detail: source.detail } : {}),
+    };
+  }
+  const data = source.data;
+  const mimeType = source.mimeType || source.media_type;
+  if ((source.kind === "base64" || data !== undefined) && typeof data === "string" && data
+    && typeof mimeType === "string" && mimeType) {
+    return { data, mimeType };
+  }
+  throw new ToolContractNormalizationError("invalid_result_image", path, "tool-result image block is malformed");
+}
+
+export function normalizeToolResultEnvelope(
+  content,
+  isError,
+  images,
+  structuredContent,
+  contentBlocks = undefined,
+  structuredContentPresent = structuredContent !== undefined,
+) {
+  if (typeof isError !== "boolean") {
+    throw new ToolContractNormalizationError("invalid_result_error_flag", "result.isError", "tool-result isError must be a boolean");
+  }
+  if (typeof structuredContentPresent !== "boolean") {
+    throw new ToolContractNormalizationError(
+      "invalid_structured_content_presence",
+      "result.structuredContentPresent",
+      "structuredContentPresent must be a boolean",
+    );
+  }
   const normalizedContent = content === undefined ? "" : content;
-  const inlineImages = [];
-  const urlImages = [];
-  if (Array.isArray(images)) {
-    for (const image of images) {
-      if (!image) continue;
-      if (typeof image.url === "string" && image.url) urlImages.push(image);
-      else if (typeof image.data === "string" && image.data && typeof image.mimeType === "string" && image.mimeType) inlineImages.push(image);
+  const suppliedBlocks = contentBlocks !== undefined;
+  let normalizedBlocks;
+  if (suppliedBlocks) {
+    if (!Array.isArray(contentBlocks)) {
+      throw new ToolContractNormalizationError("invalid_result_blocks", "result.contentBlocks", "contentBlocks must be an array");
+    }
+    normalizedBlocks = cloneJson(contentBlocks);
+  }
+  const projectedImages = [];
+  if (!suppliedBlocks && Array.isArray(images)) {
+    for (let index = 0; index < images.length; index++) {
+      const image = images[index];
+      if (image && typeof image.url === "string" && image.url) {
+        const normalized = {
+          url: image.url,
+          ...(typeof image.mimeType === "string" && image.mimeType ? { mimeType: image.mimeType } : {}),
+          ...(typeof image.detail === "string" && image.detail ? { detail: image.detail } : {}),
+        };
+        projectedImages.push(normalized);
+      } else if (image && typeof image.data === "string" && image.data && typeof image.mimeType === "string" && image.mimeType) {
+        const normalized = { data: image.data, mimeType: image.mimeType };
+        projectedImages.push(normalized);
+      } else {
+        throw new ToolContractNormalizationError("invalid_result_image", `result.images.${index}`, "tool-result image is malformed");
+      }
     }
   }
-  const allImages = [...inlineImages, ...urlImages];
+  if (!suppliedBlocks) {
+    normalizedBlocks = [
+      ...(normalizedContent !== "" ? [{ type: "text", text: typeof normalizedContent === "string" ? normalizedContent : JSON.stringify(normalizedContent) }] : []),
+      ...projectedImages.map((image) => ({
+        type: "image",
+        source: image.url
+          ? { kind: "url", url: image.url, ...(image.mimeType ? { mimeType: image.mimeType } : {}), ...(image.detail ? { detail: image.detail } : {}) }
+          : { kind: "base64", data: image.data, mimeType: image.mimeType },
+      })),
+    ];
+  } else {
+    for (let index = 0; index < normalizedBlocks.length; index++) {
+      const image = resultImageFromBlock(normalizedBlocks[index], `result.contentBlocks.${index}`);
+      if (image) projectedImages.push(image);
+    }
+  }
+  const inlineImages = projectedImages.filter((image) => typeof image.data === "string");
+  const urlImages = projectedImages.filter((image) => typeof image.url === "string");
   return {
     content: normalizedContent,
-    isError: isError === true,
-    images: allImages.length ? allImages : null,
+    contentBlocks: normalizedBlocks,
+    isError,
+    images: projectedImages.length ? projectedImages : null,
     inlineImages: inlineImages.length ? inlineImages : null,
     urlImages: urlImages.length ? urlImages : null,
-    structuredContent: structuredContent && typeof structuredContent === "object" ? structuredContent : null,
+    structuredContent: structuredContentPresent ? cloneJson(structuredContent) : null,
+    structuredContentPresent,
   };
 }
 
