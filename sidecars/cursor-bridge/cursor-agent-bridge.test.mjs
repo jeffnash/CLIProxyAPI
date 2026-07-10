@@ -14,6 +14,9 @@ const bridge = await import("./cursor-agent-bridge.mjs");
 const {
   AdvertisedToolRegistry,
   CC_CASES,
+  CLIENT_TOOL_PROVIDER_ID,
+  COMPOSER_MAX_INVALID_TOOL_CALLS,
+  DEFAULT_MCP_SERVER_KEY,
   Session,
   authorizeRequestWith,
   bindHostIsLoopback,
@@ -208,6 +211,18 @@ test("malformed supplied workspace degrades to neutral context instead of reject
   assert.deepEqual(sessions.get("bad-workspace"), undefined);
 });
 
+test("invalid advertised schemas fail before creating a turn session", async () => {
+  const res = new MockResponse();
+  await handleTurn(request(), res, neutralBody({
+    sessionId: "invalid-tool-schema",
+    input: { type: "user", text: "hello" },
+    tools: [{ name: "Broken", inputSchema: { type: "not-a-json-schema-type" } }],
+  }), "key");
+  assert.equal(res.status, 422);
+  assert.match(res.text(), /invalid inputSchema/);
+  assert.equal(sessions.has("invalid-tool-schema"), false);
+});
+
 test("unknown workspace never leaks the SDK isolation directory through shell result metadata", () => {
   const unary = CC_CASES.shellArgs.buildResult("ok", { command: "pwd" }, false, { cwd: "" });
   const stream = CC_CASES.shellStreamArgs.buildChunks("ok", false, { cwd: "" });
@@ -223,6 +238,29 @@ test("advertised tools have one normalized registry and duplicate names fail clo
   assert.deepEqual(registry.find("A").inputSchema, { type: "object" });
   assert.throws(() => registry.replace([{ name: "A" }, { toolName: "A" }]), /appears more than once/);
   assert.throws(() => registry.replace([{}]), /missing a string name/);
+  assert.throws(() => registry.replace([{ name: "Broken", inputSchema: { type: "definitely-not-json-schema" } }]), /invalid inputSchema/);
+  assert.throws(() => registry.replace([{ name: "Async", inputSchema: { $async: true, type: "object" } }]), /asynchronous JSON Schema/);
+});
+
+test("advertised schema validation honors declared modern JSON Schema dialects", () => {
+  const registry = new AdvertisedToolRegistry();
+  registry.replace([{
+    name: "Modern",
+    inputSchema: {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: {
+        pair: {
+          type: "array",
+          prefixItems: [{ type: "string" }, { type: "number" }],
+          items: false,
+        },
+      },
+      required: ["pair"],
+    },
+  }]);
+  assert.equal(registry.validate("Modern", { pair: ["x", 1] }), null);
+  assert.equal(registry.validate("Modern", { pair: ["x", "wrong"] }).structuredContent.errors[0].path, "pair.1");
 });
 
 test("patched advertisement and MCP inventory consume the same registry", () => {
@@ -236,6 +274,169 @@ test("patched advertisement and MCP inventory consume the same registry", () => 
   const inventory = state.flatMap((server) => server.tools.map((tool) => tool.name)).sort();
   assert.deepEqual(inventory, session.advertise.map((tool) => tool.name).sort());
   assert.equal(mcpServerKeyForTool("mcp__memory__search"), "memory");
+  assert.equal(mcpServerKeyForTool("Bash"), DEFAULT_MCP_SERVER_KEY);
+  assert.equal(mcpServerKeyForTool("_mcp__codebase_memory_mcp_index_status"), DEFAULT_MCP_SERVER_KEY);
+  assert.ok(state.flatMap((server) => server.tools).every((tool) => tool.providerIdentifier === CLIENT_TOOL_PROVIDER_ID));
+  assert.ok(Object.hasOwn(servers, DEFAULT_MCP_SERVER_KEY));
+  assert.equal(servers[DEFAULT_MCP_SERVER_KEY].headers["X-Client-Tools-Session"], session.id);
+});
+
+test("the generic MCP server carries tools added after the SDK server map is fixed without duplicates", async () => {
+  const session = new Session("dynamic-registry", "key");
+  session.advertise = [];
+  const initiallyDialed = buildMcpServers(session);
+  assert.deepEqual(Object.keys(initiallyDialed), [DEFAULT_MCP_SERVER_KEY]);
+  session.mcpServerKeys = Object.freeze(Object.keys(initiallyDialed));
+  session.advertise = [
+    { name: "mcp__memory__search", inputSchema: { type: "object" } },
+    { name: "Bash", inputSchema: { type: "object" } },
+  ];
+  const state = headlessMcpState(session).__ccJson.success.servers;
+  assert.deepEqual(state.map((server) => server.serverName), [DEFAULT_MCP_SERVER_KEY]);
+  assert.deepEqual(state[0].tools.map((tool) => tool.name).sort(), ["Bash", "mcp__memory__search"]);
+  sessions.set(session.id, session);
+  const listed = await mcpDispatch({ jsonrpc: "2.0", id: 32, method: "tools/list" }, session.id, "");
+  assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), ["Bash", "mcp__memory__search"]);
+});
+
+test("new natural MCP servers overflow into generic while existing servers keep one exact copy", () => {
+  const session = new Session("dynamic-natural-registry", "key");
+  session.advertise = [{ name: "mcp__memory__search", inputSchema: { type: "object" } }];
+  session.mcpServerKeys = Object.freeze(Object.keys(buildMcpServers(session)));
+  assert.deepEqual([...session.mcpServerKeys].sort(), [DEFAULT_MCP_SERVER_KEY, "memory"].sort());
+  session.advertise = [
+    { name: "mcp__memory__search", inputSchema: { type: "object" } },
+    { name: "mcp__github__get_issue", inputSchema: { type: "object" } },
+    { name: "Read", inputSchema: { type: "object" } },
+  ];
+  const state = headlessMcpState(session).__ccJson.success.servers;
+  const byServer = Object.fromEntries(state.map((server) => [server.serverName, server.tools.map((tool) => tool.name).sort()]));
+  assert.deepEqual(byServer.memory, ["mcp__memory__search"]);
+  assert.deepEqual(byServer[DEFAULT_MCP_SERVER_KEY], ["Read", "mcp__github__get_issue"]);
+  assert.equal(state.flatMap((server) => server.tools).length, 3);
+});
+
+test("reserved JavaScript property names remain valid MCP server keys", () => {
+  const session = new Session("reserved-server-keys", "key");
+  session.advertise = [
+    { name: "mcp__constructor__lookup", inputSchema: { type: "object" } },
+    { name: "mcp__toString__read", inputSchema: { type: "object" } },
+  ];
+  const servers = buildMcpServers(session);
+  assert.ok(Object.hasOwn(servers, "constructor"));
+  assert.ok(Object.hasOwn(servers, "toString"));
+  const inventory = headlessMcpState(session).__ccJson.success.servers.flatMap((server) => server.tools.map((tool) => tool.name));
+  assert.deepEqual(inventory.sort(), ["mcp__constructor__lookup", "mcp__toString__read"].sort());
+});
+
+test("MCP server keys cannot become URL dot segments", () => {
+  assert.equal(mcpServerKeyForTool(`mcp__${"."}__lookup`), "server-dot");
+  assert.equal(mcpServerKeyForTool(`mcp__${".."}__lookup`), "server-dotdot");
+});
+
+test("tool manifest is harness-neutral and treats the MCP label as transport metadata", () => {
+  const manifest = toolManifest([
+    { name: "_mcp__codebase_memory_mcp_index_status", description: "status", inputSchema: { type: "object" } },
+    { name: "Read", description: "read", inputSchema: { type: "object" } },
+  ]);
+  assert.match(manifest, /client-owned tools/i);
+  assert.match(manifest, /transport metadata/i);
+  assert.match(manifest, new RegExp(DEFAULT_MCP_SERVER_KEY));
+  assert.doesNotMatch(manifest, /claude[- ]code/i);
+  assert.doesNotMatch(manifest, /CallMcpTool/);
+});
+
+test("schema-invalid patched MCP calls are rejected before client handoff", async () => {
+  const { session, output } = seedSession("invalid-patched-mcp", "key", [{
+    name: "mcp__codebase_memory_mcp_index_status",
+    description: "status",
+    inputSchema: {
+      type: "object",
+      properties: { repo_path: { type: "string" }, project: { type: "string" } },
+      required: ["repo_path", "project"],
+      additionalProperties: false,
+    },
+  }]);
+  const response = await session.dispatchMcp({
+    toolName: "mcp__codebase_memory_mcp_index_status",
+    args: {},
+    toolCallId: "invalid-sdk-mcp",
+  });
+  assert.equal(response.__ccJson.success.isError, true);
+  assert.equal(response.__ccJson.success.structuredContent.code, "client_tool_invalid_arguments");
+  assert.equal(response.__ccJson.success.structuredContent.executed, false);
+  assert.deepEqual(response.__ccJson.success.structuredContent.errors.map((error) => error.path).sort(), ["project", "repo_path"]);
+  assert.equal(session.currentRound, null);
+  assert.equal(session.invalidToolCalls, 1);
+  assert.doesNotMatch(output.text(), /tool_call/);
+});
+
+test("schema-invalid HTTP MCP calls use the same preflight and enum validation", async () => {
+  const { session, output } = seedSession("invalid-http-mcp", "key", [{
+    name: "todo",
+    description: "todo",
+    inputSchema: {
+      type: "object",
+      properties: { op: { type: "string", enum: ["init", "view"] } },
+      required: ["op"],
+      additionalProperties: false,
+    },
+  }]);
+  const response = await mcpDispatch({
+    jsonrpc: "2.0",
+    id: 9,
+    method: "tools/call",
+    params: { name: "todo", arguments: { op: "create" } },
+  }, session.id, DEFAULT_MCP_SERVER_KEY);
+  assert.equal(response.result.isError, true);
+  assert.equal(response.result.structuredContent.code, "client_tool_invalid_arguments");
+  assert.equal(response.result.structuredContent.executed, false);
+  assert.equal(response.result.structuredContent.errors[0].keyword, "enum");
+  assert.equal(session.currentRound, null);
+  assert.equal(session.invalidToolCalls, 1);
+  assert.doesNotMatch(output.text(), /tool_call/);
+});
+
+test("repeated schema-invalid calls terminate the SDK run instead of spinning forever", async () => {
+  const { session, output } = seedSession("invalid-call-loop", "key", [{
+    name: "Required",
+    inputSchema: { type: "object", required: ["value"] },
+  }]);
+  for (let i = 0; i < COMPOSER_MAX_INVALID_TOOL_CALLS; i++) {
+    const response = await session.dispatchMcp({ toolName: "Required", args: {}, toolCallId: `invalid-${i}` });
+    assert.equal(response.__ccJson.success.isError, true);
+  }
+  assert.equal(session.invalidToolCalls, COMPOSER_MAX_INVALID_TOOL_CALLS);
+  assert.equal(session.loopTripped, true);
+  assert.match(output.text(), /invalid client-tool call bound/);
+  assert.doesNotMatch(output.text(), /"type":"tool_call"/);
+});
+
+test("schema preflight runs after safe wrapper normalization and valid calls still open ToolRound", async () => {
+  const { session } = seedSession("normalized-valid-mcp", "key", [{
+    name: "Lookup",
+    description: "lookup",
+    inputSchema: {
+      type: "object",
+      properties: { q: { type: "string" } },
+      required: ["q"],
+      additionalProperties: false,
+    },
+  }]);
+  const opened = await openTool(session, { input: { q: { text: "normalized" } } });
+  assert.deepEqual(opened.call.input, { q: "normalized" });
+  assert.equal(session.invalidToolCalls, 0);
+  await session.cancel({ terminalReason: "test_cleanup", detail: "valid normalization test complete" });
+  await assert.rejects(opened.promise, /test_cleanup/);
+});
+
+test("replacing the advertised registry also replaces its schema validator", () => {
+  const registry = new AdvertisedToolRegistry();
+  registry.replace([{ name: "A", inputSchema: { type: "object", required: ["first"] } }]);
+  const firstFailure = registry.validate("A", {});
+  assert.equal(firstFailure.structuredContent.errors[0].path, "first");
+  registry.replace([{ name: "A", inputSchema: { type: "object", required: ["second"] } }]);
+  assert.equal(registry.validate("A", {}).structuredContent.errors[0].path, "second");
 });
 
 test("tool-name reconciliation is exact or unambiguous and never arbitrary single-tool routing", () => {
@@ -262,6 +463,25 @@ test("signed continuation receipts are persisted before the live callback resolv
   assert.ok(saved.calls[0].resultHash);
   assert.deepEqual(saved.calls[0].receipt.result.structuredContent, { ok: true });
   assert.equal(saved.terminal.reason, "completed");
+});
+
+test("invalid continuation schemas are refused before a durable result receipt", async () => {
+  const { session } = seedSession("invalid-continuation-schema", "cursor-key");
+  const opened = await openTool(session);
+  let callbackSettled = false;
+  void opened.promise.then(() => { callbackSettled = true; }, () => { callbackSettled = true; });
+  const res = new MockResponse();
+  await handleContinue(request(), res, continuationBody([
+    { toolCallId: opened.call.wireId, content: "must-not-commit" },
+  ], {}, {
+    tools: [{ name: "Broken", inputSchema: { type: "not-a-json-schema-type" } }],
+  }), "cursor-key");
+  assert.equal(res.status, 422);
+  assert.match(res.text(), /invalid_advertised_tools/);
+  assert.equal(callbackSettled, false);
+  assert.equal(journalRecord(opened.round.route).calls[0].resultHash, null);
+  await session.cancel({ terminalReason: "test_cleanup", detail: "invalid continuation test complete" });
+  await assert.rejects(opened.promise, /test_cleanup/);
 });
 
 test("whole-batch token validation is atomic: one tampered id commits nothing", async () => {
@@ -613,7 +833,7 @@ test("shutdown cancellation terminal-resolves every open callback", async () => 
 
 test("HTTP MCP tools/call uses ToolRound and preserves isError, structuredContent, and image output", async () => {
   const { session } = seedSession("mcp-http", "key");
-  const responsePromise = mcpDispatch({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "Lookup", arguments: { q: "x" } } }, session.id, "claude-code");
+  const responsePromise = mcpDispatch({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "Lookup", arguments: { q: "x" } } }, session.id, DEFAULT_MCP_SERVER_KEY);
   await waitFor(() => session.currentRound?.fifo.length === 1 && session.currentRound.calls.get(session.currentRound.fifo[0]).handedAt, "HTTP MCP handoff");
   if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
   const round = session.currentRound;
@@ -651,20 +871,20 @@ test("patched MCP dispatch uses the same ToolRound adapter and result contract",
 });
 
 test("MCP missing session and unknown tool are typed errors, never fake success", async () => {
-  const missing = await mcpDispatch({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "Lookup", arguments: {} } }, "gone", "cc");
+  const missing = await mcpDispatch({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "Lookup", arguments: {} } }, "gone", DEFAULT_MCP_SERVER_KEY);
   assert.equal(missing.result.isError, true);
   const { session } = seedSession("unknown-tool", "key", [{ name: "Read" }, { name: "Bash" }]);
-  const unknown = await mcpDispatch({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "DestroyEverything", arguments: {} } }, session.id, "cc");
+  const unknown = await mcpDispatch({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "DestroyEverything", arguments: {} } }, session.id, DEFAULT_MCP_SERVER_KEY);
   assert.equal(unknown.result.isError, true);
   assert.match(unknown.result.content[0].text, /not available/);
 });
 
 test("MCP tools/list is derived live from the registry with object schemas", async () => {
   const { session } = seedSession("list", "key", [{ name: "A" }, { name: "B", inputSchema: { type: "object", required: ["q"] } }]);
-  const listed = await mcpDispatch({ jsonrpc: "2.0", id: 3, method: "tools/list" }, session.id, "cc");
+  const listed = await mcpDispatch({ jsonrpc: "2.0", id: 3, method: "tools/list" }, session.id, DEFAULT_MCP_SERVER_KEY);
   assert.deepEqual(listed.result.tools.map((tool) => tool.name), ["A", "B"]);
   assert.deepEqual(listed.result.tools[0].inputSchema, { type: "object" });
-  assert.deepEqual(mcpToolsForServer(session, "cc").map((tool) => tool.name), ["A", "B"]);
+  assert.deepEqual(mcpToolsForServer(session, DEFAULT_MCP_SERVER_KEY).map((tool) => tool.name), ["A", "B"]);
 });
 
 test("Grok 4.5 model aliases preserve slow default and map effort", () => {
@@ -689,7 +909,7 @@ test("tool-choice gating does not widen the advertised set or fake native succes
 test("synthetic agent-tools artifacts are blocked before ToolRound across native, MCP, and shell seams", async () => {
   const artifact = "agent-tools/fdc5389e-988d-4ef4-8d1b-f31037f28f8a.txt";
   assert.equal(syntheticAgentArtifactRequest("Write", { file_path: artifact }), true);
-  assert.equal(syntheticAgentArtifactRequest("mcp__claude-code__Read", { path: `/tmp/${artifact}` }), true);
+  assert.equal(syntheticAgentArtifactRequest("mcp__client-tools__Read", { path: `/tmp/${artifact}` }), true);
   assert.equal(syntheticAgentArtifactRequest("Bash", { command: `head -c 2000 ${artifact}` }), true);
   assert.equal(syntheticAgentArtifactRequest("Write", { file_path: "agent-tools/notes.txt" }), false);
   assert.equal(syntheticAgentArtifactRequest("Write", { file_path: "/home/me/repo/normal.txt" }), false);

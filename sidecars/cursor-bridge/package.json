@@ -17,7 +17,8 @@
   "dependencies": {
     "@cursor/sdk": "1.0.23",
     "acorn": "8.15.0",
-    "acorn-walk": "8.3.4"
+    "acorn-walk": "8.3.4",
+    "ajv": "8.20.0"
   },
   "overrides": {
     "undici": "6.27.0"

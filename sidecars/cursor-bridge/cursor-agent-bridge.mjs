@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Cursor Agent Bridge (Cursor Composer Client-Tools) — the official @cursor/sdk drives the Cursor agent, but EVERY tool
-// executes on the end user's machine via Claude Code (through CLIProxy), and the sidecar filesystem is
-// never touched for tool execution.
+// executes in the calling harness on the end user's machine (through CLIProxy), and the sidecar filesystem is
+// never touched for tool execution. The harness may be Claude Code, OMP/Pi, Codex, or any compatible client.
 //
 // TOPOLOGY (the sidecar ONLY talks to CLIProxy, never to the client directly):
 //   Harness <-OpenAI/Anthropic-> CLIProxy (Go) <-HTTP/SSE /agent/turn + /agent/continue-> THIS sidecar <-@cursor/sdk-> Cursor API
 //
-// Tools route to CC via the patched bundle's globalThis.__CC_EXEC_U/__CC_EXEC_S; the client's tools[]
+// Tools route to the client via the patched bundle's legacy-named globalThis.__CC_EXEC_U/__CC_EXEC_S ABI; the client's tools[]
 // are advertised to the model as mcp_tools via globalThis.__CC_GET_ADVERTISE__ (patch inject). Results
 // are built as Cursor protobuf messages by the patched serializeResult ($) doing <Type>.fromJson(ccJson).
 //
@@ -31,6 +31,9 @@ import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, writeFileSync, mkdirSync, accessSync, constants, writeSync } from "node:fs";
 import path from "node:path";
+import Ajv from "ajv";
+import Ajv2019 from "ajv/dist/2019.js";
+import Ajv2020 from "ajv/dist/2020.js";
 import {
   ToolRound,
   ToolRoundError,
@@ -98,7 +101,7 @@ const EMPTY_CWD = path.join(STATE_ROOT, ".empty");
 // This is deliberately independent of workspace identity: it prevents old
 // agents seeded with proxy-side sentinel paths from surviving the redesign
 // without making cwd/workspace part of routing.
-const DURABLE_AGENT_CONTEXT_EPOCH = "ct3";
+const DURABLE_AGENT_CONTEXT_EPOCH = "ct4";
 // PENDING_TIMEOUT_MS / SESSION_TTL_MS must be POSITIVE (a 0 watchdog would reap a tool the instant it is
 // emitted; a 0 TTL would evict a session immediately) — floor them at 1ms via min:1.
 const PENDING_TIMEOUT_MS = envInt("CURSOR_AGENT_PENDING_TIMEOUT_MS", 600000, { min: 1 });
@@ -144,11 +147,17 @@ function mcpImageResultsEnabled() {
   const v = process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
   return v !== "0" && v !== "false";
 }
+// These identifiers are intentionally harness-neutral. They are visible to the
+// Cursor SDK/model as the provider/server that hosts client-owned tools, so a
+// Claude-specific label causes non-Claude harnesses to invent a nonexistent
+// "Claude Code MCP" hop. The __CC_* global names remain only as a private ABI
+// with the pinned SDK patch; they are never the product-level identity.
+const CLIENT_TOOL_PROVIDER_ID = "client-tools";
+const DEFAULT_MCP_SERVER_KEY = "client-tools";
 // Grouping: how advertised tools are partitioned across MCP servers — one|natural|per-tool (default natural).
-//   one      -> a single server "cc" advertising ALL tools (one MCP connection).
+//   one      -> a single generic "client-tools" server advertising ALL tools (one MCP connection).
 //   natural  -> reconstruct the user's real MCP topology from mcp__<server>__<tool> names; non-mcp tools
-//               (Bash/Read/Task/WebSearch/…) lump into a synthetic "claude-code" server (cosmetic; bounds
-//               each tools/list payload and mirrors the model's expected grouping).
+//               and harness-flattened MCP names are grouped under the generic "client-tools" server.
 //   per-tool -> one server per advertised tool (worst-case compat/diagnostic mode).
 // Parsed once at startup; an unknown value falls back to "natural" with a console.warn.
 const MCP_GROUPING = (() => {
@@ -597,20 +606,29 @@ const TOOL_MANIFEST_IN_RULE = TOOL_MANIFEST_MODE === "rule" || TOOL_MANIFEST_MOD
 // clean end_turn/[DONE] (that would falsely report a runaway loop as a successful answer).
 const COMPOSER_MAX_TOOL_ROUNDS = envInt("CURSOR_COMPOSER_MAX_TOOL_ROUNDS", 200, { min: 1 });
 const COMPOSER_MAX_REPEAT_TOOL = envInt("CURSOR_COMPOSER_MAX_REPEAT_TOOL", 8, { min: 0 });
+// Invalid calls are rejected inside the bridge before a client ToolRound is
+// created. Bound those internal retries separately so a model cannot spin
+// forever without advancing the ordinary tool-round counter. This is a count,
+// not an upstream deadline.
+const COMPOSER_MAX_INVALID_TOOL_CALLS = envInt("CURSOR_COMPOSER_MAX_INVALID_TOOL_CALLS", 32, { min: 1 });
+// Observability only: after this much silence from SDK callbacks, emit a debug
+// line on the existing SSE keepalive cadence. It never cancels or times out the
+// established Cursor stream.
+const COMPOSER_STALL_LOG_MS = envInt("CURSOR_COMPOSER_STALL_LOG_MS", 60_000, { min: 1_000 });
 function toolManifest(advertised) {
   const adv = Array.isArray(advertised) ? advertised : [];
   if (!adv.length) return "";
-  // Group tools by their MCP server key — that is how composer-2.5 actually SEES them (model-confirmed: these are
-  // NOT top-level tools; each lives on an MCP server and is invoked as an MCP tool call, server + tool — so it
-  // read files itself instead of calling Workflow). Naming the server + framing them as MCP tools is what makes
-  // it invoke them. Grouping mirrors buildMcpServers/tools/list (mcpServerKeyForTool) so it matches what it sees.
+  // Group tools by their SDK MCP transport key so the manifest matches the
+  // inventory the model sees. The prose deliberately treats the label as
+  // transport metadata and tells the model to call the exact tool directly;
+  // no client-harness-specific wrapper is part of the product contract.
   const byServer = new Map(); // serverKey -> ["- name[: desc]", ...] (insertion order preserved)
   let bytes = 0;
   let truncated = false;
   for (const t of adv) {
     const name = (t && (t.toolName || t.name)) || "";
     if (!name) continue;
-    const server = mcpServerKeyForTool(name, MCP_GROUPING) || "claude-code";
+    const server = mcpServerKeyForTool(name, MCP_GROUPING) || DEFAULT_MCP_SERVER_KEY;
     // Names only by default (TOOL_MANIFEST_DESC_MAX=0); the full verbatim descriptions already reach the model via
     // tools/list. Set CURSOR_COMPOSER_TOOL_MANIFEST_DESC_MAX>0 for per-tool descriptions up to that length.
     let desc = "";
@@ -628,22 +646,23 @@ function toolManifest(advertised) {
   const sections = [];
   for (const [server, srvLines] of byServer) sections.push("MCP server `" + server + "` — tools:\n" + srvLines.join("\n"));
   if (truncated) sections.push("…(more MCP tools available)");
-  let out = "You have MCP tools available this turn, listed below by their MCP server. TREAT THESE MCP TOOLS AS FIRST-CLASS: use them exactly as you would your own built-in tools — they are never second-class, optional, or unavailable. The user (and your task) may refer to them plainly as 'tools', or by the action itself ('read the file', 'run a search', 'launch a workflow', 'use subagents') — those all mean these MCP tools, so CALL the matching MCP tool rather than doing the work yourself or claiming a listed tool is unavailable. Each is invoked as an MCP tool call (its MCP server + the tool name). Match each tool's parameter schema exactly (required fields, types, names); on an invalid-parameters error, fix the args and retry rather than abandon the tool.\n\n" + sections.join("\n\n");
+  let out = "You have client-owned tools available this turn through the MCP transport below. Treat them as first-class tools: invoke the listed tool directly by its exact name and argument schema. The MCP server label is transport metadata only; do not invent or narrate an additional wrapper tool, and do not assume any particular client harness. The user may refer to a tool plainly by its action ('read the file', 'run a search', 'launch a workflow', 'use subagents'); call the matching listed tool. Match every required field, type, and enum exactly. Invalid calls are rejected before client execution and must be retried with corrected arguments.\n\n" + sections.join("\n\n");
   // Targeted clarifications (model-confirmed): Workflow lives on its MCP server (not top-level), so composer read
   // files itself; and its schema marks nothing required, so it omitted the script. Make both unambiguous, ONLY
   // when the tool is actually advertised this turn.
   const advNames = adv.map((t) => (t && (t.toolName || t.name)) || "");
   const notes = [];
-  const hasExternalMcp = advNames.some((name) => (mcpServerKeyForTool(name, MCP_GROUPING) || "claude-code") !== "claude-code");
+  const hasExternalMcp = advNames.some((name) => /^_?mcp__/.test(name)
+    || (mcpServerKeyForTool(name, MCP_GROUPING) || DEFAULT_MCP_SERVER_KEY) !== DEFAULT_MCP_SERVER_KEY);
   if (hasExternalMcp) {
     notes.push("MCP tool results are delivered directly in this conversation, including large results. Consume them in place. NEVER copy a tool result into `agent-tools/<uuid>.txt`, and NEVER call file or shell tools to read such an artifact back.");
   }
   if (advNames.includes("Workflow")) {
-    notes.push("To launch a workflow, invoke the `Workflow` MCP tool NOW — it lives on its MCP server (it is NOT a top-level tool or a feature of the codebase under review). Pass `script` (inline JS: `export const meta={...}` then agent()/parallel()/pipeline()) OR `scriptPath`; a name/title-only call with neither runs nothing. In the script `agent()` is POSITIONAL — `agent('prompt text', {agentType:'general-purpose'})`, NEVER `agent({prompt,...})` (an object makes the prompt '[object Object]'); and `parallel`/`pipeline` take `() =>` thunks, never bare `agent(...)`.");
+    notes.push("To launch a workflow, invoke the `Workflow` client tool NOW (it is not a feature of the codebase under review). Pass `script` (inline JS: `export const meta={...}` then agent()/parallel()/pipeline()) OR `scriptPath`; a name/title-only call with neither runs nothing. In the script `agent()` is POSITIONAL — `agent('prompt text', {agentType:'general-purpose'})`, NEVER `agent({prompt,...})` (an object makes the prompt '[object Object]'); and `parallel`/`pipeline` take `() =>` thunks, never bare `agent(...)`.");
   }
   const subagentTool = advNames.includes("Agent") ? "Agent" : advNames.find((n) => n === "Task" || n.indexOf("Task") === 0);
   if (subagentTool) {
-    notes.push("To run work in subagents, actually invoke the `" + subagentTool + "` MCP tool with its arguments — do not merely narrate that you are delegating.");
+    notes.push("To run work in subagents, actually invoke the `" + subagentTool + "` client tool with its arguments — do not merely narrate that you are delegating.");
   }
   if (notes.length) out += "\n\n" + notes.join("\n\n");
   return out;
@@ -1364,11 +1383,81 @@ function rateLimitedKeyToRecycle(sessionsMap, platformsMap) {
   return s ? keyHash(s.cursorKey) : null;
 }
 
+const TOOL_SCHEMA_VALIDATOR_CACHE_MAX = 2048;
+const toolSchemaValidatorCache = new Map();
+
+function compileAdvertisedToolSchema(name, schema) {
+  const cacheKey = JSON.stringify(schema);
+  if (toolSchemaValidatorCache.has(cacheKey)) return toolSchemaValidatorCache.get(cacheKey);
+  let validate;
+  try {
+    if (schema.$async === true) throw new Error("asynchronous JSON Schema validation is not supported for client tools");
+    // One Ajv instance per unique schema avoids cross-harness `$id` collisions.
+    // Select the declared dialect so a harness using 2019-09 or 2020-12 is not
+    // rejected merely because Ajv's default instance targets draft-07. The
+    // compiled function is cached, so this cost is paid only once per shape.
+    const dialect = typeof schema.$schema === "string" ? schema.$schema : "";
+    const AjvForDialect = /2020-12/i.test(dialect) ? Ajv2020 : /2019-09/i.test(dialect) ? Ajv2019 : Ajv;
+    validate = new AjvForDialect({
+      allErrors: true,
+      strict: false,
+      allowUnionTypes: true,
+      coerceTypes: false,
+      useDefaults: false,
+      removeAdditional: false,
+      validateFormats: false,
+    }).compile(schema);
+  } catch (error) {
+    throw new Error(`advertised tool '${name}' has an invalid inputSchema: ${(error && error.message) || String(error)}`);
+  }
+  if (toolSchemaValidatorCache.size >= TOOL_SCHEMA_VALIDATOR_CACHE_MAX) toolSchemaValidatorCache.clear();
+  toolSchemaValidatorCache.set(cacheKey, validate);
+  return validate;
+}
+
+function validationErrorPath(error) {
+  const parts = String(error && error.instancePath || "")
+    .split("/")
+    .filter(Boolean)
+    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+  if (error && error.keyword === "required" && error.params && error.params.missingProperty) {
+    parts.push(String(error.params.missingProperty));
+  } else if (error && error.keyword === "additionalProperties" && error.params && error.params.additionalProperty) {
+    parts.push(String(error.params.additionalProperty));
+  }
+  return parts.join(".") || "arguments";
+}
+
+function advertisedToolValidationFailure(name, errors) {
+  const rawErrors = Array.isArray(errors) ? errors : [];
+  const normalized = rawErrors.slice(0, 64).map((error) => ({
+    path: validationErrorPath(error),
+    keyword: String(error && error.keyword || "schema"),
+    message: String(error && error.message || "does not match the advertised schema"),
+  }));
+  const shown = normalized.slice(0, 12);
+  const lines = shown.map((error) => `- ${error.path}: ${error.message}`);
+  if (normalized.length > shown.length) lines.push(`- … ${normalized.length - shown.length} more schema errors`);
+  return {
+    content: `Client tool '${name}' was not executed because its arguments failed the advertised JSON schema:\n${lines.join("\n")}\nRetry the same tool with every required field and the exact declared types/enums.`,
+    isError: true,
+    structuredContent: {
+      code: "client_tool_invalid_arguments",
+      tool: name,
+      errors: normalized,
+      errorCount: rawErrors.length,
+      errorsTruncated: rawErrors.length > normalized.length,
+      executed: false,
+    },
+  };
+}
+
 class AdvertisedToolRegistry {
-  constructor() { this.tools = Object.freeze([]); this.byName = new Map(); }
+  constructor() { this.tools = Object.freeze([]); this.byName = new Map(); this.validators = new Map(); }
   replace(tools) {
     const next = [];
     const byName = new Map();
+    const validators = new Map();
     for (const tool of Array.isArray(tools) ? tools : []) {
       const name = tool && (tool.toolName || tool.name);
       if (!name || typeof name !== "string") throw new Error("advertised tool is missing a string name");
@@ -1378,13 +1467,20 @@ class AdvertisedToolRegistry {
       if (byName.has(name)) throw new Error(`advertised tool '${name}' appears more than once`);
       const normalized = Object.freeze({ ...tool, name, toolName: name, inputSchema });
       byName.set(name, normalized);
+      validators.set(name, compileAdvertisedToolSchema(name, inputSchema));
       next.push(normalized);
     }
     this.byName = byName;
+    this.validators = validators;
     this.tools = Object.freeze(next);
   }
   all() { return this.tools; }
   find(name) { return this.byName.get(name) || null; }
+  validate(name, input) {
+    const validate = this.validators.get(name);
+    if (!validate || validate(input)) return null;
+    return advertisedToolValidationFailure(name, validate.errors);
+  }
   scoped(toolChoice) { return effectiveAdvertise(this.tools, toolChoice); }
 }
 
@@ -1436,6 +1532,10 @@ class Session {
                                   // tool calls are journaled by ToolRound). Cleared at clearTurnState.
     this.pendingDeltaBytes = 0;   // running byte size of pendingDeltas (bounded like outQueue)
     this.toolRegistry = new AdvertisedToolRegistry();
+    // Exact MCP server keys passed to the current SDK agent handle. The
+    // generic key is always included and absorbs tools whose natural server
+    // appears only after the durable agent's fixed mcpServers map was built.
+    this.mcpServerKeys = null;
     this.activeAdvertise = null;  // ADD-40: the TURN-SCOPED effective advertised set (gated by tool_choice) for
                                   // the LIFETIME of the live run. `advertise` is restored to the full set right
                                   // after agent.send (it is needed for cross-turn refresh + re-seed), but the
@@ -1463,6 +1563,8 @@ class Session {
     this.syntheticArtifactBlockedPaths = new Set();
     this.syntheticArtifactRejects = 0;
     this.lastActivity = nowMs();
+    this.lastSdkActivityAt = this.lastActivity;
+    this.lastStallLogAt = 0;
     this.done = false;
     this.tail = Promise.resolve();   // per-session FIFO chain: each new-user turn runs after the prior one's run completes
     this.waiters = 0;                // new-user turns queued but not yet running (single source of truth for depth-cap + eviction safety)
@@ -1475,6 +1577,7 @@ class Session {
     this.toolRounds = 0;             // tool-result rounds taken by the CURRENT logical run (pauseForTools cycles)
     this.lastToolSig = null;         // signature (name+args) of the SOLE tool in the last single-tool round, or null
     this.repeatToolCount = 0;        // consecutive single-tool rounds whose signature equals lastToolSig
+    this.invalidToolCalls = 0;       // schema-rejected calls handled inside the bridge (no client round allocated)
     this.loopTripped = false;        // latched true once a loop bound trips, so we terminate the run only once
   }
 
@@ -1618,12 +1721,32 @@ class Session {
     return normalized;
   }
 
+  validateClientToolInput(name, input) {
+    const failure = this.toolRegistry.validate(name, input);
+    if (!failure) return null;
+    this.invalidToolCalls++;
+    dbg("client tool schema preflight rejected before handoff", "session=" + this.id,
+      "name=" + name, "invalidCalls=" + this.invalidToolCalls,
+      "errors=" + safeJson(failure.structuredContent && failure.structuredContent.errors));
+    if (this.invalidToolCalls >= COMPOSER_MAX_INVALID_TOOL_CALLS) {
+      const reason = `composer run exceeded the invalid client-tool call bound (${COMPOSER_MAX_INVALID_TOOL_CALLS}); aborting a likely schema-retry loop`;
+      failure.content += `\n${reason}`;
+      failure.structuredContent.limitExceeded = true;
+      this.tripLoopBound(reason);
+    }
+    return failure;
+  }
+
   openClientTool({ source, rawToolCallId, name, input, resultAdapter }) {
     input = this.normalizeClientToolInput(name, input);
     const syntheticFailure = this.syntheticArtifactFailure(name, input);
     if (syntheticFailure) {
       dbg("synthetic agent-tools artifact blocked", "session=" + this.id, "source=" + source, "name=" + name);
       return Promise.resolve(resultAdapter ? resultAdapter(syntheticFailure) : syntheticFailure);
+    }
+    const validationFailure = this.validateClientToolInput(name, input);
+    if (validationFailure) {
+      return Promise.resolve(resultAdapter ? resultAdapter(validationFailure) : validationFailure);
     }
     const round = this.ensureToolRound();
     return new Promise((resolve, reject) => {
@@ -1876,7 +1999,7 @@ class Session {
   // resetLoopBounds clears the per-logical-run agentic-loop counters (ADD-106). Called when a FRESH send starts a
   // new logical run (driveUserSend) — NOT on a tool_results resume, which continues the SAME logical run and so
   // keeps accumulating rounds. A cancel/supersession also resets them via the next fresh send.
-  resetLoopBounds() { this.toolRounds = 0; this.lastToolSig = null; this.repeatToolCount = 0; this.loopTripped = false; this.stashedToolResultImages = []; }
+  resetLoopBounds() { this.toolRounds = 0; this.lastToolSig = null; this.repeatToolCount = 0; this.invalidToolCalls = 0; this.loopTripped = false; this.stashedToolResultImages = []; }
 
   // checkLoopBound (ADD-106) counts ONE tool-result round (the batch about to be delivered in pauseForTools) and
   // enforces the per-logical-run bounds. Returns true when a bound TRIPPED (the run was terminated as an error
@@ -1918,7 +2041,8 @@ class Session {
     if (this.loopTripped) return;
     this.loopTripped = true;
     this.lastRunError = reason; // BR2: a later tool_results that finds the run gone surfaces this real error
-    dbg("tripLoopBound", "session=" + this.id, "rounds=" + this.toolRounds, "repeat=" + this.repeatToolCount, reason);
+    dbg("tripLoopBound", "session=" + this.id, "rounds=" + this.toolRounds,
+      "repeat=" + this.repeatToolCount, "invalid=" + this.invalidToolCalls, reason);
     this.rejectAllPending(reason, TerminalReason.LOOP_BOUND);
     this.sse({ type: "turn_end", stop_reason: "error", error: reason });
     this.settle();
@@ -2141,6 +2265,7 @@ class Session {
     // Null the closed agent handle so a surviving queued waiter (the session is kept when waiters remain)
     // re-resumes/recreates a live agent via ensureAgent instead of reusing this dead one.
     this.agent = null; this.agentPromise = null;
+    this.mcpServerKeys = null;
     this.settle();
     if (notify) this.notifyLogicalDone(); // run torn down -> release any queued waiter so the chain advances
   }
@@ -2254,8 +2379,12 @@ async function ensureAgent(session, model) {
     // and applied to BOTH the resume and create branches below (they spread the same opts).
     try {
       const servers = buildMcpServers(session);
-      if (servers && Object.keys(servers).length) opts.mcpServers = servers;
+      if (servers && Object.keys(servers).length) {
+        opts.mcpServers = servers;
+        session.mcpServerKeys = Object.freeze(Object.keys(servers));
+      }
     } catch (e) {
+      session.mcpServerKeys = null;
       dbg("ensureAgent buildMcpServers failed (continuing native-only)", "session=" + session.id, (e && e.message) || String(e));
     }
     // C05: resume/create against the DURABLE agentId (rotates on too-long), not the external session id.
@@ -2322,36 +2451,52 @@ async function ensureAgent(session, model) {
 // answers on a later /agent/continue request.
 
 // mcpServerKeyForTool maps an advertised tool NAME to its server key under the active grouping. Pure helper.
-//   one      -> always "cc".
-//   natural  -> mcp__<server>__<tool> -> sanitize(<server>); everything else -> "claude-code".
+//   one      -> always the generic client-tools key.
+//   natural  -> mcp__<server>__<tool> -> sanitize(<server>); everything else -> client-tools.
 //   per-tool -> sanitize(<toolName>) (one server per tool).
-// sanitize restricts a key to a URL-safe segment [A-Za-z0-9_.-] (other chars -> "-").
-function mcpSanitizeKey(s) { return String(s || "").replace(/[^A-Za-z0-9_.-]/g, "-"); }
+// sanitize restricts a key to a URL-safe segment [A-Za-z0-9_.-] (other chars ->
+// "-") and excludes exact dot segments, which URL clients may normalize away.
+function mcpSanitizeKey(s) {
+  const key = String(s || "").replace(/[^A-Za-z0-9_.-]/g, "-");
+  if (key === ".") return "server-dot";
+  if (key === "..") return "server-dotdot";
+  return key || DEFAULT_MCP_SERVER_KEY;
+}
 function mcpServerKeyForTool(name, grouping = MCP_GROUPING) {
   const n = String(name || "");
-  if (grouping === "one") return "cc";
+  if (grouping === "one") return DEFAULT_MCP_SERVER_KEY;
   if (grouping === "per-tool") return mcpSanitizeKey(n);
   // natural: reconstruct the originating MCP server from the mcp__<server>__<tool> convention. Non-greedy
   // first group so the FIRST "__" after the prefix delimits server vs tool (a server token may itself carry
   // single underscores, e.g. plugin_chrome-devtools-mcp_chrome-devtools, but never "__").
   const m = n.match(/^mcp__(.+?)__(.+)$/);
-  return m ? mcpSanitizeKey(m[1]) : "claude-code";
+  return m ? mcpSanitizeKey(m[1]) : DEFAULT_MCP_SERVER_KEY;
 }
 
 // mcpToolsForServer returns the slice of the session's advertised tools that belongs to serverKey under the
-// active grouping. For grouping "one" (serverKey "cc" / empty) it returns ALL advertised tools. Recomputed
+// active grouping. For grouping "one" it returns ALL advertised tools. In natural grouping, an omitted HTTP
+// path key means the generic client-tools bucket; it must not duplicate tools from named MCP server buckets. Recomputed
 // per request (never cached) because session.advertise can change per turn. Each entry is shaped for
 // tools/list: {name, description, inputSchema} with a valid object inputSchema default.
 function mcpToolsForServer(session, serverKey, grouping = MCP_GROUPING) {
   // ADD-40: tools/list during a live run reflects the turn-scoped effective set (tool_choice-gated), so a
   // none/specific run does not even ADVERTISE a disallowed tool through the shim.
   const adv = (session && session.advertiseForGating && session.advertiseForGating()) || (session && session.advertise) || [];
-  const all = grouping === "one" || !serverKey || serverKey === "cc";
+  const effectiveServerKey = serverKey || DEFAULT_MCP_SERVER_KEY;
+  const all = grouping === "one";
+  const configuredKeys = session && Array.isArray(session.mcpServerKeys)
+    ? new Set(session.mcpServerKeys)
+    : null;
   const out = [];
   for (const t of adv) {
     const name = t.toolName || t.name;
     if (!name) continue;
-    if (!all && mcpServerKeyForTool(name, grouping) !== serverKey) continue;
+    let assignedServerKey = mcpServerKeyForTool(name, grouping);
+    // The SDK agent's mcpServers map is fixed for the lifetime of its current
+    // handle. Route tools from a newly appearing natural/per-tool server over
+    // the always-dialed generic server instead of making them disappear.
+    if (!all && configuredKeys && !configuredKeys.has(assignedServerKey)) assignedServerKey = DEFAULT_MCP_SERVER_KEY;
+    if (!all && assignedServerKey !== effectiveServerKey) continue;
     const schema = t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : { type: "object" };
     // Inject a schema-derived argument contract (+ any per-tool extra) so the model calls each tool with its exact
     // arg shape and never conflates tools. ONLY in what composer reads here; session.advertise stays untouched.
@@ -2364,7 +2509,7 @@ function mcpToolsForServer(session, serverKey, grouping = MCP_GROUPING) {
 // session, or {} when the shim is off (DEFAULT ON; off only when CURSOR_COMPOSER_MCP_SHIM is "0"/"false").
 // Every server is the same loopback http shape; only the SET of keys + the per-key tool slice differ by
 // grouping. The url carries the sessionId (authoritative) and, when grouping != "one", the serverKey segment;
-// a belt-and-suspenders X-CC-Session header is sent too (our handler ignores it — the path is authoritative).
+// a belt-and-suspenders generic client-tools header is sent too (our handler ignores it — the path is authoritative).
 // MUST be fail-safe: any throw returns {} so a shim bug can never break the working native path. R5: under
 // "natural", if two distinct server tokens sanitize to the SAME key, degrade this session to "one" (correct
 // full tool names are unchanged regardless) and log a dbg line.
@@ -2375,17 +2520,24 @@ function buildMcpServers(session) {
     const sid = session.id;
     const mkServer = (serverKey) => ({
       type: "http",
-      url: `http://127.0.0.1:${PORT}/mcp/${sid}` + (serverKey && serverKey !== "cc" ? `/${serverKey}` : ""),
-      headers: { "X-CC-Session": sid },
+      url: `http://127.0.0.1:${PORT}/mcp/${sid}` + (serverKey && serverKey !== DEFAULT_MCP_SERVER_KEY ? `/${serverKey}` : ""),
+      headers: { "X-Client-Tools-Session": sid },
     });
     // Comment 6: register at least ONE session-scoped loopback server even when the CURRENT turn advertises NO
     // tools. The durable agent's mcpServers map is fixed when the agent is first created/resumed; if we returned
     // {} on a tool-less first turn, the SDK would never dial /mcp and a tool advertised on a LATER turn could not
     // surface (tools/list reads session.advertise DYNAMICALLY, so the empty server still picks up later tools
     // without rotating the durable agent). Always-register is the simpler path (no advertise-transition rotation).
-    if (!adv.length) { dbg("buildMcpServers: no tools this turn -> register one empty session server (Comment 6)", "session=" + sid); return { cc: mkServer("cc") }; }
-    if (MCP_GROUPING === "one") return { cc: mkServer("cc") };
-    const servers = {};
+    if (!adv.length) {
+      dbg("buildMcpServers: no tools this turn -> register one empty generic session server (Comment 6)", "session=" + sid);
+      return { [DEFAULT_MCP_SERVER_KEY]: mkServer(DEFAULT_MCP_SERVER_KEY) };
+    }
+    if (MCP_GROUPING === "one") return { [DEFAULT_MCP_SERVER_KEY]: mkServer(DEFAULT_MCP_SERVER_KEY) };
+    // Always dial the generic server. Besides hosting ordinary harness tools,
+    // it is the overflow route for a natural/per-tool server that appears on a
+    // later turn after the SDK agent's server map has become fixed.
+    const servers = Object.create(null);
+    servers[DEFAULT_MCP_SERVER_KEY] = mkServer(DEFAULT_MCP_SERVER_KEY);
     // R5 collision guard (natural only): detect two distinct server tokens collapsing to one URL-safe key.
     const seenRaw = new Map(); // sanitizedKey -> rawServerToken (for the collision check)
     for (const t of adv) {
@@ -2394,15 +2546,15 @@ function buildMcpServers(session) {
       const key = mcpServerKeyForTool(name, MCP_GROUPING);
       if (MCP_GROUPING === "natural") {
         const m = name.match(/^mcp__(.+?)__(.+)$/);
-        const raw = m ? m[1] : "claude-code";
+        const raw = m ? m[1] : DEFAULT_MCP_SERVER_KEY;
         const prev = seenRaw.get(key);
         if (prev !== undefined && prev !== raw) {
           dbg("buildMcpServers natural key collision -> degrade to one", "session=" + sid, "key=" + key, "a=" + prev, "b=" + raw);
-          return { cc: mkServer("cc") };
+          return { [DEFAULT_MCP_SERVER_KEY]: mkServer(DEFAULT_MCP_SERVER_KEY) };
         }
         seenRaw.set(key, raw);
       }
-      if (!servers[key]) servers[key] = mkServer(key);
+      if (!Object.hasOwn(servers, key)) servers[key] = mkServer(key);
     }
     return servers;
   } catch (e) {
@@ -2417,23 +2569,25 @@ function buildMcpServers(session) {
 // behavior) made the backend expose ZERO MCP tools even though the loopback servers were dialed + tools/list'd,
 // so composer never invoked an advertised MCP tool (observed dispatchMcp=0, no tools/call). We report each
 // DIALED loopback server (buildMcpServers is the authoritative set — same keys, INCL. the Comment-6
-// always-register-"cc" and the natural collision-degrade) with its currently-enabled tool slice
+// always-register generic server and the natural collision-degrade) with its currently-enabled tool slice
 // (mcpToolsForServer is tool_choice-gated, ADD-40). server_identifier == the dialed server key so the runtime
-// correlates a state server to its dialed counterpart; tool name == tool_name and providerIdentifier:"cc"
-// match the run-request mcp_tools advertise so the backend treats them as the SAME tool; status:"connected" is
+// correlates a state server to its dialed counterpart; tool name == tool_name and the provider identifier
+// matches the run-request mcp_tools advertise so the backend treats them as the SAME tool; status:"connected" is
 // the runtime's "ready" value (a "needsAuth" server is filtered out). Fail-safe: empty/absent advertise (or
 // shim off) -> { servers: [] }, an HONEST "no servers" success (never a fabricated tool, strictly better than
 // the old error); any throw falls back to the typed-unavailable error (no worse than before). HANDLER change
 // only — the exec was already routed to __CC_EXEC_U by the patch, exactly like requestContextArgs.
 function headlessMcpState(session) {
   try {
-    const dialed = buildMcpServers(session); // authoritative dialed-server set; keys match what the SDK dialed
+    const dialed = Array.isArray(session && session.mcpServerKeys)
+      ? Object.fromEntries(session.mcpServerKeys.map((key) => [key, true]))
+      : buildMcpServers(session); // before agent creation, derive the exact set that will be dialed
     const servers = [];
     for (const key of Object.keys(dialed)) {
       const tools = mcpToolsForServer(session, key).map((t) => ({
         name: t.name,
         toolName: t.name, // dispatchMcp reconciles by name; keep tool_name == name
-        providerIdentifier: "cc", // matches the run-request mcp_tools provider so it is the SAME tool
+        providerIdentifier: CLIENT_TOOL_PROVIDER_ID,
         description: t.description || "",
         inputSchema: t.inputSchema && typeof t.inputSchema === "object" ? t.inputSchema : { type: "object" },
       }));
@@ -2466,7 +2620,7 @@ async function mcpDispatch(msg, sessionId, serverKey) {
     switch (method) {
       case "initialize": {
         const ver = (params && typeof params.protocolVersion === "string" && params.protocolVersion) || "2025-06-18";
-        dbg("mcp initialize", "session=" + sessionId, "serverKey=" + (serverKey || "cc"), "protocol=" + ver);
+        dbg("mcp initialize", "session=" + sessionId, "serverKey=" + (serverKey || DEFAULT_MCP_SERVER_KEY), "protocol=" + ver);
         return mcpResult(id, { protocolVersion: ver, capabilities: { tools: {} }, serverInfo: { name: "cursor-composer-clienttools", version: "1" } });
       }
       case "notifications/initialized":
@@ -2477,7 +2631,7 @@ async function mcpDispatch(msg, sessionId, serverKey) {
       case "tools/list": {
         const session = sessions.get(sessionId);
         const tools = session ? mcpToolsForServer(session, serverKey) : [];
-        dbg("mcp tools/list", "session=" + sessionId, "serverKey=" + (serverKey || "cc"), "count=" + tools.length);
+        dbg("mcp tools/list", "session=" + sessionId, "serverKey=" + (serverKey || DEFAULT_MCP_SERVER_KEY), "count=" + tools.length);
         dbgToolFormat("tools/list", sessionId, serverKey, tools); // verbose: the exact per-tool schema the model receives
         // Return everything; omit nextCursor (a few hundred tools is fine, no real pagination needed).
         return mcpResult(id, { tools });
@@ -2486,7 +2640,7 @@ async function mcpDispatch(msg, sessionId, serverKey) {
         const want = (params && params.name) || "";
         const input = (params && params.arguments) || {};
         const session = sessions.get(sessionId);
-        dbg("mcp tools/call", "session=" + sessionId, "serverKey=" + (serverKey || "cc"), "name=" + want);
+        dbg("mcp tools/call", "session=" + sessionId, "serverKey=" + (serverKey || DEFAULT_MCP_SERVER_KEY), "name=" + want);
         if (!session) {
           // Degrade, never fake success: an unknown/expired session yields a typed isError tool result.
           return mcpResult(id, { content: [{ type: "text", text: `session ${sessionId} not found (bridge restart or idle eviction); the tool call cannot be routed` }], isError: true });
@@ -2595,6 +2749,7 @@ function streamCallbacks(session, ep) {
     onDelta: ({ update }) => {
       try {
         if (!live()) return; // #13: drop a dead/superseded run's late delta — never leak into a successor turn
+        session.lastSdkActivityAt = nowMs();
         const ty = update && (update.type || update.case);
         const txt = update && (update.text != null ? update.text : (update.value && update.value.text));
         if (ty === "text-delta" && txt) {
@@ -2629,6 +2784,7 @@ function streamCallbacks(session, ep) {
     onStep: (step) => {
       if (!live()) return; // #13: ignore a dead run's step callback
       try {
+        session.lastSdkActivityAt = nowMs();
         dbg("onStep PROBE", "session=" + session.id, "toolBatch=" + session.activeToolBatch().length,
           "queued=" + session.queuedToolCalls().length, "activeRes=" + !!session.activeRes,
           "shape=" + safeJson(step && typeof step === "object" ? Object.keys(step) : typeof step));
@@ -2663,7 +2819,7 @@ function dbgToolFormat(tag, sessionId, serverKey, tools) {
       return nm + "{d=" + (t && t.description ? String(t.description).length : 0) + " p=" + props + keyStr + " r=" + req + (bare ? " BARE" : "") + "}";
     });
     const bareN = parts.filter((p) => p.indexOf(" BARE}") >= 0).length;
-    dbg(tag + " TOOLFMT", "session=" + sessionId, "serverKey=" + (serverKey || "cc"), "n=" + parts.length, "bareSchema=" + bareN, parts.join(" "));
+    dbg(tag + " TOOLFMT", "session=" + sessionId, "serverKey=" + (serverKey || DEFAULT_MCP_SERVER_KEY), "n=" + parts.length, "bareSchema=" + bareN, parts.join(" "));
   } catch { /* never throw from a probe */ }
 }
 
@@ -3176,6 +3332,16 @@ async function handleContinue(req, res, body, cursorKey) {
     continuationFailure(res, 422, "empty_tool_results", "a continuation requires at least one tool result");
     return;
   }
+  let preparedToolRegistry;
+  try {
+    // Validate the replacement registry before touching a durable result
+    // receipt. A malformed schema must never create the crash boundary
+    // "result committed, callback not resumed".
+    preparedToolRegistry = prepareAdvertisedToolRegistry(body);
+  } catch (error) {
+    continuationFailure(res, 422, "invalid_advertised_tools", (error && error.message) || String(error));
+    return;
+  }
   try {
     const { codec, journal } = getRoundInfrastructure();
     const parsed = results.map((result) => codec.parse(result && result.toolCallId));
@@ -3207,7 +3373,7 @@ async function handleContinue(req, res, body, cursorKey) {
       if (!session || session.currentRound !== round) {
         try { round.terminalize(TerminalReason.RESTART_LOST, "live round lost its owning Session"); } catch {}
       } else {
-        refreshSessionFromBody(session, body);
+        refreshSessionFromBody(session, body, preparedToolRegistry);
         const constraints = {
           toolChoice: body.toolChoice || "",
           responseFormat: body.responseFormat,
@@ -3260,7 +3426,7 @@ async function handleContinue(req, res, body, cursorKey) {
     session.recoverySourceRound = round;
     session.resetSeedState();
     sessions.set(session.id, session);
-    refreshSessionFromBody(session, body);
+    refreshSessionFromBody(session, body, preparedToolRegistry);
     round.recordRecovery({
       at: nowMs(),
       decision: "faithful_reseed",
@@ -3305,6 +3471,13 @@ async function handleTurn(req, res, body, cursorKey) {
   // Validate BEFORE opening the SSE so we can return a real HTTP status.
   if (!sessionId) { fail(400, "sessionId is required"); return; }
   if (!validClientEnv(body.clientEnv)) body.clientEnv = { workspaceUnknown: true };
+  let preparedToolRegistry;
+  try {
+    preparedToolRegistry = prepareAdvertisedToolRegistry(body);
+  } catch (error) {
+    fail(422, (error && error.message) || String(error));
+    return;
+  }
 
   // Upstream rate-limit circuit breaker: while OPEN for this key, fast-fail NEW runs with a clear 429 so client
   // retries back off instead of re-poisoning the freshly-recycled HTTP/2 connection. tool_results continuations
@@ -3357,7 +3530,7 @@ async function handleTurn(req, res, body, cursorKey) {
       await session.rotateForKeyChange(cursorKey);
     }
   }
-  refreshSessionFromBody(session, body);
+  refreshSessionFromBody(session, body, preparedToolRegistry);
   // ADD-37 (extended by ADD-106): a plain NEW-USER turn that arrives while a run is still LIVE on this session
   // is an INTERRUPTION, not a concurrent generation — the user is steering, so the old run must yield to the
   // new instruction. Two sub-cases, both now interrupted:
@@ -3454,12 +3627,19 @@ function enqueueTurn(req, res, session, model, input, constraints) {
   }).finally(() => { releaseNext(); });
 }
 
-function refreshSessionFromBody(session, body) {
-  if (Array.isArray(body.tools)) {
-    session.advertise = body.tools.map((t) => ({
-      name: t.name, toolName: t.name, providerIdentifier: "cc", description: t.description || "",
+function prepareAdvertisedToolRegistry(body) {
+  if (!Array.isArray(body && body.tools)) return undefined;
+  const registry = new AdvertisedToolRegistry();
+  registry.replace(body.tools.map((t) => ({
+      name: t.name, toolName: t.name, providerIdentifier: CLIENT_TOOL_PROVIDER_ID, description: t.description || "",
       inputSchema: augmentUnderspecifiedToolSchema(t.name, t.inputSchema || t.parameters || undefined),
-    }));
+  })));
+  return registry;
+}
+
+function refreshSessionFromBody(session, body, preparedToolRegistry = undefined) {
+  if (Array.isArray(body.tools)) {
+    session.toolRegistry = preparedToolRegistry || prepareAdvertisedToolRegistry(body);
   }
   if (body.clientEnv && typeof body.clientEnv === "object") {
     session.clientEnv = body.clientEnv;
@@ -3494,6 +3674,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   let keepalive = null;
   try {
     session.beginResponse(res); session.touch(); session.turnToken++;
+    session.lastStallLogAt = 0;
     session.toolChoice = (constraints && constraints.toolChoice) || "";
     session.settleTurn = settleOnce;
     res.on("close", onClose);
@@ -3503,7 +3684,19 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
 
     // Keepalive through same writer (truthful signal), skip if blocked handled inside sse
     keepalive = setInterval(() => {
-      try { session.sse({ type: "ping" }); } catch {}
+      try {
+        session.sse({ type: "ping" });
+        const now = nowMs();
+        const quietMs = Math.max(0, now - session.lastSdkActivityAt);
+        if (quietMs >= COMPOSER_STALL_LOG_MS
+            && (session.lastStallLogAt === 0 || now - session.lastStallLogAt >= COMPOSER_STALL_LOG_MS)) {
+          session.lastStallLogAt = now;
+          dbg("runTurn awaiting SDK progress (observability only; no upstream timeout)",
+            "session=" + session.id, "quietMs=" + quietMs, "runLive=" + (session.run !== null),
+            "pending=" + session.pendingCount(), "queued=" + session.queuedToolCalls().length,
+            "activeRes=" + !!session.activeRes);
+        }
+      } catch {}
     }, SSE_KEEPALIVE_MS);
     if (keepalive.unref) keepalive.unref();
 
@@ -3518,6 +3711,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     userText = appendRulesReminder(userText); // CURSOR_COMPOSER_USER_MSG_REMINDER: standing per-turn nudge (off by default)
     session.streamedText = "";   // reset per user turn (NOT across tool-result continuations within a run)
     session.reasonedThisRun = false; // #15: mirror streamedText — reasoning-produced tracking spans this run
+    session.lastSdkActivityAt = nowMs();
     session.resetLoopBounds();   // ADD-106: a fresh send begins a new logical run -> reset the agentic-loop counters
     session.done = false;
     session.lastRunError = null;  // BR2: a fresh run starts clean; a prior run's error must not leak forward
@@ -3757,6 +3951,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         await driveUserSend(recoveryText, fallbackImages);
       } else {
         const applied = round.applyCommittedResults(committedIds);
+        if (applied.length > 0) session.lastSdkActivityAt = nowMs();
         const remaining = round.pendingCount;
         dbg("runTurn durable tool_results", "session=" + session.id, "committed=" + committedIds.length,
           "applied=" + applied.length, "remaining=" + remaining, "runLive=" + (session.run !== null));
@@ -4234,5 +4429,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, buildRestartRecoveryInput, continuationTenantMismatch, sessions, liveToolRounds, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, buildRestartRecoveryInput, continuationTenantMismatch, sessions, liveToolRounds, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }
