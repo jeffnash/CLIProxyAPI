@@ -1,11 +1,30 @@
 {
   "$schema": "https://schema.railpack.com",
-  "provider": "go",
+  "provider": "golang",
   "packages": {
     "go": "1.26",
     "node": "22"
   },
+  "buildAptPackages": [
+    "g++",
+    "make",
+    "python3"
+  ],
+  "steps": {
+    "build": {
+      "commands": [
+        "...",
+        "cp out cli-proxy-api && chmod +x cli-proxy-api",
+        "cd sidecars/cursor-bridge && npm ci && npm test && npm run selftest"
+      ]
+    }
+  },
   "deploy": {
+    "startCommand": "bash scripts/railway_start.sh",
+    "variables": {
+      "BAKED_SERVER_REQUIRED": "1",
+      "NODE_ENV": "production"
+    },
     "aptPackages": [
       "bash",
       "ca-certificates",

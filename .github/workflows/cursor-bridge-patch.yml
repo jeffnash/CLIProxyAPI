@@ -1,7 +1,7 @@
 name: cursor-bridge patch verify
 
 # Verifies, on a clean tree, that the Cursor Cursor Composer Client-Tools sidecar installs and the @cursor/sdk patch
-# applies correctly (anchors + version pin + SHA). Catches SDK drift before release.
+# applies correctly (AST seams + exact version/hashes + descriptor). Catches SDK drift before release.
 on:
   push:
     paths:
@@ -28,26 +28,22 @@ jobs:
         run: npm ci
       - name: Unit tests (npm test)
         run: npm test
-      - name: Verify the loaded CJS bundle is patched
+      - name: Verify the installed SDK against the structural patch descriptor
         run: |
           node -e '
-            const { createRequire } = require("module");
+            const patcher = require("./scripts/apply-clienttools-patch.cjs");
             const path = require("path");
-            const req = createRequire(process.cwd() + "/cursor-agent-bridge.mjs");
-            const p = req.resolve("@cursor/sdk");
-            if (!p.endsWith("dist/cjs/index.js")) { console.error("resolved non-cjs:", p); process.exit(1); }
             const fs = require("fs");
-            const indexSrc = fs.readFileSync(p, "latin1");
-            if (!indexSrc.includes("cursor-composer-clienttools-eager-v1")) {
-              console.error("MISSING index eager-load marker:", p);
-              process.exit(1);
-            }
-            const chunk = path.join(path.dirname(p), "973.js");
-            const src = fs.readFileSync(chunk, "latin1");
-            for (const m of ["cursor-composer-clienttools-patched-v1", "__CC_EXEC_U", "__CC_EXEC_S", "__CC_GET_ADVERTISE__", "__CC_ALLOW_NATIVE", "__CC_SELFTEST_DISPATCH_U", "__CC_SELFTEST_DISPATCH_S"]) {
-              if (!src.includes(m)) { console.error("MISSING patch marker:", m); process.exit(1); }
-            }
-            console.log("patched bundle verified:", chunk);
+            const root = path.join(process.cwd(), "node_modules", "@cursor", "sdk");
+            const descriptor = JSON.parse(fs.readFileSync(path.join(root, patcher.DESCRIPTOR_REL), "utf8"));
+            const version = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
+            patcher.validateDescriptor({
+              descriptor,
+              version,
+              bundleSource: fs.readFileSync(path.join(root, patcher.BUNDLE_REL), "latin1"),
+              indexSource: fs.readFileSync(path.join(root, patcher.INDEX_REL), "latin1"),
+            });
+            console.log("structural patch descriptor verified", descriptor);
           '
       - name: Run bridge fail-closed self-tests against the patched bundle
         run: npm run selftest

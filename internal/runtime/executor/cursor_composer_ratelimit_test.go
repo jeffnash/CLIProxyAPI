@@ -24,10 +24,10 @@ func TestComposerBridgeRateLimitStatusError(t *testing.T) {
 		}
 	}
 
-	// A 410 keeps its lost-continuation guidance (must not collapse into the 429 branch).
+	// A 410 keeps its lost-continuation guidance (must not collapse into the 429 branch). Per section 8, message now says round_lost.
 	gone := (&composerBridgeStatusError{status: composerBridgeStatusGone, correlation: "c2"}).Error()
-	if !strings.Contains(gone, "re-seed") {
-		t.Fatalf("410 Error() = %q, missing re-seed guidance", gone)
+	if !strings.Contains(gone, "round_lost") {
+		t.Fatalf("410 Error() = %q, missing round_lost", gone)
 	}
 
 	// An arbitrary non-2xx keeps the generic status message.

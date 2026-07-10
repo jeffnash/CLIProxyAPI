@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -25,10 +24,18 @@ func authWith(id, apiKey string) *cliproxyauth.Auth {
 }
 func optsWithHeaders(h map[string]string) cliproxyexecutor.Options {
 	hdr := http.Header{}
+	hdr.Set("X-Cwd", "/tmp/cliproxy-test-workspace")
+	hdr.Set("X-Workspace-Path", "/tmp/cliproxy-test-workspace")
 	for k, v := range h {
 		hdr.Set(k, v)
 	}
 	return cliproxyexecutor.Options{Headers: hdr}
+}
+
+func composerExecOpts(format, conv string) cliproxyexecutor.Options {
+	opts := optsWithHeaders(map[string]string{"X-Conversation-Id": conv})
+	opts.SourceFormat = sdktranslator.FromString(format)
+	return opts
 }
 
 // toolTurn builds an OpenAI-shape payload for a real agentic turn (it advertises a tool), so it is NOT
@@ -163,44 +170,6 @@ func TestDeriveComposerSessionID_StatelessMint(t *testing.T) {
 	s2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"), cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_x_account__session_uuid-2"}}`)})
 	if s1 == s2 {
 		t.Fatalf("different Claude session uuids must differ")
-	}
-}
-
-// Comment 1: a continuation (tool_results) turn with no stable id routes by a previously emitted
-// tool_call_id. EX6: an unknown tool_call_id with no stable id no longer errors — it DEGRADES GRACEFULLY by
-// minting a fresh session (the continuation carries history+system, so the bridge re-seeds).
-func TestDeriveComposerSessionID_ToolCallContinuation(t *testing.T) {
-	auth := authWith("authA", "keyA")
-	sid, err := deriveComposerSessionID(auth, "cursorkey", toolTurn("start"), optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-x"}))
-	if err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	composerOwnership.record(composerTenant(auth, cliproxyexecutor.Options{}), "tc_42", sid)
-	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_42"}]},{"role":"tool","tool_call_id":"tc_42","content":"R"}]}`)
-	got, err := deriveComposerSessionID(auth, "cursorkey", cont, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("continuation should route by tool_call_id: %v", err)
-	}
-	if got != sid {
-		t.Fatalf("continuation routed to wrong session: %s vs %s", got, sid)
-	}
-	// EX6: an unknown tool_call_id with no stable id MINTS a fresh session (degrade-gracefully, never 500).
-	unknown := []byte(`{"messages":[{"role":"tool","tool_call_id":"tc_unknown","content":"R"}]}`)
-	gotU, errU := deriveComposerSessionID(auth, "cursorkey", unknown, cliproxyexecutor.Options{})
-	if errU != nil {
-		t.Fatalf("unknown tool_call_id with no stable id must NOT error (EX6 degrade-gracefully): %v", errU)
-	}
-	if !strings.HasPrefix(gotU, "sess_") {
-		t.Fatalf("unknown continuation must mint a fresh sess_ id, got %q", gotU)
-	}
-	// L1: the SAME tool_call_id under a DIFFERENT tenant must NOT resolve to the first tenant's session. With
-	// EX6 it no longer errors; it mints a fresh session DISTINCT from the first tenant's emitting session.
-	gotB, errB := deriveComposerSessionID(authWith("authB", "keyB"), "cursorkey", cont, cliproxyexecutor.Options{})
-	if errB != nil {
-		t.Fatalf("cross-tenant continuation must not error (EX6): %v", errB)
-	}
-	if gotB == sid {
-		t.Fatalf("cross-tenant tool_call_id reuse must NOT resolve to tenant A's session (got %s)", gotB)
 	}
 }
 
@@ -552,7 +521,7 @@ func TestExecuteComposerStreamBridgeErrorSurfaces(t *testing.T) {
 	auth := &cliproxyauth.Auth{ID: "t", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
 	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Read"}}]}`)}
 	sr, err := e.executeComposerStream(context.Background(), auth, "k", req,
-		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"err1"}}})
+		composerExecOpts("openai", "err1"))
 	if err != nil {
 		t.Fatalf("stream setup: %v", err)
 	}
@@ -748,7 +717,7 @@ func TestExecuteComposerNonStream(t *testing.T) {
 	e := NewCursorExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{ID: "authT", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
 	mkOpts := func() cliproxyexecutor.Options {
-		return cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"conv-nonstream"}}}
+		return composerExecOpts("openai", "conv-nonstream")
 	}
 	mkReq := func(text string) cliproxyexecutor.Request {
 		payload := []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"` + text + `"}],"tools":[{"type":"function","function":{"name":"Read","description":"read a file","parameters":{"type":"object"}}}]}`)
@@ -839,7 +808,7 @@ func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 	// the typed ping (an empty delta lazily emits message_start), so the ping is never the first frame.
 	claudeReq := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"name":"Read","input_schema":{"type":"object"}}]}`)}
 	srA, err := e.executeComposerStream(context.Background(), auth, "k", claudeReq,
-		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), Headers: http.Header{"X-Conversation-Id": []string{"ping-a"}}})
+		composerExecOpts("claude", "ping-a"))
 	if err != nil {
 		t.Fatalf("stream(claude): %v", err)
 	}
@@ -860,7 +829,7 @@ func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 	// OpenAI client: the ping renders as a benign no-op chunk (never a bare comment), and real content survives.
 	oaiReq := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)}
 	srO, err := e.executeComposerStream(context.Background(), auth, "k", oaiReq,
-		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"ping-o"}}})
+		composerExecOpts("openai", "ping-o"))
 	if err != nil {
 		t.Fatalf("stream(openai): %v", err)
 	}
@@ -917,32 +886,6 @@ func TestComposerToolResultsExtractionCount(t *testing.T) {
 	}
 }
 
-// Comment 5: a tool_results continuation routes by tool_call_id OWNERSHIP ahead of the stable conv id. When
-// stable metadata derives session A but the tool was emitted under session B, the continuation must route to B.
-func TestDeriveComposerSessionID_ContinuationOwnershipWins(t *testing.T) {
-	auth := authWith("authA", "keyA")
-	convA := optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-A"})
-	sessionA, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), convA)
-	sessionB := "sess_ownerB000000000000000000000000"
-	composerOwnership.record(composerTenant(auth, convA), "tc_owned_by_B", sessionB)
-	// A continuation carrying conv-A metadata (which derives sessionA) but answering a tool emitted by B.
-	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"tc_owned_by_B"}]},{"role":"tool","tool_call_id":"tc_owned_by_B","content":"R"}]}`)
-	got, err := deriveComposerSessionID(auth, "cursorkey", cont, convA)
-	if err != nil {
-		t.Fatalf("ownership continuation must route, not error: %v", err)
-	}
-	if got != sessionB {
-		t.Fatalf("continuation must route to the emitting session B (%s), not the stable conv-id session A (%s); got %s", sessionB, sessionA, got)
-	}
-	// ADD-70: re-emitting the SAME id under session A makes it owned by {A,B} — now AMBIGUOUS, not
-	// latest-writer-wins. Because this continuation carries the conv-A stable id, the ambiguity is
-	// disambiguated by routing to the conv-A stable session (which is sessionA), never by guessing.
-	composerOwnership.record(composerTenant(auth, convA), "tc_owned_by_B", sessionA)
-	if got2, _ := deriveComposerSessionID(auth, "cursorkey", cont, convA); got2 != sessionA {
-		t.Fatalf("ambiguous re-emitted id with a stable conv id must route to the conv-A session A (%s), got %s", sessionA, got2)
-	}
-}
-
 // L1: callerCredential must cover all inbound credential forms (headers + query params) so distinct
 // callers sharing one Cursor key are isolated regardless of how they authenticate.
 func TestCallerCredentialForms(t *testing.T) {
@@ -975,19 +918,65 @@ func TestComposerResponseIDUnique(t *testing.T) {
 	}
 }
 
-func TestExtractComposerClientEnv(t *testing.T) {
-	env := extractComposerClientEnv(optsWithHeaders(map[string]string{
-		"X-Workspace-Path": "/home/u/proj", "X-Cwd": "/home/u/proj/sub", "X-Shell": "fish", "X-Os-Version": "linux 6.1",
-	}))
-	b, _ := json.Marshal(env)
-	if gjson.GetBytes(b, "shell").String() != "fish" || gjson.GetBytes(b, "processWorkingDirectory").String() != "/home/u/proj/sub" {
-		t.Fatalf("clientEnv not parsed from headers: %s", b)
+func TestComposerClientToolRoutingTokenPrefixContract(t *testing.T) {
+	const expected = "cct1_"
+	if composerClientToolRoutingTokenPrefix != expected {
+		t.Fatalf("Go routing-token prefix = %q, want %q; update it with ROUTING_TOKEN_VERSION in tool-round.mjs", composerClientToolRoutingTokenPrefix, expected)
 	}
-	if gjson.GetBytes(b, "workspacePaths.0").String() != "/home/u/proj" {
-		t.Fatalf("workspacePaths not parsed: %s", b)
+	hint := composerContinuationHintFor("", []byte(`{}`))
+	if !hint.hasClientToolID("  cct1_route_0_signature  ") {
+		t.Fatal("current signed routing-token prefix was not recognized")
 	}
-	if extractComposerClientEnv(cliproxyexecutor.Options{}) != nil {
-		t.Fatalf("no headers => nil clientEnv")
+	if hint.hasClientToolID("cct2_route_0_signature") {
+		t.Fatal("unknown routing-token version was recognized")
+	}
+}
+
+func TestValidatedComposerClientEnvHeaderlessAndInvalidAreNeutral(t *testing.T) {
+	headerless := validatedComposerClientEnv(cliproxyexecutor.Options{})
+	if headerless["workspaceUnknown"] != true || headerless["workspacePaths"] != nil || headerless["processWorkingDirectory"] != nil {
+		t.Fatalf("headerless Claude-like request must become neutral, got %#v", headerless)
+	}
+	invalid := optsWithHeaders(map[string]string{
+		"X-Cwd":            "relative/proxy/path",
+		"X-Workspace-Path": "/app/sidecar-do-not-use",
+		"X-Shell":          "zsh",
+	})
+	got := validatedComposerClientEnv(invalid)
+	if got["workspaceUnknown"] != true {
+		t.Fatalf("invalid workspace must degrade to neutral instead of 422, got %#v", got)
+	}
+	if got["workspacePaths"] != nil || got["processWorkingDirectory"] != nil {
+		t.Fatalf("invalid headers must not leak a partial proxy/client path: %#v", got)
+	}
+}
+
+func TestComposerTurnBodyNeutralWorkspaceNeverInventsSentinel(t *testing.T) {
+	env := validatedComposerClientEnv(cliproxyexecutor.Options{})
+	body := composerTurnBody("sess_test", "cursor-grok-4.5", map[string]any{"type": "user", "text": "inspect this repo"}, nil, "auto", env, nil)
+	if !gjson.GetBytes(body, "clientEnv.workspaceUnknown").Bool() {
+		t.Fatalf("neutral workspace marker missing: %s", body)
+	}
+	for _, forbidden := range []string{"/workspace", "/app", `"processWorkingDirectory":"."`} {
+		if strings.Contains(string(body), forbidden) {
+			t.Fatalf("headerless request invented forbidden workspace %q: %s", forbidden, body)
+		}
+	}
+}
+
+func TestComposerToolResultEntryPreservesExplicitStructuredContent(t *testing.T) {
+	m := gjson.Parse(`{"role":"tool","tool_call_id":"call_1","content":"plain text","structured_content":{"count":2,"ok":true}}`)
+	got := composerToolResultEntry(m)
+	if got["content"] != "plain text" {
+		t.Fatalf("text content changed: %#v", got["content"])
+	}
+	structured, ok := got["structuredContent"].(map[string]any)
+	if !ok || structured["count"] != float64(2) || structured["ok"] != true {
+		t.Fatalf("structured content not preserved: %#v", got["structuredContent"])
+	}
+	textOnly := composerToolResultEntry(gjson.Parse(`{"role":"tool","tool_call_id":"call_2","content":"{\"not\":\"promoted\"}"}`))
+	if _, exists := textOnly["structuredContent"]; exists {
+		t.Fatal("JSON-looking text must not be promoted to structured content")
 	}
 }
 
@@ -1534,42 +1523,6 @@ func TestDeriveComposerSessionID_ToollessBodyConvFollowup(t *testing.T) {
 	}
 }
 
-// M32: a continuation batch whose tool_call_ids were emitted by DIFFERENT sessions must surface an explicit
-// mixed-session error — never silently route the whole batch to one session (stranding the other's result).
-func TestDeriveComposerSessionID_MixedSessionBatchErrors(t *testing.T) {
-	auth := authWith("authB", "keyB")
-	tenant := composerTenant(auth, cliproxyexecutor.Options{})
-	composerOwnership.record(tenant, "tc_sessA", "sess_A0000000000000000000000000000000")
-	composerOwnership.record(tenant, "tc_sessB", "sess_B0000000000000000000000000000000")
-	mixed := []byte(`{"messages":[
-		{"role":"assistant","tool_calls":[{"id":"tc_sessA"},{"id":"tc_sessB"}]},
-		{"role":"tool","tool_call_id":"tc_sessA","content":"RA"},
-		{"role":"tool","tool_call_id":"tc_sessB","content":"RB"}
-	]}`)
-	_, err := deriveComposerSessionID(auth, "cursorkey", mixed, cliproxyexecutor.Options{})
-	if err == nil {
-		t.Fatalf("M32: a mixed-session batch must error, not route partially")
-	}
-	if !strings.Contains(err.Error(), "multiple sessions") {
-		t.Fatalf("M32: error must identify the mixed-session cause, got %v", err)
-	}
-	// A batch whose recognized ids all belong to the SAME session routes normally (no error).
-	composerOwnership.record(tenant, "tc_same1", "sess_S0000000000000000000000000000000")
-	composerOwnership.record(tenant, "tc_same2", "sess_S0000000000000000000000000000000")
-	same := []byte(`{"messages":[
-		{"role":"assistant","tool_calls":[{"id":"tc_same1"},{"id":"tc_same2"}]},
-		{"role":"tool","tool_call_id":"tc_same1","content":"R1"},
-		{"role":"tool","tool_call_id":"tc_same2","content":"R2"}
-	]}`)
-	got, errSame := deriveComposerSessionID(auth, "cursorkey", same, cliproxyexecutor.Options{})
-	if errSame != nil {
-		t.Fatalf("M32: a same-session batch must route, not error: %v", errSame)
-	}
-	if got != "sess_S0000000000000000000000000000000" {
-		t.Fatalf("M32: same-session batch must route to that session, got %s", got)
-	}
-}
-
 // H07/H22: an allowed_tools allow-list restricts the advertised set to the intersection; an EMPTY
 // intersection surfaces explicit-unsupported (advertise nothing + unsupported note) — never widen to all.
 func TestApplyComposerAllowedTools(t *testing.T) {
@@ -1694,7 +1647,7 @@ func TestExecuteComposerStreamRedactsBridgeErrorBody(t *testing.T) {
 	auth := &cliproxyauth.Auth{ID: "t", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
 	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Read"}}]}`)}
 	_, err := e.executeComposerStream(context.Background(), auth, "k", req,
-		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"redact1"}}})
+		composerExecOpts("openai", "redact1"))
 	if err == nil {
 		t.Fatalf("M25: a bridge 500 must surface an error")
 	}
@@ -1741,7 +1694,7 @@ func TestExecuteComposerStreamKeepaliveResponsesAndGemini(t *testing.T) {
 	for _, fmtName := range []string{"openai-response", "gemini"} {
 		req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}`)}
 		sr, err := e.executeComposerStream(context.Background(), auth, "k", req,
-			cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString(fmtName), Headers: http.Header{"X-Conversation-Id": []string{"ka-" + fmtName}}})
+			composerExecOpts(fmtName, "ka-"+fmtName))
 		if err != nil {
 			t.Fatalf("%s: stream setup: %v", fmtName, err)
 		}
@@ -1776,7 +1729,7 @@ func TestExecuteComposerStreamKeepaliveNotBeforeEnvelope(t *testing.T) {
 	auth := &cliproxyauth.Auth{ID: "authK2", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
 	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}`)}
 	sr, err := e.executeComposerStream(context.Background(), auth, "k", req,
-		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Headers: http.Header{"X-Conversation-Id": []string{"ka-pre"}}})
+		composerExecOpts("openai-response", "ka-pre"))
 	if err != nil {
 		t.Fatalf("stream setup: %v", err)
 	}
@@ -1809,7 +1762,7 @@ func TestADD59_BridgeStatusErrorPreservesCode(t *testing.T) {
 			e := NewCursorExecutor(&config.Config{})
 			auth := &cliproxyauth.Auth{ID: "tA59", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
 			req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}`)}
-			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"a59-" + mode}}}
+			opts := composerExecOpts("openai", "a59-"+mode)
 			var err error
 			if mode == "stream" {
 				_, err = e.executeComposerStream(context.Background(), auth, "k", req, opts)
@@ -1940,7 +1893,7 @@ func TestADD68_ScannerBufferRaised(t *testing.T) {
 	auth := &cliproxyauth.Auth{ID: "tA68", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
 	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}`)}
 	resp, err := e.executeComposer(context.Background(), auth, "k", req,
-		cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"a68"}}})
+		composerExecOpts("openai", "a68"))
 	if err != nil {
 		t.Fatalf("ADD-68: a >52MB single SSE line must not tear down the stream: %v", err)
 	}
@@ -2044,7 +1997,7 @@ func TestADD56_ExecutorRejectsImageOnlyInvalid(t *testing.T) {
 	auth := &cliproxyauth.Auth{ID: "tA56", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
 	payload := []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,"}}]}]}`)
 	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: payload}
-	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{"a56x"}}}
+	opts := composerExecOpts("openai", "a56x")
 	_, err := e.executeComposer(context.Background(), auth, "k", req, opts)
 	if err == nil {
 		t.Fatalf("ADD-56: nonstream must reject an image-only-invalid turn")
@@ -2100,7 +2053,7 @@ func TestADD65_ResponsesChainedContinuationIsToolResults(t *testing.T) {
 	if len(results) != 1 || results[0]["toolCallId"] != "call_A" {
 		t.Fatalf("ADD-65: the tool result must be collected, got %v", results)
 	}
-	// Without previous_response_id AND without tool ownership, the SAME shape must NOT be a continuation (it is
+	// Without previous_response_id AND without a signed bridge tool id, the SAME shape must NOT be a continuation (it is
 	// an ordinary conversation that ends [tool, user]) — it falls through to a fresh user turn.
 	plain := []byte(`{"messages":[
 		{"role":"user","content":"do the thing"},
@@ -2109,139 +2062,6 @@ func TestADD65_ResponsesChainedContinuationIsToolResults(t *testing.T) {
 	]}`)
 	if inp2 := composerInput(plain); inp2["type"] != "user" {
 		t.Fatalf("ADD-65: without a continuation signal the [tool,user] shape must be a fresh user turn, got %v", inp2["type"])
-	}
-}
-
-// ADD-65: ownership alone (no previous_response_id) is a valid continuation signal — when a trailing tool id
-// is owned for the tenant, the chained shape classifies as tool_results and routes to the owning session.
-func TestADD65_OwnershipSignalRoutesContinuation(t *testing.T) {
-	auth := authWith("authA65", "keyA65")
-	owner := "sess_owner65000000000000000000000000"
-	tenant := composerTenant(auth, cliproxyexecutor.Options{})
-	composerOwnership.record(tenant, "call_owned65", owner)
-	oai := []byte(`{"messages":[
-		{"role":"user","content":"start"},
-		{"role":"tool","tool_call_id":"call_owned65","content":"R"},
-		{"role":"user","content":"and more"}
-	]}`)
-	inp := composerInputHinted(oai, composerContinuationHintFor(tenant, oai))
-	if inp["type"] != "tool_results" {
-		t.Fatalf("ADD-65: an owned trailing tool id must make the chained shape a tool_results continuation, got %v", inp["type"])
-	}
-	got, err := deriveComposerSessionID(auth, "cursorkey", oai, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("ADD-65: routing must not error: %v", err)
-	}
-	if got != owner {
-		t.Fatalf("ADD-65: chained continuation must route to the owning session %s, got %s", owner, got)
-	}
-}
-
-// ADD-70: the same visible tool-call id emitted by TWO of a tenant's sessions must be AMBIGUOUS — a
-// continuation echoing it with no stable id must surface a typed error, never silently pick the latest writer.
-func TestADD70_AmbiguousOwnershipRejectedWithoutDisambiguator(t *testing.T) {
-	auth := authWith("authA70", "keyA70")
-	tenant := composerTenant(auth, cliproxyexecutor.Options{})
-	composerOwnership.record(tenant, "call_dup70", "sess_a70000000000000000000000000000")
-	composerOwnership.record(tenant, "call_dup70", "sess_b70000000000000000000000000000")
-	cont := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"call_dup70"}]},{"role":"tool","tool_call_id":"call_dup70","content":"R"}]}`)
-	// No stable id and no previous_response_id -> ambiguous -> typed error.
-	_, err := deriveComposerSessionID(auth, "cursorkey", cont, cliproxyexecutor.Options{})
-	if !errors.Is(err, errAmbiguousToolOwnership) {
-		t.Fatalf("ADD-70: an ambiguous id with no disambiguator must return errAmbiguousToolOwnership, got %v", err)
-	}
-	// #7 (review): a stable conv id alone does NOT disambiguate — call_dup70 is owned by {a70,b70}, NEITHER of
-	// which is the conv-id (base) session, so routing to base would mis-post the result onto the parent and strand
-	// the real owner. With no opener-bridge match, the ambiguity is surfaced (clean client error the client can
-	// reseed from), NEVER collapsed to base. (#8's session-namespaced ids prevent this ambiguity for new flows.)
-	_, err2 := deriveComposerSessionID(auth, "cursorkey", cont, optsWithHeaders(map[string]string{"X-Conversation-Id": "conv-disambig70"}))
-	if !errors.Is(err2, errAmbiguousToolOwnership) {
-		t.Fatalf("ADD-70/#7: a stable conv id that matches no owner must NOT collapse to base; expected ambiguity error, got %v", err2)
-	}
-}
-
-// ADD-50: re-emitting an active tool-call id must perform a true LRU touch (keep it), so unrelated churn does
-// not evict it. We use a tiny per-tenant cap via a fresh store to prove the touched key survives.
-func TestADD50_TrueLRURefresh(t *testing.T) {
-	s := newComposerToolCallStore()
-	s.perCap = 3
-	s.entryTTL = 0 // disable TTL for this test
-	tenant := "tnt50"
-	s.record(tenant, "id_keep", "sess_keep")
-	s.record(tenant, "id_1", "sess_x")
-	s.record(tenant, "id_2", "sess_x")
-	// Touch id_keep so it becomes most-recently-used; then push two more to evict the oldest.
-	s.record(tenant, "id_keep", "sess_keep") // touch (same session)
-	s.record(tenant, "id_3", "sess_x")       // evicts the now-oldest (id_1)
-	s.record(tenant, "id_4", "sess_x")       // evicts id_2
-	to := s.tenants[tenant]
-	if to == nil {
-		t.Fatalf("ADD-50: tenant ownership missing")
-	}
-	if _, ok := to.byKey[composerOwnershipKey("sess_keep", "id_keep")]; !ok {
-		t.Fatalf("ADD-50: a touched (re-emitted) id must survive cap eviction; it was evicted")
-	}
-	if _, ok := to.byKey[composerOwnershipKey("sess_x", "id_1")]; ok {
-		t.Fatalf("ADD-50: the genuinely-oldest id_1 should have been evicted")
-	}
-}
-
-// ADD-71: per-tenant cap — one noisy tenant must NOT evict another tenant's ownership entries.
-func TestADD71_PerTenantCapIsolation(t *testing.T) {
-	s := newComposerToolCallStore()
-	s.perCap = 2
-	s.entryTTL = 0
-	// Quiet tenant records one id.
-	s.record("quiet", "q_id", "sess_q")
-	// Noisy tenant blows way past its own cap.
-	for i := 0; i < 50; i++ {
-		s.record("noisy", fmt.Sprintf("n_%d", i), "sess_n")
-	}
-	if to := s.tenants["quiet"]; to == nil || len(to.byTool["q_id"]) == 0 {
-		t.Fatalf("ADD-71: a noisy tenant must not evict the quiet tenant's entry")
-	}
-	if to := s.tenants["noisy"]; to == nil || len(to.byKey) > s.perCap {
-		t.Fatalf("ADD-71: the noisy tenant must be bounded by its own per-tenant cap")
-	}
-}
-
-// ADD-71: ownership entries expire by age (TTL), so the cap is not the only cleanup; and forgetSession drops a
-// finished session's entries.
-func TestADD71_TTLAndSessionForget(t *testing.T) {
-	s := newComposerToolCallStore()
-	now := time.Now()
-	s.nowFn = func() time.Time { return now }
-	s.entryTTL = time.Minute
-	s.record("tnt", "old_id", "sess_old")
-	// Advance past TTL; a lookup-time expiry must drop it.
-	now = now.Add(2 * time.Minute)
-	if s.ownsTool("tnt", "old_id") {
-		t.Fatalf("ADD-71: an entry older than the TTL must be expired")
-	}
-	// forgetSession drops a session's entries explicitly.
-	now = time.Now()
-	s.nowFn = func() time.Time { return now }
-	s.record("tnt2", "a", "sess_keep")
-	s.record("tnt2", "b", "sess_drop")
-	s.forgetSession("tnt2", "sess_drop")
-	if s.ownsTool("tnt2", "b") {
-		t.Fatalf("ADD-71: forgetSession must drop the finished session's id")
-	}
-	if !s.ownsTool("tnt2", "a") {
-		t.Fatalf("ADD-71: forgetSession must keep other sessions' ids")
-	}
-}
-
-// ADD-71: the exported composerOwnership.forgetSession drops a session's entries from the global store.
-func TestADD71_ForgetWrapper(t *testing.T) {
-	tenant := "tnt_forget_wrapper"
-	composerOwnership.record(tenant, "fw_id", "sess_fw")
-	if !composerOwnership.ownsTool(tenant, "fw_id") {
-		t.Fatalf("ADD-71: setup — id must be owned before forget")
-	}
-	composerOwnership.forgetSession(tenant, "sess_fw")
-	if composerOwnership.ownsTool(tenant, "fw_id") {
-		t.Fatalf("ADD-71: forgetComposerSessionToolCalls must drop the session's id from the global store")
 	}
 }
 
@@ -2550,7 +2370,7 @@ func TestADD104_NonObjectToolInputPreserved(t *testing.T) {
 	}
 }
 
-// Comment 5: a Responses previous_response_id continuation (and a tool-ownership-hinted continuation) whose
+// Comment 5: a Responses previous_response_id continuation (and a signed-tool-id continuation) whose
 // trailing user image is malformed must NOT be rejected by lastUserTurnImageOnlyInvalid before tool results
 // are handled — it is a continuation, not an image-only new-user turn.
 func TestComment5_HintedContinuationNotRejectedAsImageOnly(t *testing.T) {
@@ -2571,10 +2391,10 @@ func TestComment5_HintedContinuationNotRejectedAsImageOnly(t *testing.T) {
 	if lastUserTurnImageOnlyInvalid(msgs, prevHint) {
 		t.Fatalf("Comment 5: a previous_response_id continuation with a malformed trailing image must NOT be rejected as image-only")
 	}
-	// WITH a tool-ownership hint (the trailing tool id is owned), it is likewise recognized as a continuation.
-	ownHint := composerContinuationHint{ownsToolCallID: func(id string) bool { return id == "tc_resp" }}
+	// WITH a signed client-tool id hint, it is likewise recognized as a continuation without Go ownership.
+	ownHint := composerContinuationHint{hasClientToolID: func(id string) bool { return id == "tc_resp" }}
 	if lastUserTurnImageOnlyInvalid(msgs, ownHint) {
-		t.Fatalf("Comment 5: a tool-ownership-hinted continuation with a malformed trailing image must NOT be rejected as image-only")
+		t.Fatalf("Comment 5: a signed-tool-id continuation with a malformed trailing image must NOT be rejected as image-only")
 	}
 }
 

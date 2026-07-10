@@ -579,7 +579,7 @@ merge_pi_config() {
       --arg base "${base_v1}" \
       --arg key "${api_key}" \
       --argjson models "${models_json}" \
-      '{providers:{cliproxy:{baseUrl:$base, api:"openai-completions", apiKey:$key, models:$models}}}')"
+      '{providers:{cliproxy:{baseUrl:$base, api:"openai-completions", apiKey:$key, models:$models, headers:{"X-Cwd":"$CLIPROXY_CLIENT_CWD","X-Workspace-Path":"$CLIPROXY_CLIENT_WORKSPACE","X-Shell":"$CLIPROXY_CLIENT_SHELL","X-Os-Version":"$CLIPROXY_CLIENT_OS_VERSION"}}}}')"
   else
     backup_file "${PI_MODELS}"
     merged="$(jq \
@@ -587,7 +587,7 @@ merge_pi_config() {
       --arg key "${api_key}" \
       --argjson models "${models_json}" \
       '
-      .providers.cliproxy = ((.providers.cliproxy // {}) | .baseUrl = $base | .api = "openai-completions" | .apiKey = $key)
+      .providers.cliproxy = ((.providers.cliproxy // {}) | .baseUrl = $base | .api = "openai-completions" | .apiKey = $key | .headers = {"X-Cwd":"$CLIPROXY_CLIENT_CWD","X-Workspace-Path":"$CLIPROXY_CLIENT_WORKSPACE","X-Shell":"$CLIPROXY_CLIENT_SHELL","X-Os-Version":"$CLIPROXY_CLIENT_OS_VERSION"})
       | .providers.cliproxy.models = (
           (($models | map(.id)) as $newids |
            ((.providers.cliproxy.models // []) | map(select(.id as $id | $newids | index($id) | not)))
@@ -658,7 +658,7 @@ merge_opencode_config() {
       --argjson models "${models_obj}" \
       '{ "$schema": "https://opencode.ai/config.json", provider: { cliproxy: {
            npm: "@ai-sdk/openai-compatible",
-           options: { baseURL: $base, apiKey: $key },
+           options: { baseURL: $base, apiKey: $key, headers: {"X-Cwd":"{env:CLIPROXY_CLIENT_CWD}","X-Workspace-Path":"{env:CLIPROXY_CLIENT_WORKSPACE}","X-Shell":"{env:CLIPROXY_CLIENT_SHELL}","X-Os-Version":"{env:CLIPROXY_CLIENT_OS_VERSION}"} },
            models: $models
          }}}')"
   else
@@ -670,7 +670,7 @@ merge_opencode_config() {
       '
       .provider.cliproxy = ((.provider.cliproxy // {}) |
         .npm = "@ai-sdk/openai-compatible" |
-        .options = ((.options // {}) | .baseURL = $base | .apiKey = $key) |
+        .options = ((.options // {}) | .baseURL = $base | .apiKey = $key | .headers = {"X-Cwd":"{env:CLIPROXY_CLIENT_CWD}","X-Workspace-Path":"{env:CLIPROXY_CLIENT_WORKSPACE}","X-Shell":"{env:CLIPROXY_CLIENT_SHELL}","X-Os-Version":"{env:CLIPROXY_CLIENT_OS_VERSION}"}) |
         .models = ((.models // {}) + $models)
       )
       ' "${OPENCODE_CONFIG}")"
@@ -704,7 +704,8 @@ generate_codex_block() {
   marker_start="$(current_marker_start)"
   marker_end="$(current_marker_end)"
   printf '%s\n' "${marker_start}"
-  printf 'openai_base_url = "%s"\n' "${base_v1}"
+  printf 'model_provider = "cliproxy_composer"\n'
+  printf 'model_providers.cliproxy_composer = { name = "CLIProxyAPI Composer", base_url = "%s", wire_api = "responses", env_key = "OPENAI_API_KEY", env_http_headers = { "X-Cwd" = "CLIPROXY_CLIENT_CWD", "X-Workspace-Path" = "CLIPROXY_CLIENT_WORKSPACE", "X-Shell" = "CLIPROXY_CLIENT_SHELL", "X-Os-Version" = "CLIPROXY_CLIENT_OS_VERSION" } }\n' "${base_v1}"
   if [[ -n "${CODEX_DEFAULT_MODEL}" ]]; then
     printf 'model = "%s"\n' "${CODEX_DEFAULT_MODEL}"
   fi

@@ -17,8 +17,9 @@
 4. Writing `./config.yaml` with a fixed template, but:
    - sets `auth-dir: "./auths_railway"` (or `AUTH_DIR_NAME`)
    - sets `api-keys:` to a single entry from `API_KEY_1`
-5. Ensuring `./cli-proxy-api` exists (builds it with `go mod download` + `go build` if missing, or if `FORCE_BUILD` is set)
-6. Running `./cli-proxy-api --config ./config.yaml`
+5. Verifying the image contains the prebuilt `./cli-proxy-api`, Node 22, the exact sidecar dependencies, and the verified structural SDK patch descriptor
+6. Starting the bridge first, waiting for `/ready`, then starting `./cli-proxy-api --config ./config.yaml`
+7. Supervising the bridge and Go server as one failure domain so either child exiting causes a coherent Railway restart
 
 ## Persistent volume (recommended)
 
@@ -54,7 +55,7 @@ Default merge safety rules:
 - `AUTH_RESTORE_PREFLIGHT` (default `1`) - run Railway-side auth validation before merging changed bundles.
 - `AUTH_RESTORE_PREFLIGHT_REQUIRED` (default `1`) - fail startup instead of blindly merging when the validation command itself cannot run.
 - `AUTH_RESTORE_PREFLIGHT_TIMEOUT_SECONDS` (default `90`) - per-auth timeout used by the deploy-time validation command. This only applies to credential validation/refresh, not established model streams.
-- `FORCE_BUILD` (default `0`) - set to `1` (or any non-`0`) to force `go build` even if `./cli-proxy-api` already exists
+- `FORCE_BUILD` (default `0`) - local/legacy non-baked mode only. The Railway image sets `BAKED_SERVER_REQUIRED=1` and rejects `FORCE_BUILD`; rebuild the image instead.
 - `LOG_LEVEL` (default `info`) - log level for stdout/file logs (`debug`, `info`, `warn`, `error`).
 - `VERBOSE_LOGGING` (default unset) - when truthy, enables debug-level logging and request/response snippet capture (useful on Railway when diagnosing issues).
 - `WRITABLE_PATH` (default unset) - base directory for runtime-writable data (e.g. `logs/` and management panel `static/`) when the repo FS is read-only.
@@ -75,7 +76,7 @@ Default merge safety rules:
 - `COPILOT_STREAM_IDLE_BUDGET_MS` (default `0`) - idle budget for SSE lines in app-layer stream handling.
   - If no SSE line arrives within this budget, the executor closes and retries the request (pre-output only).
   - Set to `0` to disable idle-budget retries.
-- `INSTALL_GO` (default `1`) - when the script needs to rebuild `./cli-proxy-api` and `go` is missing on `PATH`, it will attempt to install `golang-go` via `apt-get` at container start.
+- `INSTALL_GO` (default `1`) - local/legacy non-baked mode only. Production Railway startup neither includes nor installs a Go toolchain.
   - Set to `0` to disable auto-install (startup will fail fast if a rebuild is needed but Go isn't available).
 - `GO_INSTALL_METHOD` (default `auto`) - how the script installs Go when a rebuild is needed and the runtime toolchain is missing/too old:
   - `auto`: try official Go tarball first, then fall back to apt
@@ -88,7 +89,7 @@ Default merge safety rules:
 - `CURSOR_API_KEY` (default unset) - when set, starts the Cursor Composer Client-Tools agent bridge (`sidecars/cursor-bridge/cursor-agent-bridge.mjs`, patched `@cursor/sdk`) on `CURSOR_AGENT_BRIDGE_PORT` (default `9798`) before the proxy, unless `CURSOR_DIRECT=1`. Also picked up by `internal/config` as a `cursor-api-key` entry. Get the key from cursor.com → Settings → Integrations (`crsr_*`).
 - `CURSOR_AGENT_BRIDGE_PORT` (default `9798`) - port for the `cursor-agent-bridge.mjs` HTTP server inside the container.
 - `CURSOR_AGENT_BRIDGE_URL` (default `http://127.0.0.1:9798`) - base URL the Go executor uses to reach the bridge (also settable per-key via the `cursor-api-key[].composer-client-tools-bridge-url` YAML attribute).
-- `CURSOR_AGENT_STATE_ROOT` (default `./.cursor-agent-store`) - writable directory where the bridge persists durable session/checkpoint state (mount a Railway volume here to survive restarts).
+- `CURSOR_AGENT_STATE_ROOT` (local default `./.cursor-agent-store`; Railway default `$RAILWAY_VOLUME_MOUNT_PATH/.cursor-agent-store`) - writable directory for SDK durable state, signed-routing key, ToolRound journals, receipts, and terminal tombstones. On Railway it must resolve beneath the attached volume or startup fails.
 - `CURSOR_DIRECT` (default unset) - set to `1` to skip the bridge and use the gated legacy direct Cursor path instead of the default ToS-safe Cursor Composer Client-Tools path.
 - `CURSOR_AGENT_BRIDGE_TOKEN` (default unset) - **multi-tenant opt-in.** Leave unset for the usual single-key setup (the bridge authenticates the forwarded key against `CURSOR_API_KEY`). When set, the bridge instead gates on this token (sent by CLIProxy as `X-Bridge-Auth`) and uses each request's forwarded per-user Cursor key under an **isolated** SDK platform + `STATE_ROOT/k_<hash>`, so multiple Cursor keys can safely share one bridge. Pair with the per-key `cursor-api-key[].composer-client-tools-bridge-token` YAML attribute. (Simpler alternative: run one bridge per Cursor key via per-key `composer-client-tools-bridge-url`.)
 - `CURSOR_AGENT_MAX_PLATFORMS` (default `64`) / `CURSOR_AGENT_PLATFORM_TTL_MS` (default `3600000`) - bound + idle-evict the per-key platform pool (multi-tenant only; the single-tenant platform is always resident).
@@ -104,7 +105,7 @@ Default merge safety rules:
   - `SECRET_DLP_TTL_SECONDS`, `SECRET_DLP_DRAIN_SECONDS`, `SECRET_DLP_STORE_FAIL_CLOSED`, `SECRET_DLP_FAIL_CLOSED`, `SECRET_DLP_LOG_EVENTS`, `SECRET_DLP_HIGH_ENTROPY`, `SECRET_DLP_MAX_FINDINGS`, `SECRET_DLP_MIN_VALUE_LENGTH`, `SECRET_DLP_REDACT_THRESHOLD`, and `SECRET_DLP_BETTERLEAKS_CONFIDENCE` tune restore storage and scanning behavior.
   - `SECRET_DLP_DEFAULT_PROVIDER_POLICY=enabled|disabled` plus `SECRET_DLP_PROVIDER_OVERRIDES=provider=enabled,other=disabled` controls which providers get redaction. Managed-provider `secret-redaction` and auth-level `secret_redaction` can override this policy.
 
-**Node.js (Cursor sidecar + optional Electron):** Railpack installs Node via Mise using fuzzy version **`22`** (`railpack.json` `packages.node`, `.nvmrc`, or `RAILPACK_NODE_VERSION`). See [Railpack Node docs](https://railpack.com/languages/node). On Railway, ensure `RAILPACK_PACKAGES` includes Node (e.g. `go@1.26 node@22`) — a value of only `go@1.26` overrides `railpack.json` and omits Node from the image. The sidecar runs `npm ci` (with install scripts for native modules like `sqlite3`) when `package-lock.json` is present. `scripts/railway_start.sh` falls back to NodeSource **22.x** only if `node` is missing at runtime.
+**Node.js (Cursor sidecar + optional Electron):** the production Docker image bakes Node **22**, runs `npm ci`, applies the structural SDK patch, runs the bridge suite, and runs the SDK self-tests during image build. `railway_start.sh` refuses a missing/wrong Node major or missing patch descriptor; it never installs or patches the Cursor sidecar at runtime. `railpack.json` retains an equivalent build-time fallback when Railpack is selected explicitly.
 - `STREAMING_KEEPALIVE_SECONDS` (default `0` / disabled) - how often the server emits SSE heartbeats (`: keep-alive\n\n`) during streaming responses.
   - What it is: a keep-alive mechanism to prevent Railway's proxy from closing idle connections.
   - What it does: sends a comment heartbeat every N seconds during SSE streaming to keep the connection alive.
@@ -164,11 +165,7 @@ Use direct `auth_bundle.sh` output only for first-time deploys or when your loca
 
 ## Build vs runtime note
 
-Railway often runs a separate **build phase** and **start/runtime phase**.
-
-- The script checks `[[ -x ./cli-proxy-api ]]`. If it exists, it skips `go mod download`/`go build` to speed up cold starts.
-- If the binary is missing, the script will build it at startup (requires the Go toolchain to be present in the runtime image; Nixpacks Go services typically include it, slim runtime Docker stages often don’t).
-- If you suspect the binary is stale or mismatched, set `FORCE_BUILD=1` (or any non-`0`) to rebuild at startup.
+`railway.json` selects the repository `Dockerfile`. The build stage compiles Go and completely prepares/tests the Cursor sidecar. The runtime stage contains the baked binary and patched dependency tree but no Go toolchain. Startup fails closed if those artifacts are missing; it does not download, compile, run `npm ci`, or patch vendor code. To change any of them, deploy a newly built image.
 
 ## Railway start command
 
@@ -177,3 +174,5 @@ Use this as your Railway Start Command:
 ```bash
 bash scripts/railway_start.sh
 ```
+
+`railway.json` already sets this command, configures `/readyz` as the deployment health check, enables restart-on-exit, and gives SIGTERM a 30-second drain window.

@@ -105,6 +105,11 @@ ensure_electron() {
     return 0
   fi
 
+  if [[ "${BAKED_SERVER_REQUIRED:-0}" == "1" ]]; then
+    err "INSTALL_ELECTRON=1 but Electron is absent from the baked image; rebuild the image instead of installing dependencies at startup"
+    return 1
+  fi
+
   if ! command -v apt-get >/dev/null 2>&1; then
     info "Electron not found and apt-get is unavailable; cannot install Electron at startup"
     return 0
@@ -140,6 +145,7 @@ TAR_PATH="${ROOT_DIR}/auths.tar.gz"
 OUT_CONFIG_PATH="${ROOT_DIR}/config.yaml"
 BIN_PATH="${ROOT_DIR}/cli-proxy-api"
 FORCE_BUILD="${FORCE_BUILD:-0}"
+BAKED_SERVER_REQUIRED="${BAKED_SERVER_REQUIRED:-0}"
 LDFLAGS_PKG="github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
 INSTALL_GO="${INSTALL_GO:-1}"
 GO_INSTALL_METHOD="${GO_INSTALL_METHOD:-auto}" # auto|tarball|apt
@@ -269,6 +275,19 @@ ensure_server_binary() {
   local current_sha build_date stored_sha
   current_sha="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo "unknown")"
   build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  if [[ "${BAKED_SERVER_REQUIRED}" == "1" ]]; then
+    if [[ "${FORCE_BUILD}" != "0" ]]; then
+      err "FORCE_BUILD is incompatible with BAKED_SERVER_REQUIRED=1; rebuild the deployment image"
+      exit 1
+    fi
+    if [[ ! -x "${BIN_PATH}" ]]; then
+      err "baked server binary is missing or not executable: ${BIN_PATH}"
+      exit 1
+    fi
+    info "Using baked server binary: ${BIN_PATH}"
+    return 0
+  fi
 
   if [[ "${FORCE_BUILD}" != "0" ]]; then
     info "FORCE_BUILD set; rebuilding server binary"
@@ -850,39 +869,47 @@ if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR
   if [[ -z "${CURSOR_AGENT_STATE_ROOT:-}" && -n "${RAILWAY_VOLUME_MOUNT_PATH:-}" ]]; then
     CURSOR_AGENT_STATE_ROOT="${RAILWAY_VOLUME_MOUNT_PATH}/.cursor-agent-store"
   fi
+  if [[ -n "${RAILWAY_ENVIRONMENT:-}${RAILWAY_PROJECT_ID:-}${RAILWAY_SERVICE_ID:-}" && -z "${RAILWAY_VOLUME_MOUNT_PATH:-}" ]]; then
+    info "Cursor Client-Tools requires an attached Railway volume; RAILWAY_VOLUME_MOUNT_PATH is missing"
+    exit 1
+  fi
   CURSOR_AGENT_STATE_ROOT="${CURSOR_AGENT_STATE_ROOT:-${ROOT_DIR}/.cursor-agent-store}"
   if [[ -d "${CURSOR_BRIDGE_DIR}" ]]; then
-    ensure_node
+    require_cmd node
+    node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+    if [[ "${node_major}" != "22" ]]; then
+      err "Cursor bridge requires baked Node.js 22.x; found $(node --version 2>/dev/null || echo unknown)"
+      exit 1
+    fi
+    if [[ ! -f "${CURSOR_BRIDGE_DIR}/node_modules/@cursor/sdk/.clienttools-patch-descriptor.json" ]]; then
+      err "Cursor bridge dependencies/structural SDK patch are missing from the image; rebuild it (runtime npm install is intentionally disabled)"
+      exit 1
+    fi
     info "Starting Cursor Composer Client-Tools agent bridge on port ${CURSOR_AGENT_BRIDGE_PORT} (Node $(node --version 2>/dev/null || echo unknown))"
     (
       cd "${CURSOR_BRIDGE_DIR}"
-      if ! command -v python3 >/dev/null 2>&1; then
-        apt-get update -y >/dev/null 2>&1 || true
-        apt-get install -y --no-install-recommends python3 make g++ >/dev/null 2>&1 || true
-      fi
-      # npm ci runs the postinstall patcher (scripts/apply-clienttools-patch.cjs) which
-      # patches @cursor/sdk; cursor-agent-bridge.mjs asserts the patch at startup.
-      if [[ -f package-lock.json ]]; then
-        npm ci >/dev/null 2>&1 || npm ci
-      else
-        npm install >/dev/null 2>&1 || npm install
-      fi
-      CURSOR_API_KEY="${CURSOR_API_KEY:-}" \
+      exec env CURSOR_API_KEY="${CURSOR_API_KEY:-}" \
         CURSOR_AGENT_BRIDGE_TOKEN="${CURSOR_AGENT_BRIDGE_TOKEN:-}" \
         CURSOR_AGENT_BRIDGE_PORT="${CURSOR_AGENT_BRIDGE_PORT}" \
         CURSOR_AGENT_STATE_ROOT="${CURSOR_AGENT_STATE_ROOT}" \
         CURSOR_COMPOSER_DEBUG="${CURSOR_COMPOSER_DEBUG:-}" \
-        node cursor-agent-bridge.mjs &
-    )
+        node cursor-agent-bridge.mjs
+    ) &
+    CURSOR_BRIDGE_PID=$!
     sidecar_ready=0
     for _ in $(seq 1 60); do
+      if ! kill -0 "${CURSOR_BRIDGE_PID}" >/dev/null 2>&1; then
+        err "Cursor Composer Client-Tools bridge exited during startup"
+        wait "${CURSOR_BRIDGE_PID}" || true
+        exit 1
+      fi
       if command -v curl >/dev/null 2>&1; then
-        if curl -fsS "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/health" >/dev/null 2>&1; then
+        if curl -fsS "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/ready" >/dev/null 2>&1; then
           sidecar_ready=1
           break
         fi
       elif command -v wget >/dev/null 2>&1; then
-        if wget -qO- "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/health" >/dev/null 2>&1; then
+        if wget -qO- "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/ready" >/dev/null 2>&1; then
           sidecar_ready=1
           break
         fi
@@ -890,14 +917,58 @@ if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR
       sleep 1
     done
     if [[ "${sidecar_ready}" != "1" ]]; then
-      info "Cursor Composer Client-Tools bridge not ready — Cursor requests will fail until it is (set CURSOR_DIRECT=1 to use the gated direct path)"
+      info "Cursor Composer Client-Tools bridge failed readiness; refusing to start the API"
+      exit 1
     else
       info "Cursor Composer Client-Tools agent bridge is ready"
     fi
+    export CURSOR_AGENT_BRIDGE_REQUIRED=1
+    export CURSOR_AGENT_BRIDGE_PORT
+    export CURSOR_AGENT_BRIDGE_URL="${CURSOR_AGENT_BRIDGE_URL:-http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}}"
   else
     info "Cursor bridge directory not found — Cursor Composer Client-Tools path unavailable"
   fi
 fi
 
 info "Starting server"
-exec "${BIN_PATH}" --config "${OUT_CONFIG_PATH}"
+if [[ -z "${CURSOR_BRIDGE_PID:-}" ]]; then
+  exec "${BIN_PATH}" --config "${OUT_CONFIG_PATH}"
+fi
+
+"${BIN_PATH}" --config "${OUT_CONFIG_PATH}" &
+SERVER_PID=$!
+
+shutdown_children() {
+  trap - TERM INT
+  kill -TERM "${SERVER_PID}" "${CURSOR_BRIDGE_PID}" >/dev/null 2>&1 || true
+  wait "${SERVER_PID}" 2>/dev/null || true
+  wait "${CURSOR_BRIDGE_PID}" 2>/dev/null || true
+  exit 0
+}
+trap shutdown_children TERM INT
+
+# Keep the API and bridge in one failure domain. The public /readyz endpoint
+# probes both while they are alive; if either child exits, terminate its sibling
+# and let Railway's restart policy rebuild a coherent pair.
+while true; do
+  if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+    set +e
+    wait "${SERVER_PID}"
+    server_status=$?
+    set -e
+    kill -TERM "${CURSOR_BRIDGE_PID}" >/dev/null 2>&1 || true
+    wait "${CURSOR_BRIDGE_PID}" 2>/dev/null || true
+    exit "${server_status}"
+  fi
+  if ! kill -0 "${CURSOR_BRIDGE_PID}" >/dev/null 2>&1; then
+    set +e
+    wait "${CURSOR_BRIDGE_PID}"
+    bridge_status=$?
+    set -e
+    err "Cursor bridge exited after startup (status=${bridge_status}); stopping API for a coherent restart"
+    kill -TERM "${SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PID}" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 1
+done

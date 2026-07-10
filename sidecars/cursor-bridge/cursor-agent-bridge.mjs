@@ -4,23 +4,16 @@
 // never touched for tool execution.
 //
 // TOPOLOGY (the sidecar ONLY talks to CLIProxy, never to the client directly):
-//   Claude Code <-Anthropic /v1/messages-> CLIProxy (Go) <-HTTP/SSE /agent/turn-> THIS sidecar <-@cursor/sdk-> Cursor API
+//   Harness <-OpenAI/Anthropic-> CLIProxy (Go) <-HTTP/SSE /agent/turn + /agent/continue-> THIS sidecar <-@cursor/sdk-> Cursor API
 //
 // Tools route to CC via the patched bundle's globalThis.__CC_EXEC_U/__CC_EXEC_S; the client's tools[]
 // are advertised to the model as mcp_tools via globalThis.__CC_GET_ADVERTISE__ (patch inject). Results
 // are built as Cursor protobuf messages by the patched serializeResult ($) doing <Type>.fromJson(ccJson).
 //
-// This revision incorporates the v2 adversarial audit's must-fixes:
-//  - streaming discriminators are text-delta/thinking-delta (not text/thinking)
-//  - sessionId is caller-supplied/minted (no per-turn content fingerprint; no cross-user collision)
-//  - resume works: createAgent({agentId: sessionId}) so resumeAgent(sessionId) matches
-//  - abort/cleanup: res 'close' rejects pendings + cancels the run; per-pending watchdog; idle session eviction
-//  - no turnSettled deadlock: zero-match tool_results error out; the handler races settle vs res-close
-//  - streamedText resets per user turn (no whole-turn re-emit)
-//  - dispatchMcp reconciles the model's (often paraphrased) tool name against the advertised set
-//  - control-flow exec cases (allowlist prechecks) return typed "allow", not a bare error
-//  - flush timer is turn-scoped and cleared on settle (no cross-turn premature pause)
-//  - real SIGTERM drain; startup mkdir + assert globals installed
+// Durable client-tool ownership lives in one bridge ToolRound. The bridge
+// journals signed wire ids, transport handoff, canonical result receipts,
+// callback application, recovery, and terminal state before exposing success.
+// Session retains only the live SDK agent/run and non-tool conversation state.
 //
 // Env: CURSOR_API_KEY (required), CURSOR_AGENT_BRIDGE_PORT (default 9798),
 //      CURSOR_AGENT_STATE_ROOT (default ./.cursor-agent-store — a writable volume on Railway),
@@ -38,6 +31,17 @@ import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, writeFileSync, mkdirSync, accessSync, constants, writeSync } from "node:fs";
 import path from "node:path";
+import {
+  ToolRound,
+  ToolRoundError,
+  RoundState,
+  CallState,
+  TerminalReason,
+  createRoundInfrastructure,
+  probeStateRoot,
+  terminalizeOrphanedRounds,
+} from "./tool-round.mjs";
+import { SseWriter } from "./sse-writer.mjs";
 
 // ADD-64: strict integer env parser. Raw parseInt silently mangles common bad config — parseInt("10m")===10
 // (a 10-MINUTE timeout collapses to 10 MILLISECONDS), parseInt("abc")===NaN (Node timers treat NaN as ~0 and
@@ -82,17 +86,31 @@ const STATE_ROOT = process.env.CURSOR_AGENT_STATE_ROOT
   || (process.env.RAILWAY_VOLUME_MOUNT_PATH
     ? path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, ".cursor-agent-store")
     : path.join(process.cwd(), ".cursor-agent-store"));
+const RAILWAY_RUNTIME = !!(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_SERVICE_ID);
+const RAILWAY_VOLUME_ROOT = process.env.RAILWAY_VOLUME_MOUNT_PATH ? path.resolve(process.env.RAILWAY_VOLUME_MOUNT_PATH) : "";
+const STATE_ROOT_RESOLVED = path.resolve(STATE_ROOT);
+const STATE_ROOT_ON_RAILWAY_VOLUME = !!RAILWAY_VOLUME_ROOT && (() => {
+  const relative = path.relative(RAILWAY_VOLUME_ROOT, STATE_ROOT_RESOLVED);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+})();
 const EMPTY_CWD = path.join(STATE_ROOT, ".empty");
+// Bump only when the durable SDK request-context contract changes incompatibly.
+// This is deliberately independent of workspace identity: it prevents old
+// agents seeded with proxy-side sentinel paths from surviving the redesign
+// without making cwd/workspace part of routing.
+const DURABLE_AGENT_CONTEXT_EPOCH = "ct3";
 // PENDING_TIMEOUT_MS / SESSION_TTL_MS must be POSITIVE (a 0 watchdog would reap a tool the instant it is
 // emitted; a 0 TTL would evict a session immediately) — floor them at 1ms via min:1.
 const PENDING_TIMEOUT_MS = envInt("CURSOR_AGENT_PENDING_TIMEOUT_MS", 600000, { min: 1 });
 const SESSION_TTL_MS = envInt("CURSOR_AGENT_SESSION_TTL_MS", 1800000, { min: 1 });
 const MAX_SESSIONS = envInt("CURSOR_AGENT_MAX_SESSIONS", 1000, { min: 1 });
+const TERMINAL_ROUND_TTL_MS = envInt("CURSOR_AGENT_TERMINAL_ROUND_TTL_MS", 7 * 24 * 60 * 60 * 1000, { min: 0 });
+const TERMINAL_ROUND_MAX = envInt("CURSOR_AGENT_TERMINAL_ROUND_MAX", 10000, { min: 0 });
 const SSE_KEEPALIVE_MS = 15000;
 // Tool-batch coalescing window. The @cursor/sdk never pauses for tools — it streams tool calls in waves —
 // so this debounce merges a wave (emits <window apart) into ONE turn_end. It is a pure latency<->round-trip
 // knob, NOT a correctness control: tools emitted after a turn closes are buffered + re-delivered next turn
-// regardless (see emitToolUse/flushUndelivered), so any value is safe. Raise it (e.g. 150-200) to coalesce
+// regardless (see emitToolUse/flushJournaledCalls), so any value is safe. Raise it (e.g. 150-200) to coalesce
 // slower waves into fewer client round-trips at the cost of a little per-turn latency; lower it for snappier
 // turns and more round-trips. Default 60 preserves the original behavior.
 // TOOL_BATCH_MS may legitimately be 0 (flush immediately, no coalescing) so min:0 is correct here.
@@ -111,8 +129,8 @@ const COMPOSER_DEBUG = process.env.CURSOR_COMPOSER_DEBUG === "1" || process.env.
 // hosting a tiny session-aware streamable-http MCP server inside this bridge (route /mcp/<sessionId>). This
 // makes composer-2.5 actually CALL advertised tools (subagents/Agent, MCP tools, WebSearch, …) instead of
 // only native read/shell. DEFAULT ON; disabled ONLY when the value is exactly "0" or "false" (any case).
-// Fully fail-safe: when off (or on any build error) buildMcpServers returns {} and behavior is byte-for-byte
-// today's native-only path. The /mcp route is dialed by the in-process SDK runtime over loopback only.
+// The advertised registry is structural and fail-closed: duplicate or malformed descriptors abort the turn.
+// The /mcp route is dialed by the in-process SDK runtime over loopback only.
 const MCP_SHIM_RAW = String(process.env.CURSOR_COMPOSER_MCP_SHIM ?? "").trim().toLowerCase();
 const MCP_SHIM_ENABLED = !(MCP_SHIM_RAW === "0" || MCP_SHIM_RAW === "false");
 // EX3 (clean image path): a tool-result IMAGE is folded into the proto McpToolResult as McpImageContent, so the
@@ -152,17 +170,22 @@ const MAX_QUEUE_DEPTH = envInt("CURSOR_AGENT_MAX_QUEUE_DEPTH", 32, { min: 1 });
 // ADD-64: generalized to the shared envInt guard (was a bespoke Number.isFinite check); min:1 so a 0/blank
 // can never disable the OOM bound (it falls back to the 64 MB default).
 const MAX_AGENT_TURN_BYTES = envInt("MAX_AGENT_TURN_BYTES", 64 * 1024 * 1024, { min: 1 });
-// ADD-100: per-session SSE output-queue cap. When a client/proxy applies sustained backpressure (res.write
-// returns false and 'drain' never fires) the bridge queues unsent SSE payloads in Session.outQueue; this
-// bounds that queue so a slow/stuck client cannot OOM the sidecar via unbounded Node write buffering. Past the
+// Per-response SSE output-queue cap. When a client/proxy applies sustained backpressure, SseWriter queues only
+// later frames that have not reached res.write. This bounds the queue so a slow/stuck client cannot OOM the sidecar. Past the
 // cap the turn is cancelled with a typed transport error (never a fake success). This is a MEMORY bound, NOT a
 // data-path wall-clock timeout (allowed by AGENTS.md); default 8 MB is generous for a quiet/slow client.
 const COMPOSER_OUT_QUEUE_MAX_BYTES = envInt("CURSOR_AGENT_OUT_QUEUE_MAX_BYTES", 8 * 1024 * 1024, { min: 1 });
-// ADD-95 (bridge backstop): cap live tool-result content the bridge resolves into a pending, distinct from the
+// Cap live tool-result content before it resolves an SDK callback, distinct from the
 // executor's history bound. The EXECUTOR's truncateCursorToolResultLive is authoritative and normally wins;
 // this is a slightly HIGHER cap so it only fires for content that bypassed the executor cap (a defense-in-depth
 // backstop). Both sides stamp the SAME marker substring 'truncated by proxy' so callers and tests agree.
 const COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES = envInt("CURSOR_AGENT_LIVE_TOOL_RESULT_MAX_BYTES", 320 * 1024, { min: 1 });
+// Cursor's pinned SDK used 40,000 bytes as the threshold for its proxy-local
+// agent-tools artifact spill. The SDK patch disables that spill entirely. This
+// lower guard threshold identifies a copied large MCP result if the backend
+// nevertheless asks a native Write to materialize one under a different path.
+const SYNTHETIC_ARTIFACT_RESULT_MIN_BYTES = envInt("CURSOR_AGENT_ARTIFACT_GUARD_MIN_BYTES", 32 * 1024, { min: 1 });
+const SYNTHETIC_ARTIFACT_RESULT_WINDOW = 8;
 // ADD-103: cap the serialized response_format / json_schema inlined into the prompt as a best-effort
 // instruction. A large generated schema (nested $defs, many enums) would otherwise bloat the prompt, leak more
 // than necessary, and risk ERROR_CONVERSATION_TOO_LONG — all for a constraint the composer path can only honor
@@ -191,32 +214,70 @@ const RUN_AS_MAIN = process.argv[1] === fileURLToPath(import.meta.url);
 // Loading is lazy (loadSdk) so this module can be imported for unit tests without pulling the SDK's
 // heavy/native deps; the real server calls loadSdk() at startup (fail-closed) BEFORE it accepts traffic.
 const require = createRequire(import.meta.url);
-// assertPatched greps the LOCAL-EXECUTOR chunk for the PATCH-MARKER 'cursor-composer-clienttools-patched-v1'.
-// As of @cursor/sdk@1.0.23 the tool-dispatch seams live in webpack chunk dist/cjs/973.js (lazy local-executor),
-// not the main index.js entry. The patcher stamps that chunk; require("@cursor/sdk") still resolves to index.js
-// (which the patcher also eager-stamps so the chunk evaluates on load). Comment 7 / ADD-102 / PATCH-MARKER-
-// CAPABILITY contract: the patcher (scripts/apply-clienttools-patch.cjs) keeps this marker at -v1 and instead
-// does a CAPABILITY check (the marker alone does not prove a bundle is current — a partial/stale patch with the
-// marker but a missing seam fails closed in the patcher with a 'stale-bundle' error). So this grep STAYS at -v1
-// and is intentionally NOT bumped. If the team ever bumps the patcher's MARK to -v2, this grep string MUST be
-// bumped in LOCKSTEP (same commit) or an old patched bundle would be wrongly accepted here. The full per-seam
-// capability verification lives on the patcher side; the runtime self-tests (selfTestBundleSeam /
-// selfTestResultSerialization) additionally prove the live seams work.
+const SDK_PATCH_DESCRIPTOR_VERSION = 2;
+const SDK_PATCHER_VERSION = 3;
+const SDK_PRISTINE_BUNDLE_SHA256 = "829ced604bb88908e49fcf5cd31eb22bce4e57d32074b2846d86a6c5afa26881";
+const SDK_PRISTINE_INDEX_SHA256 = "3157e86833e5033ce7b870cfd9810edc4b1e9c0637b93170779d6cbb3feba022";
+const SDK_PINNED_VERSION = "1.0.23";
+const SDK_PATCH_SEAMS = {
+  serializer: 1,
+  unaryDispatch: 1,
+  streamDispatch: 1,
+  advertiseRegistry: 1,
+  mcpArtifactSpillPolicy: 1,
+  localExecutorLoader: 1,
+  moduleExport: 1,
+};
+
+// Marker text is only a diagnostic. Runtime trust comes from the descriptor emitted
+// by the structural patcher plus exact hashes of both installed CJS files. This
+// catches stale caches, partial writes, hand-edited vendor files, and patcher/bridge
+// skew before the SDK can execute a tool natively on the sidecar.
 function assertPatched(p) {
   if (!p.endsWith(path.join("dist", "cjs", "index.js"))) {
     throw new Error(`[bridge] @cursor/sdk resolved to ${p}, expected dist/cjs/index.js — refusing to start (tools would run natively on the sidecar FS).`);
   }
-  // v1.0.23+: seams are in the local-executor webpack chunk (973.js), not the main entry.
-  const chunk = path.join(path.dirname(p), "973.js");
-  let chunkSrc;
+  const sdkRoot = path.resolve(path.dirname(p), "..", "..");
+  const chunk = path.join(sdkRoot, "dist", "cjs", "973.js");
+  const descriptorPath = path.join(sdkRoot, ".clienttools-patch-descriptor.json");
+  let descriptor;
+  let chunkBytes;
+  let indexBytes;
+  let sdkPackage;
   try {
-    chunkSrc = readFileSync(chunk, "latin1");
+    descriptor = JSON.parse(readFileSync(descriptorPath, "utf8"));
+    chunkBytes = readFileSync(chunk);
+    indexBytes = readFileSync(p);
+    sdkPackage = JSON.parse(readFileSync(path.join(sdkRoot, "package.json"), "utf8"));
   } catch (e) {
-    throw new Error(`[bridge] @cursor/sdk local-executor chunk missing at ${chunk} (${(e && e.message) || e}). Run scripts/apply-clienttools-patch.cjs after installing @cursor/sdk@1.0.23. Refusing to start.`);
+    throw new Error(`[bridge] cannot load the @cursor/sdk structural patch descriptor/files (${(e && e.message) || e}). Run npm ci in sidecars/cursor-bridge. Refusing to start.`);
   }
-  if (!chunkSrc.slice(0, 64).includes("cursor-composer-clienttools-patched-v1")) {
-    throw new Error(`[bridge] @cursor/sdk local-executor chunk at ${chunk} is NOT patched (missing cursor-composer-clienttools-patched-v1). Run scripts/apply-clienttools-patch.cjs (reinstall a pristine bundle first if it was patched by an older version). Refusing to start.`);
+  const expectedShape = JSON.stringify(SDK_PATCH_SEAMS);
+  if (
+    sdkPackage.version !== SDK_PINNED_VERSION ||
+    descriptor?.sdkVersion !== SDK_PINNED_VERSION ||
+    descriptor?.descriptorVersion !== SDK_PATCH_DESCRIPTOR_VERSION ||
+    descriptor?.patcherVersion !== SDK_PATCHER_VERSION ||
+    descriptor?.bundle !== "dist/cjs/973.js" ||
+    descriptor?.index !== "dist/cjs/index.js" ||
+    descriptor?.nativeExecutionDefault !== "deny" ||
+    descriptor?.mcpArtifactSpillThresholdBytes !== 0 ||
+    descriptor?.sourceVerified !== true ||
+    descriptor?.pristineBundleSha256 !== SDK_PRISTINE_BUNDLE_SHA256 ||
+    descriptor?.pristineIndexSha256 !== SDK_PRISTINE_INDEX_SHA256 ||
+    JSON.stringify(descriptor?.seams) !== expectedShape
+  ) {
+    throw new Error("[bridge] @cursor/sdk patch descriptor does not match the bridge's exact client-tools contract. Refusing to start.");
   }
+  const bundleHash = createHash("sha256").update(chunkBytes).digest("hex");
+  const indexHash = createHash("sha256").update(indexBytes).digest("hex");
+  if (descriptor.patchedBundleSha256 !== bundleHash || descriptor.patchedIndexSha256 !== indexHash) {
+    throw new Error("[bridge] @cursor/sdk installed bytes do not match the patch descriptor. Refusing to start.");
+  }
+  if (!chunkBytes.subarray(0, 64).toString("latin1").includes("cursor-composer-clienttools-patched-v3") || !indexBytes.toString("latin1").includes("cursor-composer-clienttools-eager-v3")) {
+    throw new Error("[bridge] @cursor/sdk descriptor hashes matched but structural markers are absent. Refusing to start.");
+  }
+  return descriptor;
 }
 let _sdk = null;
 function loadSdk() {
@@ -280,12 +341,9 @@ function parseShellContent(c) {
   return { stdout: String(c ?? ""), stderr: "", exitCode: 0, aborted: false };
 }
 
-// ccToolId derives the tool-call id used as BOTH the emitted SSE id and our pending-map key. It restricts
-// the id to [a-zA-Z0-9_-] — the exact charset internal/util.SanitizeClaudeToolID allows — so the id the
-// Claude client echoes back (after that sanitizer runs on the outbound leg) equals the key we store here;
-// otherwise an id containing ':' '.' '=' or a space would be rewritten outbound and never match our pending
-// call inbound (the tool result would be lost and the turn would hang/error). The fallback uses a FULL
-// random uuid (not a truncated 8-hex slice) to avoid 32-bit birthday collisions across sessions.
+// ccToolId normalizes the SDK's raw correlation id before ToolRound hashes it
+// for in-round idempotency. It is never exposed to the harness; ToolRound
+// allocates the client-visible signed routing token.
 function ccToolId(s) {
   const raw = (s && s.toolCallId) || `tc_${randomUUID()}`;
   return String(raw).replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -333,11 +391,60 @@ function truncateLiveToolResult(content, cap = COMPOSER_LIVE_TOOL_RESULT_MAX_BYT
   if (typeof content !== "string") return content;
   const total = Buffer.byteLength(content);
   if (total <= cap) return content;
-  // Keep a byte-bounded prefix (slice by chars then verify bytes; a final byte-safe trim avoids splitting a
-  // multibyte codepoint mid-sequence).
   let kept = content.slice(0, cap);
   while (Buffer.byteLength(kept) > cap && kept.length) kept = kept.slice(0, -1);
   return kept + `\n[tool result truncated by proxy: kept ${Buffer.byteLength(kept)}/${total} bytes]`;
+}
+// normalizeClientToolResult gives every tool adapter one result contract (checklist section 3)
+// - Preserves failure only when isError === true (never infers from text)
+// - Keeps strings, objects, arrays, scalars, null deterministic
+// - Separates valid inline base64 images and URL images without dropping either
+// - Keeps valid structured content as object
+// - Applies Workflow/background augmentations
+function normalizeClientToolResult(content, isError, images, structuredContent, toolName) {
+  const normalizedIsError = isError === true;
+  let normalizedContent = content;
+  if (normalizedContent === undefined) normalizedContent = "";
+  // Keep deterministic: don't coerce null to empty, keep as is except undefined -> ""
+  // Apply augmentations here (single place)
+  if (toolName) {
+    if (toolName === "Workflow") {
+      normalizedContent = augmentWorkflowResultOnFailure(normalizedContent, normalizedIsError);
+    }
+    normalizedContent = augmentBackgroundLaunchResult(normalizedContent, toolName);
+  }
+  // Apply live cap to string content (bridge backstop)
+  normalizedContent = truncateLiveToolResult(normalizedContent);
+  // Separate images: valid inline base64 vs URL
+  const inlineImages = [];
+  const urlImages = [];
+  if (Array.isArray(images)) {
+    for (const im of images) {
+      if (!im) continue;
+      if (typeof im.url === "string" && im.url) {
+        urlImages.push(im);
+      } else if (typeof im.data === "string" && im.data && typeof im.mimeType === "string" && im.mimeType) {
+        inlineImages.push(im);
+      }
+    }
+  }
+  const allImages = [...inlineImages, ...urlImages];
+  // Structured content: keep valid object only
+  let normalizedStructured = null;
+  if (structuredContent && typeof structuredContent === "object" && !Array.isArray(structuredContent)) {
+    normalizedStructured = structuredContent;
+  } else if (structuredContent && typeof structuredContent === "object") {
+    // Allow array/object as structured content if explicitly provided
+    normalizedStructured = structuredContent;
+  }
+  return {
+    content: normalizedContent,
+    isError: normalizedIsError,
+    images: allImages.length ? allImages : null,
+    inlineImages: inlineImages.length ? inlineImages : null,
+    urlImages: urlImages.length ? urlImages : null,
+    structuredContent: normalizedStructured,
+  };
 }
 
 const TOOL_CHOICE_SPECIFIC_PREFIX = "specific:";
@@ -527,6 +634,10 @@ function toolManifest(advertised) {
   // when the tool is actually advertised this turn.
   const advNames = adv.map((t) => (t && (t.toolName || t.name)) || "");
   const notes = [];
+  const hasExternalMcp = advNames.some((name) => (mcpServerKeyForTool(name, MCP_GROUPING) || "claude-code") !== "claude-code");
+  if (hasExternalMcp) {
+    notes.push("MCP tool results are delivered directly in this conversation, including large results. Consume them in place. NEVER copy a tool result into `agent-tools/<uuid>.txt`, and NEVER call file or shell tools to read such an artifact back.");
+  }
   if (advNames.includes("Workflow")) {
     notes.push("To launch a workflow, invoke the `Workflow` MCP tool NOW — it lives on its MCP server (it is NOT a top-level tool or a feature of the codebase under review). Pass `script` (inline JS: `export const meta={...}` then agent()/parallel()/pipeline()) OR `scriptPath`; a name/title-only call with neither runs nothing. In the script `agent()` is POSITIONAL — `agent('prompt text', {agentType:'general-purpose'})`, NEVER `agent({prompt,...})` (an object makes the prompt '[object Object]'); and `parallel`/`pipeline` take `() =>` thunks, never bare `agent(...)`.");
   }
@@ -544,9 +655,9 @@ function toolManifest(advertised) {
 // fromJson seam. Returns null when there is nothing to advertise.
 function toolManifestRule(advertised, cwd) {
   const content = toolManifest(advertised);
-  if (!content) return null;
+  if (!content || !cwd) return null;
   return {
-    fullPath: (cwd || "/workspace") + "/.cursor/rules/cliproxy-tools.mdc",
+    fullPath: cwd + "/.cursor/rules/cliproxy-tools.mdc",
     content, type: { global: {} }, source: "CURSOR_RULE_SOURCE_USER",
     environments: [], disabledEnvironments: [],
   };
@@ -588,16 +699,33 @@ function toPlainJson(v) {
   return v;
 }
 
-// Headless request context (never goes to CC): neutral /workspace paths, no sidecar dirs.
+// Headless request context (never goes to CC). Production sessions always carry the validated client path;
+// startup self-tests use EMPTY_CWD, never a fake user workspace.
 function requestContextEnvelope(ce, ws, cwd, rules) {
+  const env = {
+    osVersion: ce.osVersion || "linux",
+    workspacePaths: ws,
+    shell: ce.shell || "bash",
+    sandboxEnabled: false,
+    timeZone: ce.timeZone || "UTC",
+    sandboxSupported: false,
+    sandboxNetworkExplicitAllowlist: [],
+    computerUseSupported: false,
+    isWorkingDirHomeDir: false,
+  };
+  if (cwd) {
+    Object.assign(env, {
+      terminalsFolder: cwd + "/.notes/terminals",
+      agentSharedNotesFolder: cwd + "/.notes/shared",
+      agentConversationNotesFolder: cwd + "/.notes/conv",
+      projectFolder: cwd,
+      agentTranscriptsFolder: cwd + "/.notes/transcripts",
+      processWorkingDirectory: cwd,
+    });
+  }
   return { __ccJson: { success: { requestContext: {
     rules,
-    env: { osVersion: ce.osVersion || "linux", workspacePaths: ws, shell: ce.shell || "bash", sandboxEnabled: false,
-      terminalsFolder: cwd + "/.notes/terminals", agentSharedNotesFolder: cwd + "/.notes/shared",
-      agentConversationNotesFolder: cwd + "/.notes/conv", timeZone: ce.timeZone || "UTC", projectFolder: cwd,
-      agentTranscriptsFolder: cwd + "/.notes/transcripts", sandboxSupported: false,
-      sandboxNetworkExplicitAllowlist: [], computerUseSupported: false, isWorkingDirHomeDir: false,
-      processWorkingDirectory: cwd },
+    env,
     repositoryInfo: [], tools: [], conversationNotesListing: "(none)", sharedNotesListing: "(none)",
     gitRepos: [], projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [],
     commitAttributionMessage: "enabled", prAttributionMessage: "enabled", agentSkills: [],
@@ -610,8 +738,9 @@ function requestContextEnvelope(ce, ws, cwd, rules) {
 // the session; a null session (e.g. the startup self-test) yields the no-rules envelope.
 function headlessRequestContext(session) {
   const ce = (session && session.clientEnv) || {};
-  const ws = Array.isArray(ce.workspacePaths) && ce.workspacePaths.length ? ce.workspacePaths : ["/workspace"];
-  const cwd = ce.processWorkingDirectory || ws[0] || "/workspace";
+  const neutral = ce.workspaceUnknown === true;
+  const ws = neutral ? [] : (Array.isArray(ce.workspacePaths) ? ce.workspacePaths : []);
+  const cwd = neutral ? "" : (ce.processWorkingDirectory || ws[0] || "");
   let rules = [];
   if (TOOL_MANIFEST_IN_RULE && session) {
     const adv = (session.advertiseForGating && session.advertiseForGating()) || session.advertise || [];
@@ -644,16 +773,23 @@ function ccErrorMessageText(c, fallback) {
   return fallback;
 }
 
-// ADD-57: the redacted workspace cwd reported in shell result metadata (workingDirectory / exit.cwd). The
-// session's client env carries the user's REAL processWorkingDirectory (threaded by the Go executor via
-// extractComposerClientEnv); fall back to the first workspace path, then the historical "/workspace" sentinel
-// when no env is present. Reporting the actual cwd (instead of always "/workspace") keeps follow-up commands
-// and relative paths anchored to the real directory rather than a fake one.
+// The advisory workspace cwd reported in shell result metadata. When unknown,
+// use the schema's neutral empty string; never expose the SDK isolation cwd.
 function composerWorkspaceCwd(clientEnv) {
   const ce = clientEnv || {};
   if (typeof ce.processWorkingDirectory === "string" && ce.processWorkingDirectory) return ce.processWorkingDirectory;
   if (Array.isArray(ce.workspacePaths) && ce.workspacePaths.length && typeof ce.workspacePaths[0] === "string" && ce.workspacePaths[0]) return ce.workspacePaths[0];
-  return "/workspace";
+  if (ce.workspaceUnknown === true) return "";
+  return "";
+}
+
+function validClientEnv(clientEnv) {
+  if (!clientEnv || typeof clientEnv !== "object") return false;
+  const cwd = clientEnv.processWorkingDirectory;
+  const ws = clientEnv.workspacePaths;
+  if (clientEnv.workspaceUnknown === true) return cwd == null && (ws == null || (Array.isArray(ws) && ws.length === 0));
+  return typeof cwd === "string" && cwd.length > 0 &&
+    Array.isArray(ws) && ws.length > 0 && ws.every((item) => typeof item === "string" && item.length > 0);
 }
 
 // ADD-43: a native READ result is honest about completeness. The client tool may return EITHER a plain string
@@ -745,8 +881,8 @@ const CC_CASES = {
   // BR8/C5: when the client marked the native shell result as failed (isError) but the parsed exitCode is 0,
   // force a non-zero exit so the model sees the failure (a success exit would mask a failed/cancelled tool).
   // ADD-57: report ctx.cwd (the session's real processWorkingDirectory) in workingDirectory / exit.cwd.
-  shellArgs:       { ccTool: "shell", stream: false, buildResult: (c, s, isError, ctx) => { const r = parseShellContent(c); const code = isError && r.exitCode === 0 ? 1 : r.exitCode; return { success: { command: s && s.command, workingDirectory: (ctx && ctx.cwd) || "/workspace", exitCode: code, stdout: r.stdout, stderr: r.stderr } }; } },
-  shellStreamArgs: { ccTool: "shell", stream: true,  buildChunks: (c, isError, ctx) => { const r = parseShellContent(c); const code = isError && r.exitCode === 0 ? 1 : r.exitCode; const aborted = isError ? true : r.aborted; const out = [{ stdout: { data: r.stdout } }]; if (r.stderr) out.push({ stderr: { data: r.stderr } }); out.push({ exit: { code, cwd: (ctx && ctx.cwd) || "/workspace", aborted, localExecutionTimeMs: 1 } }); return out; } },
+  shellArgs:       { ccTool: "shell", stream: false, buildResult: (c, s, isError, ctx) => { const r = parseShellContent(c); const code = isError && r.exitCode === 0 ? 1 : r.exitCode; return { success: { command: s && s.command, workingDirectory: (ctx && ctx.cwd) || "", exitCode: code, stdout: r.stdout, stderr: r.stderr } }; } },
+  shellStreamArgs: { ccTool: "shell", stream: true,  buildChunks: (c, isError, ctx) => { const r = parseShellContent(c); const code = isError && r.exitCode === 0 ? 1 : r.exitCode; const aborted = isError ? true : r.aborted; const out = [{ stdout: { data: r.stdout } }]; if (r.stderr) out.push({ stderr: { data: r.stderr } }); out.push({ exit: { code, cwd: (ctx && ctx.cwd) || "", aborted, localExecutionTimeMs: 1 } }); return out; } },
   // grep/ls: routed via TYPED_UNAVAILABLE_U in unaryExecPreflight (not CC_CASES).
 };
 // Control-flow exec cases the server may send: answer with a typed "allow" so the run proceeds (a bare
@@ -800,13 +936,9 @@ function typedUnavailableResult(cas) {
 // drive the SAME function the live run uses instead of a hand-retyped literal (ADD-74: a literal can drift from
 // the real shape and pass CI while the first real tool-call crashes inside fromJson). content is normalized to a
 // string exactly as the live wrap did (object content -> JSON.stringify). isError is strict-true.
-function mcpDispatchResult(content, isError, images) {
+function mcpDispatchResult(content, isError, images, structuredContent) {
   const text = typeof content === "string" ? content : JSON.stringify(content ?? "");
   const parts = [];
-  // EX3 (clean path A): inline base64 tool-result images as McpImageContent — the content oneof's `image`
-  // member (agent.v1.McpImageContent = { data: bytes(T:12), mime_type: string }; protobuf-es fromJson decodes a
-  // base64 STRING into the bytes field). Placed BEFORE the text part. url-form images carry no base64 `data`
-  // here, so they are skipped and fall back to the (flag-off) fresh-send path. Caller gates whether images flow.
   if (Array.isArray(images)) {
     for (const im of images) {
       if (im && typeof im.data === "string" && im.data && typeof im.mimeType === "string" && im.mimeType) {
@@ -815,7 +947,12 @@ function mcpDispatchResult(content, isError, images) {
     }
   }
   if (text || parts.length === 0) parts.push({ text: { text } });
-  return { success: { isError: isError === true, content: parts } };
+  const result = { success: { isError: isError === true, content: parts } };
+  // Preserve structuredContent if provided (for future SDKs that support it; currently ignored in MCP shape but kept for testing parity)
+  if (structuredContent && typeof structuredContent === "object") {
+    result.success.structuredContent = structuredContent;
+  }
+  return result;
 }
 
 function ccArgsFor(cas, s) {
@@ -828,12 +965,97 @@ function ccArgsFor(cas, s) {
   }
 }
 
+// Cursor sometimes tries to spill a large MCP result through its built-in
+// filesystem tools using agent-tools/<uuid>.txt, then reads that file back.
+// In a remote client-tools deployment that path is an internal Cursor
+// artifact, not a user-requested workspace operation. Forwarding it makes the
+// harness create implementation debris on the user's machine and can start a
+// write/read/shell loop. Block only that unmistakable UUID artifact shape;
+// ordinary user Read/Write/Bash calls continue through ToolRound unchanged.
+const SYNTHETIC_AGENT_ARTIFACT_FILE_RE = /(?:^|[\\/\s'"=])agent-tools[\\/][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt(?:$|[\s'"?#])/i;
+const SYNTHETIC_AGENT_ARTIFACT_PATH_RE = /[^\s'"=]*agent-tools[\\/][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt/ig;
+const SYNTHETIC_AGENT_ARTIFACT_TOOLS = new Set([
+  "bash", "exec", "execcommand", "read", "readfile", "runcommand", "shell", "write", "writefile",
+]);
+const SYNTHETIC_AGENT_ARTIFACT_DISABLED_MSG =
+  "Cursor's internal agent-tools artifact handoff is disabled for remote client tools. " +
+  "The MCP/tool result is already available in this conversation; use it directly and do not write, read, list, or shell-inspect an agent-tools file.";
+const SYNTHETIC_AGENT_ARTIFACT_WRITE_TOOLS = new Set(["write", "writefile"]);
+const SYNTHETIC_AGENT_ARTIFACT_PATH_KEYS = ["path", "file_path", "filePath"];
+const SYNTHETIC_AGENT_ARTIFACT_CONTENT_KEYS = ["content", "fileText", "file_text", "text"];
+const SYNTHETIC_AGENT_ARTIFACT_COMMAND_KEYS = ["command", "cmd"];
+
+function normalizedToolLeaf(name) {
+  const parts = String(name || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return (parts.at(-1) || "").replace(/[^a-z0-9]/g, "");
+}
+
+function syntheticAgentArtifactRequest(name, input) {
+  if (!SYNTHETIC_AGENT_ARTIFACT_TOOLS.has(normalizedToolLeaf(name))) return false;
+  const value = input && typeof input === "object" ? input : {};
+  for (const key of ["path", "file_path", "filePath", "command", "cmd"]) {
+    if (typeof value[key] === "string" && SYNTHETIC_AGENT_ARTIFACT_FILE_RE.test(value[key])) return true;
+  }
+  return false;
+}
+
+function syntheticAgentArtifactFailure(name, input) {
+  if (!syntheticAgentArtifactRequest(name, input)) return null;
+  return {
+    content: SYNTHETIC_AGENT_ARTIFACT_DISABLED_MSG,
+    images: [],
+    isError: true,
+    structuredContent: { code: "synthetic_agent_artifact_disabled" },
+  };
+}
+
+function artifactInputPaths(input) {
+  const value = input && typeof input === "object" ? input : {};
+  const paths = SYNTHETIC_AGENT_ARTIFACT_PATH_KEYS
+    .map((key) => value[key])
+    .filter((candidate) => typeof candidate === "string" && candidate.length > 0);
+  for (const key of SYNTHETIC_AGENT_ARTIFACT_COMMAND_KEYS) {
+    if (typeof value[key] !== "string") continue;
+    for (const candidate of value[key].match(SYNTHETIC_AGENT_ARTIFACT_PATH_RE) || []) paths.push(candidate);
+  }
+  return [...new Set(paths)];
+}
+
+function artifactInputText(input, keys) {
+  const value = input && typeof input === "object" ? input : {};
+  for (const key of keys) if (typeof value[key] === "string") return value[key];
+  return "";
+}
+
+function artifactContentHashes(content) {
+  if (typeof content !== "string" || Buffer.byteLength(content) < SYNTHETIC_ARTIFACT_RESULT_MIN_BYTES) return [];
+  const variants = new Set([content, content.replace(/\r\n/g, "\n")]);
+  for (const value of [...variants]) variants.add(value.replace(/\n+$/g, ""));
+  return [...variants].map((value) => createHash("sha256").update(value).digest("hex"));
+}
+
+function syntheticArtifactFailure(decision) {
+  const repeat = decision.attempt > 1
+    ? ` This internal handoff has already been rejected ${decision.attempt} times; stop retrying it.`
+    : "";
+  return {
+    content: `${SYNTHETIC_AGENT_ARTIFACT_DISABLED_MSG}${repeat}`,
+    images: [],
+    isError: true,
+    structuredContent: {
+      code: "synthetic_agent_artifact_disabled",
+      reason: decision.reason,
+      attempt: decision.attempt,
+    },
+  };
+}
+
 // blockedNativeResult builds a typed FAILURE result for a native tool the model tried to use while tool_choice
 // disallowed it (H08). It uses the SAME failure channels as a real failed tool — the `error` variant for
 // read/write/delete and a non-zero/aborted exit for shell — so the model SEES the block and chooses another
 // path, never a fabricated success. Returns the unary { __ccJson } shape; the streaming case yields chunks.
 const NATIVE_TOOL_DISABLED_MSG = "tool disabled for this turn by tool_choice policy";
-function blockedNativeResult(cas, s, cwd = "/workspace") {
+function blockedNativeResult(cas, s, cwd = "") {
   switch (cas) {
     case "shellArgs":
       // ADD-57: report the session's real cwd here too (cosmetic — nothing executed — but consistent).
@@ -875,11 +1097,29 @@ function blockedNativeExecIfNeeded(store, cas, s, stream) {
   return Promise.resolve(blockedNativeResult(cas, s, cwd));
 }
 
+function blockedSyntheticNativeExecIfNeeded(store, cas, s, stream) {
+  const spec = CC_CASES[cas];
+  if (!store || !spec) return null;
+  const input = ccArgsFor(cas, s);
+  const failure = store.session.syntheticArtifactFailure(spec.ccTool, input);
+  if (!failure) return null;
+  const cwd = composerWorkspaceCwd(store.session.clientEnv);
+  dbg("__CC_EXEC_" + (stream ? "S" : "U") + " internal artifact blocked at SDK dispatch", "session=" + store.session.id, "cas=" + cas);
+  if (stream) {
+    return (async function* () {
+      for (const chunk of spec.buildChunks(failure.content, true, { cwd })) yield { __ccJson: chunk };
+    })();
+  }
+  return Promise.resolve({ __ccJson: spec.buildResult(failure.content, s, true, { cwd }) });
+}
+
 globalThis.__CC_EXEC_U = function (n, e, s, t) {
   const cas = caseOf(t);
   const store = als.getStore();
   const preflight = unaryExecPreflight(cas, store);
   if (preflight) return preflight;
+  const synthetic = blockedSyntheticNativeExecIfNeeded(store, cas, s, false);
+  if (synthetic) return synthetic;
   if (cas === "mcpArgs") {
     if (!store) return Promise.reject(new Error("[bridge] mcpArgs outside a session"));
     return store.session.dispatchMcp(s);
@@ -897,8 +1137,10 @@ globalThis.__CC_EXEC_S = function (n, e, s, t) {
   const spec = CC_CASES[cas];
   const store = als.getStore();
   if (!spec || !spec.stream || !spec.buildChunks || !store) {
-    return (async function* () { throw new Error(`[bridge] streaming tool '${cas}' not supported by the Claude Code bridge`); })();
+      return (async function* () { throw new Error(`[bridge] streaming tool '${cas}' not supported by the Claude Code bridge`); })();
   }
+  const synthetic = blockedSyntheticNativeExecIfNeeded(store, cas, s, true);
+  if (synthetic) return synthetic;
   const blocked = blockedNativeExecIfNeeded(store, cas, s, true);
   if (blocked) return blocked;
   return store.session.dispatchStream(cas, spec, s);
@@ -906,6 +1148,21 @@ globalThis.__CC_EXEC_S = function (n, e, s, t) {
 
 // ---- session: holds the live SDK run + bridges tool calls across /agent/turn calls ----
 const sessions = new Map();
+const liveToolRounds = new Map(); // signed route -> ToolRound with live SDK callbacks in this process
+let roundInfrastructure = null;
+let bridgeReady = false;
+function getRoundInfrastructure() {
+  if (!roundInfrastructure) roundInfrastructure = createRoundInfrastructure(STATE_ROOT);
+  return roundInfrastructure;
+}
+function loadToolRoundById(toolCallId) {
+  const { codec, journal } = getRoundInfrastructure();
+  const parsed = codec.parse(toolCallId);
+  const live = liveToolRounds.get(parsed.route);
+  if (live) return { parsed, round: live, live: true };
+  const round = ToolRound.load(journal, codec, parsed.route);
+  return { parsed, round, live: false };
+}
 // Bound the sessions map (no unbounded growth): evict least-recently-active, IDLE sessions over the cap. A
 // session is idle-evictable ONLY when it has no open response, no live/paused run, AND no queued waiters — so
 // we never evict a session that is streaming or paused awaiting tool_results (its SDK run is live between
@@ -913,7 +1170,11 @@ const sessions = new Map();
 function enforceSessionCap() {
   if (sessions.size <= MAX_SESSIONS) return;
   const evictable = [...sessions.values()].filter((s) => !s.activeRes && !s.run && !s.hasQueuedWaiters()).sort((a, b) => a.lastActivity - b.lastActivity);
-  for (const s of evictable) { if (sessions.size <= MAX_SESSIONS) break; sessions.delete(s.id); void s.cancel(); }
+  for (const s of evictable) {
+    if (sessions.size <= MAX_SESSIONS) break;
+    sessions.delete(s.id);
+    void s.cancel({ terminalReason: TerminalReason.SESSION_EVICTED, detail: "session capacity eviction" });
+  }
 }
 // ADD-63 (LOAD-SHED, never evict live work): before admitting a NEW session, try to make room by evicting
 // idle sessions, then report whether there is room. When the map is at MAX_SESSIONS and EVERY session is
@@ -1103,19 +1364,39 @@ function rateLimitedKeyToRecycle(sessionsMap, platformsMap) {
   return s ? keyHash(s.cursorKey) : null;
 }
 
+class AdvertisedToolRegistry {
+  constructor() { this.tools = Object.freeze([]); this.byName = new Map(); }
+  replace(tools) {
+    const next = [];
+    const byName = new Map();
+    for (const tool of Array.isArray(tools) ? tools : []) {
+      const name = tool && (tool.toolName || tool.name);
+      if (!name || typeof name !== "string") throw new Error("advertised tool is missing a string name");
+      const inputSchema = tool.inputSchema && typeof tool.inputSchema === "object" && !Array.isArray(tool.inputSchema)
+        ? tool.inputSchema
+        : { type: "object" };
+      if (byName.has(name)) throw new Error(`advertised tool '${name}' appears more than once`);
+      const normalized = Object.freeze({ ...tool, name, toolName: name, inputSchema });
+      byName.set(name, normalized);
+      next.push(normalized);
+    }
+    this.byName = byName;
+    this.tools = Object.freeze(next);
+  }
+  all() { return this.tools; }
+  find(name) { return this.byName.get(name) || null; }
+  scoped(toolChoice) { return effectiveAdvertise(this.tools, toolChoice); }
+}
+
 class Session {
   constructor(id, cursorKey) {
     this.id = id;
-    // #8 (review): a short per-session hash used to NAMESPACE client-visible tool-call ids (wireToolId), so two
-    // sibling sessions emitting the same sanitized local id produce GLOBALLY-unique visible ids — the Go
-    // ownership map then keys on a unique id per (session, tool) and never falsely flags cross-session ambiguity.
-    this.idHash = createHash("sha256").update(String(id)).digest("hex").slice(0, 8);
     // C05: the DURABLE Cursor agent id is DECOUPLED from the external sessionID. `id` is the stable routing
     // key the Go executor derives (continuations keep routing here); `agentId` is what we hand to
     // resumeAgent/createAgent. They start equal, but on ERROR_CONVERSATION_TOO_LONG we ROTATE `agentId`
     // (e.g. <id>_r2) and tombstone the poisoned durable agent, so the next turn seeds a FRESH agent under a
     // new id and never resumeAgent()s the over-budget one — while the external sessionID is unchanged.
-    this.agentId = id;
+    this.agentId = `${id}_${DURABLE_AGENT_CONTEXT_EPOCH}`;
     this.recoveryEpoch = 0;       // C05: increments each too-long rotation; suffixes the rotated agentId
     this.modelEpoch = 0;          // ADD-62: increments each MODEL-CHANGE rotation; a SEPARATE budget from
                                   // recoveryEpoch so toggling models never burns the crash-recovery rotations
@@ -1129,28 +1410,19 @@ class Session {
                                   // to the old model) + forces a re-seed, instead of silently answering from it.
     this.cursorKey = cursorKey || API_KEY; // the Cursor key whose platform this session runs on
     this.agent = null; this.agentPromise = null; this.run = null;
-    this.activeRes = null; this.pending = new Map();
-    this.turnBatch = []; this.flushTimer = null;
+    this.activeRes = null; this.responseWriter = null;
+    this.currentRound = null; this.roundSeq = 0;
+    // When a continuation lands after the paused callback process is gone, the
+    // replacement run keeps this terminal source round attached until it
+    // reaches a real final terminal. That lets the journal distinguish
+    // "reseed started" from "reseed completed" and makes a lost-response retry
+    // idempotent without inventing another SDK run.
+    this.recoverySourceRound = null;
+    this.flushTimer = null;
     this.stepToolStarted = 0;     // tool-call-started deltas seen for the CURRENT assistant step (the step's tool
                                   // count); used to wait for a slow batch before pausing. Reset at step/turn boundaries.
     this.batchWaitExtensions = 0; // how many extra debounce windows we have waited for the current step's batch
                                   // (bounded by TOOL_BATCH_MAX_EXTENSIONS so an over-count never hangs the turn).
-    this.delivered = new Set();   // tool ids the client has SEEN (sent in a turn_end) this logical run — so a
-                                  // tool_results turn matches against what was actually delivered (Comment 2)
-    this.everEmitted = new BoundedIdSet(); // BR1/ADD-49: tool ids this session has issued to the client, across
-                                  // the session lifetime (NOT cleared per run like `delivered`), BOUNDED to the
-                                  // most-recent EVER_EMITTED_CAP ids (LRU). A late tool_result for an id we DID
-                                  // recently emit (then watchdog-reaped / already resolved) is benign; an id
-                                  // never issued — OR one so old it aged out of the bound — is unknown -> error
-                                  // turn. Bounding stops both unbounded memory growth and the permanent-benign
-                                  // downgrade of ancient ids on long-lived sessions.
-    this.undelivered = [];        // {id,name,input} of tools emitted with no open response (turn closed mid-burst);
-                                  // delivered on the next /agent/turn so the client can answer them (Comment 1)
-    this.rawToWireId = new Map();  // H23: raw SDK tool-call id -> the sanitized WIRE id we emitted for it. Same
-                                   // raw id always maps to the same wire id (idempotent); two DIFFERENT raw ids
-                                   // that sanitize to the same wire id get DISAMBIGUATED so neither overwrites
-                                   // the other's pending (the original collision bug at pending.set).
-    this.usedWireIds = new Set();  // H23: every wire id this session has handed out (collision detection set).
     this.turnToken = 0;           // increments per turn; flush is bound to a token
     this.settleTurn = null;
     this.stashedToolResultImages = []; // EX3: tool-result images from a PARTIAL batch, held until the batch completes
@@ -1161,9 +1433,9 @@ class Session {
     this.pendingDeltas = [];      // #14: ordered {type:'text'|'reasoning',delta} the run produced while NO
                                   // response was open (it outlived the turn). Flushed IN ORDER on the next turn's
                                   // open response instead of being DROPPED (text deltas used to vanish here while
-                                  // only tool-uses were buffered in `undelivered`). Cleared at clearTurnState.
+                                  // tool calls are journaled by ToolRound). Cleared at clearTurnState.
     this.pendingDeltaBytes = 0;   // running byte size of pendingDeltas (bounded like outQueue)
-    this.advertise = [];
+    this.toolRegistry = new AdvertisedToolRegistry();
     this.activeAdvertise = null;  // ADD-40: the TURN-SCOPED effective advertised set (gated by tool_choice) for
                                   // the LIFETIME of the live run. `advertise` is restored to the full set right
                                   // after agent.send (it is needed for cross-turn refresh + re-seed), but the
@@ -1183,21 +1455,18 @@ class Session {
     this.clientEnv = null;        // client's real env (workspace/cwd/shell) for headless requestContext
     this.toolChoice = "";         // H08: the current turn's resolved tool_choice token (auto|none|required|specific:<n>);
                                   // read by the dispatch seam to best-effort gate NATIVE tools. Set per send in driveUserSend.
+    // Turn-scoped defense against Cursor's internal large-result artifact
+    // workflow. Only hashes and rejected paths are retained; tool content
+    // remains owned by the durable ToolRound receipt and SDK continuation.
+    this.syntheticArtifactUserText = "";
+    this.syntheticArtifactResults = [];
+    this.syntheticArtifactBlockedPaths = new Set();
+    this.syntheticArtifactRejects = 0;
     this.lastActivity = nowMs();
     this.done = false;
     this.tail = Promise.resolve();   // per-session FIFO chain: each new-user turn runs after the prior one's run completes
     this.waiters = 0;                // new-user turns queued but not yet running (single source of truth for depth-cap + eviction safety)
-    // ADD-100: SSE backpressure/failure state. `sse()` returns a boolean (true=accepted/queued, false=dropped
-    // because the turn was already torn down by overflow). When res.write() signals backpressure (returns false)
-    // we buffer the payload in `outQueue` (BOUNDED) and drain it on the socket's 'drain' event; a thrown write
-    // marks the write path failed. If the queue exceeds OUT_QUEUE_MAX_BYTES (a slow/stuck client that never
-    // drains) we cancel the turn with a typed transport error rather than letting Node buffer unboundedly. The
-    // 'drain' listener is attached lazily (once) per activeRes and detached on clearTurnState/cancel.
-    this.outQueue = [];              // queued SSE payload strings awaiting 'drain'
-    this.outQueueBytes = 0;          // running byte size of outQueue (cap enforcement)
-    this.writeFailed = false;        // a write threw OR the queue overflowed -> the stream is dead for this turn
-    this._drainBound = null;         // the bound 'drain' handler attached to the current activeRes (for detach)
-    this._drainRes = null;           // the res the 'drain' handler is attached to (so we detach from the right one)
+    this.writeFailed = false;
     this._logicalDone = [];          // resolvers fired when the live run TRULY completes (onRunComplete/onRunError/cancel), NOT at a tool-pause
     this.runEpoch = 0;               // bumped per run + on cancel; a run.wait() callback ignores its result if the epoch advanced (the run was superseded/cancelled and a new turn may already own the session)
     // ADD-106 (Comment 3): per-LOGICAL-RUN agentic-loop bound counters. Reset by resetLoopBounds() when a fresh
@@ -1209,271 +1478,227 @@ class Session {
     this.loopTripped = false;        // latched true once a loop bound trips, so we terminate the run only once
   }
 
+  get advertise() { return this.toolRegistry.all(); }
+  set advertise(tools) { this.toolRegistry.replace(tools); }
+
   touch() { this.lastActivity = nowMs(); }
+  resetSyntheticArtifactGuard(userText = "") {
+    this.syntheticArtifactUserText = typeof userText === "string" ? userText : "";
+    this.syntheticArtifactResults = [];
+    this.syntheticArtifactBlockedPaths.clear();
+    this.syntheticArtifactRejects = 0;
+  }
+  rememberLargeMcpResult(content, toolName = "") {
+    const text = typeof content === "string" ? content : JSON.stringify(content ?? "");
+    const hashes = artifactContentHashes(text);
+    if (hashes.length === 0) return false;
+    this.syntheticArtifactResults.push({ hashes: new Set(hashes), bytes: Buffer.byteLength(text), toolName: String(toolName || "") });
+    if (this.syntheticArtifactResults.length > SYNTHETIC_ARTIFACT_RESULT_WINDOW) this.syntheticArtifactResults.shift();
+    return true;
+  }
+  userExplicitlyRequestedPath(candidate) {
+    return typeof candidate === "string" && candidate.length > 0 && this.syntheticArtifactUserText.includes(candidate);
+  }
+  syntheticArtifactDecision(name, input) {
+    const leaf = normalizedToolLeaf(name);
+    if (!SYNTHETIC_AGENT_ARTIFACT_TOOLS.has(leaf)) return null;
+    const paths = artifactInputPaths(input);
+    const command = artifactInputText(input, SYNTHETIC_AGENT_ARTIFACT_COMMAND_KEYS);
+    const explicit = paths.some((candidate) => this.userExplicitlyRequestedPath(candidate));
+    let reason = "";
+
+    if (!explicit && syntheticAgentArtifactRequest(name, input)) {
+      reason = "reserved_agent_tools_path";
+    }
+    if (!reason && !explicit && SYNTHETIC_AGENT_ARTIFACT_WRITE_TOOLS.has(leaf)) {
+      const content = artifactInputText(input, SYNTHETIC_AGENT_ARTIFACT_CONTENT_KEYS);
+      const hashes = artifactContentHashes(content);
+      if (hashes.some((hash) => this.syntheticArtifactResults.some((result) => result.hashes.has(hash)))) {
+        reason = "copied_large_mcp_result";
+      }
+    }
+    if (!reason) {
+      const referencesRejectedPath = [...this.syntheticArtifactBlockedPaths].some((blockedPath) =>
+        paths.includes(blockedPath) || command.includes(blockedPath));
+      if (referencesRejectedPath) reason = "rejected_artifact_followup";
+    }
+    if (!reason) return null;
+
+    for (const candidate of paths) this.syntheticArtifactBlockedPaths.add(candidate);
+    this.syntheticArtifactRejects++;
+    return { reason, attempt: this.syntheticArtifactRejects, paths };
+  }
+  syntheticArtifactFailure(name, input) {
+    const decision = this.syntheticArtifactDecision(name, input);
+    return decision ? syntheticArtifactFailure(decision) : null;
+  }
+  ensureToolRound() {
+    if (this.currentRound && this.currentRound.state !== RoundState.TERMINAL) return this.currentRound;
+    const { journal, codec } = getRoundInfrastructure();
+    this.currentRound = new ToolRound({
+      sessionId: this.id,
+      agentId: this.agentId,
+      runEpoch: this.runEpoch,
+      roundSeq: ++this.roundSeq,
+      tenantFingerprint: keyFingerprint(this.cursorKey),
+      model: this.model || "",
+      journal,
+      codec,
+      clock: nowMs,
+      terminalCallback: (round) => {
+        if (liveToolRounds.get(round.route) === round) liveToolRounds.delete(round.route);
+      },
+    });
+    liveToolRounds.set(this.currentRound.route, this.currentRound);
+    return this.currentRound;
+  }
+  pendingCount() { return this.currentRound ? this.currentRound.pendingCount : 0; }
+  pendingIds() { return this.currentRound ? [...this.currentRound.callbacks.keys()] : []; }
+  pendingHas(id) { return !!(this.currentRound && this.currentRound.callbacks.has(id)); }
+  activeToolBatch() {
+    if (!this.currentRound) return [];
+    return this.currentRound.batch.map((id) => this.currentRound.calls.get(id)).filter(Boolean);
+  }
+  queuedToolCalls() {
+    if (!this.currentRound) return [];
+    return this.currentRound.outbound.map((id) => this.currentRound.calls.get(id)).filter(Boolean);
+  }
   hasQueuedWaiters() { return this.waiters > 0; }
   resetSeedState() { this.seeded = false; this.seededSystem = ""; this.historyFingerprint = null; }
   async finishRotationCancel() { await this.cancel(); this.done = false; }
-  // whenLogicalDone resolves when the CURRENT live run terminates. If no run is live, it resolves now. This
-  // is the queue's admission signal and is deliberately DISTINCT from settle(): settle() also fires when a
-  // turn pauses for client tools while the SDK run stays alive awaiting tool_results, so admitting the next
-  // turn on settle() would collide with the still-live run. Admission must wait for real completion.
   whenLogicalDone() { if (!this.run) return Promise.resolve(); return new Promise((r) => this._logicalDone.push(r)); }
   notifyLogicalDone() { const ws = this._logicalDone; this._logicalDone = []; for (const w of ws) { try { w(); } catch {} } }
-  // sse writes an SSE frame and returns whether the WRITE PATH is healthy (ADD-100). Returns true when the
-  // frame was accepted by the socket OR safely queued behind backpressure; returns false when the write threw
-  // or the per-session output queue overflowed (the turn is then cancelled). Callers that gate delivery on the
-  // write succeeding (emitToolUse / flushUndelivered / pauseForTools) MUST check this and re-buffer / not pause
-  // on false, so a tool is never marked `delivered` to a client that did not actually receive it.
-  sse(obj) {
-    if (!this.activeRes) return false;
-    if (this.writeFailed) return false;
-    return this.writePayload(formatSseData(obj));
+  beginResponse(res) {
+    this.activeRes = res;
+    this.writeFailed = false;
+    const writer = new SseWriter(res, {
+      maxQueueBytes: COMPOSER_OUT_QUEUE_MAX_BYTES,
+      onFailure: (error) => {
+        if (this.responseWriter !== writer) return;
+        this.writeFailed = true;
+        this.lastRunError = `[bridge] SSE transport failure: ${error.message}`;
+        if (this.currentRound && this.currentRound.state !== RoundState.TERMINAL) {
+          try { this.currentRound.terminalize(TerminalReason.TRANSPORT_ERROR, error.message); } catch {}
+        }
+        this.settle();
+        void this.cancel({ terminalReason: TerminalReason.TRANSPORT_ERROR, detail: error.message });
+      },
+    });
+    this.responseWriter = writer;
+    return writer;
   }
-  // writePayload performs the low-level write with backpressure handling. true = accepted or queued; false =
-  // failed (threw) or overflowed. On a `false` return from res.write() (backpressure) we queue the payload and
-  // attach a one-shot 'drain' listener (idempotent per res) to flush the queue when the socket clears.
+  sse(obj) { return this.sseReceipt(obj).ok; }
+  sseReceipt(obj) { return this.writePayload(formatSseData(obj)); }
   writePayload(payload) {
-    if (this.writeFailed || !this.activeRes) return false;
-    const res = this.activeRes;
-    // If we are already buffering behind backpressure, keep order: queue rather than writing ahead of the queue.
-    if (this.outQueue.length) return this.enqueueOut(payload);
-    let ok;
-    try { ok = res.write(payload); }
-    catch (e) { dbg("sse write THREW -> mark stream dead + cancel turn (ADD-100)", "session=" + this.id, (e && e.message) || String(e)); this.failWrite("sse write error: " + ((e && e.message) || String(e))); return false; }
-    if (ok === false) return this.enqueueOut(payload);
-    return true;
-  }
-  // enqueueOut buffers a payload that backpressure rejected and ensures the 'drain' flusher is attached. Returns
-  // false (and cancels the turn) when the bounded queue would overflow; true when safely queued.
-  enqueueOut(payload) {
-    const bytes = Buffer.byteLength(payload);
-    if (this.outQueueBytes + bytes > COMPOSER_OUT_QUEUE_MAX_BYTES) {
-      dbg("sse outQueue overflow -> cancel turn (ADD-100)", "session=" + this.id, "queuedBytes=" + this.outQueueBytes, "cap=" + COMPOSER_OUT_QUEUE_MAX_BYTES);
-      this.failWrite(`SSE output queue exceeded ${COMPOSER_OUT_QUEUE_MAX_BYTES} bytes (client backpressure)`);
-      return false;
+    if (!this.responseWriter && this.activeRes) this.beginResponse(this.activeRes);
+    if (!this.responseWriter || this.writeFailed) {
+      const handedToNode = Promise.reject(new Error("stream dead"));
+      handedToNode.catch(() => {});
+      return { queued: false, handedToNode, ok: false };
     }
-    this.outQueue.push(payload);
-    this.outQueueBytes += bytes;
-    this.attachDrain();
-    return true;
+    return this.responseWriter.write(payload);
   }
-  // attachDrain wires a single 'drain' listener on the current activeRes that flushes outQueue in order.
-  attachDrain() {
-    const res = this.activeRes;
-    if (!res || (this._drainBound && this._drainRes === res) || typeof res.on !== "function") return;
-    this.detachDrain();
-    this._drainRes = res;
-    this._drainBound = () => this.drainOut();
-    res.on("drain", this._drainBound);
-  }
-  detachDrain() {
-    if (this._drainBound && this._drainRes && typeof this._drainRes.off === "function") {
-      try { this._drainRes.off("drain", this._drainBound); } catch { /* ignore */ }
-    }
-    this._drainBound = null; this._drainRes = null;
-  }
-  // drainOut flushes the queued payloads on a 'drain' event, stopping if the socket signals backpressure again.
-  drainOut() {
-    const res = this.activeRes;
-    if (!res || this.writeFailed) return;
-    while (this.outQueue.length) {
-      const payload = this.outQueue[0];
-      let ok;
-      try { ok = res.write(payload); }
-      catch (e) { this.failWrite("sse drain write error: " + ((e && e.message) || String(e))); return; }
-      this.outQueue.shift();
-      this.outQueueBytes -= Buffer.byteLength(payload);
-      if (ok === false) return; // still backpressured; the next 'drain' resumes
-    }
-    this.detachDrain();
-  }
-  // failWrite marks the write path dead and cancels the turn with a typed transport error so the run is torn
-  // down (rejecting pendings, advancing the FIFO) instead of waiting on a client that will never receive output.
   failWrite(reason) {
-    if (this.writeFailed) return;
-    this.writeFailed = true;
-    this.outQueue = []; this.outQueueBytes = 0;
-    this.detachDrain();
-    this.lastRunError = "[bridge] SSE transport failure: " + reason;
-    // Cancel asynchronously; cancel() rejects pendings + notifies logical-done so the queue advances. We do NOT
-    // try to write an error frame (the stream is dead). settle() (inside cancel) clears this turn's latch.
-    void this.cancel();
+    if (this.responseWriter) this.responseWriter.fail(new Error(reason));
   }
+  async finishResponse() {
+    if (this.responseWriter) await this.responseWriter.endAfter("data: [DONE]\n\n");
+  }
+  detachDrain() {}
 
-  // wireToolId derives the per-session WIRE tool-call id from the SDK tool spec, resolving sanitization
-  // collisions (H23). ccToolId sanitizes the raw id to the Claude charset; two distinct raw ids (e.g. "call:a"
-  // and "call_a", or "x.y" and "x_y") can sanitize to the SAME wire id, and the second pending.set would then
-  // overwrite the first — one tool result resolving the wrong pending, the other hanging. We keep a per-session
-  // raw->wire map (idempotent: the same raw id always yields the same wire id, so a re-emit is stable) plus a
-  // used-wire-id set; on a collision with a DIFFERENT raw id we append a short stable hash of the raw id so the
-  // wire id is unique. A spec with no toolCallId mints a fresh tc_<uuid> (already collision-free) and is not
-  // tracked in the map (each mint is unique).
-  wireToolId(s) {
-    const raw = (s && s.toolCallId) || null;
-    if (!raw) return this.namespaceToolId(ccToolId(s)); // minted uuid path: unique by construction
-    const existing = this.rawToWireId.get(raw);
-    if (existing) return existing; // same raw id -> same (already-namespaced) wire id (idempotent re-emit)
-    let wire = ccToolId(s);
-    if (this.usedWireIds.has(wire)) {
-      // Collision: a DIFFERENT raw id already owns this sanitized wire id. Disambiguate with a short stable
-      // hash of the raw id, retrying (extremely unlikely) until unique, so neither pending is overwritten.
-      const base = wire;
-      let n = 0;
-      do {
-        const h = createHash("sha256").update(raw + "#" + n).digest("hex").slice(0, 8);
-        wire = `${base}_${h}`;
-        n++;
-      } while (this.usedWireIds.has(wire));
-      dbg("wireToolId collision disambiguated", "session=" + this.id, "raw=" + raw, "wire=" + wire);
+  normalizeClientToolInput(name, input) {
+    let normalized = wrapToolInput(input);
+    if (normalized == null) normalized = {};
+    const advertised = (this.advertise || []).find((tool) => (tool.toolName || tool.name) === name);
+    if (advertised && advertised.inputSchema) normalized = normalizeToolArgsToSchema(name, normalized, advertised.inputSchema);
+    if (name === "Workflow" && normalized && typeof normalized.script === "string") {
+      const snapped = snapWorkflowAgentTypes(normalized.script);
+      if (snapped !== normalized.script) normalized = { ...normalized, script: snapped };
     }
-    this.usedWireIds.add(wire); // tracks the LOCAL sanitized id for per-session collision detection
-    // #8 (D4/review): namespace the VISIBLE id with this session so it is GLOBALLY unique at the tenant boundary.
-    // The pending/delivered/everEmitted sets and resolvePending all use this SAME namespaced id, so the
-    // emit -> client -> tool_results round-trip is transparent; only the SDK's internal raw id differs, and the
-    // bridge never needs the raw id to route a result back (the pending is keyed by the namespaced id). The Go
-    // executor forwards the namespaced id verbatim, so its tenant-global ownership map keys on a unique id.
-    const namespaced = this.namespaceToolId(wire);
-    this.rawToWireId.set(raw, namespaced);
-    return namespaced;
-  }
-  // namespaceToolId prefixes a per-session short hash so the client-visible tool id is unique across ALL of the
-  // tenant's concurrent sessions (cct_<sessionHash>_<localId>). Idempotent if already namespaced (defensive).
-  namespaceToolId(localWire) {
-    const prefix = `cct_${this.idHash}_`;
-    return String(localWire).startsWith(prefix) ? String(localWire) : prefix + localWire;
+    return normalized;
   }
 
-  // ADD-76: create the pending entry WITHOUT arming the abandonment watchdog. The timer must NOT start until
-  // the tool is actually DELIVERED to the client (a tool buffered in `undelivered` with no open response has
-  // never been seen, so reaping it after PENDING_TIMEOUT_MS would reject a tool the client never had a chance
-  // to answer). startPendingTimer arms the watchdog at delivery (pauseForTools / flushUndelivered). A pending
-  // whose timer never started simply has timer:null; clearTimeout(null) and clearTimeout(undefined) are no-ops.
-  newPending(id, resolveWrap) {
-    this.pending.set(id, { resolve: resolveWrap, reject: (err) => { const p = this.pending.get(id); if (p && p.timer) clearTimeout(p.timer); resolveWrap.__reject(err); }, timer: null });
-  }
-  // startPendingTimer arms the PENDING_TIMEOUT_MS abandonment watchdog for an ALREADY-DELIVERED tool (ADD-76).
-  // Idempotent: re-arming an already-armed (or already-resolved) pending is a no-op, so calling it from both
-  // pauseForTools and flushUndelivered for the same id never double-arms.
-  startPendingTimer(id) {
-    const p = this.pending.get(id);
-    if (!p || p.timer) return;
-    p.timer = setTimeout(() => {
-      const cur = this.pending.get(id);
-      if (cur) { this.pending.delete(id); cur.reject(new Error(`[bridge] tool ${id} abandoned after ${PENDING_TIMEOUT_MS}ms`)); }
-    }, PENDING_TIMEOUT_MS);
-  }
-  // resolvePending answers a pending client tool call. isError (C5/BR4) flags a FAILED/cancelled client tool
-  // so the result reaches the model AS a failure (the resolve wrappers in dispatchUnary/Stream/Mcp route it
-  // into the Cursor result's isError / non-zero exit shapes) instead of being reported as a clean success.
-  resolvePending(id, content, isError = false, images = null) {
-    const p = this.pending.get(id);
-    if (!p) return false;
-    // ADD-95 (bridge backstop): cap an oversized live tool-result string before it resolves into the resuming
-    // run (the executor cap normally wins; this only trims content that bypassed it). Same 'truncated by proxy'
-    // marker on both halves. Structured object content is passed through untouched.
-    const capped = truncateLiveToolResult(content);
-    // EX3: forward any tool-result images to the resolve wrap (3rd arg) so the /mcp tools/call response can
-    // carry them as MCP image content when COMPOSER_MCP_IMAGE_RESULTS is on. Wraps that ignore it are unaffected.
-    if (p.timer) clearTimeout(p.timer); this.pending.delete(id); p.resolve(capped, isError === true, images);
-    // ADD-60: a streaming client can answer a tool BEFORE the TOOL_BATCH_MS debounce flushes (the concurrent
-    // activeRes path resolves it into the live run). If that id is still sitting in turnBatch, the pending
-    // flush would later emit a STALE `turn_end{tool_use, tool_calls:[id]}` for an already-answered call (the
-    // client then sees a stale terminal or re-executes the tool). Drop the resolved id from turnBatch; if the
-    // batch empties, cancel the flush timer so no stale tool_use turn fires for satisfied calls.
-    if (this.turnBatch.length) {
-      this.turnBatch = this.turnBatch.filter((b) => b.id !== id);
-      if (this.turnBatch.length === 0 && this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
+  openClientTool({ source, rawToolCallId, name, input, resultAdapter }) {
+    input = this.normalizeClientToolInput(name, input);
+    const syntheticFailure = this.syntheticArtifactFailure(name, input);
+    if (syntheticFailure) {
+      dbg("synthetic agent-tools artifact blocked", "session=" + this.id, "source=" + source, "name=" + name);
+      return Promise.resolve(resultAdapter ? resultAdapter(syntheticFailure) : syntheticFailure);
     }
-    return true;
-  }
-
-  // matchToolResults is the ONE shared strict tool-result matcher used by BOTH the normal runTurn path AND
-  // the concurrent activeRes fast path (C-TOOLRESULT-MATCH). Having a single matcher is the fix for C04 (the
-  // concurrent path used to clean-ack with no unknown/zero-match safety, faking success). For each result it
-  // applies, in order:
-  //   1. resolve-by-id against session.pending (threading isError) -> matched.
-  //   2. else if the id was EVER emitted/delivered by this session -> a BENIGN ack (watchdog-reaped or already
-  //      resolved); NOT unknown.
-  //   3. else -> unknown (an id this session NEVER issued: a genuine desync/foreign id).
-  // C03: the old unconditional `pending.size === 1` fallback is REMOVED — a non-empty toolCallId is matched
-  // STRICTLY. The ONLY idless escape is an EXPLICIT `tr.idless === true` flag a schema translator sets when it
-  // can PROVE the client carried no id (e.g. a future Gemini path with no functionCall.id); absent the flag,
-  // we never guess. With C02 (Gemini now emits real functionCall.id) the parallel-Gemini case round-trips by
-  // id, so the heuristic fallback is no longer needed.
-  // Returns { matched:int, unknown:string[] } (pending count is read off session.pending by the caller).
-  matchToolResults(results) {
-    let matched = 0;
-    const unknown = [];
-    for (const tr of results || []) {
-      const isErr = tr.isError === true;
-      if (this.resolvePending(tr.toolCallId, tr.content, isErr, tr.images)) { matched++; continue; }
-      // Explicit idless/minted result: a translator proved there was no client-visible id. Resolve the lone
-      // pending ONLY when exactly one is outstanding (never guess among several). This is the sole survivor of
-      // the removed C03 fallback and fires only behind the explicit flag.
-      if (tr.idless === true && this.pending.size === 1) {
-        const loneId = this.pending.keys().next().value;
-        dbg("matchToolResults idless 1-pending resolve", "session=" + this.id, "resolving=" + loneId);
-        if (this.resolvePending(loneId, tr.content, isErr, tr.images)) { matched++; continue; }
+    const round = this.ensureToolRound();
+    return new Promise((resolve, reject) => {
+      let callbackSettled = false;
+      const callback = {
+        resolve: (result) => {
+          if (callbackSettled) return;
+          try {
+            const adapted = resultAdapter ? resultAdapter(result) : result;
+            callbackSettled = true;
+            resolve(adapted);
+          }
+          catch (error) {
+            callbackSettled = true;
+            reject(error);
+            throw error;
+          }
+        },
+        reject: (error) => {
+          if (callbackSettled) return;
+          callbackSettled = true;
+          reject(error);
+        },
+      };
+      try {
+        const call = round.openCall({ source, rawToolCallId, name, input, callback });
+        this.emitToolUse(call.wireId, name, input);
+      } catch (error) {
+        reject(error);
       }
-      // BR1: an id that misses but was ever emitted/delivered is benign (reaped or already resolved). Only an
-      // id never issued by this session is genuinely unknown.
-      if (!this.delivered.has(tr.toolCallId) && !this.everEmitted.has(tr.toolCallId)) unknown.push(tr.toolCallId);
-    }
-    return { matched, unknown };
+    });
   }
-
-  // allToolResultsForeign peeks (NON-mutating) whether EVERY result in the batch carries a concrete id this
-  // session never issued — not pending, not delivered, not ever-emitted — and no idless-lone-pending escape
-  // applies. That is exactly the set matchToolResults would push entirely into `unknown` while resolving
-  // nothing: the orphan / mis-route signal. It happens when the run that OWNED these tool calls died and the Go
-  // executor cleared its tool_call ownership (composerApplyLeaseStop -> forgetSession on an error stop), so the
-  // tool result got routed by lineage to a DIFFERENT session that cannot own it. Used to return HTTP 410 BEFORE
-  // the SSE headers are written — the same lost-continuation signal as an unknown session — so the executor's
-  // reseed-on-410 replays the conversation as a fresh user turn instead of emitting an "unknown tool_call_id"
-  // error over HTTP 200 that the client then retries forever (the result has no live owner anywhere).
-  allToolResultsForeign(results) {
-    const batch = results || [];
-    if (batch.length === 0) return false;
-    for (const tr of batch) {
-      if (!tr) return false;
-      if (tr.idless === true && this.pending.size === 1) return false; // would resolve the lone pending
-      const id = tr.toolCallId;
-      if (this.pending.has(id) || this.delivered.has(id) || this.everEmitted.has(id)) return false;
-    }
-    return true;
+  startPendingTimer(id) {
+    const round = this.currentRound;
+    if (!round) return;
+    round.startTimer(id, PENDING_TIMEOUT_MS, () => {
+      const detail = `tool ${id} abandoned after ${PENDING_TIMEOUT_MS}ms`;
+      try { round.terminalize(TerminalReason.PENDING_TIMEOUT, detail); } catch {}
+      this.lastRunError = `[bridge] ${detail}`;
+      void this.cancel({ terminalReason: TerminalReason.PENDING_TIMEOUT, detail });
+    });
+  }
+  applyClientResults(results, round = this.currentRound) {
+    if (!round) throw new ToolRoundError("round_lost", "no live ToolRound owns these results", 410);
+    const applied = round.applyResults(results || []);
+    return { ...applied, matched: applied.additions.length + applied.duplicates.length, unknown: [] };
   }
 
   dispatchUnary(cas, spec, s) {
-    const id = this.wireToolId(s); // H23: collision-safe per-session wire id
-    // ADD-57: resolve the result context (real cwd) at emit time from the session's client env.
     const ctx = { cwd: composerWorkspaceCwd(this.clientEnv) };
-    return new Promise((resolve, reject) => {
-      // C5/BR8: buildResult sees isError so a native tool the client marked failed (e.g. shell) is routed
-      // through the failure shape (non-zero exitCode) instead of being reported to the model as success.
-      const wrap = (content, isError) => { try { resolve({ __ccJson: spec.buildResult(content, s, isError === true, ctx) }); } catch (err) { reject(err); } };
-      wrap.__reject = reject;
-      this.newPending(id, wrap);
-      this.emitToolUse(id, spec.ccTool, ccArgsFor(cas, s));
+    return this.openClientTool({
+      source: "patched-unary",
+      rawToolCallId: (s && s.toolCallId) || ccToolId(s),
+      name: spec.ccTool,
+      input: ccArgsFor(cas, s),
+      resultAdapter: (result) => ({ __ccJson: spec.buildResult(result.content, s, result.isError === true, ctx) }),
     });
   }
   dispatchStream(cas, spec, s) {
-    const id = this.wireToolId(s); // H23: collision-safe per-session wire id
     const self = this;
-    const ctx = { cwd: composerWorkspaceCwd(this.clientEnv) }; // ADD-57: real cwd for exit.cwd
+    const ctx = { cwd: composerWorkspaceCwd(this.clientEnv) };
     return (async function* () {
-      // C5/BR8: carry isError alongside the streamed content so buildChunks can emit a non-zero exit chunk.
-      const { content, isError } = await new Promise((resolve, reject) => {
-        const wrap = (c, e) => resolve({ content: c, isError: e === true }); wrap.__reject = reject;
-        self.newPending(id, wrap);
-        self.emitToolUse(id, spec.ccTool, ccArgsFor(cas, s));
+      const result = await self.openClientTool({
+        source: "patched-stream",
+        rawToolCallId: (s && s.toolCallId) || ccToolId(s),
+        name: spec.ccTool,
+        input: ccArgsFor(cas, s),
+        resultAdapter: (value) => value,
       });
-      for (const chunk of spec.buildChunks(content, isError, ctx)) yield { __ccJson: chunk };
+      for (const chunk of spec.buildChunks(result.content, result.isError === true, ctx)) yield { __ccJson: chunk };
     })();
   }
   // The model called one of the client's advertised tools (incl MCPs). Reconcile the (often paraphrased)
   // name against the advertised set, then route to CC. CC's text result becomes the McpResult content.
   dispatchMcp(s) {
-    const id = this.wireToolId(s); // H23: collision-safe per-session wire id
     const want = (s && (s.toolName || s.name)) || "";
     const ccName = this.reconcileToolName(want);
     const input = toPlainJson(s && s.args);
@@ -1489,22 +1714,18 @@ class Session {
       dbg("dispatchMcp TOOL NOT AVAILABLE", "want=" + want, "advertisedCount=" + eff.length, "advertised=" + names);
       return Promise.resolve({ __ccJson: mcpDispatchResult(`Tool '${want}' is not available. Available tools: ${names || "(none)"}.`, true) });
     }
-    return new Promise((resolve, reject) => {
-      // C5/BR4: a client tool that failed/was cancelled (isError) must reach the model AS a failure, so the
-      // McpResult's isError mirrors the threaded flag rather than being hardcoded false.
-      const wrap = (content, isError, images) => {
-        // EX3 (clean path A): this is the LIVE client-tool path (the SDK runtime execs tools in-process via the
-        // patched bundle, NOT the HTTP /mcp server). When enabled, fold a tool-result image into the proto
-        // McpToolResult as McpImageContent so the model sees it on RESUME — no fresh-send side-channel.
-        const imgs = mcpImageResultsEnabled() && Array.isArray(images) && images.length ? images : null;
+    return this.openClientTool({
+      source: "patched-mcp",
+      rawToolCallId: (s && s.toolCallId) || ccToolId(s),
+      name: ccName,
+      input,
+      resultAdapter: (result) => {
+        const norm = normalizeClientToolResult(result.content, result.isError, result.images, result.structuredContent, ccName);
+        this.rememberLargeMcpResult(norm.content, ccName);
+        const imgs = mcpImageResultsEnabled() && norm.inlineImages ? norm.inlineImages : null;
         if (imgs) dbg("EX3 dispatchMcp folding image into McpToolResult (path A)", "session=" + this.id, "name=" + ccName, "images=" + imgs.length);
-        let out = ccName === "Workflow" ? augmentWorkflowResultOnFailure(content, isError) : content;
-        out = augmentBackgroundLaunchResult(out, ccName); // a background launch (Workflow, or a backgrounded Bash) -> tell the model to WAIT, not relaunch or redo the work (named + id so it is clear WHICH)
-        resolve({ __ccJson: mcpDispatchResult(out, isError, imgs) });
-      };
-      wrap.__reject = reject;
-      this.newPending(id, wrap);
-      this.emitToolUse(id, ccName, input);
+        return { __ccJson: mcpDispatchResult(norm.content, norm.isError, imgs, norm.structuredContent) };
+      },
     });
   }
   // ADD-40: the effective advertised set the MODEL's tool calls are gated against. While a run is live this is
@@ -1543,57 +1764,36 @@ class Session {
     return matches.length === 1 ? matches[0] : null;                   // ambiguous/none -> typed isError
   }
 
-  emitToolUse(id, name, input) {
+  emitToolUse(id, name, input, { handJournaled = false } = {}) {
     this.touch();
-    // ADD-104: normalize a non-object tool input to {input:<raw>} ONCE, here, before it is buffered (turnBatch /
-    // undelivered) or written to SSE — so the direct emit AND any later flushUndelivered re-emit carry the same
-    // stable object shape, and the executor never collapses a string/number/array arg to {}.
-    input = wrapToolInput(input);
-    // GENERAL MCP-ARG FALLBACK: composer-2.5 sometimes sends a STRING-typed argument as a wrapper OBJECT (e.g.
-    // Bash.command / Workflow.script arrived as {…} -> "[object Object]" / a failed command). Coerce each arg the
-    // tool's schema types as a PRIMITIVE back to its scalar (pull the string out of a content-block/wrapper),
-    // leaving genuinely object/array-typed args untouched. Schema-driven, so it never corrupts a real object arg.
-    const advTool = (this.advertise || []).find((t) => (t.toolName || t.name) === name);
-    if (advTool && advTool.inputSchema) input = normalizeToolArgsToSchema(name, input, advTool.inputSchema);
-    // Workflow value-snap: rewrite a known-wrong agentType/subagent_type VALUE in the script (e.g. generalPurpose
-    // -> general-purpose) so the workflow does not fail with "agent type '...' not found".
-    if (name === "Workflow" && input && typeof input.script === "string") {
-      const snapped = snapWorkflowAgentTypes(input.script);
-      if (snapped !== input.script) { input = { ...input, script: snapped }; dbg("emitToolUse: snapped workflow agentType value(s)", "session=" + this.id); }
-    }
-    if (!this.activeRes || this.writeFailed) {
-      // No open client-facing response (the prior turn already closed mid-burst), or the write path is dead.
-      // Writing the tool_call to a dead/absent socket would silently create a pending the client can never
-      // answer (the desync). Buffer it and deliver it on the next /agent/turn (Comment 1). everEmitted records
-      // the issued id (lifetime) so a late result for it is benign, not an "unknown" foreign id.
-      dbg("emitToolUse BUFFERED (no activeRes / write dead)", "session=" + this.id, "id=" + id, "name=" + name);
-      this.everEmitted.add(id);
-      this.undelivered.push({ id, name, input });
+    const round = this.currentRound;
+    const call = round && round.calls.get(id);
+    if (!call) throw new ToolRoundError("unknown_tool_call_id", `cannot emit unregistered tool call ${id}`, 500);
+    input = call.input;
+    if (!this.activeRes || this.writeFailed || (round.state === RoundState.AWAITING_RESULTS && !handJournaled)) {
+      // REGISTERED is itself the durable not-yet-handed queue. No second `undelivered` buffer exists.
+      dbg("emitToolUse journaled for next response", "session=" + this.id, "id=" + id, "name=" + name);
       return;
     }
     dbg("emitToolUse", "session=" + this.id, "id=" + id, "name=" + name, "in=" + dbgInputShape(input));
-    this.turnBatch.push({ id, name, input });
-    // ADD-100: gate delivery bookkeeping on the WRITE actually succeeding. If res.write threw or overflowed the
-    // bounded output queue, the client did NOT receive this tool_call — so do NOT mark it delivered/everEmitted
-    // and do NOT arm the debounce/pause. Re-buffer it into `undelivered` so it is re-attempted on a later turn,
-    // and bail. A client must never have its run paused on a tool it never saw (RBT-009).
-    const ok = this.sse({ type: "tool_call", id, name, input });
-    if (!ok) {
-      dbg("emitToolUse write FAILED -> re-buffer, do not mark delivered/pause (ADD-100)", "session=" + this.id, "id=" + id);
-      this.turnBatch = this.turnBatch.filter((b) => b.id !== id);
-      this.everEmitted.add(id);
-      this.undelivered.push({ id, name, input });
-      return;
-    }
-    // ADD-60: mark the id delivered the moment its tool_call frame is WRITTEN to the client (not only later at
-    // pauseForTools). A streaming client may post a continuation answering this id BEFORE the debounce fires;
-    // resolvePending then removes it from turnBatch, but the client has genuinely SEEN the id, so an early
-    // result for it must be treated as a real match (delivered), never as an unknown/foreign id.
-    this.everEmitted.add(id); // BR1: record EVERY issued id (lifetime), so a late result is benign not "unknown"
-    this.delivered.add(id);
-    const token = this.turnToken;
-    if (this.flushTimer) clearTimeout(this.flushTimer);
-    this.flushTimer = setTimeout(() => { if (token === this.turnToken) this.maybePauseForTools(token); }, TOOL_BATCH_MS);
+    const receipt = this.sseReceipt({ type: "tool_call", id, name, input });
+    if (!receipt.ok) return;
+    receipt.handedToNode.then(() => {
+      if (round.state === RoundState.TERMINAL) return;
+      try { round.markHanded(id); }
+      catch (error) {
+        try { round.terminalize(TerminalReason.TRANSPORT_ERROR, error.message); } catch {}
+        this.lastRunError = error.message;
+        void this.cancel({ terminalReason: TerminalReason.TRANSPORT_ERROR, detail: error.message });
+        return;
+      }
+      this.startPendingTimer(id);
+      const token = this.turnToken;
+      if (this.flushTimer) clearTimeout(this.flushTimer);
+      this.flushTimer = setTimeout(() => { if (token === this.turnToken) this.maybePauseForTools(token); }, TOOL_BATCH_MS);
+    }).catch(() => {
+      // The response-local writer owns transport terminalization and callback rejection.
+    });
   }
   // bufferDelta (#14) stores a text/reasoning delta the run produced while no live response was open (it outlived
   // the turn), preserving order, so it is flushed on the next turn instead of dropped. Bounded: past the cap we
@@ -1624,45 +1824,27 @@ class Session {
       }
     }
   }
-  // flushUndelivered delivers tools that were emitted while no response was open, on a later turn's OPEN
-  // response, so the client finally sees them and can answer them. Emits one tool_use turn_end + settles.
-  flushUndelivered() {
-    if (!this.undelivered.length || !this.activeRes || this.writeFailed) return false;
-    const batch = this.undelivered;
-    this.undelivered = [];
-    dbg("flushUndelivered", "session=" + this.id, "count=" + batch.length, "ids=" + safeJson(batch.map((t) => t.id)));
-    const delivered = [];
-    for (const t of batch) {
-      // ADD-100: only mark a tool delivered after its frame WRITES successfully. On a write failure, re-buffer
-      // the remainder (this one + the rest) so nothing is marked seen that the client never received.
-      const ok = this.sse({ type: "tool_call", id: t.id, name: t.name, input: t.input });
-      if (!ok) {
-        dbg("flushUndelivered write FAILED -> re-buffer remainder (ADD-100)", "session=" + this.id, "id=" + t.id);
-        this.undelivered.unshift(t, ...batch.slice(batch.indexOf(t) + 1));
-        break;
-      }
-      this.delivered.add(t.id); this.everEmitted.add(t.id);
-      // ADD-76: the watchdog clock for a buffered tool starts ONLY now, at delivery (it was created without a
-      // timer in newPending), so the client gets a fair PENDING_TIMEOUT_MS window from when it first saw the tool.
-      this.startPendingTimer(t.id);
-      delivered.push(t.id);
-    }
-    if (!delivered.length) return false; // first write failed before anything was delivered (turn cancelled)
-    this.sse({ type: "turn_end", stop_reason: "tool_use", tool_calls: delivered });
-    this.settle();
+  // REGISTERED calls in the durable round are the only not-yet-handed queue. Re-emitting them uses the same
+  // receipt path as a call produced while this response was already open.
+  flushJournaledCalls() {
+    const batch = this.queuedToolCalls();
+    if (!batch.length || !this.activeRes || this.writeFailed) return false;
+    dbg("flushJournaledCalls", "session=" + this.id, "count=" + batch.length, "ids=" + safeJson(batch.map((call) => call.wireId)));
+    for (const call of batch) this.emitToolUse(call.wireId, call.name, call.input, { handJournaled: true });
     return true;
   }
-  // maybePauseForTools (elegant step-boundary refinement): when the SDK has announced MORE tools for this step
-  // (stepToolStarted) than we have delivered (turnBatch), wait one more debounce window for the rest of the
+  // When the SDK has announced more tools for this step than the durable round has handed to the response,
+  // wait one more debounce window for the rest of the
   // wave instead of pausing now — so a slow burst lands in ONE turn_end rather than spilling its tail into the
   // next turn's buffer. BOUNDED by TOOL_BATCH_MAX_EXTENSIONS so an over-count (an announced tool that never
   // dispatches) can never hang the turn. With no step signal (stepToolStarted==0, e.g. unit tests) it pauses
   // immediately — identical to the old debounce. It only ever DELAYS the pause, so it can never strand a tool.
   maybePauseForTools(token) {
-    if (this.stepToolStarted > this.turnBatch.length && this.batchWaitExtensions < TOOL_BATCH_MAX_EXTENSIONS) {
+    const batch = this.activeToolBatch();
+    if (this.stepToolStarted > batch.length && this.batchWaitExtensions < TOOL_BATCH_MAX_EXTENSIONS) {
       this.batchWaitExtensions++;
       dbg("maybePauseForTools: awaiting full step batch", "session=" + this.id,
-        "delivered=" + this.turnBatch.length, "announced=" + this.stepToolStarted, "ext=" + this.batchWaitExtensions);
+        "delivered=" + batch.length, "announced=" + this.stepToolStarted, "ext=" + this.batchWaitExtensions);
       this.flushTimer = setTimeout(() => { if (token === this.turnToken) this.maybePauseForTools(token); }, TOOL_BATCH_MS);
       return;
     }
@@ -1671,20 +1853,23 @@ class Session {
   }
   pauseForTools() {
     this.flushTimer = null;
+    const round = this.currentRound;
+    const batch = this.activeToolBatch();
+    if (!round || !batch.length || round.state === RoundState.TERMINAL) return;
     // ADD-106 (Comment 3): COUNT this tool-result round and enforce the per-logical-run loop bounds BEFORE
     // delivering the batch. If a bound trips, tear the run down as a MODEL/CLIENT-visible error terminal instead
     // of pausing for tools — so a runaway agentic loop (endless tool rounds, or the same tool+args hammered) can
     // never stream/pause forever, and is NEVER reported as a clean success.
     if (this.checkLoopBound()) return;
-    // ADD-76: arm the abandonment watchdog for each batched id NOW, at the moment it is delivered in the
-    // tool_use turn_end (the pending was created without a timer in newPending). ADD-100: the ids are already in
-    // `delivered` (set at successful emit time); the turn_end write is best-effort here (the run pauses either
-    // way and the ids are tracked), so a failed terminal write does not strand bookkeeping.
-    for (const b of this.turnBatch) { this.delivered.add(b.id); this.startPendingTimer(b.id); }
-    this.sse({ type: "turn_end", stop_reason: "tool_use", tool_calls: this.turnBatch.map((b) => b.id) });
-    this.turnBatch = [];
-    this.stepToolStarted = 0; this.batchWaitExtensions = 0; // the step's batch is delivered; the next step re-counts
-    this.settle();
+    round.markAwaitingResults();
+    const receipt = this.sseReceipt({ type: "turn_end", stop_reason: "tool_use", tool_calls: batch.map((call) => call.wireId) });
+    if (!receipt.ok) return;
+    receipt.handedToNode.then(() => {
+      round.batch = [];
+      this.stepToolStarted = 0;
+      this.batchWaitExtensions = 0;
+      this.settle();
+    }).catch(() => {});
   }
   settle() { const f = this.settleTurn; this.settleTurn = null; if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; } if (f) f(); }
 
@@ -1703,9 +1888,9 @@ class Session {
     this.toolRounds++;
     // Repeat detector: only a SINGLE-tool round has a well-defined "same call" signature. A multi-tool round
     // (parallel batch) is genuine progress, so it resets the consecutive-repeat streak.
-    const batch = this.turnBatch;
+    const batch = this.activeToolBatch();
     if (batch.length === 1) {
-      const sig = batch[0].name + " " + safeJson(batch[0].input);
+      const sig = batch[0].name + "\u0000" + safeJson(batch[0].input);
       if (sig === this.lastToolSig) this.repeatToolCount++;
       else { this.lastToolSig = sig; this.repeatToolCount = 1; }
     } else {
@@ -1734,12 +1919,13 @@ class Session {
     this.loopTripped = true;
     this.lastRunError = reason; // BR2: a later tool_results that finds the run gone surfaces this real error
     dbg("tripLoopBound", "session=" + this.id, "rounds=" + this.toolRounds, "repeat=" + this.repeatToolCount, reason);
+    this.rejectAllPending(reason, TerminalReason.LOOP_BOUND);
     this.sse({ type: "turn_end", stop_reason: "error", error: reason });
     this.settle();
     // cancel() tears down the live run/agent, rejects every pending, bumps runEpoch (epoch-gating the dead run's
     // callbacks), and fires notifyLogicalDone so a queued new-user turn is admitted. done=true short-circuits any
     // late onRunComplete/onRunError from the cancelled run so the error terminal above is the run's only terminal.
-    void this.cancel();
+    void this.cancel({ terminalReason: TerminalReason.LOOP_BOUND, detail: reason });
   }
 
   onRunComplete(res) {
@@ -1754,10 +1940,10 @@ class Session {
     // res.result lump if NO deltas fired this run (non-streaming edge) — otherwise we'd duplicate.
     const fullResult = (res && res.result) || "";
     if (!this.streamedText && fullResult) this.sse({ type: "text", delta: fullResult });
-    // ERROR HONESTY (Comment 3): a run that "finished" but produced NO user-visible output this run — no streamed
+    // A run that "finished" but produced no user-visible output this run — no streamed
     // text, no result lump, and no tool call delivered OR buffered — is an EMPTY turn, not a success. Surface it
-    // as turn_end{error} so the client is never handed a clean empty completion (a false success). `delivered`
-    // and `undelivered` accumulate across the run's tool rounds (clearTurnState runs only at the terminal), so
+    // as turn_end{error} so the client is never handed a clean empty completion. Durable ToolRound state
+    // accumulates across the run's tool rounds (clearTurnState runs only at the terminal), so
     // this is accurate for a multi-round run and only fires on a genuinely empty finished run.
     const finished = res && res.status === "finished";
     // #15: reasoning, still-buffered catch-up deltas, and any reported usage ALSO count as produced output, so a
@@ -1765,15 +1951,50 @@ class Session {
     // turn (a false error). The empty->error path fires ONLY on a finished run with genuinely nothing produced.
     const hasUsage = !!(res && res.usage && typeof res.usage === "object" && Object.keys(res.usage).length > 0);
     const producedOutput = !!this.streamedText || this.reasonedThisRun || !!fullResult
-      || this.delivered.size > 0 || this.undelivered.length > 0 || this.pendingDeltas.length > 0 || hasUsage;
-    const stopReason = finished && producedOutput ? "end_turn" : "error";
-    // A successful run proves the upstream connection is healthy -> close any rate-limit breaker for this key.
-    if (stopReason === "end_turn") closeBreaker(keyHash(this.cursorKey));
-    const turnError = finished
+      || this.toolRounds > 0 || this.queuedToolCalls().length > 0 || this.pendingDeltas.length > 0 || hasUsage;
+    const unresolvedTools = this.pendingCount() > 0 || this.queuedToolCalls().length > 0;
+    let stopReason = finished && producedOutput && !unresolvedTools ? "end_turn" : "error";
+    let turnError = unresolvedTools
+      ? "composer run completed while client tools remained unresolved"
+      : finished
       ? (producedOutput ? (res && res.error) : "composer run finished with no output (empty turn)")
       : ((res && res.error) || "composer run did not finish");
+    if (stopReason === "end_turn" && this.recoverySourceRound) {
+      try {
+        const prior = this.recoverySourceRound.recovery || {};
+        this.recoverySourceRound.recordRecovery({
+          ...prior,
+          completedAt: nowMs(),
+          decision: "completed",
+          replacementAgentId: this.agentId,
+        });
+        this.recoverySourceRound = null;
+      } catch (error) {
+        // A clean final response is not safe until the recovery completion
+        // receipt is durable. Surface an error so an identical harness retry
+        // can recover again instead of silently starting duplicate work.
+        stopReason = "error";
+        turnError = `failed to persist recovery completion: ${(error && error.message) || error}`;
+      }
+    }
+    if (stopReason !== "end_turn" && this.recoverySourceRound) {
+      try {
+        const prior = this.recoverySourceRound.recovery || {};
+        this.recoverySourceRound.recordRecovery({
+          ...prior,
+          decision: "failed",
+          failedAt: nowMs(),
+          reason: turnError || "replacement run did not complete cleanly",
+        });
+      } catch {}
+      this.recoverySourceRound = null;
+      if (sessions.get(this.id) === this) sessions.delete(this.id);
+    }
+    // A successful run with every required durable receipt persisted proves
+    // the upstream connection is healthy.
+    if (stopReason === "end_turn") closeBreaker(keyHash(this.cursorKey));
+    this.rejectAllPending("run completed while client tools remained unresolved", TerminalReason.RUN_ERROR);
     this.sse({ type: "turn_end", stop_reason: stopReason, status: res && res.status, error: turnError, usage: (res && res.usage) || {} });
-    this.rejectAllPending("run completed");
     this.clearTurnState();
     this.settle();
     this.notifyLogicalDone(); // real completion -> admit the next queued new-user turn
@@ -1783,9 +2004,19 @@ class Session {
     this.done = true; this.run = null;
     const msg = (err && err.message) || String(err);
     this.lastRunError = msg; // BR2: a tool_results turn that finds the run gone surfaces this real error
+    if (this.recoverySourceRound) {
+      try {
+        const prior = this.recoverySourceRound.recovery || {};
+        this.recoverySourceRound.recordRecovery({ ...prior, decision: "failed", failedAt: nowMs(), reason: msg });
+      } catch {}
+      this.recoverySourceRound = null;
+      // A failed recovery is retryable from the durable source round. Remove
+      // the replacement Session so the retry cannot collide with a dead run.
+      if (sessions.get(this.id) === this) sessions.delete(this.id);
+    }
     dbg("onRunError", "session=" + this.id, (err && err.stack) || msg);
+    this.rejectAllPending("run errored", TerminalReason.RUN_ERROR);
     this.sse({ type: "turn_end", stop_reason: "error", error: msg });
-    this.rejectAllPending("run errored");
     this.clearTurnState();
     this.settle();
     this.notifyLogicalDone(); // run terminated (error) -> admit the next queued new-user turn
@@ -1803,7 +2034,7 @@ class Session {
   // existing durable state is unchanged); any rotation appends a stable, unique suffix (`_rN` and/or `_mN`).
   // Combining both epochs guarantees a fresh unique id even when a model change follows a too-long rotation.
   composeAgentId() {
-    let aid = this.id;
+    let aid = `${this.id}_${DURABLE_AGENT_CONTEXT_EPOCH}`;
     if (this.recoveryEpoch > 0) aid += `_r${this.recoveryEpoch + 1}`; // first too-long rotation -> _r2
     if (this.modelEpoch > 0) aid += `_m${this.modelEpoch}`;           // first model change   -> _m1
     if (this.keyEpoch > 0) aid += `_k${this.keyEpoch}`;               // ADD-79: first key change -> _k1
@@ -1839,7 +2070,7 @@ class Session {
   // durable agent is bound to the OLD model (resumeAgent would silently keep answering from it), so we
   // tombstone it, allocate a fresh agentId under a SEPARATE modelEpoch budget (so model toggling never burns
   // the C05 crash-recovery rotations), and force a re-seed of the client's history into the fresh agent under
-  // the new model. The external session id is KEPT so continuations keep routing here. Per owner decision:
+  // the new model. The external session id is KEPT so continuations keep routing here. Per the durability contract:
   // rotate + re-seed (NOT 409-reject, NOT silently reuse the old model's agent). Bounded so pathological
   // model-flapping cannot churn agentIds without limit; past the cap we keep the last rotated agent (the next
   // turn re-seeds into it) rather than dropping the session.
@@ -1883,30 +2114,26 @@ class Session {
     dbg("rotateForKeyChange -> rotate durable agentId for new key (no resumeAgent(old key's agent))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId);
     await this.finishRotationCancel();
   }
-  rejectAllPending(why) {
-    for (const [, p] of this.pending) { try { p.reject(new Error(`[bridge] ${why}`)); } catch {} }
-    this.pending.clear();
+  rejectAllPending(why, reason = TerminalReason.RUN_ERROR) {
+    if (this.currentRound && this.currentRound.state !== RoundState.TERMINAL) {
+      this.currentRound.terminalize(reason, why);
+    }
   }
-  // Clear per-run tool-delivery state when the logical run ends/errors/cancels (Comment 1): stale turnBatch,
-  // undelivered buffer, and the delivered set must not leak into the next logical run on this session.
   clearTurnState() {
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
-    this.turnBatch = []; this.undelivered = []; this.delivered.clear();
     this.stepToolStarted = 0; this.batchWaitExtensions = 0; // #85: reset the step batch counters at the terminal
     this.pendingDeltas = []; this.pendingDeltaBytes = 0; // #14: drop any undelivered text/reasoning; the run is over
     this.activeAdvertise = null; // ADD-40: the turn-scoped effective tool policy ends with the run
-    // ADD-100: drop any queued backpressured output + detach the 'drain' listener; the run is over.
-    this.outQueue = []; this.outQueueBytes = 0; this.detachDrain();
   }
   // cancel tears down the live run/agent + rejects pendings. ADD-90: `notify` controls whether queued waiters
   // are released (notifyLogicalDone). External callers (onClose, handleTurn interrupt, rotate*, shutdown, evict,
   // failWrite) use the default notify:true so the FIFO advances. Internal SUPERSESSION (cancelStaleRun) passes
   // notify:false so a queued new-user turn is NOT promoted before driveUserSend installs the replacement
   // session.run — otherwise the queued turn and the replacement send would race on the same durable agent.
-  async cancel({ notify = true } = {}) {
+  async cancel({ notify = true, terminalReason = TerminalReason.CLIENT_CANCELLED, detail = "session cancelled" } = {}) {
     this.done = true;     // short-circuit any late run.wait() settlement (onRunComplete/onRunError no-op on done)
     this.runEpoch++;      // invalidate the in-flight run's completion callback so it can't mutate a successor turn
-    this.rejectAllPending("session cancelled");
+    this.rejectAllPending(detail, terminalReason);
     this.clearTurnState();
     try { await (this.run && this.run.cancel && this.run.cancel()); } catch {}
     try { await (this.agent && this.agent.close && this.agent.close()); } catch {}
@@ -1920,27 +2147,6 @@ class Session {
 }
 
 function nowMs() { return Date.now(); }
-
-// ADD-49: a bounded FIFO id-set used for `everEmitted` (the per-session lifetime record of issued tool ids).
-// A long-lived session emitting thousands of tool calls across many runs would otherwise let `everEmitted`
-// grow without bound (memory) AND keep treating ancient stale ids as "benign" forever. We bound it: only the
-// most recent EVER_EMITTED_CAP ids are retained; an older id falls out and, if a stale result for it arrives,
-// it is treated as genuinely unknown (a real desync) rather than a permanent benign downgrade. The cap is
-// generous so a normal multi-run conversation never evicts a still-relevant id. has()/add() are O(1).
-const EVER_EMITTED_CAP = 4096;
-class BoundedIdSet {
-  constructor(cap = EVER_EMITTED_CAP) { this.cap = cap; this.set = new Set(); }
-  add(id) {
-    if (this.set.has(id)) { this.set.delete(id); this.set.add(id); return; } // refresh recency (true LRU touch)
-    this.set.add(id);
-    if (this.set.size > this.cap) { const oldest = this.set.values().next().value; this.set.delete(oldest); }
-  }
-  has(id) { return this.set.has(id); }
-  get size() { return this.set.size; }
-  clear() { this.set.clear(); }
-  values() { return this.set.values(); }
-  [Symbol.iterator]() { return this.set[Symbol.iterator](); }
-}
 
 // ── H12: durable per-agent history fingerprint (survives a bridge restart) ──────────────────────────────
 // The BR-DS optimization (resume a durable agent that has prior turns -> mark seeded, skip re-prepend) is
@@ -2112,8 +2318,8 @@ async function ensureAgent(session, model) {
 // The SDK's local runtime is a real MCP client: given an http McpServerConfig it connects out, calls
 // tools/list, surfaces those tools to composer-2.5, and drives tools/call when the model picks one. We host
 // that server here over loopback (route /mcp/<sessionId>[/<serverKey>]) so a tools/call converges on the
-// SAME pending/emit machinery as a native dispatchMcp — the model's call becomes an SSE tool_call the client
-// answers on a later /agent/turn (resolvePending fulfills the awaiting promise).
+// same ToolRound adapter as patched MCP dispatch — the model's call becomes an SSE tool_call the client
+// answers on a later /agent/continue request.
 
 // mcpServerKeyForTool maps an advertised tool NAME to its server key under the active grouping. Pure helper.
 //   one      -> always "cc".
@@ -2200,8 +2406,8 @@ function buildMcpServers(session) {
     }
     return servers;
   } catch (e) {
-    dbg("buildMcpServers threw (returning {})", "session=" + (session && session.id), (e && e.message) || String(e));
-    return {};
+    dbg("buildMcpServers threw (fail closed)", "session=" + (session && session.id), (e && e.message) || String(e));
+    throw e;
   }
 }
 
@@ -2291,36 +2497,32 @@ async function mcpDispatch(msg, sessionId, serverKey) {
           const names = (session.advertise || []).map((t) => t.toolName || t.name).join(", ");
           return mcpResult(id, { content: [{ type: "text", text: `Tool '${want}' is not available. Available tools: ${names || "(none)"}.` }], isError: true });
         }
-        // Correlate + await exactly like Session.dispatchMcp: ccToolId(undefined) mints a sanitized tc_<uuid>
-        // that is BOTH the SSE tool_call id and the pending-map key. The only bound on the wait is the existing
-        // PENDING_TIMEOUT_MS watchdog (no new data-path timeout). resolvePending (on the later tool_results
-        // turn) fulfills `wrap`; rejectAllPending (run completed/errored/cancelled/abandoned) -> __reject.
-        const callId = ccToolId(undefined);
         try {
-          const out = await new Promise((resolve, reject) => {
-            const wrap = (c, _e, imgs) => resolve({ content: c, images: imgs });
-            wrap.__reject = reject;
-            session.newPending(callId, wrap);
-            session.emitToolUse(callId, ccName, input);
+          const out = await session.openClientTool({
+            source: "http-mcp",
+            rawToolCallId: `http-mcp:${String(id ?? randomUUID())}`,
+            name: ccName,
+            input,
+            resultAdapter: (result) => result,
           });
-          // EX3 (clean path B): return inline base64 tool-result images as MCP image content, BEFORE the text, so
-          // the model sees the image on RESUME. Standard MCP CallToolResult content part {type:"image",data,mimeType}.
-          // url-form images are not base64 here, so they fall through to the text + the (flag-off) fresh-send path.
+          // Normalize once via shared helper (checklist 3)
+          const norm = normalizeClientToolResult(out.content, out.isError, out.images, out.structuredContent, ccName);
+          session.rememberLargeMcpResult(norm.content, ccName);
           const parts = [];
-          if (mcpImageResultsEnabled() && Array.isArray(out.images)) {
-            for (const im of out.images) {
-              if (im && typeof im.data === "string" && im.data && typeof im.mimeType === "string" && im.mimeType) {
-                parts.push({ type: "image", data: im.data, mimeType: im.mimeType });
-              }
+          // Inline base64 images
+          if (mcpImageResultsEnabled() && norm.inlineImages) {
+            for (const im of norm.inlineImages) {
+              parts.push({ type: "image", data: im.data, mimeType: im.mimeType });
             }
-            if (parts.length) console.error("[cct] EX3 mcp tools/call (path B) returning image content session=" + sessionId + " name=" + ccName + " images=" + parts.length);
           }
-          const text = typeof out.content === "string" ? out.content : JSON.stringify(out.content ?? "");
+          // URL images fallback as text? Keep as text reference for now, plus preserve data
+          // For URL images, we include them as text if no inline, but also keep url-image fallback data
+          const text = typeof norm.content === "string" ? norm.content : JSON.stringify(norm.content ?? "");
           if (text || parts.length === 0) parts.push({ type: "text", text });
-          return mcpResult(id, { content: parts, isError: false });
+          const result = { content: parts, isError: norm.isError };
+          if (norm.structuredContent && typeof norm.structuredContent === "object") result.structuredContent = norm.structuredContent;
+          return mcpResult(id, result);
         } catch (rejErr) {
-          // Run completed/errored/cancelled/abandoned before the client answered: a typed failure (per MCP,
-          // tool-execution failures are RESULTS with isError, not protocol errors), so the runtime never hangs.
           return mcpResult(id, { content: [{ type: "text", text: (rejErr && rejErr.message) || String(rejErr) }], isError: true });
         }
       }
@@ -2413,7 +2615,7 @@ function streamCallbacks(session, ep) {
           if (ty === "tool-call-started") session.stepToolStarted++;
           else if (ty === "step-started" || ty === "step-completed" || ty === "turn-ended") { session.stepToolStarted = 0; session.batchWaitExtensions = 0; }
           try { dbg("onDelta STEP", "session=" + session.id, "type=" + ty, "stepToolStarted=" + session.stepToolStarted,
-            "turnBatch=" + session.turnBatch.length, "undelivered=" + session.undelivered.length, "activeRes=" + !!session.activeRes); } catch { /* never throw from a probe */ }
+            "toolBatch=" + session.activeToolBatch().length, "queued=" + session.queuedToolCalls().length, "activeRes=" + !!session.activeRes); } catch { /* never throw from a probe */ }
         }
         // A NON-EMPTY delta whose discriminator we don't recognize would otherwise be silently dropped (the
         // model's answer vanishes behind a clean turn_end). Surface it so a future @cursor/sdk discriminator
@@ -2427,8 +2629,8 @@ function streamCallbacks(session, ep) {
     onStep: (step) => {
       if (!live()) return; // #13: ignore a dead run's step callback
       try {
-        dbg("onStep PROBE", "session=" + session.id, "turnBatch=" + session.turnBatch.length,
-          "undelivered=" + session.undelivered.length, "activeRes=" + !!session.activeRes,
+        dbg("onStep PROBE", "session=" + session.id, "toolBatch=" + session.activeToolBatch().length,
+          "queued=" + session.queuedToolCalls().length, "activeRes=" + !!session.activeRes,
           "shape=" + safeJson(step && typeof step === "object" ? Object.keys(step) : typeof step));
       } catch { /* never throw from a probe */ }
     },
@@ -2865,8 +3067,30 @@ function validateBindHost(host, hasToken, allowInsecure = false) {
 function healthBody(req) {
   const h = (req && req.headers) || {};
   const authed = BRIDGE_TOKEN && constEq(h["x-bridge-auth"], BRIDGE_TOKEN);
-  if (isLoopbackRemote(req) || authed) return { ok: true, patched: true, sessions: sessions.size };
+  if (isLoopbackRemote(req) || authed) return { ok: true, ready: bridgeReady, patched: true, sessions: sessions.size };
   return { ok: true };
+}
+
+function readinessBody() {
+  return bridgeReady ? { ok: true, ready: true } : { ok: false, ready: false };
+}
+
+function classifyMcpRoute(req) {
+  const requestUrl = String(req && req.url || "");
+  if (!(requestUrl === "/mcp" || requestUrl.startsWith("/mcp/"))) return null;
+  if (!isLoopbackRemote(req)) {
+    return { error: "the SDK MCP shim is loopback-only", status: 403 };
+  }
+  const segs = requestUrl.split("?", 1)[0].split("/").filter(Boolean);
+  if (segs.length > 3) return { error: "malformed MCP path", status: 400 };
+  try {
+    const sessionId = segs[1] ? decodeURIComponent(segs[1]) : "";
+    const serverKey = segs[2] ? decodeURIComponent(segs[2]) : "";
+    if (!sessionId) return { error: "missing sessionId in /mcp path", status: 404 };
+    return { sessionId, serverKey };
+  } catch {
+    return { error: "malformed MCP path encoding", status: 400 };
+  }
 }
 
 // PayloadTooLargeError marks a request body that exceeded MAX_AGENT_TURN_BYTES so callers can map it to 413.
@@ -2887,7 +3111,190 @@ async function readBodyBounded(req) {
   return raw;
 }
 
+async function writeShortSse(res, terminal) {
+  res.writeHead(200, SSE_HEADERS);
+  const writer = new SseWriter(res, { maxQueueBytes: COMPOSER_OUT_QUEUE_MAX_BYTES });
+  const receipt = writer.write(formatSseData(terminal));
+  if (receipt.ok) await receipt.handedToNode.catch(() => {});
+  await writer.endAfter("data: [DONE]\n\n");
+}
+
+function continuationFailure(res, status, code, message, details = null) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: { code, message, ...(details ? { details } : {}) } }));
+}
+
+function recoveryResultSummary(round, input) {
+  return (input.results || []).map((result) => {
+    const call = round.calls.get(result.toolCallId);
+    const images = Array.isArray(result.images)
+      ? result.images.map((image) => ({ mimeType: image && image.mimeType, url: image && image.url, attached: !!(image && image.data) }))
+      : [];
+    return {
+      toolCallId: result.toolCallId,
+      toolName: call ? call.name : "",
+      content: result.content,
+      isError: result.isError === true,
+      structuredContent: result.structuredContent ?? null,
+      images,
+    };
+  });
+}
+
+function buildRestartRecoveryInput(round, input) {
+  const history = typeof input.history === "string" ? input.history.trim() : "";
+  if (!history) return null;
+  const summary = recoveryResultSummary(round, input);
+  const recovered = [
+    "[Recovered client-tool round after a proxy restart]",
+    "These are the exact results returned by the user-machine harness for tool calls already present in the prior conversation:",
+    JSON.stringify(summary),
+    "Continue the original task from the previous conversation. Do not treat the recovered results as a new unrelated request.",
+  ].join("\n");
+  const trailing = typeof input.userText === "string" ? input.userText : "";
+  return {
+    ...input,
+    type: "user",
+    text: trailing ? `${recovered}\n\n${trailing}` : recovered,
+    images: [...(Array.isArray(input.images) ? input.images : []), ...collectToolResultImages(input)],
+  };
+}
+
+function continuationTenantMismatch(round, cursorKey, multiTenant = MULTI_TENANT) {
+  const stored = typeof round?.tenantFingerprint === "string" ? round.tenantFingerprint : "";
+  if (multiTenant && stored === "") return true;
+  return stored !== "" && stored !== keyFingerprint(cursorKey);
+}
+
+// `/agent/continue` is the sole continuation ingress. It routes by the signed tool-call ids, validates and
+// journals the complete batch before writing SSE headers, and only then settles the paused SDK callbacks.
+async function handleContinue(req, res, body, cursorKey) {
+  const input = body && body.input;
+  if (body && !validClientEnv(body.clientEnv)) body.clientEnv = { workspaceUnknown: true };
+  const results = input && input.type === "tool_results" && Array.isArray(input.results) ? input.results : null;
+  if (!results || results.length === 0) {
+    continuationFailure(res, 422, "empty_tool_results", "a continuation requires at least one tool result");
+    return;
+  }
+  try {
+    const { codec, journal } = getRoundInfrastructure();
+    const parsed = results.map((result) => codec.parse(result && result.toolCallId));
+    const route = parsed[0].route;
+    if (parsed.some((token) => token.route !== route)) {
+      throw new ToolRoundError("mixed_tool_rounds", "tool-result batch spans multiple rounds", 409);
+    }
+    let round = liveToolRounds.get(route);
+    const hasLiveCallbacks = !!round;
+    if (!round) round = ToolRound.load(journal, codec, route);
+    if (!round) throw new ToolRoundError("round_lost", "the signed tool round is not present in the durable journal", 410);
+    if (continuationTenantMismatch(round, cursorKey)) {
+      throw new ToolRoundError("tenant_mismatch", "the signed tool round belongs to a different Cursor credential", 403);
+    }
+
+    const wasTerminal = round.state === RoundState.TERMINAL;
+    // A restart can occur after Node accepted the tool_call frame but before the
+    // handoff timestamp reached the journal. A signed result from the same
+    // authenticated tenant is proof the client saw that registered call, so a
+    // non-live round may durably accept it and then recover/refuse faithfully.
+    const committed = round.commitResults(results, {
+      allowTerminalReceipt: !hasLiveCallbacks && wasTerminal,
+      allowRegisteredReceipt: !hasLiveCallbacks,
+    });
+    const committedIds = [...new Set([...committed.additions, ...committed.duplicates])];
+
+    if (hasLiveCallbacks) {
+      const session = sessions.get(round.sessionId);
+      if (!session || session.currentRound !== round) {
+        try { round.terminalize(TerminalReason.RESTART_LOST, "live round lost its owning Session"); } catch {}
+      } else {
+        refreshSessionFromBody(session, body);
+        const constraints = {
+          toolChoice: body.toolChoice || "",
+          responseFormat: body.responseFormat,
+          stop: body.stop,
+          maxTokens: body.maxTokens,
+          unsupportedHardGuarantees: body.unsupportedHardGuarantees,
+        };
+        if (session.activeRes) {
+          round.applyCommittedResults(committedIds);
+          await writeShortSse(res, {
+            type: "turn_end",
+            stop_reason: round.pendingCount > 0 ? "tool_use" : "end_turn",
+            receipt: "duplicate_or_concurrent",
+          });
+          return;
+        }
+        res.writeHead(200, SSE_HEADERS);
+        await runTurn(req, res, session, body.model || round.model || "composer-2.5", input, constraints, { round, committedIds });
+        return;
+      }
+    }
+
+    // A completed round may be retried after its response was lost. Its durable receipt is authoritative; an
+    // identical retry is acknowledged without rerunning either the harness tool or an SDK callback.
+    if (wasTerminal && round.terminal && round.terminal.reason === TerminalReason.COMPLETED && committed.additions.length === 0) {
+      await writeShortSse(res, { type: "turn_end", stop_reason: "end_turn", receipt: "already_applied" });
+      return;
+    }
+    if (wasTerminal && round.recovery && round.recovery.decision === "completed" && committed.additions.length === 0) {
+      await writeShortSse(res, { type: "turn_end", stop_reason: "end_turn", receipt: "already_recovered" });
+      return;
+    }
+
+    const recoveryInput = buildRestartRecoveryInput(round, input);
+    if (round.state !== RoundState.TERMINAL) round.terminalize(TerminalReason.RESTART_LOST, "paused SDK callback process is no longer present");
+    if (!recoveryInput) {
+      round.recordRecovery({ at: nowMs(), decision: "refused", reason: "bounded conversation history is absent" });
+      throw new ToolRoundError(
+        "round_lost",
+        "the paused SDK callback process is gone and this continuation has no bounded history for a faithful recovery",
+        410,
+      );
+    }
+    if (sessions.has(round.sessionId)) {
+      throw new ToolRoundError("recovery_session_conflict", "the recovery session id is already active", 409);
+    }
+    if (!sessionCapHasRoomForNew()) throw new ToolRoundError("session_capacity", "session capacity is full", 429);
+    const session = new Session(round.sessionId, cursorKey);
+    session.agentId = `${round.agentId || round.sessionId}_ctrecover_${round.route.slice(0, 10)}`;
+    session.recoverySourceRound = round;
+    session.resetSeedState();
+    sessions.set(session.id, session);
+    refreshSessionFromBody(session, body);
+    round.recordRecovery({
+      at: nowMs(),
+      decision: "faithful_reseed",
+      replacementAgentId: session.agentId,
+      resultHashes: results.map((result) => round.calls.get(result.toolCallId).resultHash),
+    });
+    const constraints = {
+      toolChoice: body.toolChoice || "",
+      responseFormat: body.responseFormat,
+      stop: body.stop,
+      maxTokens: body.maxTokens,
+      unsupportedHardGuarantees: body.unsupportedHardGuarantees,
+    };
+    res.writeHead(200, SSE_HEADERS);
+    await runTurn(req, res, session, body.model || round.model || "composer-2.5", recoveryInput, constraints);
+  } catch (error) {
+    if (res.headersSent) {
+      try { res.end(); } catch {}
+      return;
+    }
+    if (error instanceof ToolRoundError) {
+      continuationFailure(res, error.status, error.code, error.message, error.details);
+      return;
+    }
+    continuationFailure(res, 500, "continue_failed", (error && error.message) || String(error));
+  }
+}
+
 async function handleTurn(req, res, body, cursorKey) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "request body must be a JSON object" }));
+    return;
+  }
   const input = body.input || (body.text != null ? { type: "user", text: body.text } : { type: "user", text: "" });
   const model = body.model || "composer-2.5";
   const sessionId = body.sessionId;
@@ -2897,6 +3304,7 @@ async function handleTurn(req, res, body, cursorKey) {
   };
   // Validate BEFORE opening the SSE so we can return a real HTTP status.
   if (!sessionId) { fail(400, "sessionId is required"); return; }
+  if (!validClientEnv(body.clientEnv)) body.clientEnv = { workspaceUnknown: true };
 
   // Upstream rate-limit circuit breaker: while OPEN for this key, fast-fail NEW runs with a clear 429 so client
   // retries back off instead of re-poisoning the freshly-recycled HTTP/2 connection. tool_results continuations
@@ -2919,125 +3327,8 @@ async function handleTurn(req, res, body, cursorKey) {
   const constraints = { toolChoice: body.toolChoice || "", responseFormat: body.responseFormat, stop: body.stop, maxTokens: body.maxTokens, unsupportedHardGuarantees: body.unsupportedHardGuarantees };
 
   if (input.type === "tool_results") {
-    // A continuation COMPLETES the active (paused) run; it must reach resolvePending promptly and must
-    // NEVER queue behind a new-user turn (that would hang the run until the abandonment watchdog).
-    const session = sessions.get(sessionId);
-    if (!session) {
-      // Unknown/expired session for a tool_results continuation (bridge restart or TTL eviction): the pending
-      // tool calls cannot be reconstructed, so the continuation is genuinely LOST. Comment 1: do NOT complete
-      // this as a turn at all. Emitting it as SSE over HTTP 200 — even with stop_reason:"error" — risks being
-      // consumed as a clean terminal (the Go executor synthesizes a [DONE] terminal on any clean stream end),
-      // silently discarding the client's tool work as a success. The tool result was NOT applied to a pending
-      // run, so we must not return success. Headers are NOT written yet on this path, so return a real HTTP
-      // error: the Go executor rejects any non-2xx /agent/turn response at its status check, BEFORE it parses
-      // or synthesizes a terminal for the stream, surfacing the lost continuation as a hard error in BOTH the
-      // streaming and non-streaming paths (rather than relying on a downstream field inspection).
-      fail(410, "unknown or expired session: the tool call this result answers was not issued by this bridge (likely a restart or idle eviction); the continuation cannot be resumed");
-      return;
-    }
-    // Refresh the advertised tool set + client env from the continuation body too (the Go executor sends
-    // `tools`/`clientEnv` on every turn): a C1 fresh-send or C2 re-seed driven from this continuation must
-    // advertise the current tools, and a re-seed needs the current env. Harmless when unchanged.
-    refreshSessionFromBody(session, body);
-    // ORPHAN GUARD (P0 — lost-owner reseed): the session exists but issued NONE of the ids in this batch, and
-    // there is no trailing user payload to drive a fresh send. This is the mis-route the bug produced — the run
-    // that owned these tool calls died, the Go executor cleared its ownership (forgetSession on the error stop),
-    // and the result was routed by lineage to a session that cannot own it. Forwarding it would emit an
-    // "unknown tool_call_id" error over HTTP 200 (headers already written at the activeRes/runTurn writeHead),
-    // which the client retries forever. Headers are NOT written yet here, so return 410 — the same
-    // lost-continuation signal as the `!session` branch above — to drive the executor's reseed-on-410, which
-    // replays the conversation as a fresh user turn (the orphaned result is already visible in that replayed
-    // history, so no context is lost). A continuation WITH user payload is left alone: runTurn's C1 path
-    // fresh-sends it and recovers on its own.
-    // Scope: ANY non-streaming session (activeRes unset) — idle, OR a paused run with its own outstanding
-    // pending, OR a session whose owning run just died and whose ownership the Go executor already forgot. For a
-    // wholly-foreign no-user-payload batch ONLY, that batch can never be resolved here (allToolResultsForeign is
-    // non-mutating and returns false the moment ANY id is pending/delivered/ever-emitted), so the sole useful
-    // action is reseed-recovery (410); the foreign id is never resolved into a pending. An ACTIVELY-STREAMING
-    // session (activeRes set) still surfaces a foreign id as an "unknown tool_call_id" error (C04: never reseed
-    // mid-stream, never a silent misroute or false success). The old full-idle gate (pending.size===0) excluded
-    // the paused / own-pending variant this bug produces under dynamic-workflow fan-out; (not activeRes) includes
-    // it while still excluding the live stream. Safe because routing is CONTENT-derived (deriveComposerSessionID
-    // over the continuation's own head/opener), so the orphan re-derives to its OWN just-died session id (lease
-    // already released + ownership forgotten at the error stop, run ended/paused, activeRes null) or a fresh
-    // reseed fork — never a sibling subagent's live stream.
-    if (!session.activeRes) {
-      const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
-      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || collectToolResultImages(input).length > 0;
-      if (!hasUserText && !hasUserImages && session.allToolResultsForeign(input.results)) {
-        dbg("tool_results ALL-FOREIGN on non-streaming session + no user payload -> 410 reseed (orphaned: owning run died, ownership lost)",
-          "session=" + sessionId, "ids=" + safeJson((input.results || []).map((r) => r && r.toolCallId)));
-        fail(410, "orphaned tool_call_id: none of these results were issued by this session (the owning run has ended); the continuation must be re-seeded");
-        return;
-      }
-    }
-    // Comment 3: tool_results ingestion is NEVER 409'd. Resolving pending tool calls is just promise
-    // resolution — safe regardless of any open response. Only the model-output STREAM is single-owner: if a
-    // continuation response is already streaming this session's run (concurrent/incremental tool_results),
-    // resolve the provided ids into the live run and return a short successful ack on THIS response, leaving
-    // the model output on the existing activeRes. Otherwise (the normal case) drive the continuation here.
-    if (session.activeRes) {
-      res.writeHead(200, SSE_HEADERS);
-      // C04 + Comment 6: the concurrent fast path now uses the SAME strict matcher as runTurn (matchToolResults)
-      // instead of a bespoke clean-ack-everything loop. The model output stream stays on the existing
-      // activeRes; THIS response only ACKS — so an unknown/foreign id (or a nonempty batch that matched nothing
-      // and is not a benign re-ack) must be a TYPED ERROR ack, never a clean end_turn that would let the client
-      // stop retrying while the run never received the result (the old C04 false-success bug).
-      const { matched, unknown } = session.matchToolResults(input.results);
-      const batchLen = (input.results || []).length;
-      const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
-      // The continuation may also carry NEW user images (top-level input.images and/or images folded into tool
-      // results); like userText, these are user payload that must reach the model, not be dropped.
-      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || collectToolResultImages(input).length > 0;
-      dbg("handleTurn tool_results CONCURRENT ack", sessionId, "matched=" + matched, "of=" + batchLen, "unknown=" + safeJson(unknown), "userText=" + hasUserText, "userImages=" + hasUserImages, "pendingAfter=" + session.pending.size);
-      // ADD-36: a PARTIAL-PARALLEL mixed turn on the concurrent path — the client answered SOME tools
-      // (matched>0), included new user text (hasUserText), but OTHER pendings remain unanswered
-      // (pending.size>0, e.g. the client cancelled/backgrounded those tools). Without handling, the live run
-      // stays blocked on the unresolved pendings until the abandonment watchdog, and the user's trailing
-      // instruction (folded into a matched tool result by the executor) is stranded — a benign clean end_turn
-      // would tell the client to stop while no answer is coming. Treat it as an interruption/redirect:
-      // synthesize a MODEL-VISIBLE cancellation result for each unresolved pending (isError) so the live run
-      // unblocks and resumes, consuming the folded user text. Never a clean end_turn that strands the work.
-      if (hasUserText && matched > 0 && session.pending.size > 0) {
-        const cancelIds = [...session.pending.keys()];
-        dbg("handleTurn CONCURRENT partial-parallel + userText -> synthesize cancellations so the run resumes (ADD-36)", sessionId, "cancelling=" + safeJson(cancelIds));
-        for (const pid of cancelIds) {
-          session.resolvePending(pid, "tool call superseded by a new user instruction; it was not completed", true);
-        }
-      }
-      // NOTE on input.userText (C1): on the concurrent path the live run already owns activeRes and is
-      // streaming the model's answer; the executor folds any trailing user text into the last tool result
-      // (C1 belt-and-suspenders), so it reaches the live run WHEN that result actually RESOLVES a pending
-      // (matched>0). Driving a separate fresh send HERE would spawn a colliding/orphaned run, so the concurrent
-      // path only acks. But when NOTHING matched (matched===0: every id was a benign re-ack / reaped / already-
-      // resolved), the fold reached no pending and the in-flight stream began BEFORE this payload arrived — so a
-      // trailing userText/images is NOT in the run anywhere. runTurn's twin handles this via the C1 redirect
-      // (driveUserSend at the `hasUserPayload && noneToResume` branch); the concurrent path cannot drive a fresh
-      // send without colliding with the live stream, so we must NOT clean-ack (which tells the client to stop
-      // retrying while its instruction was silently lost). Surface a typed error so the client re-sends it.
-      const userPayloadLost = (hasUserText || hasUserImages) && matched === 0 && unknown.length === 0;
-      try {
-        if (unknown.length > 0) {
-          // Foreign/never-issued id: a genuine desync. Surface it (do NOT fake success) so the client sees it.
-          res.write(formatSseData({ type: "turn_end", stop_reason: "error", error: `unknown tool_call_id ${unknown[0]}: not issued by this session` }));
-        } else if (userPayloadLost) {
-          // matched===0 + new user payload: the continuation's userText/images could not be delivered to the
-          // in-flight run (it predates this payload, and the concurrent path cannot fresh-send). Error so the
-          // client retries the instruction on a fresh turn — never a clean end_turn that drops it (finding #6).
-          dbg("handleTurn CONCURRENT user payload could not reach the live run -> error ack so the client retries (finding#6)", sessionId, "userText=" + hasUserText, "userImages=" + hasUserImages);
-          res.write(formatSseData({ type: "turn_end", stop_reason: "error", error: "a new user instruction or image arrived while a run was streaming and could not be delivered to it; resend it as a new turn" }));
-        } else {
-          // matched>0 -> resolved into the live run; matched===0 with no user payload -> all ids were benign
-          // re-acks (already-resolved/duplicate). Either way a clean ack is correct (the run is live).
-          res.write(formatSseData({ type: "turn_end", stop_reason: "end_turn" }));
-        }
-        res.write("data: [DONE]\n\n"); res.end();
-      } catch { /* socket closed */ }
-      return;
-    }
-    dbg("handleTurn tool_results -> existing session", sessionId, "pending=" + session.pending.size, "runActive=" + !!session.run);
-    res.writeHead(200, SSE_HEADERS);
-    return runTurn(req, res, session, model, input, constraints);
+    fail(400, "tool results must be submitted to /agent/continue using their signed tool-call ids");
+    return;
   }
 
   // New-user turn: get-or-create the session, refresh advertised tools/env, then enqueue on the per-session
@@ -3105,8 +3396,8 @@ async function handleTurn(req, res, body, cursorKey) {
   // fails each awaiting tool promise model-visibly — the new turn's terminal is the only clean end_turn/[DONE], and
   // it belongs to the new instruction, never to the superseded tool calls.
   if (session.run) {
-    dbg("handleTurn USER INTERRUPT of a live run -> cancel stale run + drive new turn (ADD-37/ADD-106)", sessionId, "streaming=" + !!session.activeRes, "pending=" + session.pending.size, "waiters=" + session.waiters);
-    await session.cancel();
+    dbg("handleTurn USER INTERRUPT of a live run -> cancel stale run + drive new turn", sessionId, "streaming=" + !!session.activeRes, "pending=" + session.pendingCount(), "waiters=" + session.waiters);
+    await session.cancel({ terminalReason: TerminalReason.INTERRUPTED, detail: "superseded by a new user turn" });
   }
   if (session.waiters >= MAX_QUEUE_DEPTH) { fail(429, "too many concurrent turns queued for this session"); return; }
   return enqueueTurn(req, res, session, model, input, constraints);
@@ -3121,19 +3412,25 @@ function enqueueTurn(req, res, session, model, input, constraints) {
   session.waiters++;
   session.touch();
   res.writeHead(200, SSE_HEADERS);
-  const ka = setInterval(() => { try { res.write(formatSseData({ type: "ping" })); } catch {} }, SSE_KEEPALIVE_MS);
+  let queueBlocked = false;
+  const onDrainQueue = () => { queueBlocked = false; };
+  if (typeof res.on === "function") res.on("drain", onDrainQueue);
+  const ka = setInterval(() => {
+    if (queueBlocked) return;
+    try {
+      const ok = res.write(formatSseData({ type: "ping" }));
+      if (ok === false) queueBlocked = true;
+    } catch {}
+  }, SSE_KEEPALIVE_MS);
   if (ka.unref) ka.unref();
   let canceled = false;
-  // BR3: a queued waiter that disconnects must free its slot + session IMMEDIATELY, not after the 10-min
-  // abandonment watchdog. So onWaitClose does its own idempotent teardown synchronously (decrement waiters,
-  // clear the keepalive, detach itself, end the socket) instead of only flipping `canceled` and waiting for
-  // the run ahead to complete before the promotion path tears it down.
   let reaped = false;
   const onWaitClose = () => {
     if (reaped) return;
     reaped = true; canceled = true;
     clearInterval(ka);
     res.off("close", onWaitClose);
+    if (typeof res.off === "function") res.off("drain", onDrainQueue);
     session.waiters = Math.max(0, session.waiters - 1);
     try { res.end(); } catch {}
   };
@@ -3144,42 +3441,32 @@ function enqueueTurn(req, res, session, model, input, constraints) {
   session.tail = new Promise((r) => { releaseNext = r; });
 
   prev.then(async () => {
-    // The waiter already self-reaped on disconnect (BR3): its teardown ran synchronously, so do NOT
-    // double-decrement waiters / double-off here — just release the FIFO so the chain advances.
     if (reaped) return;
-    // Atomic handoff: no await between off(onWaitClose) and runTurn (which synchronously registers its own
-    // active-turn close handler), so a disconnect can never slip through unhandled at the promotion boundary.
     clearInterval(ka);
     res.off("close", onWaitClose);
+    if (typeof res.off === "function") res.off("drain", onDrainQueue);
     session.waiters = Math.max(0, session.waiters - 1);
-    if (canceled) {
-      try { res.write(formatSseData({ type: "turn_end", stop_reason: "end_turn" })); res.write("data: [DONE]\n\n"); res.end(); } catch {}
-      return;
-    }
+    if (canceled) { try { res.end(); } catch {} return; }
     try {
-      await runTurn(req, res, session, model, input, constraints); // returns at a tool-pause OR at completion
-      await session.whenLogicalDone();                              // hold the FIFO slot until the run TRULY completes
+      await runTurn(req, res, session, model, input, constraints);
+      await session.whenLogicalDone();
     } catch (e) { dbg("enqueueTurn run error", "session=" + session.id, (e && e.message) || String(e)); }
   }).finally(() => { releaseNext(); });
 }
 
-function dedupeByName(tools) {
-  const seen = new Set(); const out = [];
-  for (const t of tools) { const k = t.toolName || t.name; if (k && !seen.has(k)) { seen.add(k); out.push(t); } }
-  return out;
-}
-
 function refreshSessionFromBody(session, body) {
   if (Array.isArray(body.tools)) {
-    session.advertise = dedupeByName(body.tools.map((t) => ({
+    session.advertise = body.tools.map((t) => ({
       name: t.name, toolName: t.name, providerIdentifier: "cc", description: t.description || "",
       inputSchema: augmentUnderspecifiedToolSchema(t.name, t.inputSchema || t.parameters || undefined),
-    })));
+    }));
   }
-  if (body.clientEnv && typeof body.clientEnv === "object") session.clientEnv = body.clientEnv;
+  if (body.clientEnv && typeof body.clientEnv === "object") {
+    session.clientEnv = body.clientEnv;
+  }
 }
 
-async function runTurn(req, res, session, model, input, constraints = {}) {
+async function runTurn(req, res, session, model, input, constraints = {}, continuation = null) {
   // ADD-98/ADD-101: declare the turn-latch + close handler BEFORE the first res.write and before assigning
   // session.activeRes, then register res.on('close') first and wrap the whole body (from the activeRes
   // assignment onward) in try/finally. A throw on the INITIAL write (a socket already destroyed before/at the
@@ -3196,31 +3483,30 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
   const onClose = () => {
     if (settled) return;
     settleOnce();
-    void session.cancel();
+    // Reject receipts before clearing queue on close (transport failure path)
+    if (session.activeRes === res) {
+      session.failWrite("response closed");
+    } else {
+      void session.cancel({ terminalReason: TerminalReason.TRANSPORT_ERROR, detail: "response closed" });
+    }
     if (!session.hasQueuedWaiters()) sessions.delete(session.id);
   };
   let keepalive = null;
   try {
-    session.activeRes = res; session.touch(); session.turnToken++;
-    session.writeFailed = false; // ADD-100: a fresh turn starts with a healthy write path
-    // H08: keep the dispatch seam's native-tool gating current for THIS turn even on a continuation that does
-    // not call driveUserSend (the model may emit new native tool calls while resuming). driveUserSend sets it
-    // again on a send; this top-level set covers the resume-only path too.
+    session.beginResponse(res); session.touch(); session.turnToken++;
     session.toolChoice = (constraints && constraints.toolChoice) || "";
     session.settleTurn = settleOnce;
-    // ADD-98: register the disconnect handler BEFORE the first write so a close during/just-before the initial
-    // write is observed and the finally still clears activeRes.
     res.on("close", onClose);
-    res.write(formatSseData({ type: "session", sessionId: session.id }));
-    // #14: deliver any text/reasoning the run produced BETWEEN turns (while no response was open), in order,
-    // before this turn's own new output — so a resuming turn never starts on a gap of dropped catch-up text.
+    // Use writer receipt for session frame to get truthful delivery signal
+    session.writePayload(formatSseData({ type: "session", sessionId: session.id }));
     session.flushPendingDeltas();
 
-    // Typed keepalive (NOT a ": keepalive" comment — the Go executor forwards only "data: " lines, so a
-    // comment never reaches the client). The executor renders {"type":"ping"} into the inbound schema's
-    // keepalive frame, resetting the client's idle watchdog during long/quiet turns.
-    keepalive = setInterval(() => { try { res.write(formatSseData({ type: "ping" })); } catch {} }, SSE_KEEPALIVE_MS);
+    // Keepalive through same writer (truthful signal), skip if blocked handled inside sse
+    keepalive = setInterval(() => {
+      try { session.sse({ type: "ping" }); } catch {}
+    }, SSE_KEEPALIVE_MS);
     if (keepalive.unref) keepalive.unref();
+
 
   // driveUserSend performs a model-visible user send on the EXISTING no-timeout agent: it seeds (prepends
   // system + prior history on the FIRST send for the session), applies the enforced constraint instructions,
@@ -3355,14 +3641,25 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
   // onRunError fires notifyLogicalDone on real completion). Otherwise the queued turn could start a SECOND
   // concurrent send on the same durable agent in the window between cancel and the replacement send. If the
   // replacement send fails, the runTurn catch path fires notifyLogicalDone as a safety net so the FIFO advances.
-  const cancelStaleRun = async () => {
+  const cancelStaleRun = async (terminalReason = TerminalReason.INTERRUPTED, detail = "run superseded by a new user turn") => {
     session.settleTurn = null;
-    await session.cancel({ notify: false });
+    await session.cancel({ notify: false, terminalReason, detail });
     session.settleTurn = settleOnce;
     session.done = false; // cancel() set done=true; clear it so a subsequent driveUserSend wires completion
   };
 
     dbg("runTurn START", "session=" + session.id, "inputType=" + input.type, "turnToken=" + session.turnToken);
+    // A genuine new user turn starts a new detection scope. Tool-result
+    // continuations and restart recovery keep the current scope so a late
+    // internal Write/Read cannot evade the guard by crossing an HTTP turn.
+    if (input.type === "user" && !session.recoverySourceRound) {
+      session.resetSyntheticArtifactGuard(input.text || "");
+    } else if (input.type === "user" && session.recoverySourceRound && Array.isArray(input.results)) {
+      for (const result of input.results) {
+        const call = session.recoverySourceRound.calls.get(result && result.toolCallId);
+        session.rememberLargeMcpResult(result && result.content, call && call.name);
+      }
+    }
     // ADD-62: a model change on an ESTABLISHED session. The durable agent was created/resumed under the OLD
     // model; ensureAgent below would resumeAgent it and silently answer from the wrong model. Rotate the
     // durable agent (separate modelEpoch budget) + force a re-seed under the new model. Gate on
@@ -3431,149 +3728,49 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
       } finally {
         session.reseeding = false;
       }
-    } else if (input.type === "tool_results") {
-      // C1/BR5: a real trailing user message in this mixed turn (set by the executor only for a genuine user
-      // message, never a pure system-reminder). If present AND nothing is left to resume (no pending after
-      // resolve, or nothing matched at all), drive a fresh user send so the user's message is answered —
-      // instead of an empty end_turn. tool-result images (BR9/EX3) are folded into that send. M28: an
-      // image-only trailing message (empty userText but images present) is ALSO user payload and must drive a
-      // fresh send, so the model answers about the image instead of an empty turn.
+    } else if (input.type === "tool_results" && continuation) {
+      const round = continuation.round;
+      if (!round || round.sessionId !== session.id) throw new ToolRoundError("round_lost", "continuation round is not owned by this Session", 410);
+      const committedIds = continuation.committedIds || [];
       const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
-      // EX3 (partial-batch safe): the tool-result images awaiting delivery THIS logical turn = any stashed from an
-      // EARLIER partial batch + this batch's images. A PARTIAL batch (other tools still pending) must not fold its
-      // image yet — that would cancel the still-pending tools' in-flight work — so it is stashed and folded only
-      // when the batch finally completes (the run would otherwise resume). The NON-image results still reach the
-      // model via their own /mcp tools/call responses, so only the image has to wait for the batch to finish.
-      const stashedToolResultImages = Array.isArray(session.stashedToolResultImages) ? session.stashedToolResultImages : [];
-      // EX3: a base64 tool-result image rides its OWN dispatchMcp result as McpImageContent (delivered at
-      // resolvePending), so it is NOT a fresh-send payload when the clean path is on — let the run resume. url-form
-      // images can't be McpImageContent (no base64 `data`), so they ALWAYS fall back to the fresh-send fold here
-      // (this batch + any earlier partial-batch stash). When the clean path is off, ALL images fold.
-      const allTurnToolResultImages = stashedToolResultImages.concat(collectToolResultImages(input));
-      const turnToolResultImages = mcpImageResultsEnabled()
-        ? allTurnToolResultImages.filter((im) => !(im && typeof im.data === "string" && im.data))
-        : allTurnToolResultImages;
-      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || turnToolResultImages.length > 0;
-      const hasUserPayload = hasUserText || hasUserImages;
-      // ADD-89 (bridge half): pre-scan — BEFORE matchToolResults mutates `pending` — whether any result that
-      // WILL resolve a pending carries isError. A reply built on a FAILED tool must not silently resume the
-      // live run (the user's trailing text would be answered as if the tool succeeded). When there is trailing
-      // user payload AND an answered result failed, we FORCE the C1 fresh-send path even if the run would
-      // otherwise resume, so the failure reaches the model AS failure and the user text is a real user turn.
-      const answeredError = (input.results || []).some((tr) =>
-        tr && tr.isError === true && (session.pending.has(tr.toolCallId) || (tr.idless === true && session.pending.size === 1)));
-      const forceFreshOnError = hasUserPayload && answeredError; // ADD-89
-      // EX3 (warm half): a tool result carrying an IMAGE cannot ride the text-only Cursor tool-result protobuf
-      // into a resuming run, so resuming would silently drop the image — the model never sees the screenshot and
-      // re-reads the file (the reported "can't read photos from a file" bug). Force the C1 fresh-send (which folds
-      // turnToolResultImages) instead of resuming, exactly as forceFreshOnError does for a failed tool. The
-      // cold/reseed twin is composerReseedLostContinuation (executor). noneToResume stays the C1 gate below, so a
-      // PARTIAL batch never cancels its still-pending tools — its image waits in the stash until the batch
-      // completes (the run would resume), at which point the whole stash is folded.
-      const forceFreshOnImage = turnToolResultImages.length > 0;
-      // The run will resume and stream the model's answer ONLY when this continuation answers the LAST pending
-      // tool(s) and a run is still live. Pre-compute that here (still BEFORE matching) so ADD-77/ADD-83 can
-      // inject a changed-system / per-turn-constraint preamble into the LAST tool result content BEFORE it is
-      // resolved into the resuming run. `willResolveAllPending` = every currently-pending id is answered by this
-      // batch. Matched/idless results that hit a pending count toward clearing it.
-      let answeredPendingCount = 0;
-      for (const tr of input.results || []) {
-        if (tr && session.pending.has(tr.toolCallId)) answeredPendingCount++;
-        else if (tr && tr.idless === true && session.pending.size === 1) answeredPendingCount++;
-      }
-      const willResolveAllPending = session.pending.size > 0 && answeredPendingCount >= session.pending.size;
-      const willResume = willResolveAllPending && session.run !== null && !forceFreshOnError && !forceFreshOnImage;
-      // ADD-77 + ADD-83 (bridge half): when this continuation will RESUME the live run, the resumed run answers
-      // under the system + constraints the run was STARTED with — but the client may have changed its system
-      // prompt (e.g. ExitPlanMode) or per-turn constraints (response_format/stop/max_tokens/tool_choice) on THIS
-      // request. The SDK cannot mutate a paused run's instructions, so inject a synthetic, model-visible preamble
-      // into the LAST tool result content (the last thing the model reads before replying) and update
-      // seededSystem so a later send does not re-apply it. Stable marker strings (tested). We do NOT inject on
-      // the forced-fresh-on-error path (driveUserSend applies system+constraints there) to avoid double-applying.
-      if (willResume && Array.isArray(input.results) && input.results.length) {
-        const preamble = [];
-        if (input.system && input.system !== session.seededSystem) {
-          preamble.push("[Updated system instructions:]\n" + input.system);
-          session.seededSystem = input.system; // remember so a later send does not re-apply the same swap
+      const allResultImages = collectToolResultImages(input);
+      const fallbackImages = mcpImageResultsEnabled()
+        ? allResultImages.filter((image) => !(image && typeof image.data === "string" && image.data))
+        : allResultImages;
+      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || fallbackImages.length > 0;
+      const resultIds = new Set(committedIds);
+      let answeredLive = 0;
+      for (const id of resultIds) if (round.callbacks.has(id)) answeredLive++;
+      const remainingAfterApply = Math.max(0, round.pendingCount - answeredLive);
+      const systemChanged = !!(input.system && input.system !== session.seededSystem);
+      const requiresFreshRecovery = fallbackImages.length > 0 || systemChanged || ((hasUserText || hasUserImages) && remainingAfterApply > 0);
+
+      if (requiresFreshRecovery) {
+        const detail = "tool continuation redirected to a faithful fresh send because the paused run could not accept all new payload";
+        if (round.state !== RoundState.TERMINAL) round.terminalize(TerminalReason.INTERRUPTED, detail);
+        await cancelStaleRun(TerminalReason.INTERRUPTED, detail);
+        session.agentId = `${session.id}_redirect_${round.route.slice(0, 10)}`;
+        session.resetSeedState();
+        const recoveryText = hasUserText
+          ? input.userText
+          : (fallbackImages.length ? "(The attached image is the output of a tool call from the prior conversation.)" : "");
+        await driveUserSend(recoveryText, fallbackImages);
+      } else {
+        const applied = round.applyCommittedResults(committedIds);
+        const remaining = round.pendingCount;
+        dbg("runTurn durable tool_results", "session=" + session.id, "committed=" + committedIds.length,
+          "applied=" + applied.length, "remaining=" + remaining, "runLive=" + (session.run !== null));
+        if (session.flushJournaledCalls()) {
+          // A newly emitted REGISTERED call now owns the response and will pause it through receipt ordering.
+        } else if (remaining > 0) {
+          const receipt = session.sseReceipt({ type: "turn_end", stop_reason: "tool_use", receipt: "partial_results_applied" });
+          if (receipt.ok) receipt.handedToNode.then(() => session.settle()).catch(() => {});
+        } else if (applied.length === 0 && session.run === null) {
+          const receipt = session.sseReceipt({ type: "turn_end", stop_reason: "end_turn", receipt: "already_applied" });
+          if (receipt.ok) receipt.handedToNode.then(() => session.settle()).catch(() => {});
         }
-        const ci = constraintInstructions({ ...constraints });
-        if (ci) preamble.push("[Constraints for your reply:]\n" + ci);
-        if (preamble.length) {
-          const last = input.results[input.results.length - 1];
-          const prev = typeof last.content === "string" ? last.content : (last.content == null ? "" : safeJson(last.content));
-          last.content = preamble.join("\n\n") + (prev ? "\n\n" + prev : "");
-          dbg("runTurn tool_results resume -> inject system/constraints preamble (ADD-77/ADD-83)", "session=" + session.id, "systemSwap=" + (input.system && input.system !== undefined), "constraints=" + (ci ? 1 : 0));
-        }
-      }
-      // C-TOOLRESULT-MATCH: match the batch with the ONE shared strict matcher (resolve-by-id -> benign-ack if
-      // ever-emitted -> else unknown). C03: the old inline `pending.size===1` fallback is GONE (it lived here);
-      // matchToolResults keeps only an explicit `tr.idless`-marked lone-pending escape. Comment 2 idempotency
-      // (re-sent already-resolved ids are benign, not fatal) is preserved by the everEmitted/delivered checks.
-      const { matched, unknown } = session.matchToolResults(input.results);
-      dbg("runTurn tool_results", "session=" + session.id, "matched=" + matched, "of=" + ((input.results || []).length),
-        "pending=" + session.pending.size, "undelivered=" + session.undelivered.length, "unknown=" + safeJson(unknown), "forceFreshOnError=" + forceFreshOnError);
-      // The run will resume and stream the model's answer ONLY when this continuation answered tool(s) and
-      // nothing is left pending and the run is still live AND we are not forcing a fresh send on a failed tool.
-      // In THAT case the trailing user message rode along folded into the last tool result (executor C1
-      // belt-and-suspenders), so a separate fresh send would be redundant AND would cancel the resuming run.
-      const runWillResume = matched > 0 && session.pending.size === 0 && session.run !== null && !forceFreshOnError && !forceFreshOnImage;
-      const noneToResume = matched === 0 || session.pending.size === 0;
-      // DECISION ORDER (C-TOOLRESULT-MATCH; H06 puts unknown BEFORE the partial-pending clean ack):
-      //   1. C1 fresh-send (user payload + nothing will resume, OR ADD-89 forced fresh on a failed tool)
-      //   2. unknown.length>0 -> ERROR turn (a foreign id must never hide behind a partial clean ack)
-      //   3. flushUndelivered (late tools delivered this turn)
-      //   4. pending.size>0 -> benign empty end_turn (true incremental answer; run stays paused)
-      //   5. matched===0 && a paused run DIED upstream -> ERROR turn (BR2; never fake success)
-      //   6. else -> benign end_turn (idempotent stale/duplicate ack)
-      if (hasUserPayload && (noneToResume || forceFreshOnError) && !runWillResume) {
-        // The user's trailing message/image would otherwise produce an empty end_turn (no output is coming).
-        // Answer it with a fresh send. If a run is still live (e.g. matched===0 but unrelated tools are
-        // pending), the user is redirecting — cancel the stale run first so we don't spawn a concurrent /
-        // orphaned run, then send. cancel() nulls the agent + bumps epoch; driveUserSend re-resumes a live agent.
-        dbg("runTurn tool_results -> C1 fresh user send", "session=" + session.id, "matched=" + matched, "pending=" + session.pending.size, "runLive=" + (session.run !== null), "text=" + hasUserText, "images=" + hasUserImages);
-        if (session.run !== null) { await cancelStaleRun(); session.seeded = true; }
-        // M28: send "" for a user-pasted image-only turn (driveUserSend folds input.images in). EX3: for a
-        // tool-result image with no trailing user text, mark the image's provenance with a NON-directive
-        // parenthetical — NOT an instruction. The user's real task lives in the durable context (or userText); a
-        // "read it and continue"-style directive here overrides it (observed: the model abandoned the task to
-        // "continue" with a self-invented one). Folds the whole stash (this batch + any earlier partial batches).
-        const freshText = hasUserText ? input.userText
-          : (turnToolResultImages.length > 0 ? "(The attached image is the output of a tool call you made.)" : "");
-        session.stashedToolResultImages = []; // folding now — clear the partial-batch stash
-        await driveUserSend(freshText, turnToolResultImages);
-      } else if (unknown.length > 0) {
-        // H06/BR1: a result for an id this session NEVER issued is a genuine desync (e.g. a wrong/foreign id).
-        // Surface it as a real error turn BEFORE any partial-pending clean ack, so it is NOT consumed as a
-        // clean empty success that silently discards the client's tool work and swallows the bogus id.
-        session.sse({ type: "turn_end", stop_reason: "error", error: `unknown tool_call_id ${unknown[0]}: not issued by this session` });
-        session.settle();
-      } else if (session.flushUndelivered()) {
-        // Tools the SDK emitted after the prior turn closed (mid-burst) are now delivered as THIS turn's
-        // tool_use batch (Comment 1) so the client can answer them; the run stays paused awaiting them.
-      } else if (session.pending.size > 0) {
-        // Some delivered tools remain unanswered (true incremental answer). The run is still blocked, so it
-        // will neither stream nor complete this turn. Don't error and don't hang: settle a benign empty turn;
-        // the run stays paused (bounded by PENDING_TIMEOUT_MS) and the client may answer the rest next.
-        // EX3: a tool-result image in THIS partial batch cannot be folded now (that would cancel the still-
-        // pending tools), so carry it in the stash — it is folded when the batch completes and the run resumes.
-        session.stashedToolResultImages = turnToolResultImages;
-        session.sse({ type: "turn_end", stop_reason: "end_turn" });
-        session.settle();
-      } else if (matched === 0) {
-        // BR2: nothing matched and nothing pending. If a paused run has since DIED upstream (parallel-tool
-        // error etc.), surface that real error instead of a clean empty turn that would fake success.
-        if (session.lastRunError && session.run === null) {
-          const err = session.lastRunError; session.lastRunError = null;
-          dbg("runTurn tool_results matched=0 but run died -> error turn", "session=" + session.id);
-          session.sse({ type: "turn_end", stop_reason: "error", error: err });
-          session.settle();
-        } else {
-          // Nothing matched and nothing pending: a stale/duplicate ack (e.g. a client retry of an already-
-          // resolved id). Acknowledge cleanly rather than erroring (Comment 2 idempotency) — this is what
-          // breaks the old retry storm. When matched>0 and pending==0, the run resumes and streams below.
-          session.sse({ type: "turn_end", stop_reason: "end_turn" });
-          session.settle();
-        }
+        // When the last callback was applied to a live run, resolving it resumes the SDK. Its next delta, tool
+        // wave, or run terminal settles this response; no synthetic terminal is emitted here.
       }
     } else if (session.run) {
       // Re-entrancy guard: a new user turn while a run is still in flight (paused awaiting tools)
@@ -3596,6 +3793,8 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
     await turnSettled;
   } catch (e) {
     dbg("runTurn CATCH exception", "session=" + session.id, (e && e.stack) || (e && e.message) || String(e));
+    const turnFailure = (e && e.message) || String(e);
+    session.rejectAllPending(`turn failed: ${turnFailure}`, TerminalReason.RUN_ERROR);
     if (!settled) session.sse({ type: "turn_end", stop_reason: "error", error: (e && e.message) || String(e) });
     // ADD-101: ALWAYS settle the turn on an error so the per-turn latch (turnSettled) resolves — otherwise a
     // throw before any settle() call leaves the latch unresolved (queue/lifecycle stalls). settle() is idempotent.
@@ -3605,7 +3804,8 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
     // waiter -> release it here so the FIFO does not hang. But ONLY when no run is live: if a run WAS installed,
     // its wait()->onRunComplete/onRunError will notify on REAL completion, and releasing a waiter early here
     // would re-introduce the very ADD-90 race (the queued turn starting concurrently with the live run).
-    if (session.run === null) session.notifyLogicalDone();
+    if (session.run !== null) await session.cancel({ terminalReason: TerminalReason.RUN_ERROR, detail: turnFailure });
+    else session.notifyLogicalDone();
     // ADD-61: an EMPTY newly-created session whose first turn failed before any AGENT was even established
     // (getPlatform/ensureAgent threw — a transient platform-init failure, or the ADD-53 key-collision reject)
     // must NOT linger in the sessions map. While present it pins its platform (platformHasSession) and blocks
@@ -3613,21 +3813,20 @@ async function runTurn(req, res, session, model, input, constraints = {}) {
     // no live/paused run, no pending tools, no queued waiters. The `session.agent === null` guard is the line
     // between this case and H11 (agent.send failed AFTER ensureAgent succeeded -> session.agent IS set): H11
     // deliberately KEEPS the session so the retry reuses the cached agent and re-prepends system + history.
-    if (!session.seeded && session.agent === null && session.run === null && session.pending.size === 0 && !session.hasQueuedWaiters() && sessions.get(session.id) === session) {
+    if (!session.seeded && session.agent === null && session.run === null && session.pendingCount() === 0 && !session.hasQueuedWaiters() && sessions.get(session.id) === session) {
       dbg("runTurn drop empty failed-first-turn session (ADD-61)", "session=" + session.id);
       sessions.delete(session.id);
-      void session.cancel();
+      void session.cancel({ terminalReason: TerminalReason.RUN_ERROR, detail: "failed first turn" });
     }
   } finally {
-    if (keepalive) clearInterval(keepalive);
+    clearInterval(keepalive);
     res.off("close", onClose);
-    if (session.activeRes === res) session.activeRes = null;
-    // ADD-100: stop buffering output + detach the 'drain' listener for THIS response (the turn is over).
-    session.detachDrain(); session.outQueue = []; session.outQueueBytes = 0;
-    // ADD-101: clear the per-turn latch handle when it still points at THIS turn's settleOnce, so a LATER
-    // cancellation (e.g. from a queued turn) never fires a stale settleTurn belonging to an already-finished turn.
+    if (session.activeRes === res) {
+      try { await session.finishResponse(); }
+      catch (error) { dbg("finishResponse failed", "session=" + session.id, (error && error.message) || String(error)); }
+      finally { session.activeRes = null; session.responseWriter = null; }
+    }
     if (session.settleTurn === settleOnce) session.settleTurn = null;
-    try { res.write("data: [DONE]\n\n"); res.end(); } catch {}
   }
 }
 
@@ -3642,17 +3841,23 @@ const server = createServer(async (req, res) => {
     res.end(JSON.stringify(healthBody(req)));
     return;
   }
-  // MCP shim endpoint: /mcp/<sessionId>[/<serverKey>]. Dialed by the in-process SDK runtime over loopback
-  // (NOT by an external client), so it is authorized by the in-path sessionId + the session lookup, not the
-  // inbound X-Bridge-Auth gate /agent/turn uses. Strip the query string, then split the path segments.
-  if (req.url && (req.url === "/mcp" || req.url.startsWith("/mcp/"))) {
-    const segs = req.url.split("?")[0].split("/").filter(Boolean); // ["mcp", sessionId?, serverKey?]
-    const sessionId = segs[1] ? decodeURIComponent(segs[1]) : "";
-    const serverKey = segs[2] ? decodeURIComponent(segs[2]) : "";
-    if (!sessionId) { res.setHeader("Access-Control-Allow-Origin", "*"); res.writeHead(404, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "missing sessionId in /mcp path" })); return; }
-    await handleMcp(req, res, sessionId, serverKey); return;
+  if (req.method === "GET" && req.url === "/ready") {
+    res.writeHead(bridgeReady ? 200 : 503, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(readinessBody()));
+    return;
   }
-  if (req.method === "POST" && req.url === "/agent/turn") {
+  // The SDK-only MCP shim is never an external API. The socket peer must be
+  // loopback and forwarded requests are refused even when they know a session id.
+  const mcpRoute = classifyMcpRoute(req);
+  if (mcpRoute) {
+    if (mcpRoute.error) {
+      res.writeHead(mcpRoute.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: mcpRoute.error }));
+      return;
+    }
+    await handleMcp(req, res, mcpRoute.sessionId, mcpRoute.serverKey); return;
+  }
+  if (req.method === "POST" && (req.url === "/agent/turn" || req.url === "/agent/continue")) {
     const cursorKey = authorizeRequest(req);
     if (!cursorKey) {
       dbg("POST /agent/turn -> 401 UNAUTHORIZED (authorizeRequest returned empty)");
@@ -3669,7 +3874,9 @@ const server = createServer(async (req, res) => {
       dbg("POST /agent/turn -> 400 body read error", (e && e.message) || String(e)); res.writeHead(400); res.end("{}"); return;
     }
     let body; try { body = JSON.parse(raw); } catch (e) { dbg("POST /agent/turn -> 400 JSON parse error", (e && e.message) || String(e)); res.writeHead(400); res.end("{}"); return; }
-    await handleTurn(req, res, body, cursorKey); return;
+    if (req.url === "/agent/continue") await handleContinue(req, res, body, cursorKey);
+    else await handleTurn(req, res, body, cursorKey);
+    return;
   }
   res.writeHead(404); res.end(JSON.stringify({ error: "not found" }));
 });
@@ -3677,7 +3884,12 @@ const server = createServer(async (req, res) => {
 // ---- idle session eviction (bounded sessions Map; no leaked agents) ----
 const evictTimer = setInterval(() => {
   const cut = nowMs() - SESSION_TTL_MS;
-  for (const [id, s] of sessions) { if (!s.activeRes && !s.run && !s.hasQueuedWaiters() && s.lastActivity < cut) { sessions.delete(id); void s.cancel(); } }
+  for (const [id, s] of sessions) {
+    if (!s.activeRes && !s.run && !s.hasQueuedWaiters() && s.lastActivity < cut) {
+      sessions.delete(id);
+      void s.cancel({ terminalReason: TerminalReason.SESSION_EVICTED, detail: "idle session eviction" });
+    }
+  }
   // Multi-tenant only: dispose idle per-user platforms. Single-tenant keeps its single platform resident
   // (it is the common, hot path) — it is never evicted, matching the pre-pool behavior exactly.
   if (MULTI_TENANT) {
@@ -3699,32 +3911,37 @@ let shuttingDown = false;
 // long, never indefinitely (set 0 to restore the old immediate-cancel behavior). Kept under a typical container
 // SIGTERM grace window so the platform never SIGKILLs us first.
 const DRAIN_MS = envInt("CURSOR_AGENT_DRAIN_MS", 20000, { min: 0 });
-async function shutdown() {
+async function shutdown(exitCode = 0, drain = true) {
   if (shuttingDown) return; shuttingDown = true;
+  bridgeReady = false;
   try { server.close(); } catch {} // refuse NEW connections; in-flight ones keep streaming
-  if (DRAIN_MS > 0) {
+  if (drain && DRAIN_MS > 0) {
     const deadline = nowMs() + DRAIN_MS;
     const anyLive = () => { for (const [, s] of sessions) { if (s && s.run && !s.done) return true; } return false; };
     try { while (anyLive() && nowMs() < deadline) { await new Promise((r) => setTimeout(r, 250)); } } catch {}
   }
-  for (const [, s] of sessions) { try { await s.cancel(); } catch {} }
+  // Persist every open round's terminal state before awaiting any SDK cleanup;
+  // one stuck close must not prevent later sessions from being journaled.
+  for (const [, s] of sessions) {
+    try { s.rejectAllPending("bridge shutdown", TerminalReason.SHUTDOWN); } catch {}
+  }
+  for (const [, s] of sessions) {
+    try { await s.cancel({ terminalReason: TerminalReason.SHUTDOWN, detail: "bridge shutdown" }); } catch {}
+  }
   sessions.clear();
   for (const [, entry] of platforms) { try { await disposePlatform(entry); } catch {} }
   platforms.clear();
-  process.exit(0);
+  process.exit(exitCode);
 }
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+process.on("SIGTERM", () => { void shutdown(0, true); });
+process.on("SIGINT", () => { void shutdown(0, true); });
 
-// CRASH BACKSTOP (P0): the @cursor/sdk validates advertised tool schemas with ajv in STRICT mode and can THROW
-// from INSIDE its own async callbacks (e.g. a malformed inputSchema reaching tools/list) — a path the bridge
-// cannot wrap per-seam because it lives inside the SDK. An uncaught throw there would KILL this Node process and
-// take the whole bridge down, so the Go executor then 503s every session until a manual redeploy (the schema-
-// compaction incident). Keep the process ALIVE and log LOUDLY — full stack, always, never silent, so a real bug
-// stays visible rather than masked. The bridge's OWN seams still surface a typed error turn to the client; a
-// single wedged turn is bounded by the per-tool PENDING_TIMEOUT / session-TTL guards, but a dead process is not.
+// CRASH BACKSTOP: an unclassified exception means process invariants are no
+// longer trustworthy. Mark readiness false, terminal-journal every open round,
+// and exit so the parent supervisor restarts the bridge and Go as one unit.
 process.on("uncaughtException", (err, origin) => {
-  try { console.error("[cursor-agent-bridge] FATAL uncaughtException (process kept alive) origin=" + origin + ":", (err && err.stack) ? err.stack : err); } catch { /* a logger throw must never re-crash the handler */ }
+  try { console.error("[cursor-agent-bridge] FATAL uncaughtException; terminalizing rounds and exiting origin=" + origin + ":", (err && err.stack) ? err.stack : err); } catch { /* a logger throw must never re-crash the handler */ }
+  void shutdown(1, false);
 });
 // sessionForClosedInputStream attributes a FLOATING WriteIterableClosedError to the one session it can SAFELY
 // blame. The error means a run's INPUT pipe (the SDK's WritableIterable — the channel agent.send writes into)
@@ -3774,7 +3991,8 @@ process.on("unhandledRejection", (reason) => {
       return;
     }
   } catch { /* never throw from the handler */ }
-  try { console.error("[cursor-agent-bridge] unhandledRejection (process kept alive):", (reason && reason.stack) ? reason.stack : reason); } catch { /* never throw from the handler */ }
+  try { console.error("[cursor-agent-bridge] FATAL unhandledRejection; terminalizing rounds and exiting:", (reason && reason.stack) ? reason.stack : reason); } catch { /* never throw from the handler */ }
+  void shutdown(1, false);
 });
 
 // Startup self-test (part 1, direct-global): client execution is guaranteed by the dispatch-seam patch
@@ -3895,8 +4113,8 @@ async function selfTestResultSerialization() {
   // (redactedReadArgs -> redactedReadResult, an alias of ReadResult; shellArgs -> shellResult). The streaming
   // shell case is the lone exception: its chunks serialize as the `shellStream` case, not `shellStreamResult`.
   const resultCaseFor = (cas) => cas.replace(/Args$/, "Result");
-  const st = { path: "/x", command: "ls", workingDirectory: "/workspace", fileText: "alpha\nbeta", offset: 0, limit: 20, returnFileContentAfterWrite: true };
-  const ctx = { cwd: "/workspace" };
+  const st = { path: "/x", command: "ls", workingDirectory: "/sdk-selftest", fileText: "alpha\nbeta", offset: 0, limit: 20, returnFileContentAfterWrite: true };
+  const ctx = { cwd: "/sdk-selftest" };
   const checks = []; // { case, label, ccJson }
   const add = (rc, label, ccJson) => checks.push({ case: rc, label, ccJson });
 
@@ -3912,7 +4130,7 @@ async function selfTestResultSerialization() {
   for (const chunk of CC_CASES.shellStreamArgs.buildChunks("output line\n", false, ctx)) add("shellStream", "shellStream:ok", chunk);
   for (const chunk of CC_CASES.shellStreamArgs.buildChunks("boom", true, ctx)) add("shellStream", "shellStream:err", chunk);
   // 3) blockedNativeResult (H08) for every native case the gate can block.
-  for (const cas of ["readArgs", "redactedReadArgs", "writeArgs", "deleteArgs", "shellArgs"]) add(resultCaseFor(cas), "blocked:" + cas, blockedNativeResult(cas, st, "/workspace").__ccJson);
+  for (const cas of ["readArgs", "redactedReadArgs", "writeArgs", "deleteArgs", "shellArgs"]) add(resultCaseFor(cas), "blocked:" + cas, blockedNativeResult(cas, st, "/sdk-selftest").__ccJson);
   // 4) CONTROL_ALLOW precheck cases answer { allowlisted: true }.
   for (const cas of Object.keys(CONTROL_ALLOW)) add(resultCaseFor(cas), "allow:" + cas, { allowlisted: true });
   // 5) CONTROL_TYPED proactive cases answer a typed value (e.g. { rejected: {} }).
@@ -3974,14 +4192,25 @@ if (RUN_AS_MAIN) {
   // Single-tenant needs CURSOR_API_KEY; multi-tenant needs CURSOR_AGENT_BRIDGE_TOKEN (per-user keys arrive
   // on each request). Require at least one so the bridge always has a way to obtain a Cursor credential.
   if (!API_KEY && !BRIDGE_TOKEN) { console.error("[bridge] set CURSOR_API_KEY (single-tenant) or CURSOR_AGENT_BRIDGE_TOKEN (multi-tenant) — refusing to start"); process.exit(1); }
+  if (RAILWAY_RUNTIME && !STATE_ROOT_ON_RAILWAY_VOLUME) {
+    console.error(`[bridge] Railway runtime requires STATE_ROOT beneath RAILWAY_VOLUME_MOUNT_PATH (stateRoot=${STATE_ROOT_RESOLVED}, volume=${RAILWAY_VOLUME_ROOT || "<missing>"}); refusing ephemeral round state`);
+    process.exit(1);
+  }
   // ADD-105: validate the bind host BEFORE doing any work. A non-loopback bind without multi-tenant auth is
   // refused (fail-closed) unless explicitly overridden; a non-loopback bind always warns about plaintext exposure.
   const bindCheck = validateBindHost(BRIDGE_HOST, MULTI_TENANT, ALLOW_INSECURE_BIND);
   if (!bindCheck.ok) { console.error("[bridge]", bindCheck.error); process.exit(1); }
   if (bindCheck.warn) console.warn("[bridge]", bindCheck.warn);
-  // mkdir the store + empty cwd so the SDK's executor-init / git-root probe doesn't ENOENT, and
-  // refuse to start if STATE_ROOT is not writable (the SDK persists session/checkpoint state there).
-  try { mkdirSync(EMPTY_CWD, { recursive: true }); accessSync(STATE_ROOT, constants.W_OK); }
+  // Refuse readiness unless STATE_ROOT supports the exact journal durability primitives. The empty cwd is
+  // only SDK initialization context; it is never advertised as the client's workspace or used for tools.
+  try {
+    mkdirSync(EMPTY_CWD, { recursive: true });
+    accessSync(STATE_ROOT, constants.W_OK);
+    probeStateRoot(STATE_ROOT);
+    const { journal, codec } = getRoundInfrastructure();
+    terminalizeOrphanedRounds(journal, codec);
+    journal.cleanupTerminal({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
+  }
   catch (e) { console.error(`[bridge] STATE_ROOT ${path.resolve(STATE_ROOT)} is not writable: ${e.message}`); process.exit(1); }
   console.log(`[bridge] mode=${MULTI_TENANT ? "multi-tenant (per-key platforms, X-Bridge-Auth gated)" : "single-tenant (one CURSOR_API_KEY)"} durable stateRoot=${path.resolve(STATE_ROOT)} (sqlite session+checkpoint state is written here; NOT a 'zero-FS' guarantee — only TOOL EXECUTION is FS-isolated to the client)`);
   // fail-closed: confirm the routing globals are installed before listening.
@@ -3998,9 +4227,12 @@ if (RUN_AS_MAIN) {
   selfTestNativeUnreachable()
     .then(() => selfTestBundleSeam())
     .then(() => selfTestResultSerialization()) // ADD-74: prove the RETURN trip (result __ccJson -> protobuf via fromJson)
-    .then(() => server.listen(PORT, BRIDGE_HOST, () => console.log(`[cursor-agent-bridge] listening on http://${BRIDGE_HOST}:${PORT} (patched CJS, fail-closed, native-unreachable + bundle-seam + result-serialization self-tests passed, durable stateRoot=${STATE_ROOT})`)))
+    .then(() => {
+      bridgeReady = true;
+      server.listen(PORT, BRIDGE_HOST, () => console.log(`[cursor-agent-bridge] listening on http://${BRIDGE_HOST}:${PORT} (ready, patched CJS, native-unreachable + bundle-seam + result-serialization self-tests passed, durable stateRoot=${STATE_ROOT})`));
+    })
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, sessions, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, BoundedIdSet, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, isLoopbackRemote, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, buildRestartRecoveryInput, continuationTenantMismatch, sessions, liveToolRounds, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

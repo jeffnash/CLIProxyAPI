@@ -527,6 +527,19 @@ func (s *Server) setupRoutes() {
 	}
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
+	readyzHandler := func(c *gin.Context) {
+		if err := checkComposerBridgeReadiness(c.Request.Context()); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready"})
+			return
+		}
+		if c.Request.Method == http.MethodHead {
+			c.Status(http.StatusOK)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ready"})
+	}
+	s.engine.GET("/readyz", readyzHandler)
+	s.engine.HEAD("/readyz", readyzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)

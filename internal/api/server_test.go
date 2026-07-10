@@ -27,6 +27,12 @@ func newTestServer(t *testing.T) *Server {
 	return newTestServerWithOptions(t)
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func newTestServerWithOptions(t *testing.T, opts ...ServerOption) *Server {
 	t.Helper()
 
@@ -89,6 +95,79 @@ func TestHealthz(t *testing.T) {
 		}
 		if rr.Body.Len() != 0 {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
+		}
+	})
+}
+
+func TestReadyzIncludesRequiredCursorBridge(t *testing.T) {
+	t.Run("bridge not required", func(t *testing.T) {
+		t.Setenv(composerBridgeRequiredEnv, "")
+		server := newTestServer(t)
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("readyz without required bridge = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("bridge ready", func(t *testing.T) {
+		bridge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/ready" {
+				t.Fatalf("bridge readiness path = %q, want /ready", r.URL.Path)
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer bridge.Close()
+		t.Setenv(composerBridgeRequiredEnv, "1")
+		t.Setenv("CURSOR_AGENT_BRIDGE_URL", bridge.URL)
+		server := newTestServer(t)
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("readyz with healthy bridge = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("bridge unavailable", func(t *testing.T) {
+		bridge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer bridge.Close()
+		t.Setenv(composerBridgeRequiredEnv, "true")
+		t.Setenv("CURSOR_AGENT_BRIDGE_URL", bridge.URL)
+		server := newTestServer(t)
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("readyz with unhealthy bridge = %d, want 503; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("bridge probe has a short internal deadline", func(t *testing.T) {
+		t.Setenv(composerBridgeRequiredEnv, "1")
+		t.Setenv("CURSOR_AGENT_BRIDGE_URL", "http://127.0.0.1:9798")
+		originalClient := composerBridgeReadinessClient
+		defer func() { composerBridgeReadinessClient = originalClient }()
+
+		var deadline time.Time
+		composerBridgeReadinessClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			var ok bool
+			deadline, ok = req.Context().Deadline()
+			if !ok {
+				t.Fatal("bridge readiness request context has no deadline")
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: req}, nil
+		})}
+
+		if err := checkComposerBridgeReadiness(t.Context()); err != nil {
+			t.Fatalf("bounded bridge readiness probe failed: %v", err)
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || remaining > composerBridgeReadinessTimeout {
+			t.Fatalf("bridge readiness deadline = %v, want > 0 and <= %v", remaining, composerBridgeReadinessTimeout)
 		}
 	})
 }

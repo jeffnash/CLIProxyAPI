@@ -34,6 +34,7 @@ auths/*
 
 # Documentation
 docs/*
+!docs/composer-clienttools-durable-round-implementation.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md
@@ -71,6 +72,8 @@ _bmad-output/*
 .codex/
 sidecars/cursor-bridge/node_modules/
 sidecars/cursor-bridge/.cursor-agent-store/
+/.cursor-agent-store/
+/agent-tools/
 
 # Cursor SDK trace harnesses — local-only debug artifacts. Keep these out of
 # source control; if you need them locally they read CURSOR_API_KEY from env.

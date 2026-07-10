@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# codex-composer-run — safe launch that captures workspace then execs codex
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/composer-workspace.sh"
+composer_capture_workspace
+# shellcheck source=codex-composer.sh
+source "${SCRIPT_DIR}/codex-composer.sh" on
+exec codex "$@"

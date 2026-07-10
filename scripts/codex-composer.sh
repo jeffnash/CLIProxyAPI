@@ -18,13 +18,15 @@
 
 usage() {
   cat <<'EOF'
-Usage: source codex-composer.sh [on|off|toggle|status]
+Usage: source codex-composer.sh [on|off|toggle|status|refresh|run]
 
 Commands:
   on       Export Codex CLI overrides pointing at CLIProxyAPI.
   off      Restore previous values.
   toggle   Switch between on and off.
   status   Print current overrides state.
+  refresh  Refresh advisory workspace headers from the current directory.
+  run      Refresh workspace headers and exec codex.
 EOF
 }
 
@@ -38,11 +40,22 @@ if [[ -n "${ZSH_VERSION:-}" && "${ZSH_EVAL_CONTEXT:-}" != *:file* ]]; then
   exit 1
 fi
 
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  SCRIPT_PATH="${(%):-%x}"
+else
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+fi
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+
 vars=(
   OPENAI_API_KEY
   OPENAI_BASE_URL
   CODEX_MODEL
   CLIPROXY_BASE_URL
+  CLIPROXY_CLIENT_CWD
+  CLIPROXY_CLIENT_WORKSPACE
+  CLIPROXY_CLIENT_SHELL
+  CLIPROXY_CLIENT_OS_VERSION
 )
 
 provider_key="cliproxy_composer"
@@ -133,6 +146,9 @@ enable_overrides() {
   base_url="${base_url%/}"
   key="$(resolve_key "${base_url}")"
   model="${COMPOSER_MODEL:-${default_model}}"
+  # shellcheck source=lib/composer-workspace.sh
+  source "${SCRIPT_DIR}/lib/composer-workspace.sh"
+  composer_capture_workspace
 
   export CLIPROXY_BASE_URL="${base_url}"
   export OPENAI_BASE_URL="${base_url%/v1}/v1"
@@ -140,6 +156,22 @@ enable_overrides() {
   export CODEX_MODEL="${model}"
   export "${active_flag}=${provider_key}"
   export CODEX_CLIPROXY_ENABLED=1
+}
+
+refresh_headers() {
+  if ! is_enabled; then
+    echo "codex-composer: not enabled, run 'on' first" >&2
+    return 1
+  fi
+  # shellcheck source=lib/composer-workspace.sh
+  source "${SCRIPT_DIR}/lib/composer-workspace.sh"
+  composer_capture_workspace
+  echo "codex-composer: refreshed advisory workspace headers from current directory"
+}
+
+run_codex() {
+  if is_enabled; then refresh_headers >/dev/null; else enable_overrides; fi
+  exec codex "$@"
 }
 
 disable_overrides() {
@@ -164,6 +196,8 @@ case "${1:-toggle}" in
   off)    disable_overrides ;;
   toggle) is_enabled && disable_overrides || enable_overrides ;;
   status) status_overrides ;;
+  refresh) refresh_headers ;;
+  run) shift; run_codex "$@" ;;
   -h|--help|help) usage ;;
   *)
     echo "error: unknown command '${1:-}'" >&2

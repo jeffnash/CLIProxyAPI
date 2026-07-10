@@ -16,7 +16,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -67,12 +66,175 @@ func protoAuth(bridgeURL string) *cliproxyauth.Auth {
 }
 
 func protoOpts(conv string) cliproxyexecutor.Options {
-	return cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai"), Headers: http.Header{"X-Conversation-Id": []string{conv}}}
+	return composerExecOpts("openai", conv)
 }
 
 func protoToolReq(text string) cliproxyexecutor.Request {
 	payload := []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"` + text + `"}],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)
 	return cliproxyexecutor.Request{Model: "composer-2.5", Payload: payload}
+}
+
+func TestClaudeHeaderlessAndInvalidWorkspaceReachBridgeAsNeutralTurns(t *testing.T) {
+	body := "data: {\"type\":\"text\",\"delta\":\"repo summary\"}\n\ndata: {\"type\":\"turn_end\",\"stop_reason\":\"stop\"}\n\ndata: [DONE]\n\n"
+	bridge := newComposerProtoBridge(t, http.StatusOK, "text/event-stream", body)
+	executor := NewCursorExecutor(&config.Config{})
+	auth := protoAuth(bridge.srv.URL)
+	req := cliproxyexecutor.Request{
+		Model: "composer-2.5",
+		Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"tell me about this repo"}],` +
+			`"tools":[{"name":"Read","description":"read a local file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}`),
+	}
+
+	cases := []struct {
+		name string
+		opts cliproxyexecutor.Options
+	}{
+		{
+			name: "headerless",
+			opts: func() cliproxyexecutor.Options {
+				opts := composerExecOpts("claude", "headerless-claude")
+				opts.Headers.Del("X-Cwd")
+				opts.Headers.Del("X-Workspace-Path")
+				return opts
+			}(),
+		},
+		{
+			name: "invalid path",
+			opts: func() cliproxyexecutor.Options {
+				opts := composerExecOpts("claude", "invalid-workspace-claude")
+				opts.Headers.Set("X-Cwd", "relative/client/path")
+				opts.Headers.Set("X-Workspace-Path", "/app/proxy-path-must-not-leak")
+				return opts
+			}(),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := executor.executeComposer(context.Background(), auth, "k", req, tc.opts)
+			if err != nil {
+				t.Fatalf("Claude turn failed: %v", err)
+			}
+			if !strings.Contains(gjson.GetBytes(resp.Payload, "content.0.text").String(), "repo summary") {
+				t.Fatalf("Claude response lost model output: %s", resp.Payload)
+			}
+			got := bridge.lastRequestBody()
+			if !gjson.GetBytes(got, "clientEnv.workspaceUnknown").Bool() {
+				t.Fatalf("workspace did not degrade to neutral: %s", got)
+			}
+			for _, forbidden := range []string{`"processWorkingDirectory"`, `"workspacePaths"`, "/workspace", "/app/proxy-path-must-not-leak"} {
+				if strings.Contains(string(got), forbidden) {
+					t.Fatalf("neutral Claude request leaked %q: %s", forbidden, got)
+				}
+			}
+		})
+	}
+}
+
+func TestHarnessProtocolsRoundTripSignedClientToolResultsThroughContinue(t *testing.T) {
+	const signedID = "cct1_AAAAAAAAAAAAAAAAAAAAAA_0_BBBBBBBBBBBBBBBBBBBBBB"
+	cases := []struct {
+		name         string
+		source       string
+		firstPayload string
+		continuation string
+	}{
+		{
+			name:   "OpenAI chat completions",
+			source: "openai",
+			firstPayload: `{"model":"composer-2.5","messages":[{"role":"user","content":"read README"}],` +
+				`"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}]}`,
+			continuation: `{"model":"composer-2.5","messages":[` +
+				`{"role":"user","content":"read README"},` +
+				`{"role":"assistant","content":null,"tool_calls":[{"id":"` + signedID + `","type":"function","function":{"name":"Read","arguments":"{\"path\":\"README.md\"}"}}]},` +
+				`{"role":"tool","tool_call_id":"` + signedID + `","content":"README contents"}],` +
+				`"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`,
+		},
+		{
+			name:   "Anthropic messages",
+			source: "claude",
+			firstPayload: `{"model":"composer-2.5","max_tokens":512,"messages":[{"role":"user","content":"read README"}],` +
+				`"tools":[{"name":"Read","description":"read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}`,
+			continuation: `{"model":"composer-2.5","max_tokens":512,"messages":[` +
+				`{"role":"user","content":"read README"},` +
+				`{"role":"assistant","content":[{"type":"tool_use","id":"` + signedID + `","name":"Read","input":{"path":"README.md"}}]},` +
+				`{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + signedID + `","content":"README contents"}]}],` +
+				`"tools":[{"name":"Read","input_schema":{"type":"object"}}]}`,
+		},
+		{
+			name:   "OpenAI Responses",
+			source: "openai-response",
+			firstPayload: `{"model":"composer-2.5","input":[{"role":"user","content":[{"type":"input_text","text":"read README"}]}],` +
+				`"tools":[{"type":"function","name":"Read","description":"read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]}`,
+			continuation: `{"model":"composer-2.5","input":[` +
+				`{"role":"user","content":[{"type":"input_text","text":"read README"}]},` +
+				`{"type":"function_call","id":"fc_1","call_id":"` + signedID + `","name":"Read","arguments":"{\"path\":\"README.md\"}","status":"completed"},` +
+				`{"type":"function_call_output","call_id":"` + signedID + `","output":"README contents"}],` +
+				`"tools":[{"type":"function","name":"Read","parameters":{"type":"object"}}]}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var paths []string
+			var bodies [][]byte
+			bridge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				paths = append(paths, r.URL.Path)
+				bodies = append(bodies, append([]byte(nil), raw...))
+				mu.Unlock()
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				if r.URL.Path == composerAgentContinuePath {
+					_, _ = io.WriteString(w, "data: {\"type\":\"text\",\"delta\":\"continued after local tool\"}\n\n"+
+						"data: {\"type\":\"turn_end\",\"stop_reason\":\"stop\"}\n\ndata: [DONE]\n\n")
+					return
+				}
+				_, _ = io.WriteString(w, "data: {\"type\":\"tool_call\",\"id\":\""+signedID+"\",\"name\":\"Read\",\"input\":{\"path\":\"README.md\"}}\n\n"+
+					"data: {\"type\":\"turn_end\",\"stop_reason\":\"tool_use\"}\n\ndata: [DONE]\n\n")
+			}))
+			defer bridge.Close()
+
+			executor := NewCursorExecutor(&config.Config{})
+			auth := protoAuth(bridge.URL)
+			opts := composerExecOpts(tc.source, "roundtrip-"+strings.ReplaceAll(tc.name, " ", "-"))
+			first, err := executor.executeComposer(context.Background(), auth, "k", cliproxyexecutor.Request{
+				Model: "composer-2.5", Payload: []byte(tc.firstPayload),
+			}, opts)
+			if err != nil {
+				t.Fatalf("first turn: %v", err)
+			}
+			if !strings.Contains(string(first.Payload), signedID) {
+				t.Fatalf("harness response lost signed tool id: %s", first.Payload)
+			}
+
+			second, err := executor.executeComposer(context.Background(), auth, "k", cliproxyexecutor.Request{
+				Model: "composer-2.5", Payload: []byte(tc.continuation),
+			}, opts)
+			if err != nil {
+				t.Fatalf("continuation: %v", err)
+			}
+			if !strings.Contains(string(second.Payload), "continued after local tool") {
+				t.Fatalf("final harness response lost resumed text: %s", second.Payload)
+			}
+
+			mu.Lock()
+			gotPaths := append([]string(nil), paths...)
+			gotBodies := append([][]byte(nil), bodies...)
+			mu.Unlock()
+			if len(gotPaths) != 2 || gotPaths[0] != composerAgentTurnPath || gotPaths[1] != composerAgentContinuePath {
+				t.Fatalf("bridge paths = %v, want [/agent/turn /agent/continue]", gotPaths)
+			}
+			if got := gjson.GetBytes(gotBodies[1], "input.results.0.toolCallId").String(); got != signedID {
+				t.Fatalf("continuation signed id = %q, want %q; body=%s", got, signedID, gotBodies[1])
+			}
+			if got := gjson.GetBytes(gotBodies[1], "input.results.0.content").String(); !strings.Contains(got, "README contents") {
+				t.Fatalf("continuation lost local tool content: %s", gotBodies[1])
+			}
+		})
+	}
 }
 
 // drainStreamErr collects a StreamResult and returns the first chunk error (or nil) plus the concatenated
@@ -285,24 +447,19 @@ func TestRBT035_NonStreamResponseContentTypeIsJSON(t *testing.T) {
 	}
 }
 
-// RBT-017 (Comment 2 / ADD-39) — multi-replica: tool-call ownership is process-local. Two SEPARATE executor
-// instances share the package-global ownership store ONLY within one process (this asserts the CURRENT
-// single-instance behavior). The contract this test pins: a continuation that reaches an instance which did
-// NOT record the emitting session must still degrade SAFELY — it routes via the stable-conv hash (deterministic
-// across instances for a conversation that carries a stable id) and the bridge body is a tool_results RE-SEED
-// (carrying history), NEVER a clean end_turn. It must never mis-route to a wrong session.
-//
-// NOTE: because composerOwnership is a package global, instance A and instance B in the SAME process DO share
-// it (single-instance fidelity). To model a genuine cross-replica MISS (the multi-replica degrade), the
-// continuation here uses a tool_call_id that was never recorded, proving the stable-conv fallback path.
-func TestRBT017_MultiReplicaContinuationDegradesSafely(t *testing.T) {
-	// One fake bridge shared by both instances; it records the last body so we can assert the re-seed shape.
+// A continuation may land on any Go replica because Go owns no tool-call routing state. Both instances must
+// forward the opaque signed id to /agent/continue unchanged; the bridge journal is the sole resolver.
+func TestRBT017_MultiReplicaContinuationIsOpaqueBridgeRouting(t *testing.T) {
+	const signedID = "cct1_AAAAAAAAAAAAAAAAAAAAAA_0_BBBBBBBBBBBBBBBBBBBBBB"
+	// One fake bridge shared by both instances; it records the last path/body so we can assert the wire contract.
 	var lastBody []byte
+	var lastPath string
 	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		lastBody = raw
+		lastPath = r.URL.Path
 		mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
@@ -313,9 +470,9 @@ func TestRBT017_MultiReplicaContinuationDegradesSafely(t *testing.T) {
 				fl.Flush()
 			}
 		}
-		// On the first (emitter) turn, emit a tool call so instance A records ownership; on any turn just end.
+		// On the first turn the bridge emits its own signed id. Go must not decode or remember it.
 		if gjson.GetBytes(raw, "input.type").String() == "user" {
-			write(`{"type":"tool_call","id":"tc_replicaA","name":"Read","input":{"path":"a.txt"}}`)
+			write(`{"type":"tool_call","id":"` + signedID + `","name":"Read","input":{"path":"a.txt"}}`)
 			write(`{"type":"turn_end","stop_reason":"tool_use"}`)
 		} else {
 			write(`{"type":"text","delta":"resumed"}`)
@@ -330,19 +487,18 @@ func TestRBT017_MultiReplicaContinuationDegradesSafely(t *testing.T) {
 	auth := protoAuth(srv.URL)
 	conv := protoOpts("rbt017-conv")
 
-	// Instance A emits a tool call (records ownership of tc_replicaA in the package-global store).
+	// Instance A emits a bridge-signed tool call.
 	_, errA := instanceA.executeComposer(context.Background(), auth, "k", protoToolReq("start"), conv)
 	if errA != nil {
 		t.Fatalf("RBT-017: instance A emitter turn must succeed, got %v", errA)
 	}
 	sessA, _ := deriveComposerSessionID(auth, "k", protoToolReq("start").Payload, conv)
 
-	// Instance B receives a continuation that echoes an id instance B NEVER recorded (model a cross-replica
-	// MISS). It must NOT mis-route: with the stable conversation id present it routes via the stable-conv hash,
-	// which is DETERMINISTIC across instances — so B derives the SAME sess_ id as A would for this conversation.
+	// Instance B receives the continuation without any process-local ownership handoff.
 	contPayload := []byte(`{"model":"composer-2.5","messages":[` +
-		`{"role":"assistant","tool_calls":[{"id":"tc_cross_replica_unknown","function":{"name":"Read"}}]},` +
-		`{"role":"tool","tool_call_id":"tc_cross_replica_unknown","content":"file contents"}]}`)
+		`{"role":"user","content":"read a.txt"},` +
+		`{"role":"assistant","tool_calls":[{"id":"` + signedID + `","function":{"name":"Read"}}]},` +
+		`{"role":"tool","tool_call_id":"` + signedID + `","content":"file contents"}]}`)
 	contReq := cliproxyexecutor.Request{Model: "composer-2.5", Payload: contPayload}
 	sessB, errSid := deriveComposerSessionID(auth, "k", contPayload, conv)
 	if errSid != nil {
@@ -351,28 +507,33 @@ func TestRBT017_MultiReplicaContinuationDegradesSafely(t *testing.T) {
 	if !strings.HasPrefix(sessB, "sess_") {
 		t.Fatalf("RBT-017: instance B must derive a real session id, got %q", sessB)
 	}
-	// The stable-conv hash is deterministic across instances: B's routing matches A's conversation session.
+	// The advisory session remains deterministic, but correctness is carried by the signed id.
 	if sessB != sessA {
-		t.Fatalf("RBT-017: a continuation with a stable conv id must route deterministically across replicas (A=%s B=%s)", sessA, sessB)
+		t.Fatalf("RBT-017: advisory session should remain deterministic across replicas (A=%s B=%s)", sessA, sessB)
 	}
 
 	resp, errB := instanceB.executeComposer(context.Background(), auth, "k", contReq, conv)
 	if errB != nil {
-		t.Fatalf("RBT-017: instance B continuation must degrade safely (re-seed), not error, got %v", errB)
+		t.Fatalf("RBT-017: instance B must forward the continuation without local routing state, got %v", errB)
 	}
 	if resp.Payload == nil {
 		t.Fatalf("RBT-017: instance B must produce a response")
 	}
-	// The bridge body for B's continuation must be a tool_results RE-SEED carrying history — NEVER a clean
-	// end_turn / fresh user turn that strands the tool output.
 	mu.Lock()
 	gotBody := append([]byte(nil), lastBody...)
+	gotPath := lastPath
 	mu.Unlock()
+	if gotPath != composerAgentContinuePath {
+		t.Fatalf("RBT-017: continuation went to %q, want %q", gotPath, composerAgentContinuePath)
+	}
 	if it := gjson.GetBytes(gotBody, "input.type").String(); it != "tool_results" {
 		t.Fatalf("RBT-017: B's continuation bridge body must be input.type=tool_results, got %q (%s)", it, string(gotBody))
 	}
-	if gjson.GetBytes(gotBody, "input.results.0.toolCallId").String() != "tc_cross_replica_unknown" {
-		t.Fatalf("RBT-017: B's continuation must carry the echoed tool result, got %s", string(gotBody))
+	if gjson.GetBytes(gotBody, "input.results.0.toolCallId").String() != signedID {
+		t.Fatalf("RBT-017: signed id was not forwarded byte-for-byte, got %s", string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "input.history").String() == "" {
+		t.Fatalf("RBT-017: bounded history must remain available for bridge restart recovery, got %s", string(gotBody))
 	}
 }
 
@@ -415,29 +576,19 @@ func TestADD82_ForcedBuiltinToolChoiceFlaggedUnavailable(t *testing.T) {
 	}
 }
 
-// P0-1 (reseed-on-410) — a LOST tool_results continuation that replays the conversation from the top (carries a
-// user opener) gets ONE bounded retry, re-framed as a fresh type:"user" seed, and SUCCEEDS instead of
-// dead-ending on the 410. The stub 410s any tool_results turn (the lost continuation) and accepts a user turn
-// (the reseed), so BOTH the non-stream and stream paths must recover. The reseed body must be a clean user seed:
-// input.type="user", NO input.results (the unanswerable tool calls are dropped), and the replayed history carried.
+// P0-1 (reseed-on-410) — per hardening section 8, reseed is DELETED. A LOST tool_results continuation
+// that previously would reseed now returns round_lost 410 with message "submitted results were not applied"
+// and exactly ONE POST (no automatic retry). This inverts the old reseed test.
 func TestP01_Reseed410ContinuationCarryingOpener(t *testing.T) {
-	var mu sync.Mutex
 	var bodies [][]byte
-	okBody := "data: {\"type\":\"text\",\"delta\":\"recovered\"}\n\ndata: {\"type\":\"turn_end\",\"stop_reason\":\"stop\"}\n\ndata: [DONE]\n\n"
+	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		bodies = append(bodies, raw)
 		mu.Unlock()
-		// The lost continuation (input.type=tool_results) is GONE; the reseed (input.type=user) is accepted.
-		if gjson.GetBytes(raw, "input.type").String() == "tool_results" {
-			w.WriteHeader(410)
-			_, _ = w.Write([]byte("unknown or expired session"))
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(okBody))
+		w.WriteHeader(410)
+		_, _ = w.Write([]byte("unknown or expired session"))
 	}))
 	defer srv.Close()
 	e := NewCursorExecutor(&config.Config{})
@@ -449,50 +600,31 @@ func TestP01_Reseed410ContinuationCarryingOpener(t *testing.T) {
 			`{"role":"tool","tool_call_id":"call_opener_1","content":"file contents"}],` +
 			`"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)}
 	}
-
-	// Non-stream: the 410 must be recovered, not surfaced.
-	resp, err := e.executeComposer(context.Background(), auth, "k", cont(), protoOpts("p01-ok-ns"))
-	if err != nil {
-		t.Fatalf("P0-1: a reseedable 410 must recover on the non-stream path, got %T %v", err, err)
+	// Non-stream: must surface 410, not recover
+	_, err := e.executeComposer(context.Background(), auth, "k", cont(), protoOpts("p01-ok-ns"))
+	if err == nil {
+		t.Fatalf("P0-1 inverted: a 410 must surface as error after deletion of reseed, got success")
 	}
-	if resp.Payload == nil {
-		t.Fatalf("P0-1: non-stream reseed must produce a response")
+	var se *composerBridgeStatusError
+	if !errors.As(err, &se) || se.StatusCode() != 410 {
+		t.Fatalf("P0-1 inverted: expected typed 410, got %T %v", err, err)
 	}
-
-	// Stream: the 410 fires pre-stream, so the reseed retry happens before the goroutine opens; the recovered
-	// text must reach the client with no chunk error.
-	sr, errS := e.executeComposerStream(context.Background(), auth, "k", cont(), protoOpts("p01-ok-s"))
-	if errS != nil {
-		t.Fatalf("P0-1: a reseedable 410 must recover on the stream path, got %T %v", errS, errS)
+	if !strings.Contains(se.Error(), "round_lost") {
+		t.Fatalf("P0-1 inverted: 410 message must contain round_lost, got %q", se.Error())
 	}
-	streamErr, payload := drainStreamErr(sr)
-	if streamErr != nil {
-		t.Fatalf("P0-1: stream reseed must not surface a chunk error, got %v", streamErr)
+	// Stream: must also surface 410
+	_, errS := e.executeComposerStream(context.Background(), auth, "k", cont(), protoOpts("p01-ok-s"))
+	if errS == nil {
+		t.Fatalf("P0-1 inverted: stream 410 must surface as error")
 	}
-	if !strings.Contains(payload, "recovered") {
-		t.Fatalf("P0-1: stream reseed must deliver the recovered turn, got %q", payload)
+	if !errors.As(errS, &se) || se.StatusCode() != 410 {
+		t.Fatalf("P0-1 inverted: stream expected typed 410, got %T %v", errS, errS)
 	}
-
-	// Shape: the reseed body must be a clean user seed (type=user, no results, history carried).
+	// Must be exactly one POST per call (no retry)
 	mu.Lock()
 	defer mu.Unlock()
-	sawLostContinuation, sawReseed := false, false
-	for _, raw := range bodies {
-		switch gjson.GetBytes(raw, "input.type").String() {
-		case "tool_results":
-			sawLostContinuation = true
-		case "user":
-			sawReseed = true
-			if gjson.GetBytes(raw, "input.results").Exists() {
-				t.Fatalf("P0-1: the reseed must DROP the unanswerable tool_results, got %s", string(raw))
-			}
-			if !gjson.GetBytes(raw, "input.history").Exists() {
-				t.Fatalf("P0-1: the reseed must carry the replayed history, got %s", string(raw))
-			}
-		}
-	}
-	if !sawLostContinuation || !sawReseed {
-		t.Fatalf("P0-1: expected a tool_results 410 then a user reseed (lost=%v reseed=%v)", sawLostContinuation, sawReseed)
+	if len(bodies) != 2 {
+		t.Fatalf("P0-1 inverted: expected exactly 2 POSTs (one non-stream, one stream) with no retry, got %d", len(bodies))
 	}
 }
 
@@ -536,26 +668,18 @@ func TestP01_Reseed410ThinContinuationStays410(t *testing.T) {
 	}
 }
 
-// P0-1 recovery extension: a THIN continuation that also carries a fresh user instruction is recoverable. The
-// stale tool_results are no longer answerable, but the latest user payload must not force a new Claude session;
-// reframe it as a clean user turn and retry once.
+// P0-1 recovery extension inverted per section 8: thin mixed no longer recovers; trailing user text is not
+// processed after dropping results. Harness must re-send user text as new turn. Returns 410 round_lost.
 func TestP01_Reseed410ThinMixedContinuationRecoversUserText(t *testing.T) {
-	var mu sync.Mutex
 	var bodies [][]byte
-	okBody := "data: {\"type\":\"text\",\"delta\":\"answered latest\"}\n\ndata: {\"type\":\"turn_end\",\"stop_reason\":\"stop\"}\n\ndata: [DONE]\n\n"
+	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		bodies = append(bodies, raw)
 		mu.Unlock()
-		if gjson.GetBytes(raw, "input.type").String() == "tool_results" {
-			w.WriteHeader(410)
-			_, _ = w.Write([]byte("unknown or expired session"))
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(okBody))
+		w.WriteHeader(410)
+		_, _ = w.Write([]byte("unknown or expired session"))
 	}))
 	defer srv.Close()
 	e := NewCursorExecutor(&config.Config{})
@@ -567,46 +691,25 @@ func TestP01_Reseed410ThinMixedContinuationRecoversUserText(t *testing.T) {
 			`{"role":"user","content":"write the goal statement now"}],` +
 			`"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`)}
 	}
-
-	resp, err := e.executeComposer(context.Background(), auth, "k", thinMixed(), protoOpts("p01-thin-mixed-ns"))
-	if err != nil {
-		t.Fatalf("P0-1: a thin mixed 410 must recover on the non-stream path, got %T %v", err, err)
+	_, err := e.executeComposer(context.Background(), auth, "k", thinMixed(), protoOpts("p01-thin-mixed-ns"))
+	if err == nil {
+		t.Fatalf("P0-1 inverted: thin mixed 410 must surface as error, not recover")
 	}
-	if resp.Payload == nil {
-		t.Fatalf("P0-1: non-stream thin mixed reseed must produce a response")
+	var se *composerBridgeStatusError
+	if !errors.As(err, &se) || se.StatusCode() != 410 {
+		t.Fatalf("P0-1 inverted: expected 410, got %T %v", err, err)
 	}
-
-	sr, errS := e.executeComposerStream(context.Background(), auth, "k", thinMixed(), protoOpts("p01-thin-mixed-s"))
-	if errS != nil {
-		t.Fatalf("P0-1: a thin mixed 410 must recover on the stream path, got %T %v", errS, errS)
+	_, errS := e.executeComposerStream(context.Background(), auth, "k", thinMixed(), protoOpts("p01-thin-mixed-s"))
+	if errS == nil {
+		t.Fatalf("P0-1 inverted: stream thin mixed 410 must surface as error")
 	}
-	streamErr, payload := drainStreamErr(sr)
-	if streamErr != nil {
-		t.Fatalf("P0-1: stream thin mixed reseed must not surface a chunk error, got %v", streamErr)
+	if !errors.As(errS, &se) || se.StatusCode() != 410 {
+		t.Fatalf("P0-1 inverted: stream expected 410, got %T %v", errS, errS)
 	}
-	if !strings.Contains(payload, "answered latest") {
-		t.Fatalf("P0-1: stream thin mixed reseed must deliver the recovered turn, got %q", payload)
-	}
-
 	mu.Lock()
 	defer mu.Unlock()
-	sawLostContinuation, sawReseed := false, false
-	for _, raw := range bodies {
-		switch gjson.GetBytes(raw, "input.type").String() {
-		case "tool_results":
-			sawLostContinuation = true
-		case "user":
-			sawReseed = true
-			if gjson.GetBytes(raw, "input.results").Exists() {
-				t.Fatalf("P0-1: thin mixed reseed must DROP stale tool_results, got %s", string(raw))
-			}
-			if got := gjson.GetBytes(raw, "input.text").String(); got != "write the goal statement now" {
-				t.Fatalf("P0-1: thin mixed reseed text = %q", got)
-			}
-		}
-	}
-	if !sawLostContinuation || !sawReseed {
-		t.Fatalf("P0-1: expected a tool_results 410 then a user reseed (lost=%v reseed=%v)", sawLostContinuation, sawReseed)
+	if len(bodies) != 2 {
+		t.Fatalf("P0-1 inverted: expected 2 POSTs no retry, got %d", len(bodies))
 	}
 }
 

@@ -7,7 +7,7 @@
     "node": ">=22 <23"
   },
   "scripts": {
-    "test": "node --test cursor-agent-bridge.test.mjs",
+    "test": "node --test *.test.mjs scripts/*.test.mjs",
     "selftest": "node scripts/run-selftests.mjs",
     "postinstall": "node scripts/apply-clienttools-patch.cjs"
   },
@@ -15,6 +15,11 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@cursor/sdk": "^1.0.23"
+    "@cursor/sdk": "1.0.23",
+    "acorn": "8.15.0",
+    "acorn-walk": "8.3.4"
+  },
+  "overrides": {
+    "undici": "6.27.0"
   }
 }

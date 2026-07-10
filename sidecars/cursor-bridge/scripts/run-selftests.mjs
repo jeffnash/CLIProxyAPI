@@ -87,7 +87,7 @@ export async function selfTestResultSerialize() {
       // CC_CASES.shellArgs buildResult success shape (the shell "success" variant is the protocol's
       // failure channel too, via a non-zero exitCode — so exercising success covers both).
       case: "shellResult",
-      payload: { success: { command: "echo hi", workingDirectory: "/workspace", exitCode: 0, stdout: "hi\n", stderr: "" } },
+      payload: { success: { command: "echo hi", workingDirectory: "/sdk-selftest", exitCode: 0, stdout: "hi\n", stderr: "" } },
     },
     {
       // MCP dispatch wrap shape (handleMcp/mcpDispatch): McpResult.success.content is a list of typed parts.
