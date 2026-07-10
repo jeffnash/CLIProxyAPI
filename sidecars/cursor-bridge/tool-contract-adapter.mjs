@@ -1,0 +1,923 @@
+import Ajv from "ajv";
+import Ajv2019 from "ajv/dist/2019.js";
+import Ajv2020 from "ajv/dist/2020.js";
+
+// The bridge is a protocol adapter between two independently evolving tool
+// runtimes:
+//
+//   harness JSON Schema <-> Cursor SDK/model tool representation
+//
+// Keep every compatibility transform here. The client-facing descriptor and
+// emitted call remain authoritative; SDK-specific wrappers and native naming
+// habits are normalized before validation and before a ToolRound is opened.
+
+const TOOL_SCHEMA_VALIDATOR_CACHE_MAX = 2048;
+const validatorCache = new Map();
+const normalizationValidatorCache = new Map();
+
+const ENVELOPE_KEYS = ["arguments", "args", "input", "parameters", "params", "targeting"];
+const GENERIC_WRAPPER_KEYS = ["value", "input", "content", "data", "payload"];
+const ARRAY_WRAPPER_KEYS = ["items", "list", "values", "array"];
+const OBJECT_WRAPPER_KEYS = ["object", "record", "map"];
+const STRING_WRAPPER_KEYS = ["text", "string"];
+
+const ARGUMENT_ALIASES = Object.freeze({
+  absolutepath: [["filePath", "path", "file", "filename"], 80],
+  cmd: [["command", "cmd", "script"], 95],
+  commandline: [["command", "cmd", "script"], 80],
+  content: [["content", "fileText", "text", "newString"], 95],
+  contents: [["content", "newString", "text"], 70],
+  cwd: [["cwd", "workingDirectory", "workdir"], 90],
+  directory: [["directory", "path"], 60],
+  filetext: [["content", "text", "newString"], 95],
+  filepath: [["filePath", "path", "file", "filename"], 90],
+  filename: [["filePath", "path", "file", "filename"], 75],
+  glob: [["pattern", "glob", "include"], 85],
+  globpattern: [["pattern", "glob", "include"], 95],
+  include: [["include", "pattern", "glob"], 70],
+  items: [["todos", "items", "tasks", "list"], 70],
+  list: [["list", "todos", "items", "tasks"], 75],
+  newcontents: [["content", "newString", "replacement", "text"], 85],
+  newstring: [["newString", "replacement", "content"], 95],
+  newtext: [["newString", "replacement", "content", "text"], 85],
+  oldcontents: [["oldString", "old", "search", "text"], 80],
+  oldstring: [["oldString", "old", "search"], 95],
+  oldtext: [["oldString", "old", "search", "text"], 85],
+  path: [["filePath", "path", "file", "filename"], 75],
+  pattern: [["pattern", "query", "regex", "search"], 80],
+  prompt: [["prompt", "description", "instructions", "query"], 80],
+  query: [["query", "pattern", "search", "prompt"], 80],
+  regex: [["pattern", "regex", "query"], 75],
+  replacement: [["newString", "replacement", "content"], 85],
+  script: [["command", "script", "cmd"], 75],
+  search: [["pattern", "query", "oldString", "search"], 70],
+  searchstring: [["pattern", "query", "oldString", "search"], 80],
+  targetdirectory: [["directory", "path"], 70],
+  targetfile: [["filePath", "path", "file", "filename"], 90],
+  targeting: [["path", "directory", "filePath"], 45],
+  tasks: [["todos", "tasks", "items", "list"], 75],
+  todo: [["todos", "items", "tasks", "list"], 70],
+  url: [["url", "uri", "href"], 90],
+  workingdirectory: [["workdir", "cwd"], 95],
+});
+
+const TOOL_NAME_FAMILIES = Object.freeze([
+  ["read", "readfile", "openfile"],
+  ["write", "writefile", "createfile"],
+  ["edit", "editfile", "replacefile", "searchreplace", "strreplace", "applypatch"],
+  ["bash", "shell", "terminal", "runterminalcmd", "runcommand", "exec", "execcommand"],
+  ["todo", "todowrite"],
+  ["delete", "deletefile", "removefile", "unlinkfile"],
+  ["glob", "fileglob", "findfiles"],
+  ["grep", "searchfiles"],
+  ["ls", "list"],
+]);
+
+const CROSS_FAMILY_TOOL_ALIASES = Object.freeze({
+  filesearch: ["glob", "grep"],
+});
+
+const TOOL_FAMILY_KINDS = Object.freeze([
+  "read", "write", "edit", "shell", "todo", "delete", "glob", "grep", "list",
+]);
+
+export function clientToolFamily(name) {
+  const raw = String(name || "");
+  const parts = raw.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const candidates = new Set([normalizeIdentifier(raw)]);
+  // Namespaced client tools often carry a transport prefix. Consider every
+  // token-boundary suffix, while preserving compound spellings such as
+  // write_file and run_terminal_cmd as one semantic candidate.
+  for (let index = 1; index < parts.length; index++) {
+    candidates.add(parts.slice(index).join(""));
+  }
+  const families = new Set();
+  for (const candidate of candidates) {
+    const index = TOOL_NAME_FAMILIES.findIndex((members) => members.includes(candidate));
+    if (index >= 0) families.add(TOOL_FAMILY_KINDS[index]);
+  }
+  return families.size === 1 ? families.values().next().value : null;
+}
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function cloneJson(value) {
+  if (Array.isArray(value)) return value.map(cloneJson);
+  if (!isObject(value)) return value;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) out[key] = cloneJson(item);
+  return out;
+}
+
+function localRefTarget(rootSchema, ref) {
+  if (!isObject(rootSchema) || typeof ref !== "string" || !ref.startsWith("#/")) return null;
+  let current = rootSchema;
+  for (const rawPart of ref.slice(2).split("/")) {
+    const part = rawPart.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (!isObject(current) && !Array.isArray(current)) return null;
+    if (!Object.hasOwn(current, part)) return null;
+    current = current[part];
+  }
+  return current;
+}
+
+// JSON Schema descriptors often factor tool inputs through local $defs refs.
+// Ajv resolves those for validation; this materialized copy gives the
+// normalization layer the same structural view without altering the exact
+// schema advertised to Cursor or compiled for wire validation.
+function materializeLocalRefs(schema, rootSchema = schema, activeRefs = new Set(), depth = 0) {
+  if (depth > 64) return schema;
+  if (Array.isArray(schema)) return schema.map((item) => materializeLocalRefs(item, rootSchema, activeRefs, depth + 1));
+  if (!isObject(schema)) return schema;
+
+  let source = schema;
+  let childRefs = activeRefs;
+  if (typeof schema.$ref === "string") {
+    const target = localRefTarget(rootSchema, schema.$ref);
+    if (target && !activeRefs.has(schema.$ref)) {
+      const nextRefs = new Set(activeRefs);
+      nextRefs.add(schema.$ref);
+      childRefs = nextRefs;
+      const resolved = materializeLocalRefs(target, rootSchema, nextRefs, depth + 1);
+      if (isObject(resolved)) {
+        source = { ...resolved, ...schema };
+        delete source.$ref;
+      }
+    }
+  }
+
+  const out = { ...source };
+  if (isObject(source.properties)) {
+    out.properties = Object.fromEntries(Object.entries(source.properties)
+      .map(([name, child]) => [name, materializeLocalRefs(child, rootSchema, childRefs, depth + 1)]));
+  }
+  for (const key of ["anyOf", "oneOf", "allOf", "prefixItems"]) {
+    if (Array.isArray(source[key])) {
+      out[key] = source[key].map((child) => materializeLocalRefs(child, rootSchema, childRefs, depth + 1));
+    }
+  }
+  for (const key of ["items", "additionalProperties", "unevaluatedProperties", "contains", "not", "if", "then", "else", "propertyNames"]) {
+    if (isObject(source[key]) || source[key] === true || source[key] === false) {
+      out[key] = materializeLocalRefs(source[key], rootSchema, childRefs, depth + 1);
+    }
+  }
+  return out;
+}
+
+function normalizeIdentifier(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function jsonKind(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value === "object" ? "object" : typeof value;
+}
+
+function schemaKinds(schema) {
+  if (schema === true || !isObject(schema)) return null;
+  if (schema === false) return new Set();
+  const out = new Set();
+  const declared = schema.type;
+  if (typeof declared === "string") out.add(declared);
+  else if (Array.isArray(declared)) {
+    for (const item of declared) if (typeof item === "string") out.add(item);
+  }
+  for (const key of ["anyOf", "oneOf"]) {
+    if (!Array.isArray(schema[key])) continue;
+    for (const branch of schema[key]) {
+      const branchKinds = schemaKinds(branch);
+      if (branchKinds) for (const kind of branchKinds) out.add(kind);
+    }
+  }
+  if (out.size === 0) {
+    if (schema.properties || schema.required || schema.additionalProperties !== undefined) out.add("object");
+    else if (schema.items || schema.prefixItems) out.add("array");
+  }
+  return out.size ? out : null;
+}
+
+function schemaAllowsKind(schema, kind) {
+  const kinds = schemaKinds(schema);
+  if (kinds === null) return true;
+  if (kinds.has(kind)) return true;
+  return kind === "number" && kinds.has("integer");
+}
+
+function schemaForValue(schema, value) {
+  if (!isObject(schema)) return schema;
+  for (const unionKey of ["anyOf", "oneOf"]) {
+    const branches = schema[unionKey];
+    if (!Array.isArray(branches)) continue;
+    const matching = branches.filter((branch) => schemaAcceptsValue(branch, value));
+    if (matching.length === 1) return matching[0];
+  }
+  return schema;
+}
+
+function schemaAcceptsValue(schema, value) {
+  if (schema === true) return true;
+  if (schema === false) return false;
+  if (!isObject(schema)) return true;
+  let key;
+  try { key = JSON.stringify(schema); } catch { return schemaAllowsKind(schema, jsonKind(value)); }
+  let validate = normalizationValidatorCache.get(key);
+  if (!validate) {
+    try { validate = compileSchema("normalization branch", schema); }
+    catch { return schemaAllowsKind(schema, jsonKind(value)); }
+    if (normalizationValidatorCache.size >= TOOL_SCHEMA_VALIDATOR_CACHE_MAX) normalizationValidatorCache.clear();
+    normalizationValidatorCache.set(key, validate);
+  }
+  return validate(value) === true;
+}
+
+function parseContainerString(value) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!(trimmed.startsWith("[") || trimmed.startsWith("{"))) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed !== null && typeof parsed === "object" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Cursor's protobuf Value wrappers sometimes look like objects to JavaScript
+// while JSON serialization reveals the actual primitive/container value.
+function unwrapJsonLikeObject(value) {
+  if (!isObject(value)) return undefined;
+  try {
+    const proto = Object.getPrototypeOf(value);
+    if ((proto === Object.prototype || proto === null) && typeof value.toJSON !== "function") return undefined;
+    const encoded = JSON.stringify(value);
+    if (typeof encoded !== "string" || encoded.length === 0) return undefined;
+    const parsed = JSON.parse(encoded);
+    return isObject(parsed) && parsed === value ? undefined : parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+function wrapperCandidates(value, propertyName, expectedKinds) {
+  const out = [];
+  const add = (candidate, source) => {
+    if (candidate === undefined || candidate === value) return;
+    if (out.some((entry) => entry.value === candidate)) return;
+    out.push({ value: candidate, source });
+  };
+
+  const serialized = unwrapJsonLikeObject(value);
+  if (serialized !== undefined) add(serialized, "json-value");
+  const parsed = parseContainerString(value);
+  if (parsed !== undefined) add(parsed, "json-string");
+  if (!isObject(value)) return out;
+
+  if (!expectedKinds || expectedKinds.has("array")) {
+    const own = Object.keys(value);
+    if (own.length && own.every((key, index) => String(index) === key)) {
+      add(own.map((key) => value[key]), "indexed-object");
+    }
+  }
+
+  const keys = [propertyName, ...GENERIC_WRAPPER_KEYS];
+  if (!expectedKinds || expectedKinds.has("array")) keys.push(...ARRAY_WRAPPER_KEYS);
+  if (!expectedKinds || expectedKinds.has("object")) keys.push(...OBJECT_WRAPPER_KEYS);
+  if (!expectedKinds || expectedKinds.has("string")) keys.push(...STRING_WRAPPER_KEYS);
+  for (const key of [...new Set(keys.filter(Boolean))]) {
+    if (Object.hasOwn(value, key)) add(value[key], `property:${key}`);
+  }
+  const own = Object.keys(value);
+  if (own.length === 1) add(value[own[0]], `sole-property:${own[0]}`);
+  return out;
+}
+
+function coerceWrappedScalar(value, expectedKinds) {
+  if (typeof value !== "string" || !expectedKinds) return undefined;
+  const trimmed = value.trim();
+  if ((expectedKinds.has("number") || expectedKinds.has("integer")) && trimmed !== "") {
+    const number = Number(trimmed);
+    if (Number.isFinite(number) && (!expectedKinds.has("integer") || Number.isInteger(number))) return number;
+  }
+  if (expectedKinds.has("boolean")) {
+    if (trimmed === "true") return true;
+    if (trimmed === "false") return false;
+  }
+  return undefined;
+}
+
+function addTransform(transforms, transform) {
+  if (transforms.length < 128) transforms.push(transform);
+}
+
+function unwrapToSchema(value, schema, propertyName, path, transforms, depth = 0) {
+  const selectedSchema = schemaForValue(schema, value);
+  const currentKind = jsonKind(value);
+
+  // Never unwrap a value whose JSON kind is already legal. That is the guard
+  // that prevents a legitimate nested object from being mistaken for an SDK
+  // wrapper merely because it has a key named value/items/data.
+  if (schemaAcceptsValue(selectedSchema, value)) return value;
+
+  const expectedKinds = schemaKinds(selectedSchema);
+  const accepted = new Map();
+  for (const candidate of wrapperCandidates(value, propertyName, expectedKinds)) {
+    let candidateValue = candidate.value;
+    let candidateKind = jsonKind(candidateValue);
+    const candidateTransforms = [];
+    const coerced = coerceWrappedScalar(candidateValue, expectedKinds);
+    if (coerced !== undefined) {
+      candidateValue = coerced;
+      candidateKind = jsonKind(candidateValue);
+    }
+    // A wrapper can contain another wrapper (OMP's todo list/items/task shape
+    // and protobuf-style JSON values both do this). Normalize the candidate in
+    // isolation before deciding whether it is the unique schema-valid unwrap.
+    // Rejected candidates never leak transforms into the real receipt.
+    if (!schemaAcceptsValue(selectedSchema, candidateValue) && depth < 32) {
+      candidateValue = normalizeValue(
+        candidateValue,
+        selectedSchema,
+        propertyName,
+        path,
+        candidateTransforms,
+        depth + 1,
+      );
+      candidateKind = jsonKind(candidateValue);
+    }
+    if (!schemaAcceptsValue(selectedSchema, candidateValue)) continue;
+    let candidateKey;
+    try { candidateKey = `${candidateKind}:${JSON.stringify(candidateValue)}`; }
+    catch { candidateKey = `${candidateKind}:${candidate.source}`; }
+    if (!accepted.has(candidateKey)) {
+      accepted.set(candidateKey, {
+        ...candidate,
+        value: candidateValue,
+        kind: candidateKind,
+        transforms: candidateTransforms,
+      });
+    }
+  }
+  if (accepted.size === 1) {
+    const candidate = accepted.values().next().value;
+    addTransform(transforms, {
+      kind: "unwrap",
+      path: path || "arguments",
+      source: candidate.source,
+      fromType: currentKind,
+      toType: candidate.kind,
+    });
+    for (const transform of candidate.transforms) addTransform(transforms, transform);
+    return candidate.value;
+  }
+  return value;
+}
+
+function schemaProperties(schema) {
+  if (!isObject(schema)) return {};
+  const merged = isObject(schema.properties) ? { ...schema.properties } : {};
+  if (Array.isArray(schema.allOf)) {
+    for (const branch of schema.allOf) Object.assign(merged, schemaProperties(branch));
+  }
+  return merged;
+}
+
+function schemaRequired(schema) {
+  if (!isObject(schema)) return new Set();
+  const required = new Set(Array.isArray(schema.required) ? schema.required.filter((item) => typeof item === "string") : []);
+  if (Array.isArray(schema.allOf)) {
+    for (const branch of schema.allOf) for (const item of schemaRequired(branch)) required.add(item);
+  }
+  for (const unionKey of ["anyOf", "oneOf"]) {
+    if (!Array.isArray(schema[unionKey]) || schema[unionKey].length === 0) continue;
+    const branchSets = schema[unionKey].map(schemaRequired);
+    for (const item of branchSets[0]) {
+      if (branchSets.every((branch) => branch.has(item))) required.add(item);
+    }
+  }
+  return required;
+}
+
+function omitOptionalPlaceholders(value, schema, path, transforms) {
+  if (!isObject(value)) return value;
+  const properties = schemaProperties(schema);
+  const required = schemaRequired(schema);
+  let out = value;
+  for (const [key, item] of Object.entries(value)) {
+    const undefinedValue = item === undefined;
+    if (undefinedValue) {
+      if (out === value) out = { ...value };
+      delete out[key];
+      addTransform(transforms, { kind: "omit-undefined", path: path ? `${path}.${key}` : key });
+      continue;
+    }
+    if (required.has(key) || !Object.hasOwn(properties, key)) continue;
+    const emptyObject = isObject(item) && Object.keys(item).length === 0;
+    if (!emptyObject) continue;
+    if (emptyObject && schemaAllowsKind(properties[key], "object")) continue;
+    if (out === value) out = { ...value };
+    delete out[key];
+    addTransform(transforms, { kind: "omit-optional-placeholder", path: path ? `${path}.${key}` : key });
+  }
+  return out;
+}
+
+function chooseAliasTarget(sourceKey, properties) {
+  const propertyNames = Object.keys(properties);
+  const sourceNormalized = normalizeIdentifier(sourceKey);
+  const normalizedMatches = propertyNames.filter((name) => normalizeIdentifier(name) === sourceNormalized);
+  if (normalizedMatches.length === 1) return { target: normalizedMatches[0], priority: 100 };
+  if (normalizedMatches.length > 1) return null;
+
+  const rule = ARGUMENT_ALIASES[sourceNormalized];
+  if (!rule) return null;
+  const [candidates, priority] = rule;
+  for (const candidate of candidates) {
+    const matches = propertyNames.filter((name) => normalizeIdentifier(name) === normalizeIdentifier(candidate));
+    if (matches.length === 1) return { target: matches[0], priority };
+    if (matches.length > 1) return null;
+  }
+  return null;
+}
+
+function nestedArgumentObject(value) {
+  if (isObject(value)) return value;
+  if (typeof value !== "string" || !value.trim().startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return isObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function flattenArgumentEnvelope(value, schema, path, transforms, depth = 0) {
+  if (!isObject(value)) return value;
+  if (depth > 16) return value;
+  const properties = schemaProperties(schema);
+  for (const envelopeKey of ENVELOPE_KEYS) {
+    if (Object.hasOwn(properties, envelopeKey)) continue;
+    let nested = nestedArgumentObject(value[envelopeKey]);
+    if (!nested) continue;
+    nested = flattenArgumentEnvelope(nested, schema, path, transforms, depth + 1);
+    const nestedKeys = Object.keys(nested);
+    if (!nestedKeys.length) continue;
+    const recognized = nestedKeys.some((key) => Object.hasOwn(properties, key) || chooseAliasTarget(key, properties));
+    if (!recognized) continue;
+    const out = { ...nested, ...value };
+    delete out[envelopeKey];
+    addTransform(transforms, { kind: "flatten-envelope", path: path || "arguments", source: envelopeKey });
+    return out;
+  }
+  return value;
+}
+
+function normalizeObjectKeys(value, schema, path, transforms) {
+  if (!isObject(value)) return value;
+  const properties = schemaProperties(schema);
+  if (!Object.keys(properties).length) return value;
+
+  const assignments = new Map();
+  for (const source of Object.keys(value).sort()) {
+    const match = Object.hasOwn(properties, source)
+      ? { target: source, priority: 120 }
+      : chooseAliasTarget(source, properties);
+    if (!match) continue;
+    const prior = assignments.get(match.target);
+    if (!prior || match.priority > prior.priority || (match.priority === prior.priority && source < prior.source)) {
+      assignments.set(match.target, { source, priority: match.priority });
+    }
+  }
+  if (!assignments.size) return value;
+
+  const mappedSources = new Set();
+  for (const assignment of assignments.values()) mappedSources.add(assignment.source);
+  const out = {};
+  for (const [source, item] of Object.entries(value)) {
+    const mapped = Object.hasOwn(properties, source) || chooseAliasTarget(source, properties);
+    if (!mapped) out[source] = item;
+  }
+  for (const [target, assignment] of assignments) {
+    out[target] = value[assignment.source];
+    if (assignment.source !== target) {
+      addTransform(transforms, {
+        kind: "rename-key",
+        path: path || "arguments",
+        source: assignment.source,
+        target,
+      });
+    }
+  }
+  for (const source of Object.keys(value)) {
+    if (mappedSources.has(source)) continue;
+    const match = Object.hasOwn(properties, source) ? { target: source } : chooseAliasTarget(source, properties);
+    if (match && assignments.has(match.target)) {
+      addTransform(transforms, {
+        kind: "drop-shadowed-alias",
+        path: path || "arguments",
+        source,
+        target: match.target,
+      });
+    }
+  }
+  return out;
+}
+
+function normalizeValue(value, schema, propertyName, path, transforms, depth = 0) {
+  if (depth > 32) return value;
+  let normalized = value;
+  // Argument envelopes have stronger semantics than generic single-property
+  // wrappers, so recognize them first and retain an accurate transform receipt.
+  if (isObject(normalized)) {
+    normalized = flattenArgumentEnvelope(normalized, schemaForValue(schema, normalized), path, transforms);
+  }
+  normalized = unwrapToSchema(normalized, schema, propertyName, path, transforms, depth);
+  const selectedSchema = schemaForValue(schema, normalized);
+
+  if (Array.isArray(normalized)) {
+    const prefixItems = Array.isArray(selectedSchema && selectedSchema.prefixItems) ? selectedSchema.prefixItems : [];
+    const itemSchema = selectedSchema && isObject(selectedSchema.items) ? selectedSchema.items : null;
+    let out = normalized;
+    for (let index = 0; index < normalized.length; index++) {
+      const childSchema = prefixItems[index] || itemSchema;
+      if (!childSchema) continue;
+      const child = normalizeValue(normalized[index], childSchema, String(index), `${path}.${index}`, transforms, depth + 1);
+      if (child !== normalized[index]) {
+        if (out === normalized) out = [...normalized];
+        out[index] = child;
+      }
+    }
+    return out;
+  }
+  if (!isObject(normalized)) return normalized;
+
+  normalized = flattenArgumentEnvelope(normalized, selectedSchema, path, transforms);
+  normalized = normalizeObjectKeys(normalized, selectedSchema, path, transforms);
+  normalized = omitOptionalPlaceholders(normalized, selectedSchema, path, transforms);
+  const properties = schemaProperties(selectedSchema);
+  let out = normalized;
+  for (const key of Object.keys(normalized)) {
+    const childSchema = properties[key];
+    if (!childSchema) continue;
+    const childPath = path ? `${path}.${key}` : key;
+    const child = normalizeValue(normalized[key], childSchema, key, childPath, transforms, depth + 1);
+    if (child !== normalized[key]) {
+      if (out === normalized) out = { ...normalized };
+      out[key] = child;
+    }
+  }
+  return out;
+}
+
+function normalizeRootInput(input, schema, transforms) {
+  if (input == null) return {};
+  if (isObject(input)) {
+    const serialized = unwrapJsonLikeObject(input);
+    if (serialized !== undefined && jsonKind(serialized) !== "object") {
+      addTransform(transforms, {
+        kind: "unwrap-root",
+        path: "arguments",
+        source: "json-value",
+        fromType: "object",
+        toType: jsonKind(serialized),
+      });
+      input = serialized;
+    }
+  }
+  if (isObject(input)) return normalizeValue(input, schema, "arguments", "", transforms);
+
+  const properties = schemaProperties(schema);
+  const propertyNames = Object.keys(properties);
+  let target = Object.hasOwn(properties, "input") ? "input" : null;
+  if (!target && propertyNames.length === 1) target = propertyNames[0];
+  if (!target) target = "input";
+  addTransform(transforms, {
+    kind: "wrap-root",
+    path: "arguments",
+    target,
+    fromType: jsonKind(input),
+    toType: "object",
+  });
+  return normalizeValue({ [target]: input }, schema, "arguments", "", transforms);
+}
+
+function explicitDecoration(propertySchema) {
+  if (!isObject(propertySchema)) return false;
+  return propertySchema["x-cliproxy-client-decoration"] === true
+    || propertySchema["x-client-decoration"] === true
+    || propertySchema["x-harness-decoration"] === true;
+}
+
+// OMP/Pi injects this exact presentation-only field into the model-facing
+// schema, then strips it before validating/executing the real tool. Recognize
+// the structural marker rather than an OMP provider/model name. A real tool
+// that owns an `i` parameter is untouched unless its descriptor is exactly the
+// injected shape, or the whole advertised inventory corroborates the
+// description-pruned form.
+function implicitIntentDecoration(name, propertySchema, allowPrunedIntent = false) {
+  if (name !== "i" || !isObject(propertySchema)) return false;
+  const keys = Object.keys(propertySchema);
+  const described = propertySchema.type === "string"
+    && propertySchema.description === "concise intent"
+    && keys.every((key) => key === "type" || key === "description");
+  const pruned = allowPrunedIntent
+    && propertySchema.type === "string"
+    && keys.length === 1
+    && keys[0] === "type";
+  return described || pruned;
+}
+
+function prunedIntentInventoryMarker(tool) {
+  const schema = tool && tool.inputSchema;
+  if (!isObject(schema) || !isObject(schema.properties)) return false;
+  if (typeof tool.description === "string" && tool.description.trim() !== "") return false;
+  const entries = Object.entries(schema.properties);
+  if (!entries.length || entries[0][0] !== "i") return false;
+  const propertySchema = entries[0][1];
+  if (!isObject(propertySchema)
+    || Object.keys(propertySchema).length !== 1
+    || propertySchema.type !== "string") return false;
+  return Array.isArray(schema.required)
+    && schema.required.length > 0
+    && schema.required.at(-1) === "i";
+}
+
+function inventoryUsesPrunedIntent(tools) {
+  const eligible = tools.filter((tool) => {
+    const schema = tool && tool.inputSchema;
+    return isObject(schema)
+      && isObject(schema.properties)
+      && Object.keys(schema.properties).length > 0
+      && !(typeof tool.description === "string" && tool.description.trim() !== "");
+  });
+  const marked = eligible.filter(prunedIntentInventoryMarker);
+  // One genuine tool may legitimately require a short field named `i`.
+  // Requiring repeated, inventory-wide evidence avoids relaxing that schema.
+  return marked.length >= 2 && marked.length * 5 >= eligible.length * 4;
+}
+
+function deriveAcceptanceSchema(schema, allowPrunedIntent = false) {
+  if (Array.isArray(schema)) return schema.map((item) => deriveAcceptanceSchema(item, allowPrunedIntent));
+  if (!isObject(schema)) return schema;
+  const out = { ...schema };
+  let changed = false;
+
+  if (isObject(schema.properties)) {
+    const properties = {};
+    const decorations = new Set();
+    for (const [name, propertySchema] of Object.entries(schema.properties)) {
+      const decoration = explicitDecoration(propertySchema)
+        || implicitIntentDecoration(name, propertySchema, allowPrunedIntent);
+      properties[name] = decoration ? true : deriveAcceptanceSchema(propertySchema, allowPrunedIntent);
+      if (decoration) decorations.add(name);
+    }
+    if (decorations.size && Array.isArray(schema.required)) {
+      const required = schema.required.filter((name) => !decorations.has(name));
+      if (required.length !== schema.required.length) {
+        out.required = required;
+        changed = true;
+      }
+    }
+    if (Object.values(properties).some((value, index) => value !== Object.values(schema.properties)[index])) {
+      out.properties = properties;
+      changed = true;
+    }
+  }
+  for (const key of ["anyOf", "oneOf", "allOf", "prefixItems"]) {
+    if (!Array.isArray(schema[key])) continue;
+    const next = schema[key].map((item) => deriveAcceptanceSchema(item, allowPrunedIntent));
+    if (next.some((value, index) => value !== schema[key][index])) {
+      out[key] = next;
+      changed = true;
+    }
+  }
+  if (isObject(schema.items)) {
+    const items = deriveAcceptanceSchema(schema.items, allowPrunedIntent);
+    if (items !== schema.items) {
+      out.items = items;
+      changed = true;
+    }
+  }
+  for (const key of ["$defs", "definitions", "dependentSchemas", "patternProperties"]) {
+    if (!isObject(schema[key])) continue;
+    const next = Object.fromEntries(Object.entries(schema[key])
+      .map(([name, child]) => [name, deriveAcceptanceSchema(child, allowPrunedIntent)]));
+    if (Object.keys(next).some((name) => next[name] !== schema[key][name])) {
+      out[key] = next;
+      changed = true;
+    }
+  }
+  for (const key of ["additionalProperties", "unevaluatedProperties", "contains", "not", "if", "then", "else", "propertyNames"]) {
+    if (!isObject(schema[key])) continue;
+    const next = deriveAcceptanceSchema(schema[key], allowPrunedIntent);
+    if (next !== schema[key]) {
+      out[key] = next;
+      changed = true;
+    }
+  }
+  return changed ? out : schema;
+}
+
+function ajvForSchema(schema) {
+  const dialect = typeof schema.$schema === "string" ? schema.$schema : "";
+  return /2020-12/i.test(dialect) ? Ajv2020 : /2019-09/i.test(dialect) ? Ajv2019 : Ajv;
+}
+
+function compileSchema(name, schema) {
+  if (schema.$async === true) throw new Error("asynchronous JSON Schema validation is not supported for client tools");
+  const AjvForDialect = ajvForSchema(schema);
+  try {
+    return new AjvForDialect({
+      allErrors: true,
+      strict: false,
+      allowUnionTypes: true,
+      coerceTypes: false,
+      useDefaults: false,
+      removeAdditional: false,
+      validateFormats: false,
+    }).compile(schema);
+  } catch (error) {
+    throw new Error(`advertised tool '${name}' has an invalid inputSchema: ${(error && error.message) || String(error)}`);
+  }
+}
+
+function compiledContract(name, schema, allowPrunedIntent = false) {
+  const cacheKey = `${allowPrunedIntent ? "pruned-intent" : "strict"}:${JSON.stringify(schema)}`;
+  if (validatorCache.has(cacheKey)) return validatorCache.get(cacheKey);
+  const wireValidator = compileSchema(name, schema);
+  const acceptanceSchema = deriveAcceptanceSchema(schema, allowPrunedIntent);
+  const acceptanceValidator = acceptanceSchema === schema ? wireValidator : compileSchema(name, acceptanceSchema);
+  const normalizationSchema = materializeLocalRefs(schema);
+  const contract = Object.freeze({ schema, normalizationSchema, acceptanceSchema, wireValidator, acceptanceValidator });
+  if (validatorCache.size >= TOOL_SCHEMA_VALIDATOR_CACHE_MAX) validatorCache.clear();
+  validatorCache.set(cacheKey, contract);
+  return contract;
+}
+
+function validationErrorPath(error) {
+  const parts = String(error && error.instancePath || "")
+    .split("/")
+    .filter(Boolean)
+    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+  if (error && error.keyword === "required" && error.params && error.params.missingProperty) {
+    parts.push(String(error.params.missingProperty));
+  } else if (error && error.keyword === "additionalProperties" && error.params && error.params.additionalProperty) {
+    parts.push(String(error.params.additionalProperty));
+  }
+  return parts.join(".") || "arguments";
+}
+
+function validationFailure(name, errors, transforms = []) {
+  const rawErrors = Array.isArray(errors) ? errors : [];
+  const normalized = rawErrors.slice(0, 64).map((error) => ({
+    path: validationErrorPath(error),
+    keyword: String(error && error.keyword || "schema"),
+    message: String(error && error.message || "does not match the advertised schema"),
+  }));
+  const shown = normalized.slice(0, 12);
+  const lines = shown.map((error) => `- ${error.path}: ${error.message}`);
+  if (normalized.length > shown.length) lines.push(`- … ${normalized.length - shown.length} more schema errors`);
+  return {
+    content: `Client tool '${name}' was not executed because its arguments failed the advertised JSON schema:\n${lines.join("\n")}\nRetry the same tool with every required field and the exact declared types/enums.`,
+    isError: true,
+    structuredContent: {
+      code: "client_tool_invalid_arguments",
+      tool: name,
+      errors: normalized,
+      errorCount: rawErrors.length,
+      errorsTruncated: rawErrors.length > normalized.length,
+      executed: false,
+      transforms,
+    },
+  };
+}
+
+export class ToolContractRegistry {
+  constructor() {
+    this.tools = Object.freeze([]);
+    this.byName = new Map();
+    this.contracts = new Map();
+  }
+
+  replace(tools) {
+    const next = [];
+    const byName = new Map();
+    const contracts = new Map();
+    for (const tool of Array.isArray(tools) ? tools : []) {
+      const name = tool && (tool.toolName || tool.name);
+      if (!name || typeof name !== "string") throw new Error("advertised tool is missing a string name");
+      const inputSchema = tool.inputSchema === true || tool.inputSchema === false
+        ? tool.inputSchema
+        : (tool.inputSchema && typeof tool.inputSchema === "object" && !Array.isArray(tool.inputSchema)
+          ? tool.inputSchema
+          : { type: "object" });
+      if (byName.has(name)) throw new Error(`advertised tool '${name}' appears more than once`);
+      const normalized = Object.freeze({ ...tool, name, toolName: name, inputSchema });
+      byName.set(name, normalized);
+      next.push(normalized);
+    }
+    const allowPrunedIntent = inventoryUsesPrunedIntent(next);
+    for (const tool of next) {
+      contracts.set(tool.name, compiledContract(tool.name, tool.inputSchema, allowPrunedIntent));
+    }
+    this.byName = byName;
+    this.contracts = contracts;
+    this.tools = Object.freeze(next);
+  }
+
+  all() { return this.tools; }
+  find(name) { return this.byName.get(name) || null; }
+
+  normalize(name, input) {
+    const contract = this.contracts.get(name);
+    const transforms = [];
+    const schema = contract ? contract.normalizationSchema : { type: "object" };
+    return { value: normalizeRootInput(input, schema, transforms), transforms };
+  }
+
+  validate(name, input, transforms = []) {
+    const contract = this.contracts.get(name);
+    if (!contract || contract.acceptanceValidator(input)) return null;
+    return validationFailure(name, contract.acceptanceValidator.errors, transforms);
+  }
+
+  scoped(toolChoice, effectiveAdvertise) {
+    return effectiveAdvertise(this.tools, toolChoice);
+  }
+}
+
+export function normalizeToolArguments(input, schema = { type: "object" }) {
+  const transforms = [];
+  return { value: normalizeRootInput(input, materializeLocalRefs(schema), transforms), transforms };
+}
+
+export function normalizeToolResultEnvelope(content, isError, images, structuredContent) {
+  const normalizedContent = content === undefined ? "" : content;
+  const inlineImages = [];
+  const urlImages = [];
+  if (Array.isArray(images)) {
+    for (const image of images) {
+      if (!image) continue;
+      if (typeof image.url === "string" && image.url) urlImages.push(image);
+      else if (typeof image.data === "string" && image.data && typeof image.mimeType === "string" && image.mimeType) inlineImages.push(image);
+    }
+  }
+  const allImages = [...inlineImages, ...urlImages];
+  return {
+    content: normalizedContent,
+    isError: isError === true,
+    images: allImages.length ? allImages : null,
+    inlineImages: inlineImages.length ? inlineImages : null,
+    urlImages: urlImages.length ? urlImages : null,
+    structuredContent: structuredContent && typeof structuredContent === "object" ? structuredContent : null,
+  };
+}
+
+export function resolveClientToolName(want, tools, { onRejectedSingle } = {}) {
+  const inventory = (Array.isArray(tools) ? tools : []).filter((tool) => tool && (tool.toolName || tool.name));
+  const names = inventory.map((tool) => tool.toolName || tool.name);
+  if (!names.length) return null;
+  const normalizedWant = normalizeIdentifier(want);
+
+  // A canonical advertised name always wins. An operator alias must never
+  // steal an exact client capability and route it to a different tool.
+  if (names.includes(want)) return want;
+  const lower = String(want || "").toLowerCase();
+  const caseInsensitive = names.filter((name) => name.toLowerCase() === lower);
+  if (caseInsensitive.length === 1) return caseInsensitive[0];
+  if (caseInsensitive.length > 1) return null;
+  const normalizedMatches = names.filter((name) => normalizeIdentifier(name) === normalizedWant);
+  if (normalizedMatches.length === 1) return normalizedMatches[0];
+  if (normalizedMatches.length > 1) return null;
+
+  // Operator-provided aliases are attached to exactly one advertised
+  // descriptor by Go. Consult them only after canonical resolution, and
+  // refuse aliases that collide with any canonical normalized spelling.
+  const canonicalNormalized = new Set(names.map(normalizeIdentifier));
+  if (!canonicalNormalized.has(normalizedWant)) {
+    const explicitMatches = inventory.filter((tool) => Array.isArray(tool.aliases)
+      && tool.aliases.some((alias) => normalizeIdentifier(alias) === normalizedWant));
+    if (explicitMatches.length === 1) return explicitMatches[0].toolName || explicitMatches[0].name;
+    if (explicitMatches.length > 1) return null;
+  }
+
+  // Native and client spellings form undirected semantic families: Cursor's
+  // native `read` can target a harness `read_file`, and a model `ReadFile` can
+  // target `_read`. A family is safe only when exactly one advertised
+  // capability belongs to it.
+  const family = TOOL_NAME_FAMILIES.find((members) => members.includes(normalizedWant));
+  const aliasTargets = new Set((family || CROSS_FAMILY_TOOL_ALIASES[normalizedWant] || []).map(normalizeIdentifier));
+  if (aliasTargets.size) {
+    const matches = names.filter((name) => aliasTargets.has(normalizeIdentifier(name)));
+    if (matches.length === 1) return matches[0];
+    return null;
+  }
+  if (names.length === 1 && onRejectedSingle) onRejectedSingle(names[0]);
+  return null;
+}
+
+export function acceptanceSchemaFor(schema, { allowPrunedIntent = false } = {}) {
+  return cloneJson(deriveAcceptanceSchema(schema, allowPrunedIntent));
+}

@@ -31,6 +31,7 @@ const {
   composerWorkspaceCwd,
   continuationTenantMismatch,
   constraintInstructions,
+  dispatchMcpBatch,
   effectiveAdvertise,
   envInt,
   handleContinue,
@@ -50,9 +51,12 @@ const {
   nativeToolBlockedByChoice,
   parseShellContent,
   platforms,
+  prepareAdvertisedToolRegistry,
   readinessBody,
   reconcileExport,
+  refreshSessionFromBody,
   sessions,
+  sdkAdvertisedTools,
   syntheticAgentArtifactFailure,
   syntheticAgentArtifactRequest,
   toolManifest,
@@ -166,14 +170,16 @@ test.after(async () => {
 });
 
 test("workspace identity is advisory and unknown context never invents a server path", () => {
-  const env = headlessRequestContext({ clientEnv: { workspaceUnknown: true }, advertiseForGating: () => [] })
-    .__ccJson.success.requestContext.env;
+  const context = headlessRequestContext({ clientEnv: { workspaceUnknown: true }, advertiseForGating: () => [] })
+    .__ccJson.success.requestContext;
+  const env = context.env;
   assert.deepEqual(env.workspacePaths, []);
   assert.equal(env.processWorkingDirectory, undefined);
   assert.equal(env.projectFolder, undefined);
   assert.equal(composerWorkspaceCwd(null), "");
   assert.equal(composerWorkspaceCwd({ workspaceUnknown: true }), "");
   assert.equal(toolManifestRule(advertised(), ""), null);
+  assert.equal(context.mcpMetaToolOptions.enabled, false);
   assert.doesNotMatch(JSON.stringify(env), /\/workspace|\/app/);
 });
 
@@ -242,6 +248,64 @@ test("advertised tools have one normalized registry and duplicate names fail clo
   assert.throws(() => registry.replace([{ name: "Async", inputSchema: { $async: true, type: "object" } }]), /asynchronous JSON Schema/);
 });
 
+test("private descriptor aliases survive body refresh, route explicitly, and never reach the SDK inventory", () => {
+  const registry = prepareAdvertisedToolRegistry({ tools: [{
+    name: "RunCommand",
+    description: "Run a command",
+    aliases: ["shell", "terminal", "shell"],
+    inputSchema: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+      additionalProperties: false,
+    },
+  }] });
+  const session = new Session("private-aliases", "key");
+  session.toolRegistry = registry;
+  assert.deepEqual(registry.find("RunCommand").aliases, ["shell", "terminal"]);
+  assert.equal(session.reconcileToolName("shell"), "RunCommand");
+  assert.equal(session.reconcileToolName("terminal"), "RunCommand");
+  assert.equal(Object.hasOwn(sdkAdvertisedTools(session)[0], "aliases"), false);
+  assert.throws(() => prepareAdvertisedToolRegistry({
+    tools: [{ name: "Bad", aliases: "shell", inputSchema: { type: "object" } }],
+  }), /invalid private aliases/);
+});
+
+test("tool inventory refresh replaces live gating, including an explicit empty clear", () => {
+  const session = new Session("dynamic-tools", "key");
+  refreshSessionFromBody(session, { tools: [{ name: "A", inputSchema: { type: "object" } }], toolChoice: "auto" });
+  session.activeAdvertise = effectiveAdvertise(session.advertise, "auto");
+  assert.deepEqual(session.advertiseForGating().map((tool) => tool.name), ["A"]);
+
+  refreshSessionFromBody(session, { tools: [{ name: "B", inputSchema: { type: "object" } }], toolChoice: "auto" });
+  assert.deepEqual(session.advertiseForGating().map((tool) => tool.name), ["B"]);
+
+  refreshSessionFromBody(session, { tools: [], toolChoice: "none" });
+  assert.deepEqual(session.advertise, []);
+  assert.deepEqual(session.advertiseForGating(), []);
+
+  refreshSessionFromBody(session, {
+    tools: [{ name: "B", inputSchema: { type: "object" } }, { name: "C", inputSchema: { type: "object" } }],
+    toolChoice: "specific:B",
+  });
+  assert.deepEqual(session.advertiseForGating().map((tool) => tool.name), ["B"]);
+  refreshSessionFromBody(session, {
+    tools: [{ name: "B", inputSchema: { type: "object" } }, { name: "C", inputSchema: { type: "object" } }],
+  });
+  assert.deepEqual(session.advertiseForGating().map((tool) => tool.name), ["B", "C"]);
+});
+
+test("boolean false tool schemas fail closed instead of widening to an executable object", () => {
+  assert.throws(() => prepareAdvertisedToolRegistry({
+    tools: [{ name: "Never", inputSchema: false }],
+  }), /inputSchema:false/);
+  const registry = new AdvertisedToolRegistry();
+  registry.replace([{ name: "Never", inputSchema: false }]);
+  const normalized = registry.normalize("Never", {});
+  const failure = registry.validate("Never", normalized.value);
+  assert.equal(failure.structuredContent.executed, false);
+});
+
 test("advertised schema validation honors declared modern JSON Schema dialects", () => {
   const registry = new AdvertisedToolRegistry();
   registry.replace([{
@@ -270,6 +334,7 @@ test("patched advertisement and MCP inventory consume the same registry", () => 
   ]);
   const servers = buildMcpServers(session);
   const state = headlessMcpState(session).__ccJson.success.servers;
+  const requestContext = headlessRequestContext(session).__ccJson.success.requestContext;
   assert.deepEqual(Object.keys(servers).sort(), state.map((server) => server.serverName).sort());
   const inventory = state.flatMap((server) => server.tools.map((tool) => tool.name)).sort();
   assert.deepEqual(inventory, session.advertise.map((tool) => tool.name).sort());
@@ -279,6 +344,8 @@ test("patched advertisement and MCP inventory consume the same registry", () => 
   assert.ok(state.flatMap((server) => server.tools).every((tool) => tool.providerIdentifier === CLIENT_TOOL_PROVIDER_ID));
   assert.ok(Object.hasOwn(servers, DEFAULT_MCP_SERVER_KEY));
   assert.equal(servers[DEFAULT_MCP_SERVER_KEY].headers["X-Client-Tools-Session"], session.id);
+  assert.deepEqual(sdkAdvertisedTools(session).map((tool) => tool.name).sort(), inventory);
+  assert.equal(requestContext.mcpMetaToolOptions.enabled, false);
 });
 
 test("the generic MCP server carries tools added after the SDK server map is fixed without duplicates", async () => {
@@ -334,16 +401,18 @@ test("MCP server keys cannot become URL dot segments", () => {
   assert.equal(mcpServerKeyForTool(`mcp__${".."}__lookup`), "server-dotdot");
 });
 
-test("tool manifest is harness-neutral and treats the MCP label as transport metadata", () => {
+test("tool manifest names client tools directly without teaching transport-specific wrappers", () => {
   const manifest = toolManifest([
     { name: "_mcp__codebase_memory_mcp_index_status", description: "status", inputSchema: { type: "object" } },
     { name: "Read", description: "read", inputSchema: { type: "object" } },
   ]);
-  assert.match(manifest, /client-owned tools/i);
-  assert.match(manifest, /transport metadata/i);
-  assert.match(manifest, new RegExp(DEFAULT_MCP_SERVER_KEY));
+  assert.match(manifest, /Available client tools this turn/);
+  assert.match(manifest, /_mcp__codebase_memory_mcp_index_status/);
+  assert.match(manifest, /- Read/);
   assert.doesNotMatch(manifest, /claude[- ]code/i);
+  assert.doesNotMatch(manifest, /MCP server|MCP transport|transport metadata/i);
   assert.doesNotMatch(manifest, /CallMcpTool/);
+  assert.doesNotMatch(manifest, /GetMcpTools/);
 });
 
 test("schema-invalid patched MCP calls are rejected before client handoff", async () => {
@@ -408,7 +477,56 @@ test("repeated schema-invalid calls terminate the SDK run instead of spinning fo
   }
   assert.equal(session.invalidToolCalls, COMPOSER_MAX_INVALID_TOOL_CALLS);
   assert.equal(session.loopTripped, true);
-  assert.match(output.text(), /invalid client-tool call bound/);
+  assert.match(output.text(), /internal client-tool rejection bound/);
+  assert.doesNotMatch(output.text(), /"type":"tool_call"/);
+});
+
+test("HTTP unknown tools and unmatched native retries share the same terminal rejection bound", async () => {
+  const http = seedSession("unknown-http-loop", "key", advertised("Lookup"));
+  for (let i = 0; i < COMPOSER_MAX_INVALID_TOOL_CALLS; i++) {
+    const response = await mcpDispatch({
+      jsonrpc: "2.0",
+      id: i,
+      method: "tools/call",
+      params: { name: "Missing", arguments: {} },
+    }, http.session.id, DEFAULT_MCP_SERVER_KEY);
+    assert.equal(response.result.isError, true);
+  }
+  assert.equal(http.session.loopTripped, true);
+  assert.equal(http.session.currentRound, null);
+  assert.match(http.output.text(), /internal client-tool rejection bound/);
+
+  const native = seedSession("unknown-native-loop", "key", []);
+  for (let i = 0; i < COMPOSER_MAX_INVALID_TOOL_CALLS; i++) {
+    const response = await native.session.dispatchUnary("readArgs", CC_CASES.readArgs, {
+      toolCallId: `missing-native-${i}`,
+      path: "/repo/a",
+    });
+    assert.ok(response.__ccJson.error);
+  }
+  assert.equal(native.session.loopTripped, true);
+  assert.equal(native.session.currentRound, null);
+  assert.match(native.output.text(), /internal client-tool rejection bound/);
+});
+
+test("repeated synthetic artifact retries terminate without ever reaching the harness", async () => {
+  const artifact = "agent-tools/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.txt";
+  const { session, output } = seedSession("synthetic-artifact-loop", "key", [{
+    name: "write_file",
+    inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path"] },
+  }]);
+  for (let i = 0; i < COMPOSER_MAX_INVALID_TOOL_CALLS; i++) {
+    const result = await session.openClientTool({
+      source: "test",
+      rawToolCallId: `artifact-${i}`,
+      name: "write_file",
+      input: { path: artifact, content: "result copy" },
+      resultAdapter: (value) => value,
+    });
+    assert.equal(result.isError, true);
+  }
+  assert.equal(session.loopTripped, true);
+  assert.equal(session.currentRound, null);
   assert.doesNotMatch(output.text(), /"type":"tool_call"/);
 });
 
@@ -428,6 +546,209 @@ test("schema preflight runs after safe wrapper normalization and valid calls sti
   assert.equal(session.invalidToolCalls, 0);
   await session.cancel({ terminalReason: "test_cleanup", detail: "valid normalization test complete" });
   await assert.rejects(opened.promise, /test_cleanup/);
+});
+
+test("native read, write, and shell dispatch use the canonical client tool contracts", async () => {
+  const cases = [
+    {
+      id: "native-read-contract",
+      cas: "readArgs",
+      spec: CC_CASES.readArgs,
+      sdk: { path: "/repo/a.py", offset: 3, limit: 4, toolCallId: "native-read" },
+      tool: "_read",
+      schema: {
+        type: "object",
+        properties: { path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } },
+        required: ["path"],
+      },
+      expected: { path: "/repo/a.py", offset: 3, limit: 4 },
+    },
+    {
+      id: "native-write-contract",
+      cas: "writeArgs",
+      spec: CC_CASES.writeArgs,
+      sdk: { path: "/repo/new.py", fileText: "print('ok')", toolCallId: "native-write" },
+      tool: "_write",
+      schema: {
+        type: "object",
+        properties: { path: { type: "string" }, content: { type: "string" } },
+        required: ["path", "content"],
+        additionalProperties: false,
+      },
+      expected: { path: "/repo/new.py", content: "print('ok')" },
+    },
+    {
+      id: "native-shell-contract",
+      cas: "shellArgs",
+      spec: CC_CASES.shellArgs,
+      sdk: { command: "pwd", workingDirectory: "/repo", toolCallId: "native-shell" },
+      tool: "_bash",
+      schema: {
+        type: "object",
+        properties: { command: { type: "string" }, cwd: { type: "string" } },
+        required: ["command"],
+        additionalProperties: false,
+      },
+      expected: { command: "pwd", cwd: "/repo" },
+    },
+  ];
+
+  for (const item of cases) {
+    const { session } = seedSession(item.id, "key", [{ name: item.tool, inputSchema: item.schema }]);
+    const promise = session.dispatchUnary(item.cas, item.spec, item.sdk);
+    promise.catch(() => {});
+    await waitFor(() => session.currentRound && session.currentRound.fifo.length === 1, `${item.cas} ToolRound`);
+    const call = session.currentRound.calls.get(session.currentRound.fifo[0]);
+    assert.equal(call.name, item.tool);
+    assert.deepEqual(call.input, item.expected);
+    assert.equal(session.invalidToolCalls, 0);
+    await session.cancel({ terminalReason: "test_cleanup", detail: `${item.cas} complete` });
+    await assert.rejects(promise, /test_cleanup/);
+    sessions.delete(session.id);
+  }
+});
+
+test("native dispatch fails closed when no advertised client capability matches", async () => {
+  const { session } = seedSession("native-no-match", "key", [{
+    name: "delete_everything",
+    inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+  }]);
+  const unary = await session.dispatchUnary("readArgs", CC_CASES.readArgs, { path: "/repo/a", toolCallId: "native-read" });
+  assert.match(unary.__ccJson.error.error, /no advertised client tool safely matches/);
+  assert.equal(session.currentRound, null);
+
+  const chunks = [];
+  for await (const chunk of session.dispatchStream("shellStreamArgs", CC_CASES.shellStreamArgs, {
+    command: "pwd",
+    toolCallId: "native-shell",
+  })) chunks.push(chunk.__ccJson);
+  assert.equal(chunks.at(-1).exit.code, 1);
+  assert.equal(chunks.at(-1).exit.aborted, true);
+  assert.equal(session.currentRound, null);
+  sessions.delete(session.id);
+});
+
+test("native SDK capabilities route bidirectionally to common client spellings", async () => {
+  const cases = [
+    {
+      id: "native-read-file",
+      cas: "readArgs",
+      spec: CC_CASES.readArgs,
+      sdk: { path: "/repo/a", toolCallId: "read-file" },
+      tool: "read_file",
+      schema: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"], additionalProperties: false },
+      expected: { file_path: "/repo/a" },
+    },
+    {
+      id: "native-write-file",
+      cas: "writeArgs",
+      spec: CC_CASES.writeArgs,
+      sdk: { path: "/repo/a", fileText: "body", toolCallId: "write-file" },
+      tool: "write_file",
+      schema: {
+        type: "object",
+        properties: { file_path: { type: "string" }, file_text: { type: "string" } },
+        required: ["file_path", "file_text"],
+        additionalProperties: false,
+      },
+      expected: { file_path: "/repo/a", file_text: "body" },
+    },
+    {
+      id: "native-terminal",
+      cas: "shellArgs",
+      spec: CC_CASES.shellArgs,
+      sdk: { command: "pwd", workingDirectory: "/repo", toolCallId: "terminal" },
+      tool: "run_terminal_cmd",
+      schema: {
+        type: "object",
+        properties: { command: { type: "string" }, working_directory: { type: "string" } },
+        required: ["command"],
+        additionalProperties: false,
+      },
+      expected: { command: "pwd", working_directory: "/repo" },
+    },
+    {
+      id: "native-remove-file",
+      cas: "deleteArgs",
+      spec: CC_CASES.deleteArgs,
+      sdk: { path: "/repo/a", toolCallId: "remove-file" },
+      tool: "remove_file",
+      schema: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"], additionalProperties: false },
+      expected: { file_path: "/repo/a" },
+    },
+  ];
+  for (const item of cases) {
+    const { session } = seedSession(item.id, "key", [{ name: item.tool, inputSchema: item.schema }]);
+    const pending = session.dispatchUnary(item.cas, item.spec, item.sdk);
+    pending.catch(() => {});
+    await waitFor(() => session.currentRound?.fifo.length === 1, `${item.tool} handoff`);
+    const call = session.currentRound.calls.get(session.currentRound.fifo[0]);
+    assert.equal(call.name, item.tool);
+    assert.deepEqual(call.input, item.expected);
+    await session.cancel({ terminalReason: "test_cleanup", detail: item.tool });
+    await assert.rejects(pending, /test_cleanup/);
+    sessions.delete(session.id);
+  }
+});
+
+test("StrReplace and TodoWrite families translate into arbitrary client contracts before handoff", async () => {
+  const { session } = seedSession("native-name-families", "key", [
+    {
+      name: "_edit",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          old_string: { type: "string" },
+          new_string: { type: "string" },
+        },
+        required: ["path", "old_string", "new_string"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "_todo",
+      inputSchema: {
+        type: "object",
+        properties: {
+          i: { type: "string", description: "concise intent" },
+          op: { type: "string", enum: ["init"] },
+          list: { type: "array", items: { type: "object" } },
+        },
+        required: ["i", "op", "list"],
+        additionalProperties: false,
+      },
+    },
+  ]);
+
+  const editPromise = session.dispatchMcp({
+    toolName: "StrReplace",
+    toolCallId: "str-replace",
+    args: { filePath: "/repo/a.py", oldString: "before", newString: "after" },
+  });
+  editPromise.catch(() => {});
+  await waitFor(() => session.currentRound && session.currentRound.fifo.length === 1, "translated edit call");
+  let call = session.currentRound.calls.get(session.currentRound.fifo[0]);
+  assert.equal(call.name, "_edit");
+  assert.deepEqual(call.input, { path: "/repo/a.py", old_string: "before", new_string: "after" });
+  await session.cancel({ terminalReason: "test_cleanup", detail: "edit complete" });
+  await assert.rejects(editPromise, /test_cleanup/);
+
+  session.done = false;
+  session.beginResponse(new MockResponse());
+  const todoPromise = session.dispatchMcp({
+    toolName: "TodoWrite",
+    toolCallId: "todo-write",
+    args: { op: { op: "init" }, list: { list: [{ task: "P0" }] } },
+  });
+  todoPromise.catch(() => {});
+  await waitFor(() => session.currentRound && session.currentRound.fifo.length === 1, "translated todo call");
+  call = session.currentRound.calls.get(session.currentRound.fifo[0]);
+  assert.equal(call.name, "_todo");
+  assert.deepEqual(call.input, { op: "init", list: [{ task: "P0" }] });
+  assert.equal(session.invalidToolCalls, 0);
+  await session.cancel({ terminalReason: "test_cleanup", detail: "todo complete" });
+  await assert.rejects(todoPromise, /test_cleanup/);
 });
 
 test("replacing the advertised registry also replaces its schema validator", () => {
@@ -856,6 +1177,59 @@ test("HTTP MCP tools/call uses ToolRound and preserves isError, structuredConten
   ]);
 });
 
+test("HTTP MCP calls are server-scoped and equal JSON-RPC ids cannot collide across servers", async () => {
+  const tools = [
+    { name: "mcp__alpha__one", inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
+    { name: "mcp__beta__two", inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
+  ];
+  const { session } = seedSession("mcp-server-scope", "key", tools);
+  session.mcpServerKeys = [DEFAULT_MCP_SERVER_KEY, "alpha", "beta"];
+
+  const wrongServer = await mcpDispatch({
+    jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "mcp__beta__two", arguments: { q: "x" } },
+  }, session.id, "alpha");
+  assert.equal(wrongServer.result.isError, true);
+  assert.match(wrongServer.result.content[0].text, /not available/);
+  assert.equal(session.currentRound, null);
+
+  const alpha = mcpDispatch({
+    jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "mcp__alpha__one", arguments: { q: "a" } },
+  }, session.id, "alpha");
+  const beta = mcpDispatch({
+    jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "mcp__beta__two", arguments: { q: "b" } },
+  }, session.id, "beta");
+  await waitFor(() => session.currentRound?.fifo.length === 2
+    && session.currentRound.fifo.every((wireId) => session.currentRound.calls.get(wireId).handedAt), "two scoped MCP calls");
+  const round = session.currentRound;
+  const calls = round.fifo.map((wireId) => round.calls.get(wireId));
+  assert.notEqual(calls[0].rawIdHash, calls[1].rawIdHash);
+  assert.deepEqual(calls.map((call) => call.name).sort(), ["mcp__alpha__one", "mcp__beta__two"]);
+  if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
+  round.markAwaitingResults();
+  round.applyResults(calls.map((call) => ({ toolCallId: call.wireId, content: call.name, isError: false })));
+  const responses = await Promise.all([alpha, beta]);
+  assert.deepEqual(responses.map((response) => response.id), [1, 1]);
+});
+
+test("JSON-RPC tool batches dispatch concurrently and preserve response order", async () => {
+  const { session } = seedSession("mcp-batch", "key", [
+    { name: "A", inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
+    { name: "B", inputSchema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
+  ]);
+  const pending = dispatchMcpBatch([
+    { jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "A", arguments: { q: "a" } } },
+    { jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "B", arguments: { q: "b" } } },
+  ], session.id, DEFAULT_MCP_SERVER_KEY);
+  await waitFor(() => session.currentRound?.fifo.length === 2
+    && session.currentRound.fifo.every((wireId) => session.currentRound.calls.get(wireId).handedAt), "parallel batch handoff");
+  const round = session.currentRound;
+  if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
+  round.markAwaitingResults();
+  round.applyResults(round.fifo.map((wireId) => ({ toolCallId: wireId, content: "ok", isError: false })));
+  const responses = await pending;
+  assert.deepEqual(responses.map((response) => response.id), [11, 12]);
+});
+
 test("patched MCP dispatch uses the same ToolRound adapter and result contract", async () => {
   const { session } = seedSession("mcp-patched", "key");
   const responsePromise = session.dispatchMcp({ toolName: "Lookup", args: { q: "x" }, toolCallId: "sdk-mcp" });
@@ -911,6 +1285,9 @@ test("synthetic agent-tools artifacts are blocked before ToolRound across native
   assert.equal(syntheticAgentArtifactRequest("Write", { file_path: artifact }), true);
   assert.equal(syntheticAgentArtifactRequest("mcp__client-tools__Read", { path: `/tmp/${artifact}` }), true);
   assert.equal(syntheticAgentArtifactRequest("Bash", { command: `head -c 2000 ${artifact}` }), true);
+  assert.equal(syntheticAgentArtifactRequest("write_file", { file_path: artifact }), true);
+  assert.equal(syntheticAgentArtifactRequest("read-file", { path: artifact }), true);
+  assert.equal(syntheticAgentArtifactRequest("run_terminal_cmd", { command: `head ${artifact}` }), true);
   assert.equal(syntheticAgentArtifactRequest("Write", { file_path: "agent-tools/notes.txt" }), false);
   assert.equal(syntheticAgentArtifactRequest("Write", { file_path: "/home/me/repo/normal.txt" }), false);
   assert.equal(syntheticAgentArtifactFailure("Lookup", { path: artifact }), null);
@@ -1032,9 +1409,9 @@ test("an explicitly user-requested artifact path is never swallowed by the inter
   assert.equal(session.syntheticArtifactDecision("Bash", { command: `head ${artifact}` }), null);
 });
 
-test("external MCP registry adds a non-authoritative no-artifact hint while the structural gate remains authoritative", () => {
+test("the neutral manifest never teaches internal artifact or wrapper behavior", () => {
   const external = toolManifest([{ name: "mcp__codebase-memory-mcp__get_architecture", description: "graph" }]);
-  assert.match(external, /NEVER copy.*agent-tools/i);
+  assert.doesNotMatch(external, /agent-tools|GetMcpTools|CallMcpTool|MCP server|MCP transport/i);
   const harnessOnly = toolManifest([{ name: "Write", description: "write a user-requested file" }]);
   assert.doesNotMatch(harnessOnly, /agent-tools/);
 });
@@ -1049,6 +1426,10 @@ test("native result builders preserve failures and completeness metadata", () =>
   assert.equal(structured.success.totalLines, "9");
   const write = buildWriteSuccess({ fileContentAfterWrite: "actual", linesCreated: 1 }, { path: "/x", fileText: "requested", returnFileContentAfterWrite: true });
   assert.equal(write.success.fileContentAfterWrite, "actual");
+  const ompStatus = "[/repo/a.py#A1B2]\nSuccessfully wrote 9 bytes to /repo/a.py";
+  const statusWrite = buildWriteSuccess(ompStatus, { path: "/repo/a.py", fileText: "requested", returnFileContentAfterWrite: true });
+  assert.equal(statusWrite.success.fileContentAfterWrite, "requested");
+  assert.equal(statusWrite.success.fileSize, String(Buffer.byteLength("requested")));
 });
 
 test("MCP result builder preserves images, errors, and structured content", () => {

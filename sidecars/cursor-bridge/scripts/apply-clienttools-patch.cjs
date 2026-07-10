@@ -17,16 +17,16 @@ const crypto = require("crypto");
 const acorn = require("acorn");
 const walk = require("acorn-walk");
 
-const PATCHER_VERSION = 3;
-const DESCRIPTOR_VERSION = 2;
+const PATCHER_VERSION = 4;
+const DESCRIPTOR_VERSION = 3;
 const PINNED_VERSION = "1.0.23";
 const EXPECTED_BUNDLE_SHA256 = "829ced604bb88908e49fcf5cd31eb22bce4e57d32074b2846d86a6c5afa26881";
 const EXPECTED_INDEX_SHA256 = "3157e86833e5033ce7b870cfd9810edc4b1e9c0637b93170779d6cbb3feba022";
 const BUNDLE_REL = path.join("dist", "cjs", "973.js");
 const INDEX_REL = path.join("dist", "cjs", "index.js");
 const DESCRIPTOR_REL = ".clienttools-patch-descriptor.json";
-const MARK = "/*cursor-composer-clienttools-patched-v3*/";
-const INDEX_MARK = "/*cursor-composer-clienttools-eager-v3*/";
+const MARK = "/*cursor-composer-clienttools-patched-v4*/";
+const INDEX_MARK = "/*cursor-composer-clienttools-eager-v4*/";
 const MODULE_ID = "./src/agent/local-executor.ts";
 const SHA_OVERRIDE_ENV = ["CURSOR_CLIENTTOOLS_ALLOW_UNVERIFIED_SDK", "CURSOR_SDK_PATCH_ALLOW_SHA_MISMATCH"];
 const EXPECTED_SEAMS = Object.freeze({
@@ -35,6 +35,7 @@ const EXPECTED_SEAMS = Object.freeze({
   streamDispatch: 1,
   advertiseRegistry: 1,
   mcpArtifactSpillPolicy: 1,
+  mcpMetaToolPolicy: 1,
   localExecutorLoader: 1,
   moduleExport: 1,
 });
@@ -206,7 +207,17 @@ function findMcpArtifactSpillPolicy(source, ast) {
     ]) {
       if (!keys.has(required)) return;
     }
-    candidates.push({ node, value: node.value, owner, original: sourceOf(source, node.value) });
+    const metaToolNode = owner.properties.find((property) => propName(property) === "mcpMetaToolEnabled");
+    if (!metaToolNode || !metaToolNode.value) return;
+    candidates.push({
+      node,
+      value: node.value,
+      owner,
+      original: sourceOf(source, node.value),
+      metaToolNode,
+      metaToolValue: metaToolNode.value,
+      metaToolOriginal: sourceOf(source, metaToolNode.value),
+    });
   });
   return one(candidates, "MCP artifact-spill policy");
 }
@@ -349,6 +360,11 @@ function applyPatch({ src, indexSrc, version, env = {} }) {
     // the full result remains in the protocol and any real filesystem action
     // continues through the harness-owned tool callback.
     { start: seams.artifactSpill.value.start, end: seams.artifactSpill.value.end, text: "0" },
+    // Keep direct requestContext.tools advertisement, but disable Cursor's
+    // generic GetMcpTools/CallMcpTool meta wrappers at the executor source.
+    // This property is in the same structurally asserted runtime policy as the
+    // artifact threshold, so SDK drift fails closed rather than re-enabling it.
+    { start: seams.artifactSpill.metaToolValue.start, end: seams.artifactSpill.metaToolValue.end, text: "false" },
   ]);
   patchedSrc = MARK + patchedSrc + dispatchHarness();
   parse(patchedSrc, `patched ${BUNDLE_REL}`);
@@ -374,6 +390,7 @@ function applyPatch({ src, indexSrc, version, env = {} }) {
     seams: { ...EXPECTED_SEAMS },
     nativeExecutionDefault: "deny",
     mcpArtifactSpillThresholdBytes: 0,
+    mcpMetaToolEnabled: false,
     sourceVerified: warnings.length === 0,
   };
   return { patchedSrc, patchedIndexSrc, descriptor, warnings };
@@ -391,7 +408,8 @@ function validateDescriptor({ descriptor, version, bundleSource, indexSource, al
   if (
     JSON.stringify(descriptor.seams) !== JSON.stringify(EXPECTED_SEAMS) ||
     descriptor.nativeExecutionDefault !== "deny" ||
-    descriptor.mcpArtifactSpillThresholdBytes !== 0
+    descriptor.mcpArtifactSpillThresholdBytes !== 0 ||
+    descriptor.mcpMetaToolEnabled !== false
   ) {
     throw new PatchError("descriptor-invalid", "patch descriptor seam contract is incomplete");
   }

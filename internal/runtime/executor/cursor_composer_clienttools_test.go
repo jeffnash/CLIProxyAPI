@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -263,10 +264,11 @@ func TestExtractComposerToolChoice(t *testing.T) {
 }
 
 func TestComposerTurnBody(t *testing.T) {
-	// tool_choice=none path: caller passes advertise=nil => no "tools" key on the wire.
+	// tool_choice=none path: caller passes advertise=nil => an explicit empty
+	// inventory clears any tools cached by a reused bridge session.
 	none := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "user", "text": "x"}, nil, "none", nil, nil)
-	if gjson.GetBytes(none, "tools").Exists() {
-		t.Fatalf("tool_choice=none must not advertise tools: %s", none)
+	if tools := gjson.GetBytes(none, "tools"); !tools.Exists() || !tools.IsArray() || len(tools.Array()) != 0 {
+		t.Fatalf("tool_choice=none must send an explicit empty inventory: %s", none)
 	}
 	if gjson.GetBytes(none, "toolChoice").String() != "none" {
 		t.Fatalf("toolChoice not forwarded: %s", none)
@@ -622,6 +624,40 @@ func TestComposerToolAliasOverrides(t *testing.T) {
 	}
 	if got["grep"] != "EnvGrep" {
 		t.Fatalf("env alias must apply when not overridden, got %q", got["grep"])
+	}
+}
+
+func TestComposerAdvertiseCarriesAliasesToBridge(t *testing.T) {
+	oai := []byte(`{"tools":[
+		{"type":"function","function":{"name":"RunCommand","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}},
+		{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}
+	]}`)
+	defs := composerToolDefs(oai)
+	prep := prepareComposerAdvertise(oai, defs, map[string]string{"shell": "RunCommand", "terminal": "RunCommand"})
+	if len(prep.advertise) != 2 {
+		t.Fatalf("expected two advertised tools, got %#v", prep.advertise)
+	}
+	aliases, _ := prep.advertise[0]["aliases"].([]string)
+	if !reflect.DeepEqual(aliases, []string{"shell", "terminal"}) {
+		t.Fatalf("explicit aliases must be sorted and attached to RunCommand, got %#v", aliases)
+	}
+	if _, exists := prep.advertise[1]["aliases"]; exists {
+		t.Fatalf("unaliased Read descriptor must not gain aliases: %#v", prep.advertise[1])
+	}
+}
+
+func TestMapComposerToolCallExactBridgePayloadPassesThrough(t *testing.T) {
+	defs := []cursorToolDefinition{{
+		Name:       "RunCommand",
+		Parameters: `{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command","description"],"additionalProperties":false}`,
+	}}
+	input := gjson.Parse(`{"command":"pwd"}`)
+	name, args := mapComposerToolCall("RunCommand", input, defs, map[string]string{"runcommand": "OtherTool"})
+	if name != "RunCommand" || args != input.Raw {
+		t.Fatalf("canonical bridge event must pass through unchanged, got name=%q args=%s", name, args)
+	}
+	if gjson.Get(args, "description").Exists() {
+		t.Fatalf("Go must not add a post-journal default to canonical bridge args: %s", args)
 	}
 }
 
@@ -1363,7 +1399,8 @@ func TestRenderComposerHistoryImagePlaceholder(t *testing.T) {
 
 // H10 (C-CONTINUATION-TOOLS): composerTurnBody must attach `tools` on EVERY turn when advertised, not only
 // on a new-user turn — the bridge refreshes its advertise set from body.tools on tool_results turns too, so
-// dropping tools on a continuation left a stale advertise set. tool_choice=none (advertise=nil) still omits.
+// dropping tools on a continuation left a stale advertise set. tool_choice=none
+// sends an explicit empty snapshot so a reused bridge clears old tools.
 func TestComposerTurnBodyToolsOnContinuation(t *testing.T) {
 	adv := []map[string]any{{"name": "Read", "toolName": "Read"}}
 	// A tool_results continuation MUST still carry the current tool inventory.
@@ -1376,10 +1413,10 @@ func TestComposerTurnBodyToolsOnContinuation(t *testing.T) {
 	if gjson.GetBytes(user, "tools.0.name").String() != "Read" {
 		t.Fatalf("H10: user turn must include tools, got %s", user)
 	}
-	// tool_choice=none gating (advertise=nil) still wins — no tools on either turn type.
+	// tool_choice=none gating (advertise=nil) still wins and explicitly clears.
 	none := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "tool_results", "results": []any{}}, nil, "none", nil, nil)
-	if gjson.GetBytes(none, "tools").Exists() {
-		t.Fatalf("H10: tool_choice=none must still omit tools even on a continuation, got %s", none)
+	if tools := gjson.GetBytes(none, "tools"); !tools.IsArray() || len(tools.Array()) != 0 {
+		t.Fatalf("H10: tool_choice=none must clear tools even on a continuation, got %s", none)
 	}
 }
 

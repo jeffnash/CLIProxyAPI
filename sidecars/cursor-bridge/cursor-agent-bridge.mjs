@@ -31,9 +31,6 @@ import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, writeFileSync, mkdirSync, accessSync, constants, writeSync } from "node:fs";
 import path from "node:path";
-import Ajv from "ajv";
-import Ajv2019 from "ajv/dist/2019.js";
-import Ajv2020 from "ajv/dist/2020.js";
 import {
   ToolRound,
   ToolRoundError,
@@ -45,6 +42,13 @@ import {
   terminalizeOrphanedRounds,
 } from "./tool-round.mjs";
 import { SseWriter } from "./sse-writer.mjs";
+import {
+  ToolContractRegistry,
+  normalizeToolArguments,
+  normalizeToolResultEnvelope,
+  clientToolFamily,
+  resolveClientToolName,
+} from "./tool-contract-adapter.mjs";
 
 // ADD-64: strict integer env parser. Raw parseInt silently mangles common bad config — parseInt("10m")===10
 // (a 10-MINUTE timeout collapses to 10 MILLISECONDS), parseInt("abc")===NaN (Node timers treat NaN as ~0 and
@@ -99,9 +103,10 @@ const STATE_ROOT_ON_RAILWAY_VOLUME = !!RAILWAY_VOLUME_ROOT && (() => {
 const EMPTY_CWD = path.join(STATE_ROOT, ".empty");
 // Bump only when the durable SDK request-context contract changes incompatibly.
 // This is deliberately independent of workspace identity: it prevents old
-// agents seeded with proxy-side sentinel paths from surviving the redesign
-// without making cwd/workspace part of routing.
-const DURABLE_AGENT_CONTEXT_EPOCH = "ct4";
+// agents seeded with proxy-side sentinel paths or the old generic MCP meta-tool
+// inventory from surviving the redesign without making cwd/workspace part of
+// routing.
+const DURABLE_AGENT_CONTEXT_EPOCH = "ct5";
 // PENDING_TIMEOUT_MS / SESSION_TTL_MS must be POSITIVE (a 0 watchdog would reap a tool the instant it is
 // emitted; a 0 TTL would evict a session immediately) — floor them at 1ms via min:1.
 const PENDING_TIMEOUT_MS = envInt("CURSOR_AGENT_PENDING_TIMEOUT_MS", 600000, { min: 1 });
@@ -223,8 +228,8 @@ const RUN_AS_MAIN = process.argv[1] === fileURLToPath(import.meta.url);
 // Loading is lazy (loadSdk) so this module can be imported for unit tests without pulling the SDK's
 // heavy/native deps; the real server calls loadSdk() at startup (fail-closed) BEFORE it accepts traffic.
 const require = createRequire(import.meta.url);
-const SDK_PATCH_DESCRIPTOR_VERSION = 2;
-const SDK_PATCHER_VERSION = 3;
+const SDK_PATCH_DESCRIPTOR_VERSION = 3;
+const SDK_PATCHER_VERSION = 4;
 const SDK_PRISTINE_BUNDLE_SHA256 = "829ced604bb88908e49fcf5cd31eb22bce4e57d32074b2846d86a6c5afa26881";
 const SDK_PRISTINE_INDEX_SHA256 = "3157e86833e5033ce7b870cfd9810edc4b1e9c0637b93170779d6cbb3feba022";
 const SDK_PINNED_VERSION = "1.0.23";
@@ -234,6 +239,7 @@ const SDK_PATCH_SEAMS = {
   streamDispatch: 1,
   advertiseRegistry: 1,
   mcpArtifactSpillPolicy: 1,
+  mcpMetaToolPolicy: 1,
   localExecutorLoader: 1,
   moduleExport: 1,
 };
@@ -271,6 +277,7 @@ function assertPatched(p) {
     descriptor?.index !== "dist/cjs/index.js" ||
     descriptor?.nativeExecutionDefault !== "deny" ||
     descriptor?.mcpArtifactSpillThresholdBytes !== 0 ||
+    descriptor?.mcpMetaToolEnabled !== false ||
     descriptor?.sourceVerified !== true ||
     descriptor?.pristineBundleSha256 !== SDK_PRISTINE_BUNDLE_SHA256 ||
     descriptor?.pristineIndexSha256 !== SDK_PRISTINE_INDEX_SHA256 ||
@@ -283,7 +290,7 @@ function assertPatched(p) {
   if (descriptor.patchedBundleSha256 !== bundleHash || descriptor.patchedIndexSha256 !== indexHash) {
     throw new Error("[bridge] @cursor/sdk installed bytes do not match the patch descriptor. Refusing to start.");
   }
-  if (!chunkBytes.subarray(0, 64).toString("latin1").includes("cursor-composer-clienttools-patched-v3") || !indexBytes.toString("latin1").includes("cursor-composer-clienttools-eager-v3")) {
+  if (!chunkBytes.subarray(0, 64).toString("latin1").includes("cursor-composer-clienttools-patched-v4") || !indexBytes.toString("latin1").includes("cursor-composer-clienttools-eager-v4")) {
     throw new Error("[bridge] @cursor/sdk descriptor hashes matched but structural markers are absent. Refusing to start.");
   }
   return descriptor;
@@ -411,49 +418,19 @@ function truncateLiveToolResult(content, cap = COMPOSER_LIVE_TOOL_RESULT_MAX_BYT
 // - Keeps valid structured content as object
 // - Applies Workflow/background augmentations
 function normalizeClientToolResult(content, isError, images, structuredContent, toolName) {
-  const normalizedIsError = isError === true;
-  let normalizedContent = content;
-  if (normalizedContent === undefined) normalizedContent = "";
+  const normalized = normalizeToolResultEnvelope(content, isError, images, structuredContent);
+  let normalizedContent = normalized.content;
   // Keep deterministic: don't coerce null to empty, keep as is except undefined -> ""
   // Apply augmentations here (single place)
   if (toolName) {
     if (toolName === "Workflow") {
-      normalizedContent = augmentWorkflowResultOnFailure(normalizedContent, normalizedIsError);
+      normalizedContent = augmentWorkflowResultOnFailure(normalizedContent, normalized.isError);
     }
     normalizedContent = augmentBackgroundLaunchResult(normalizedContent, toolName);
   }
   // Apply live cap to string content (bridge backstop)
   normalizedContent = truncateLiveToolResult(normalizedContent);
-  // Separate images: valid inline base64 vs URL
-  const inlineImages = [];
-  const urlImages = [];
-  if (Array.isArray(images)) {
-    for (const im of images) {
-      if (!im) continue;
-      if (typeof im.url === "string" && im.url) {
-        urlImages.push(im);
-      } else if (typeof im.data === "string" && im.data && typeof im.mimeType === "string" && im.mimeType) {
-        inlineImages.push(im);
-      }
-    }
-  }
-  const allImages = [...inlineImages, ...urlImages];
-  // Structured content: keep valid object only
-  let normalizedStructured = null;
-  if (structuredContent && typeof structuredContent === "object" && !Array.isArray(structuredContent)) {
-    normalizedStructured = structuredContent;
-  } else if (structuredContent && typeof structuredContent === "object") {
-    // Allow array/object as structured content if explicitly provided
-    normalizedStructured = structuredContent;
-  }
-  return {
-    content: normalizedContent,
-    isError: normalizedIsError,
-    images: allImages.length ? allImages : null,
-    inlineImages: inlineImages.length ? inlineImages : null,
-    urlImages: urlImages.length ? urlImages : null,
-    structuredContent: normalizedStructured,
-  };
+  return { ...normalized, content: normalizedContent };
 }
 
 const TOOL_CHOICE_SPECIFIC_PREFIX = "specific:";
@@ -578,9 +555,9 @@ function nativeToolBlockedByChoice(toolChoice) {
 const TOOL_MANIFEST_DESC_MAX = envInt("CURSOR_COMPOSER_TOOL_MANIFEST_DESC_MAX", 0, { min: 0 }); // 0 = names only (the model already has the FULL verbatim descriptions via tools/list)
 const TOOL_MANIFEST_MAX_BYTES = envInt("CURSOR_COMPOSER_TOOL_MANIFEST_MAX_BYTES", 16384, { min: 256 });
 // CURSOR_COMPOSER_TOOL_MANIFEST selects WHERE the tool manifest is delivered (client-agnostic):
-//   rule           -> a system-level always-apply CursorRule via requestContext.rules (per-session, authoritative)
-//   prompt         -> appended to the user turn's text (soft, in-band)
-//   both (default) -> both channels (prompt is reliably read in-band; rule is authoritative + cache-friendly)
+//   prompt (default) -> appended once to the user turn's text
+//   rule             -> a system-level always-apply CursorRule via requestContext.rules
+//   both             -> both channels (explicit legacy opt-in; duplicates the text)
 //   off|0|false|none -> neither
 const TOOL_MANIFEST_MODE = (() => {
   const v = String(process.env.CURSOR_COMPOSER_TOOL_MANIFEST ?? "").trim().toLowerCase();
@@ -588,7 +565,7 @@ const TOOL_MANIFEST_MODE = (() => {
   if (v === "prompt" || v === "text") return "prompt";
   if (v === "rule" || v === "rules") return "rule";
   if (v === "both") return "both";
-  return "both"; // default (unset/"1"/"true"): rule-only was under-obeyed in practice; in-band prompt is reliably read
+  return "prompt";
 })();
 const TOOL_MANIFEST_IN_PROMPT = TOOL_MANIFEST_MODE === "prompt" || TOOL_MANIFEST_MODE === "both";
 const TOOL_MANIFEST_IN_RULE = TOOL_MANIFEST_MODE === "rule" || TOOL_MANIFEST_MODE === "both";
@@ -618,54 +595,31 @@ const COMPOSER_STALL_LOG_MS = envInt("CURSOR_COMPOSER_STALL_LOG_MS", 60_000, { m
 function toolManifest(advertised) {
   const adv = Array.isArray(advertised) ? advertised : [];
   if (!adv.length) return "";
-  // Group tools by their SDK MCP transport key so the manifest matches the
-  // inventory the model sees. The prose deliberately treats the label as
-  // transport metadata and tells the model to call the exact tool directly;
-  // no client-harness-specific wrapper is part of the product contract.
-  const byServer = new Map(); // serverKey -> ["- name[: desc]", ...] (insertion order preserved)
+  const lines = [];
   let bytes = 0;
   let truncated = false;
   for (const t of adv) {
     const name = (t && (t.toolName || t.name)) || "";
     if (!name) continue;
-    const server = mcpServerKeyForTool(name, MCP_GROUPING) || DEFAULT_MCP_SERVER_KEY;
-    // Names only by default (TOOL_MANIFEST_DESC_MAX=0); the full verbatim descriptions already reach the model via
-    // tools/list. Set CURSOR_COMPOSER_TOOL_MANIFEST_DESC_MAX>0 for per-tool descriptions up to that length.
+    // Names only by default; the structural descriptor carries the complete
+    // schema. Optional descriptions remain bounded presentation metadata.
     let desc = "";
     if (TOOL_MANIFEST_DESC_MAX > 0 && t && t.description) {
       desc = String(t.description).replace(/\s+/g, " ").trim();
       if (desc.length > TOOL_MANIFEST_DESC_MAX) desc = desc.slice(0, TOOL_MANIFEST_DESC_MAX - 1) + "…";
     }
     const line = desc ? `- ${name}: ${desc}` : `- ${name}`;
-    if (bytes + line.length + server.length + 2 > TOOL_MANIFEST_MAX_BYTES) { truncated = true; break; }
-    if (!byServer.has(server)) byServer.set(server, []);
-    byServer.get(server).push(line);
-    bytes += line.length + 1;
+    const lineBytes = Buffer.byteLength(line) + 1;
+    if (bytes + lineBytes > TOOL_MANIFEST_MAX_BYTES) { truncated = true; break; }
+    lines.push(line);
+    bytes += lineBytes;
   }
-  if (!byServer.size) return "";
-  const sections = [];
-  for (const [server, srvLines] of byServer) sections.push("MCP server `" + server + "` — tools:\n" + srvLines.join("\n"));
-  if (truncated) sections.push("…(more MCP tools available)");
-  let out = "You have client-owned tools available this turn through the MCP transport below. Treat them as first-class tools: invoke the listed tool directly by its exact name and argument schema. The MCP server label is transport metadata only; do not invent or narrate an additional wrapper tool, and do not assume any particular client harness. The user may refer to a tool plainly by its action ('read the file', 'run a search', 'launch a workflow', 'use subagents'); call the matching listed tool. Match every required field, type, and enum exactly. Invalid calls are rejected before client execution and must be retried with corrected arguments.\n\n" + sections.join("\n\n");
-  // Targeted clarifications (model-confirmed): Workflow lives on its MCP server (not top-level), so composer read
-  // files itself; and its schema marks nothing required, so it omitted the script. Make both unambiguous, ONLY
-  // when the tool is actually advertised this turn.
-  const advNames = adv.map((t) => (t && (t.toolName || t.name)) || "");
-  const notes = [];
-  const hasExternalMcp = advNames.some((name) => /^_?mcp__/.test(name)
-    || (mcpServerKeyForTool(name, MCP_GROUPING) || DEFAULT_MCP_SERVER_KEY) !== DEFAULT_MCP_SERVER_KEY);
-  if (hasExternalMcp) {
-    notes.push("MCP tool results are delivered directly in this conversation, including large results. Consume them in place. NEVER copy a tool result into `agent-tools/<uuid>.txt`, and NEVER call file or shell tools to read such an artifact back.");
-  }
-  if (advNames.includes("Workflow")) {
-    notes.push("To launch a workflow, invoke the `Workflow` client tool NOW (it is not a feature of the codebase under review). Pass `script` (inline JS: `export const meta={...}` then agent()/parallel()/pipeline()) OR `scriptPath`; a name/title-only call with neither runs nothing. In the script `agent()` is POSITIONAL — `agent('prompt text', {agentType:'general-purpose'})`, NEVER `agent({prompt,...})` (an object makes the prompt '[object Object]'); and `parallel`/`pipeline` take `() =>` thunks, never bare `agent(...)`.");
-  }
-  const subagentTool = advNames.includes("Agent") ? "Agent" : advNames.find((n) => n === "Task" || n.indexOf("Task") === 0);
-  if (subagentTool) {
-    notes.push("To run work in subagents, actually invoke the `" + subagentTool + "` client tool with its arguments — do not merely narrate that you are delegating.");
-  }
-  if (notes.length) out += "\n\n" + notes.join("\n\n");
-  return out;
+  if (!lines.length) return "";
+  if (truncated) lines.push("- …more client tools are available");
+  return "Available client tools this turn:\n"
+    + lines.join("\n")
+    + "\nCall the matching tool directly by its exact name and declared schema. "
+    + "A tool failure is real and must not be treated as success.";
 }
 
 // toolManifestRule wraps the manifest text in a valid always-apply agent.v1.CursorRule for delivery via
@@ -690,13 +644,23 @@ globalThis.__CC_GET_ADVERTISE__ = () => {
   if (!st || !st.session) { console.warn("[bridge] __CC_GET_ADVERTISE__: no ALS session context; advertising no tools"); return []; }
   // ADD-40: consult the same turn-scoped effective set the dispatch gate uses (activeAdvertise when a run is
   // live), so what the model is OFFERED and what it can DISPATCH stay consistent under tool_choice.
-  const adv = st.session.advertiseForGating ? st.session.advertiseForGating() : (st.session.advertise || []);
+  const adv = sdkAdvertisedTools(st.session);
   // Proves the SDK's tool-advertising path (the non-prewarmed else branch) actually runs per model turn and
   // how many tools it hands the model. If this fires with a full count yet the model still calls only native
   // read/shell, the gap is the MODEL not engaging mcpTools — not a missing advertisement.
   dbg("__CC_GET_ADVERTISE__ called by SDK", "session=" + st.session.id, "returning=" + adv.length + " tools");
   return adv;
 };
+
+// Descriptor aliases are private bridge routing metadata. They must be
+// available to reconcile native SDK names, but they are not part of Cursor's
+// MCP tool descriptor and must never be exposed to the SDK/model.
+function sdkAdvertisedTools(session) {
+  const advertised = session && session.advertiseForGating
+    ? session.advertiseForGating()
+    : (session && session.advertise) || [];
+  return advertised.map(({ aliases: _aliases, ...tool }) => tool);
+}
 
 // wrapToolInput (ADD-104) gives a tool-call input a STABLE wire shape for the client. The SDK/model may emit
 // MCP args as a raw string/number/array/boolean (or a client-registered tool whose JSON schema is a primitive),
@@ -749,7 +713,10 @@ function requestContextEnvelope(ce, ws, cwd, rules) {
     gitRepos: [], projectLayouts: [], mcpInstructions: [], fileContents: {}, customSubagents: [],
     commitAttributionMessage: "enabled", prAttributionMessage: "enabled", agentSkills: [],
     precomputedHumanChanges: [], supportsMcpAuth: true, gitRepoInfoComplete: true,
-    mcpMetaToolOptions: { enabled: true, mcpDescriptors: [] }, nonFileRules: [] } } } };
+    // Direct advertised tools remain in requestContext.tools. Disable only
+    // Cursor's generic GetMcpTools/CallMcpTool discovery wrappers so every
+    // harness sees and calls its own tool names directly.
+    mcpMetaToolOptions: { enabled: false, mcpDescriptors: [] }, nonFileRules: [] } } } };
 }
 // headlessRequestContext answers the SDK runtime's requestContextArgs CLIENT request, per session. When the tool
 // manifest mode includes "rule", it injects an always-apply CursorRule carrying THIS session's tool manifest, so
@@ -853,8 +820,12 @@ function buildWriteSuccess(c, s) {
     if (s && s.returnFileContentAfterWrite) r.success.fileContentAfterWrite = actual;
     return r;
   }
-  // Plain string: if the client returned the post-write content as a string, prefer it; else use requested.
-  const actual = typeof c === "string" && c ? c : requested;
+  // A harness normally returns a human status string (OMP: "[path#hash]\nSuccessfully wrote N bytes") rather
+  // than the post-write bytes. A plain string therefore cannot prove actual
+  // content and must never be reported back to Cursor as fileContentAfterWrite.
+  // Use the requested bytes; only the structured envelope above is an explicit
+  // actual-content channel.
+  const actual = requested;
   const r = { success: { path: s && s.path, linesCreated: actual.split("\n").length, fileSize: String(Buffer.byteLength(actual)) } };
   if (s && s.returnFileContentAfterWrite) r.success.fileContentAfterWrite = actual;
   return r;
@@ -993,24 +964,16 @@ function ccArgsFor(cas, s) {
 // ordinary user Read/Write/Bash calls continue through ToolRound unchanged.
 const SYNTHETIC_AGENT_ARTIFACT_FILE_RE = /(?:^|[\\/\s'"=])agent-tools[\\/][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt(?:$|[\s'"?#])/i;
 const SYNTHETIC_AGENT_ARTIFACT_PATH_RE = /[^\s'"=]*agent-tools[\\/][0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.txt/ig;
-const SYNTHETIC_AGENT_ARTIFACT_TOOLS = new Set([
-  "bash", "exec", "execcommand", "read", "readfile", "runcommand", "shell", "write", "writefile",
-]);
+const SYNTHETIC_AGENT_ARTIFACT_FAMILIES = new Set(["read", "write", "shell"]);
 const SYNTHETIC_AGENT_ARTIFACT_DISABLED_MSG =
   "Cursor's internal agent-tools artifact handoff is disabled for remote client tools. " +
   "The MCP/tool result is already available in this conversation; use it directly and do not write, read, list, or shell-inspect an agent-tools file.";
-const SYNTHETIC_AGENT_ARTIFACT_WRITE_TOOLS = new Set(["write", "writefile"]);
 const SYNTHETIC_AGENT_ARTIFACT_PATH_KEYS = ["path", "file_path", "filePath"];
 const SYNTHETIC_AGENT_ARTIFACT_CONTENT_KEYS = ["content", "fileText", "file_text", "text"];
 const SYNTHETIC_AGENT_ARTIFACT_COMMAND_KEYS = ["command", "cmd"];
 
-function normalizedToolLeaf(name) {
-  const parts = String(name || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  return (parts.at(-1) || "").replace(/[^a-z0-9]/g, "");
-}
-
 function syntheticAgentArtifactRequest(name, input) {
-  if (!SYNTHETIC_AGENT_ARTIFACT_TOOLS.has(normalizedToolLeaf(name))) return false;
+  if (!SYNTHETIC_AGENT_ARTIFACT_FAMILIES.has(clientToolFamily(name))) return false;
   const value = input && typeof input === "object" ? input : {};
   for (const key of ["path", "file_path", "filePath", "command", "cmd"]) {
     if (typeof value[key] === "string" && SYNTHETIC_AGENT_ARTIFACT_FILE_RE.test(value[key])) return true;
@@ -1101,6 +1064,7 @@ function unaryExecPreflight(cas, store) {
   // stream error. (Subagent/computerUse/etc. without a safe result shape still fall through to the reject.)
   if (TYPED_UNAVAILABLE_U.has(cas)) {
     dbg("__CC_EXEC_U typed-unavailable result (H17)", "session=" + (store && store.session && store.session.id), "cas=" + cas);
+    if (store && store.session) store.session.recordInternalToolRejection("typed-unavailable", cas);
     return Promise.resolve(typedUnavailableResult(cas));
   }
   return null;
@@ -1110,6 +1074,7 @@ function blockedNativeExecIfNeeded(store, cas, s, stream) {
   if (!store || !nativeToolBlockedByChoice(store.session.toolChoice)) return null;
   const cwd = composerWorkspaceCwd(store.session.clientEnv);
   dbg("__CC_EXEC_" + (stream ? "S" : "U") + " native tool blocked by tool_choice", "session=" + store.session.id, "cas=" + cas, "toolChoice=" + store.session.toolChoice);
+  store.session.recordInternalToolRejection("tool-choice", cas);
   if (stream) {
     return (async function* () { yield { __ccJson: { stdout: { data: "" } } }; yield { __ccJson: { exit: { code: 1, cwd, aborted: true, localExecutionTimeMs: 1 } } }; })();
   }
@@ -1124,6 +1089,7 @@ function blockedSyntheticNativeExecIfNeeded(store, cas, s, stream) {
   if (!failure) return null;
   const cwd = composerWorkspaceCwd(store.session.clientEnv);
   dbg("__CC_EXEC_" + (stream ? "S" : "U") + " internal artifact blocked at SDK dispatch", "session=" + store.session.id, "cas=" + cas);
+  store.session.recordInternalToolRejection("synthetic-artifact", cas);
   if (stream) {
     return (async function* () {
       for (const chunk of spec.buildChunks(failure.content, true, { cwd })) yield { __ccJson: chunk };
@@ -1383,104 +1349,7 @@ function rateLimitedKeyToRecycle(sessionsMap, platformsMap) {
   return s ? keyHash(s.cursorKey) : null;
 }
 
-const TOOL_SCHEMA_VALIDATOR_CACHE_MAX = 2048;
-const toolSchemaValidatorCache = new Map();
-
-function compileAdvertisedToolSchema(name, schema) {
-  const cacheKey = JSON.stringify(schema);
-  if (toolSchemaValidatorCache.has(cacheKey)) return toolSchemaValidatorCache.get(cacheKey);
-  let validate;
-  try {
-    if (schema.$async === true) throw new Error("asynchronous JSON Schema validation is not supported for client tools");
-    // One Ajv instance per unique schema avoids cross-harness `$id` collisions.
-    // Select the declared dialect so a harness using 2019-09 or 2020-12 is not
-    // rejected merely because Ajv's default instance targets draft-07. The
-    // compiled function is cached, so this cost is paid only once per shape.
-    const dialect = typeof schema.$schema === "string" ? schema.$schema : "";
-    const AjvForDialect = /2020-12/i.test(dialect) ? Ajv2020 : /2019-09/i.test(dialect) ? Ajv2019 : Ajv;
-    validate = new AjvForDialect({
-      allErrors: true,
-      strict: false,
-      allowUnionTypes: true,
-      coerceTypes: false,
-      useDefaults: false,
-      removeAdditional: false,
-      validateFormats: false,
-    }).compile(schema);
-  } catch (error) {
-    throw new Error(`advertised tool '${name}' has an invalid inputSchema: ${(error && error.message) || String(error)}`);
-  }
-  if (toolSchemaValidatorCache.size >= TOOL_SCHEMA_VALIDATOR_CACHE_MAX) toolSchemaValidatorCache.clear();
-  toolSchemaValidatorCache.set(cacheKey, validate);
-  return validate;
-}
-
-function validationErrorPath(error) {
-  const parts = String(error && error.instancePath || "")
-    .split("/")
-    .filter(Boolean)
-    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
-  if (error && error.keyword === "required" && error.params && error.params.missingProperty) {
-    parts.push(String(error.params.missingProperty));
-  } else if (error && error.keyword === "additionalProperties" && error.params && error.params.additionalProperty) {
-    parts.push(String(error.params.additionalProperty));
-  }
-  return parts.join(".") || "arguments";
-}
-
-function advertisedToolValidationFailure(name, errors) {
-  const rawErrors = Array.isArray(errors) ? errors : [];
-  const normalized = rawErrors.slice(0, 64).map((error) => ({
-    path: validationErrorPath(error),
-    keyword: String(error && error.keyword || "schema"),
-    message: String(error && error.message || "does not match the advertised schema"),
-  }));
-  const shown = normalized.slice(0, 12);
-  const lines = shown.map((error) => `- ${error.path}: ${error.message}`);
-  if (normalized.length > shown.length) lines.push(`- … ${normalized.length - shown.length} more schema errors`);
-  return {
-    content: `Client tool '${name}' was not executed because its arguments failed the advertised JSON schema:\n${lines.join("\n")}\nRetry the same tool with every required field and the exact declared types/enums.`,
-    isError: true,
-    structuredContent: {
-      code: "client_tool_invalid_arguments",
-      tool: name,
-      errors: normalized,
-      errorCount: rawErrors.length,
-      errorsTruncated: rawErrors.length > normalized.length,
-      executed: false,
-    },
-  };
-}
-
-class AdvertisedToolRegistry {
-  constructor() { this.tools = Object.freeze([]); this.byName = new Map(); this.validators = new Map(); }
-  replace(tools) {
-    const next = [];
-    const byName = new Map();
-    const validators = new Map();
-    for (const tool of Array.isArray(tools) ? tools : []) {
-      const name = tool && (tool.toolName || tool.name);
-      if (!name || typeof name !== "string") throw new Error("advertised tool is missing a string name");
-      const inputSchema = tool.inputSchema && typeof tool.inputSchema === "object" && !Array.isArray(tool.inputSchema)
-        ? tool.inputSchema
-        : { type: "object" };
-      if (byName.has(name)) throw new Error(`advertised tool '${name}' appears more than once`);
-      const normalized = Object.freeze({ ...tool, name, toolName: name, inputSchema });
-      byName.set(name, normalized);
-      validators.set(name, compileAdvertisedToolSchema(name, inputSchema));
-      next.push(normalized);
-    }
-    this.byName = byName;
-    this.validators = validators;
-    this.tools = Object.freeze(next);
-  }
-  all() { return this.tools; }
-  find(name) { return this.byName.get(name) || null; }
-  validate(name, input) {
-    const validate = this.validators.get(name);
-    if (!validate || validate(input)) return null;
-    return advertisedToolValidationFailure(name, validate.errors);
-  }
+class AdvertisedToolRegistry extends ToolContractRegistry {
   scoped(toolChoice) { return effectiveAdvertise(this.tools, toolChoice); }
 }
 
@@ -1603,8 +1472,8 @@ class Session {
     return typeof candidate === "string" && candidate.length > 0 && this.syntheticArtifactUserText.includes(candidate);
   }
   syntheticArtifactDecision(name, input) {
-    const leaf = normalizedToolLeaf(name);
-    if (!SYNTHETIC_AGENT_ARTIFACT_TOOLS.has(leaf)) return null;
+    const family = clientToolFamily(name);
+    if (!SYNTHETIC_AGENT_ARTIFACT_FAMILIES.has(family)) return null;
     const paths = artifactInputPaths(input);
     const command = artifactInputText(input, SYNTHETIC_AGENT_ARTIFACT_COMMAND_KEYS);
     const explicit = paths.some((candidate) => this.userExplicitlyRequestedPath(candidate));
@@ -1613,7 +1482,7 @@ class Session {
     if (!explicit && syntheticAgentArtifactRequest(name, input)) {
       reason = "reserved_agent_tools_path";
     }
-    if (!reason && !explicit && SYNTHETIC_AGENT_ARTIFACT_WRITE_TOOLS.has(leaf)) {
+    if (!reason && !explicit && family === "write") {
       const content = artifactInputText(input, SYNTHETIC_AGENT_ARTIFACT_CONTENT_KEYS);
       const hashes = artifactContentHashes(content);
       if (hashes.some((hash) => this.syntheticArtifactResults.some((result) => result.hashes.has(hash)))) {
@@ -1710,41 +1579,55 @@ class Session {
   detachDrain() {}
 
   normalizeClientToolInput(name, input) {
-    let normalized = wrapToolInput(input);
-    if (normalized == null) normalized = {};
-    const advertised = (this.advertise || []).find((tool) => (tool.toolName || tool.name) === name);
-    if (advertised && advertised.inputSchema) normalized = normalizeToolArgsToSchema(name, normalized, advertised.inputSchema);
-    if (name === "Workflow" && normalized && typeof normalized.script === "string") {
-      const snapped = snapWorkflowAgentTypes(normalized.script);
-      if (snapped !== normalized.script) normalized = { ...normalized, script: snapped };
+    const normalized = this.toolRegistry.normalize(name, input);
+    if (name === "Workflow" && normalized.value && typeof normalized.value.script === "string") {
+      const snapped = snapWorkflowAgentTypes(normalized.value.script);
+      if (snapped !== normalized.value.script) normalized.value = { ...normalized.value, script: snapped };
     }
     return normalized;
   }
 
-  validateClientToolInput(name, input) {
-    const failure = this.toolRegistry.validate(name, input);
+  validateClientToolInput(name, input, transforms = []) {
+    const failure = this.toolRegistry.validate(name, input, transforms);
     if (!failure) return null;
-    this.invalidToolCalls++;
+    this.recordInternalToolRejection("schema", name);
     dbg("client tool schema preflight rejected before handoff", "session=" + this.id,
       "name=" + name, "invalidCalls=" + this.invalidToolCalls,
       "errors=" + safeJson(failure.structuredContent && failure.structuredContent.errors));
-    if (this.invalidToolCalls >= COMPOSER_MAX_INVALID_TOOL_CALLS) {
+    if (this.loopTripped) {
       const reason = `composer run exceeded the invalid client-tool call bound (${COMPOSER_MAX_INVALID_TOOL_CALLS}); aborting a likely schema-retry loop`;
       failure.content += `\n${reason}`;
       failure.structuredContent.limitExceeded = true;
-      this.tripLoopBound(reason);
     }
     return failure;
   }
 
+  recordInternalToolRejection(kind, detail = "") {
+    if (this.loopTripped) return true;
+    this.invalidToolCalls++;
+    dbg("internal client-tool rejection", "session=" + this.id, "kind=" + kind,
+      "detail=" + detail, "count=" + this.invalidToolCalls);
+    if (this.invalidToolCalls >= COMPOSER_MAX_INVALID_TOOL_CALLS) {
+      this.tripLoopBound(`composer run exceeded the internal client-tool rejection bound (${COMPOSER_MAX_INVALID_TOOL_CALLS}); aborting a likely retry loop (${kind})`);
+      return true;
+    }
+    return false;
+  }
+
   openClientTool({ source, rawToolCallId, name, input, resultAdapter }) {
-    input = this.normalizeClientToolInput(name, input);
+    const normalized = this.normalizeClientToolInput(name, input);
+    input = normalized.value;
+    if (normalized.transforms.length) {
+      dbg("client tool contract translated SDK arguments", "session=" + this.id,
+        "name=" + name, "transforms=" + safeJson(normalized.transforms));
+    }
     const syntheticFailure = this.syntheticArtifactFailure(name, input);
     if (syntheticFailure) {
       dbg("synthetic agent-tools artifact blocked", "session=" + this.id, "source=" + source, "name=" + name);
+      this.recordInternalToolRejection("synthetic-artifact", name);
       return Promise.resolve(resultAdapter ? resultAdapter(syntheticFailure) : syntheticFailure);
     }
-    const validationFailure = this.validateClientToolInput(name, input);
+    const validationFailure = this.validateClientToolInput(name, input, normalized.transforms);
     if (validationFailure) {
       return Promise.resolve(resultAdapter ? resultAdapter(validationFailure) : validationFailure);
     }
@@ -1797,10 +1680,17 @@ class Session {
 
   dispatchUnary(cas, spec, s) {
     const ctx = { cwd: composerWorkspaceCwd(this.clientEnv) };
+    const clientTool = this.reconcileToolName(spec.ccTool);
+    if (!clientTool) {
+      const detail = `no advertised client tool safely matches Cursor's native '${spec.ccTool}' capability`;
+      dbg("native client tool unavailable", "session=" + this.id, "name=" + spec.ccTool);
+      this.recordInternalToolRejection("native-unmatched", spec.ccTool);
+      return Promise.resolve({ __ccJson: spec.buildResult(detail, s, true, ctx) });
+    }
     return this.openClientTool({
       source: "patched-unary",
       rawToolCallId: (s && s.toolCallId) || ccToolId(s),
-      name: spec.ccTool,
+      name: clientTool,
       input: ccArgsFor(cas, s),
       resultAdapter: (result) => ({ __ccJson: spec.buildResult(result.content, s, result.isError === true, ctx) }),
     });
@@ -1808,11 +1698,19 @@ class Session {
   dispatchStream(cas, spec, s) {
     const self = this;
     const ctx = { cwd: composerWorkspaceCwd(this.clientEnv) };
+    const clientTool = this.reconcileToolName(spec.ccTool);
     return (async function* () {
+      if (!clientTool) {
+        const detail = `no advertised client tool safely matches Cursor's native '${spec.ccTool}' capability`;
+        dbg("native streaming client tool unavailable", "session=" + self.id, "name=" + spec.ccTool);
+        self.recordInternalToolRejection("native-unmatched", spec.ccTool);
+        for (const chunk of spec.buildChunks(detail, true, ctx)) yield { __ccJson: chunk };
+        return;
+      }
       const result = await self.openClientTool({
         source: "patched-stream",
         rawToolCallId: (s && s.toolCallId) || ccToolId(s),
-        name: spec.ccTool,
+        name: clientTool,
         input: ccArgsFor(cas, s),
         resultAdapter: (value) => value,
       });
@@ -1835,6 +1733,7 @@ class Session {
       const eff = this.advertiseForGating();
       const names = eff.map((t) => t.toolName || t.name).join(", ");
       dbg("dispatchMcp TOOL NOT AVAILABLE", "want=" + want, "advertisedCount=" + eff.length, "advertised=" + names);
+      this.recordInternalToolRejection("mcp-unmatched", want);
       return Promise.resolve({ __ccJson: mcpDispatchResult(`Tool '${want}' is not available. Available tools: ${names || "(none)"}.`, true) });
     }
     return this.openClientTool({
@@ -1858,33 +1757,10 @@ class Session {
   advertiseForGating() { return this.activeAdvertise != null ? this.activeAdvertise : (this.advertise || []); }
   reconcileToolName(want) {
     const adv = this.advertiseForGating();
-    if (!adv.length) return null;
-    const names = adv.map((t) => t.toolName || t.name);
-    if (names.includes(want)) return want;                              // exact
-    const lw = (want || "").toLowerCase();
-    const ci = names.filter((nm) => nm.toLowerCase() === lw);           // case-insensitive
-    if (ci.length === 1) return ci[0];
-    const tok = (s) => String(s || "").toLowerCase().split(/[-_.:/ ]+/).filter(Boolean);
-    // H18: the single-advertised-tool rule (the model slightly misnaming the ONLY tool) is INTENTIONAL but is
-    // now GUARDED — apply it ONLY when `want` is a PLAUSIBLE variant of that one tool, NEVER for an arbitrary
-    // unrelated/known-foreign id (e.g. routing `nanobanana_generate` to the only tool `Bash` would turn a
-    // hallucinated action into a real call). Plausible = case/punctuation-insensitive equal, OR token overlap
-    // with the one tool's name. If it does not plausibly match -> null (caller returns a typed isError
-    // "unavailable" result), so a foreign id is rejected rather than routed to a powerful tool.
-    if (adv.length === 1) {
-      const only = names[0];
-      const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-      if (norm(want) === norm(only)) return only;                      // punctuation/case variant of the one tool
-      const wt = tok(lw), ot = new Set(tok(only));
-      if (wt.some((t) => ot.has(t))) return only;                      // shares a token with the one tool
-      dbg("reconcileToolName single-tool guard rejected implausible name", "session=" + this.id, "want=" + want, "only=" + only);
-      return null;                                                     // unrelated/foreign -> typed isError
-    }
-    // token-boundary fuzzy: accept ONLY when exactly one advertised tool shares the want's last token.
-    // (No substring includes() — that mis-routed e.g. "config" -> "reconfigure_database".)
-    const tail = tok(lw).pop() || lw;
-    const matches = names.filter((nm) => tok(nm).includes(tail));
-    return matches.length === 1 ? matches[0] : null;                   // ambiguous/none -> typed isError
+    return resolveClientToolName(want, adv, {
+      onRejectedSingle: (only) => dbg("reconcileToolName single-tool guard rejected implausible name",
+        "session=" + this.id, "want=" + want, "only=" + only),
+    });
   }
 
   emitToolUse(id, name, input, { handJournaled = false } = {}) {
@@ -2505,6 +2381,14 @@ function mcpToolsForServer(session, serverKey, grouping = MCP_GROUPING) {
   return out;
 }
 
+function mcpDescriptorsForServer(session, serverKey, grouping = MCP_GROUPING) {
+  const listedNames = new Set(mcpToolsForServer(session, serverKey, grouping).map((tool) => tool.name));
+  const advertised = (session && session.advertiseForGating && session.advertiseForGating())
+    || (session && session.advertise)
+    || [];
+  return advertised.filter((tool) => listedNames.has(tool.toolName || tool.name));
+}
+
 // buildMcpServers returns the Record<serverKey, McpServerConfig> registered via AgentOptions.mcpServers for a
 // session, or {} when the shim is off (DEFAULT ON; off only when CURSOR_COMPOSER_MCP_SHIM is "0"/"false").
 // Every server is the same loopback http shape; only the SET of keys + the per-key tool slice differ by
@@ -2645,16 +2529,20 @@ async function mcpDispatch(msg, sessionId, serverKey) {
           // Degrade, never fake success: an unknown/expired session yields a typed isError tool result.
           return mcpResult(id, { content: [{ type: "text", text: `session ${sessionId} not found (bridge restart or idle eviction); the tool call cannot be routed` }], isError: true });
         }
-        const ccName = session.reconcileToolName(want);
+        const scopedTools = mcpDescriptorsForServer(session, serverKey);
+        const ccName = resolveClientToolName(want, scopedTools);
         dbg("mcp tools/call reconciled", "session=" + sessionId, "want=" + want, "reconciled=" + (ccName || "<UNAVAILABLE>"));
         if (!ccName) {
-          const names = (session.advertise || []).map((t) => t.toolName || t.name).join(", ");
+          const names = scopedTools.map((t) => t.toolName || t.name).join(", ");
+          session.recordInternalToolRejection("http-mcp-unmatched", want);
           return mcpResult(id, { content: [{ type: "text", text: `Tool '${want}' is not available. Available tools: ${names || "(none)"}.` }], isError: true });
         }
         try {
+          const effectiveServerKey = serverKey || DEFAULT_MCP_SERVER_KEY;
+          const rpcId = id == null ? randomUUID() : Buffer.from(JSON.stringify(id)).toString("base64url");
           const out = await session.openClientTool({
             source: "http-mcp",
-            rawToolCallId: `http-mcp:${String(id ?? randomUUID())}`,
+            rawToolCallId: `http-mcp:${effectiveServerKey}:${rpcId}`,
             name: ccName,
             input,
             resultAdapter: (result) => result,
@@ -2689,6 +2577,11 @@ async function mcpDispatch(msg, sessionId, serverKey) {
     dbg("mcpDispatch internal error", "session=" + sessionId, (e && e.message) || String(e));
     return msg && (msg.id !== undefined && msg.id !== null) ? mcpError(msg.id, -32603, "Internal error") : null;
   }
+}
+
+async function dispatchMcpBatch(messages, sessionId, serverKey) {
+  const responses = await Promise.all(messages.map((message) => mcpDispatch(message, sessionId, serverKey)));
+  return responses.filter((response) => response !== null);
 }
 
 // handleMcp serves the /mcp/<sessionId>[/<serverKey>] streamable-http endpoint. POST carries a single
@@ -2728,8 +2621,12 @@ async function handleMcp(req, res, sessionId, serverKey) {
   // on initialize). We accept any/none on later requests; the URL path is the authority.
   res.setHeader("Mcp-Session-Id", sessionId);
   if (Array.isArray(body)) {
-    const out = [];
-    for (const m of body) { const r = await mcpDispatch(m, sessionId, serverKey); if (r) out.push(r); }
+    if (body.length === 0) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(mcpError(null, -32600, "Invalid Request")));
+      return;
+    }
+    const out = await dispatchMcpBatch(body, sessionId, serverKey);
     // A batch of pure notifications yields no responses -> 202; otherwise return the response array.
     if (!out.length) { res.writeHead(202, { "Content-Type": "application/json" }); res.end(); return; }
     res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(out)); return;
@@ -2841,81 +2738,18 @@ function dbgInputShape(input) {
   } catch { return "?"; }
 }
 
-// extractScalarFromWrapper pulls a primitive (string/number/boolean) out of a wrapper OBJECT the model/SDK may
-// emit for a scalar arg — a content block {type:"text",text:…} or {text}/{value}/{content}/{string}/{input}, the
-// same-key nesting {command:{command:…}}/{script:{script:…}}, or an object with exactly one own property of the
-// wanted type. Returns undefined when nothing matches (the caller leaves the value untouched).
+// Compatibility exports for callers/tests that used the pre-adapter helpers.
+// Production calls use ToolContractRegistry.normalize so scalars, arrays,
+// objects, aliases, and client-only decorations share one implementation.
 function extractScalarFromWrapper(obj, wantType, sameKey) {
-  if (obj == null || typeof obj !== "object" || Array.isArray(obj)) return undefined;
-  const ok = (v) => (wantType === "string" ? (typeof v === "string" ? v : undefined)
-    : wantType === "number" ? (typeof v === "number" ? v : (typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v)) ? Number(v) : undefined))
-    : wantType === "boolean" ? (typeof v === "boolean" ? v : (v === "true" ? true : v === "false" ? false : undefined)) : undefined);
-  const keys = ["text", "value", "content", "string", "input"];
-  if (sameKey) keys.unshift(sameKey);
-  for (const k of keys) { const got = ok(obj[k]); if (got !== undefined) return got; }
-  const own = Object.keys(obj);
-  if (own.length === 1) { const got = ok(obj[own[0]]); if (got !== undefined) return got; }
-  // STRING-LIKE OBJECT: composer-2.5 delivers some string args as an object whose JSON serialization is a bare
-  // string LITERAL (a boxed String, or a value wrapper whose toJSON returns the string) — NOT a {text}/{value}
-  // block, so the key probes above miss it (observed: Bash.command / Workflow.script arrived this way). For a
-  // string-typed param, recover the primitive: if JSON.stringify yields a "…" literal, parse it back. Safe — a
-  // genuine object serializes to {…}/[…] (never starts with "), so a real object arg is never touched.
-  if (wantType === "string") {
-    try {
-      const j = JSON.stringify(obj);
-      if (typeof j === "string" && j.length >= 2 && j.charCodeAt(0) === 34 && j.charCodeAt(j.length - 1) === 34) return JSON.parse(j);
-    } catch { /* not serializable -> fall through, leave untouched */ }
-  }
-  return undefined;
+  const key = sameKey || "value";
+  const schema = { type: "object", properties: { [key]: { type: wantType } } };
+  const normalized = normalizeToolArguments({ [key]: obj }, schema).value[key];
+  return normalized === obj ? undefined : normalized;
 }
 
-// unwrapPrimitiveLikeObject recovers the primitive from an object whose JSON serialization is a BARE primitive
-// literal — a boxed String/Number/Boolean, or any value-wrapper whose toJSON returns a primitive. composer-2.5
-// delivers many scalar args this way (string args as boxed Strings; booleans as boxed Booleans, e.g. the Agent
-// spawn's readonly=new Boolean(true) -> "Invalid tool parameters"). Schema-INDEPENDENT and universally safe: a
-// genuine object/array serializes to {…}/[…] (never a bare ", -, digit, t, or f), so a real object arg is never
-// touched. Returns undefined for anything that is not primitive-like.
-function unwrapPrimitiveLikeObject(v) {
-  try {
-    if (v == null || typeof v !== "object" || Array.isArray(v)) return undefined;
-    const j = JSON.stringify(v);
-    if (typeof j !== "string" || !j.length) return undefined;
-    const c = j.charCodeAt(0);
-    if (c === 34 /* " */ || c === 45 /* - */ || (c >= 48 && c <= 57) /* 0-9 */ || c === 116 /* t */ || c === 102 /* f */) {
-      const p = JSON.parse(j);
-      if (typeof p === "string" || typeof p === "number" || typeof p === "boolean") return p;
-    }
-    return undefined;
-  } catch { return undefined; }
-}
-
-// normalizeToolArgsToSchema is the general MCP-arg fallback (see emitToolUse): composer-2.5 wraps scalar args in
-// objects. For EVERY arg: (1) universally unwrap a primitive-like object (boxed String/Number/Boolean) — covers
-// any arg, INCLUDING ones not in the schema (e.g. an extra readonly:true); then (2) for an arg the schema types
-// as a primitive but is still an object, pull the scalar from a content-block/wrapper ({type:text,text} etc.).
-// Best-effort + fail-safe — an arg it cannot coerce is left untouched (dbgInputShape logs the wrapper).
-function normalizeToolArgsToSchema(name, input, schema) {
-  try {
-    if (!input || typeof input !== "object" || Array.isArray(input)) return input;
-    const props = schema && schema.properties && typeof schema.properties === "object" ? schema.properties : {};
-    let out = input;
-    for (const k of Object.keys(input)) {
-      const v = input[k];
-      if (v == null || typeof v !== "object" || Array.isArray(v)) continue;
-      let coerced = unwrapPrimitiveLikeObject(v); // (1) universal: a boxed primitive (any arg)
-      if (coerced === undefined) {                // (2) schema-driven: a typed-primitive param wrapped as {text}/{value}/…
-        const ps = props[k];
-        const want = ps && typeof ps.type === "string" ? ps.type : null;
-        if (want === "string" || want === "number" || want === "boolean") coerced = extractScalarFromWrapper(v, want, k);
-      }
-      if (coerced !== undefined) {
-        if (out === input) out = { ...input };
-        out[k] = coerced;
-        dbg("normalizeToolArgs coerced wrapper -> scalar", "tool=" + name, "arg=" + k, "wrapper=" + safeJson(v).slice(0, 160));
-      }
-    }
-    return out;
-  } catch { return input; }
+function normalizeToolArgsToSchema(_name, input, schema) {
+  return normalizeToolArguments(input, schema).value;
 }
 
 // CURSOR_COMPOSER_TOOL_ARG_CONTRACT (default ON; "0"/"false"/"off"/"no" to disable) gates the schema-derived
@@ -3630,16 +3464,44 @@ function enqueueTurn(req, res, session, model, input, constraints) {
 function prepareAdvertisedToolRegistry(body) {
   if (!Array.isArray(body && body.tools)) return undefined;
   const registry = new AdvertisedToolRegistry();
-  registry.replace(body.tools.map((t) => ({
+  registry.replace(body.tools.map((t) => {
+    let aliases = [];
+    if (t.aliases !== undefined) {
+      if (!Array.isArray(t.aliases) || t.aliases.length > 64
+        || t.aliases.some((alias) => typeof alias !== "string" || !alias.trim() || alias.length > 256)) {
+        throw new Error(`advertised tool '${t && t.name}' has invalid private aliases`);
+      }
+      aliases = [...new Set(t.aliases.map((alias) => alias.trim()))];
+    }
+    const suppliedSchema = Object.hasOwn(t, "inputSchema")
+      ? t.inputSchema
+      : (Object.hasOwn(t, "parameters") ? t.parameters : undefined);
+    if (suppliedSchema === false) {
+      throw new Error(`advertised tool '${t && t.name}' has inputSchema:false, which cannot be represented by the SDK object-argument contract`);
+    }
+    if (suppliedSchema !== undefined && suppliedSchema !== true
+      && (!suppliedSchema || typeof suppliedSchema !== "object" || Array.isArray(suppliedSchema))) {
+      throw new Error(`advertised tool '${t && t.name}' has an invalid inputSchema`);
+    }
+    const inputSchema = suppliedSchema === true
+      ? { type: "object", additionalProperties: true }
+      : augmentUnderspecifiedToolSchema(t.name, suppliedSchema);
+    return {
       name: t.name, toolName: t.name, providerIdentifier: CLIENT_TOOL_PROVIDER_ID, description: t.description || "",
-      inputSchema: augmentUnderspecifiedToolSchema(t.name, t.inputSchema || t.parameters || undefined),
-  })));
+      inputSchema,
+      ...(aliases.length ? { aliases } : {}),
+    };
+  }));
   return registry;
 }
 
 function refreshSessionFromBody(session, body, preparedToolRegistry = undefined) {
   if (Array.isArray(body.tools)) {
     session.toolRegistry = preparedToolRegistry || prepareAdvertisedToolRegistry(body);
+    session.toolChoice = typeof body.toolChoice === "string" ? body.toolChoice : "";
+    if (session.activeAdvertise !== null) {
+      session.activeAdvertise = effectiveAdvertise(session.advertise, session.toolChoice);
+    }
   }
   if (body.clientEnv && typeof body.clientEnv === "object") {
     session.clientEnv = body.clientEnv;
@@ -4429,5 +4291,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, buildRestartRecoveryInput, continuationTenantMismatch, sessions, liveToolRounds, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDispatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, buildRestartRecoveryInput, continuationTenantMismatch, sessions, liveToolRounds, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

@@ -18,6 +18,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2931,6 +2932,26 @@ func composerToolAliases(auth *cliproxyauth.Auth) map[string]string {
 // the client with empty arguments (a silent wrong-tool invocation). The wrapper key 'input' is the pinned
 // cross-file contract so a client that introspects sees a stable shape on both the bridge and executor halves.
 func mapComposerToolCall(name string, input gjson.Result, defs []cursorToolDefinition, overrides map[string]string) (string, string) {
+	// The bridge's ToolContractRegistry is authoritative for live Client-Tools
+	// events: it resolves the exact client descriptor, normalizes arguments,
+	// validates them, and journals that canonical payload before emitting SSE.
+	// Preserve an exact bridge name byte-for-byte here so Go cannot add defaults
+	// or otherwise make the harness execute arguments different from the durable
+	// ToolRound receipt. The legacy resolver below remains only for older or
+	// noncanonical bridge events during an upgrade.
+	for i := range defs {
+		if defs[i].Name != name {
+			continue
+		}
+		if input.Exists() && input.IsObject() {
+			return name, input.Raw
+		}
+		if !input.Exists() {
+			return name, "{}"
+		}
+		b, _ := json.Marshal(map[string]any{"input": input.Value()})
+		return name, string(b)
+	}
 	spec := resolveToolSpec(name, defs, overrides)
 	outName := name
 	if spec != nil {
@@ -2956,6 +2977,33 @@ func mapComposerToolCall(name string, input gjson.Result, defs []cursorToolDefin
 	return spec.Name, string(b)
 }
 
+// attachComposerToolAliases projects explicit operator aliases onto the exact
+// advertised descriptor they target. The bridge can then resolve native SDK
+// names without emitting an unadvertised fallback and without relying on Go to
+// rewrite a call after it has already been journaled. Alias keys are normalized
+// by composerToolAliases; bridge matching is normalized too.
+func attachComposerToolAliases(advertise []map[string]any, defs []cursorToolDefinition, overrides map[string]string) []map[string]any {
+	if len(advertise) == 0 || len(overrides) == 0 {
+		return advertise
+	}
+	byTarget := make(map[string][]string)
+	for alias := range overrides {
+		if spec := resolveToolOverride(alias, overrides, defs); spec != nil {
+			byTarget[spec.Name] = append(byTarget[spec.Name], alias)
+		}
+	}
+	for _, entry := range advertise {
+		name, _ := entry["name"].(string)
+		aliases := byTarget[name]
+		if len(aliases) == 0 {
+			continue
+		}
+		sort.Strings(aliases)
+		entry["aliases"] = aliases
+	}
+	return advertise
+}
+
 // composerAdvertisePrep holds advertise/toolChoice/constraints after allow-list and tool_choice gating.
 type composerAdvertisePrep struct {
 	advertise   []map[string]any
@@ -2977,6 +3025,7 @@ func prepareComposerAdvertise(oai []byte, defs []cursorToolDefinition, toolAlias
 			constraints = appendUnsupportedGuarantee(constraints, "allowed_tools requested but none of the allowed tools are available (no tools advertised; do not call any tool)")
 		}
 	}
+	advertise = attachComposerToolAliases(advertise, defs, toolAliases)
 	return composerAdvertisePrep{advertise: advertise, toolChoice: toolChoice, constraints: constraints}
 }
 
@@ -2990,7 +3039,13 @@ func composerTurnBody(sessionID, model string, input map[string]any, advertise [
 	// dropping tools on a continuation left the bridge with a STALE advertise set (removed/added tools, plan-mode
 	// ExitPlanMode, MCP availability changes). The tool_choice=none gating in executeComposer/executeComposerStream
 	// runs BEFORE this (advertise=nil there), so `none` still sends no tools — that ordering is intentional.
-	if len(advertise) > 0 {
+	// The inventory is an authoritative snapshot on every HTTP turn. An empty
+	// array explicitly clears a reused bridge session; omitting the field left
+	// stale tools executable after tool_choice:none, allowed-tools narrowing, or
+	// dynamic client-tool removal.
+	if advertise == nil {
+		body["tools"] = []map[string]any{}
+	} else {
 		body["tools"] = advertise
 	}
 	if toolChoice != "" {
@@ -3662,24 +3717,8 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 	defer func() { composerApplyLeaseStop(tenant, sessionID, leaseStop, leaseOwner, ctx) }()
 	// H16/#21 (C-RESPID): the outward-response-id -> sessionID mapping is recorded AFTER the bridge accepts a
 	// valid SSE stream (below), not here — a failed dispatch must leave no phantom mapping (mirrors the stream path).
-	advertise := composerAdvertise(oai)
-	toolChoice := resolveComposerToolChoice(oai, defs, toolAliases)
-	constraints := composerConstraints(oai)
-	if toolChoice == "none" {
-		// tool_choice=none: advertise nothing so the model cannot call CLIENT tools. H08 (best-effort): the
-		// `none`/`specific:` token is also forwarded to the bridge (composerTurnBody.toolChoice), which gates
-		// the model's NATIVE built-ins via constraintInstructions + by rejecting native exec cases. Native
-		// Cursor tools are SDK built-ins not in the advertise set, so they cannot be structurally
-		// un-advertised here — the gating of native tools is best-effort and owned by the bridge.
-		advertise = nil
-	} else {
-		// H07/H22: restrict to allowed_tools; never widen silently (empty intersection => explicit-unsupported).
-		var unsupportedTools bool
-		advertise, unsupportedTools = applyComposerAllowedTools(advertise, oai, defs, toolAliases)
-		if unsupportedTools {
-			constraints = appendUnsupportedGuarantee(constraints, "allowed_tools requested but none of the allowed tools are available (no tools advertised; do not call any tool)")
-		}
-	}
+	prep := prepareComposerAdvertise(oai, defs, toolAliases)
+	advertise, toolChoice, constraints := prep.advertise, prep.toolChoice, prep.constraints
 	// ADD-65: build input with the SAME tenant continuation hint deriveComposerSessionID used, so a Responses
 	// server-side-chained [..., tool, user] turn is sent as tool_results (with userText) — not a fresh user turn
 	// behind a paused run.

@@ -100,6 +100,7 @@ test("AST discovery identifies each semantic seam exactly once", () => {
   assert.equal(seams.stream.receiver, "r");
   assert.equal(seams.advertise.receiverSource, "u");
   assert.equal(seams.artifactSpill.original, "void 0");
+  assert.equal(seams.artifactSpill.metaToolOriginal, "d");
   const index = findIndexSeams(indexFixture());
   assert.deepEqual(index.loader.chunkIds, [745, 973]);
   assert.equal(index.loader.webpackRequire, "a");
@@ -130,7 +131,7 @@ test("a missing structural local-executor loader fails closed", () => {
   throwsCode(() => patchFixture({ omitLoader: true }), "structural-mismatch");
 });
 
-test("patched output parses and installs all four runtime capabilities", () => {
+test("patched output installs direct tools while disabling native execution, artifact spill, and MCP meta wrappers", () => {
   const result = patchFixture();
   assert.ok(result.patchedSrc.startsWith(MARK));
   assert.ok(result.patchedIndexSrc.includes(INDEX_MARK));
@@ -139,6 +140,8 @@ test("patched output parses and installs all four runtime capabilities", () => {
   }
   assert.match(result.patchedSrc, /native sidecar execution is forbidden/);
   assert.match(result.patchedSrc, /mcpFileOutputThresholdBytes:0/);
+  assert.match(result.patchedSrc, /mcpMetaToolEnabled:false/);
+  assert.match(result.patchedSrc, /__CC_GET_ADVERTISE__/);
 });
 
 test("the index eager-load is derived from the loader AST", () => {
@@ -151,6 +154,7 @@ test("descriptor records exact seam counts and patched hashes", () => {
   assert.deepEqual(result.descriptor.seams, { ...EXPECTED_SEAMS });
   assert.equal(result.descriptor.nativeExecutionDefault, "deny");
   assert.equal(result.descriptor.mcpArtifactSpillThresholdBytes, 0);
+  assert.equal(result.descriptor.mcpMetaToolEnabled, false);
   assert.equal(result.descriptor.sourceVerified, false);
   throwsCode(
     () => validateDescriptor({ descriptor: result.descriptor, version: PINNED_VERSION, bundleSource: result.patchedSrc, indexSource: result.patchedIndexSrc }),
@@ -170,6 +174,10 @@ test("descriptor rejects byte tampering, seam tampering, and version skew", () =
   );
   throwsCode(
     () => validateDescriptor({ descriptor: { ...result.descriptor, seams: { ...result.descriptor.seams, unaryDispatch: 0 } }, version: PINNED_VERSION, bundleSource: result.patchedSrc, indexSource: result.patchedIndexSrc }),
+    "descriptor-invalid",
+  );
+  throwsCode(
+    () => validateDescriptor({ descriptor: { ...result.descriptor, mcpMetaToolEnabled: true }, version: PINNED_VERSION, bundleSource: result.patchedSrc, indexSource: result.patchedIndexSrc, allowUnverified: true }),
     "descriptor-invalid",
   );
   throwsCode(
