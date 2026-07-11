@@ -157,11 +157,20 @@ test("independent bridge infrastructures share one atomically published routing 
 test("journal creates, revises, and detects stale revisions", (t) => {
   const dir = withTempDir(t);
   const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 2) });
-  const round = new ToolRound({ sessionId: "sess", runEpoch: 1, roundSeq: 1, journal, codec });
+  const round = new ToolRound({
+    sessionId: "sess",
+    runEpoch: 1,
+    roundSeq: 1,
+    clientLeaseToken: "18446744073709551615",
+    journal,
+    codec,
+  });
   assert.equal(round.revision, 1);
   const saved = journal.read(round.route);
   assert.equal(saved.state, RoundState.COLLECTING);
   assert.equal(saved.revision, 1);
+  assert.equal(saved.clientLeaseToken, "18446744073709551615", "uint64 lease tokens remain lossless in the journal");
+  assert.equal(ToolRound.load(journal, codec, round.route).clientLeaseToken, "18446744073709551615");
   assert.throws(() => journal.save(saved, 0), (error) => error.code === "journal_revision_conflict");
   const call = round.openCall({ name: "Read", input: { path: "/x" }, callback: callbackLog([], "a") });
   assert.equal(round.revision, 2);
@@ -471,6 +480,80 @@ test("deferred user input is journaled independently and advances exactly once",
   });
 });
 
+test("uncertain deferred delivery preserves its exact SDK envelope until final response receipt", (t) => {
+  const dir = withTempDir(t);
+  const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 31) });
+  const round = new ToolRound({ sessionId: "exact-deferred", journal, codec });
+  const originalMessage = { text: "original SDK message", images: [{ data: "QUJD", dimension: { width: 1, height: 1 } }] };
+  const originalAdvertise = [{
+    name: "OriginalTool",
+    description: "the descriptor used by the accepted SDK send",
+    inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+  }];
+  round.queueDeferredInput("message-exact", {
+    userText: "original intent",
+    history: "original recovery context",
+  });
+  round.markDeferredInputState("message-exact", DeferredInputState.DELIVERING, {
+    agentId: "agent-original",
+    idempotencyKey: "send-key-original",
+    message: originalMessage,
+    advertise: originalAdvertise,
+    inventoryEpoch: "cti1_original",
+    model: "cursor-grok-4.5-xhigh",
+    toolChoice: "auto",
+    seededSystem: "original system",
+  });
+
+  // A retry may carry fresher mutable context, but it must not rewrite the
+  // payload already bound to the durable SDK idempotency key.
+  assert.deepEqual(round.queueDeferredInput("message-exact", {
+    userText: "original intent",
+    history: "newer retry context",
+    system: "newer retry system",
+  }), {
+    clientMessageId: "message-exact",
+    duplicate: true,
+    status: "delivering",
+  });
+  let saved = ToolRound.load(journal, codec, round.route).deferredInput("message-exact");
+  assert.deepEqual(saved.deliveryMessage, originalMessage);
+  assert.deepEqual(saved.deliveryAdvertise, originalAdvertise);
+  assert.equal(saved.deliveryAgentId, "agent-original");
+  assert.equal(saved.deliveryIdempotencyKey, "send-key-original");
+
+  // agent.send resolving is acceptance evidence, not proof that the resumed
+  // model turn produced and durably receipted its final answer.
+  round.markDeferredInputState("message-exact", DeferredInputState.DELIVERED, {
+    evidence: "agent_send_resolved",
+  });
+  saved = ToolRound.load(journal, codec, round.route).deferredInput("message-exact");
+  assert.deepEqual(saved.deliveryMessage, originalMessage);
+  assert.deepEqual(saved.deliveryAdvertise, originalAdvertise);
+  assert.equal(saved.deliveryFinalizedAt, undefined);
+
+  round.requeueUncertainDeferredInput("message-exact");
+  saved = ToolRound.load(journal, codec, round.route).deferredInput("message-exact");
+  assert.equal(saved.state, DeferredInputState.QUEUED);
+  assert.deepEqual(saved.deliveryMessage, originalMessage);
+  assert.deepEqual(saved.deliveryAdvertise, originalAdvertise);
+
+  round.markDeferredInputState("message-exact", DeferredInputState.DELIVERING);
+  round.markDeferredInputState("message-exact", DeferredInputState.DELIVERED, {
+    evidence: "completed_turn_receipt",
+    finalized: true,
+  });
+  saved = ToolRound.load(journal, codec, round.route).deferredInput("message-exact");
+  assert.equal(saved.state, DeferredInputState.DELIVERED);
+  assert.ok(saved.deliveryFinalizedAt);
+  assert.equal(saved.deliveryMessage, undefined);
+  assert.equal(saved.deliveryAdvertise, undefined);
+  assert.throws(
+    () => round.requeueUncertainDeferredInput("message-exact"),
+    (error) => error.code === "client_message_already_finalized",
+  );
+});
+
 test("deferred snapshots keep one recovery context, supersede stale intent, and stay bounded", (t) => {
   const dir = withTempDir(t);
   const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 23) });
@@ -481,6 +564,9 @@ test("deferred snapshots keep one recovery context, supersede stale intent, and 
     agentId: "agent-0",
     textHash: "a".repeat(64),
     hasImages: false,
+    idempotencyKey: "send-key-0",
+    message: "large exact send:" + "y".repeat(128 * 1024),
+    advertise: [{ name: "OriginalTool", inputSchema: { type: "object" } }],
   });
   round.queueDeferredInput("message-1", { userText: "intent 1", history: "latest context" });
 
@@ -488,6 +574,8 @@ test("deferred snapshots keep one recovery context, supersede stale intent, and 
   assert.equal(first.state, DeferredInputState.SUPERSEDED);
   assert.equal(first.supersedeReason, "delivery_uncertain_superseded");
   assert.equal(first.input, null);
+  assert.equal(first.deliveryMessage, undefined);
+  assert.equal(first.deliveryAdvertise, undefined);
   // Definitive late SDK evidence may still upgrade an uncertain tombstone.
   round.markDeferredInputState("message-0", DeferredInputState.DELIVERED, {
     evidence: "user_message_appended",
@@ -512,6 +600,7 @@ test("deferred snapshots keep one recovery context, supersede stale intent, and 
   assert.equal(saved.recoveryContext.history, "context 99");
   const serialized = JSON.stringify(saved);
   assert.equal(serialized.includes(history), false, "superseded history must not remain duplicated in tombstones");
+  assert.equal(serialized.includes("large exact send"), false, "superseded SDK envelopes must not bloat tombstones");
 });
 
 test("terminal cleanup retains a round while deferred input is still owed", (t) => {

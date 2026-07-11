@@ -40,6 +40,12 @@ export const DeferredInputState = Object.freeze({
 export const MAX_DEFERRED_INPUT_RECORDS = 64;
 export const MAX_DEFERRED_INTENT_BYTES = 1 << 20;
 export const MAX_DEFERRED_CONTEXT_BYTES = 2 << 20;
+export const MAX_DEFERRED_DELIVERY_BYTES = 32 << 20;
+
+function canonicalClientLeaseToken(value) {
+  const token = typeof value === "string" ? value.trim() : "";
+  return /^[1-9][0-9]{0,19}$/.test(token) ? token : "";
+}
 
 export const RoundState = Object.freeze({
   COLLECTING: "COLLECTING",
@@ -422,11 +428,21 @@ function compactDeferredState(record) {
       ? entry.state
       : DeferredInputState.QUEUED;
     const actionable = state === DeferredInputState.QUEUED || state === DeferredInputState.DELIVERING;
-    return {
+    const retainsExactDelivery = (state === DeferredInputState.QUEUED
+        && (entry.deliveryAttempts || 0) > 0
+        && Object.prototype.hasOwnProperty.call(entry, "deliveryMessage"))
+      || state === DeferredInputState.DELIVERING
+      || (state === DeferredInputState.DELIVERED && !entry.deliveryFinalizedAt);
+    const saved = {
       ...entry,
       state,
       input: actionable ? canonicalDeferredInput(entry && entry.input) : null,
     };
+    if (!retainsExactDelivery) {
+      delete saved.deliveryMessage;
+      delete saved.deliveryAdvertise;
+    }
+    return saved;
   });
 
   // Each HTTP request is a complete stateless snapshot. A newer QUEUED
@@ -446,9 +462,12 @@ function compactDeferredState(record) {
   }
 
   const actionable = normalized.filter((entry) => entry.state === DeferredInputState.QUEUED
-    || entry.state === DeferredInputState.DELIVERING);
+    || entry.state === DeferredInputState.DELIVERING
+    || (entry.state === DeferredInputState.DELIVERED && !entry.deliveryFinalizedAt));
   const tombstones = normalized.filter((entry) => entry.state !== DeferredInputState.QUEUED
-    && entry.state !== DeferredInputState.DELIVERING).slice(-MAX_DEFERRED_INPUT_RECORDS);
+    && entry.state !== DeferredInputState.DELIVERING
+    && !(entry.state === DeferredInputState.DELIVERED && !entry.deliveryFinalizedAt))
+    .slice(-MAX_DEFERRED_INPUT_RECORDS);
   return {
     deferredInputs: [...tombstones, ...actionable]
       .sort((left, right) => (left.receivedAt || 0) - (right.receivedAt || 0)),
@@ -840,6 +859,7 @@ export class ToolRound {
     roundId = null,
     tenantFingerprint = "",
     model = "",
+    clientLeaseToken = "",
     journal = null,
     codec = null,
     clock = () => Date.now(),
@@ -867,6 +887,7 @@ export class ToolRound {
       this.roundSeq = record.roundSeq;
       this.tenantFingerprint = record.tenantFingerprint || "";
       this.model = record.model || "";
+      this.clientLeaseToken = canonicalClientLeaseToken(record.clientLeaseToken);
       this.createdAt = record.createdAt;
       this.updatedAt = record.updatedAt;
       this.state = record.state;
@@ -896,6 +917,7 @@ export class ToolRound {
     this.roundSeq = roundSeq;
     this.tenantFingerprint = tenantFingerprint;
     this.model = model;
+    this.clientLeaseToken = canonicalClientLeaseToken(clientLeaseToken);
     this.createdAt = this.clock();
     this.updatedAt = this.createdAt;
     this.state = RoundState.COLLECTING;
@@ -917,6 +939,13 @@ export class ToolRound {
 
   get pending() { return this.callbacks; }
   get pendingCount() { return this.callbacks.size; }
+  get unreceiptedOwedCallCount() {
+    let count = 0;
+    for (const call of this.calls.values()) {
+      if (call.handedAt != null && !call.receipt && !call.callbackAppliedAt) count++;
+    }
+    return count;
+  }
   get isTerminal() { return this.state === RoundState.TERMINAL; }
 
   toRecord() {
@@ -924,6 +953,7 @@ export class ToolRound {
       agentId: this.agentId,
       calls: this.fifo.map((id) => serializedCall(this.calls.get(id))),
       createdAt: this.createdAt,
+      clientLeaseToken: this.clientLeaseToken,
       deferredInputs: this.deferredInputs.map((input) => ({ ...input })),
       recoveryContext: this.recoveryContext,
       model: this.model,
@@ -1178,10 +1208,13 @@ export class ToolRound {
     // round's shared recovery context back to an older stateless snapshot.
     // Context may advance only with a new intent or with the currently
     // actionable retry of that same intent.
-    const existingIsActionable = prepared.existing && (
-      prepared.existing.state === DeferredInputState.QUEUED
-      || prepared.existing.state === DeferredInputState.DELIVERING
-    );
+    // Once agent.send has started, the exact SDK envelope and the recovery
+    // context that produced it are immutable. A transport retry may carry a
+    // newer system/history snapshot, but applying that snapshot under the
+    // already-persisted idempotency key would map two different payloads to
+    // one SDK request id. Only an unsent QUEUED entry may advance context.
+    const existingIsActionable = prepared.existing
+      && prepared.existing.state === DeferredInputState.QUEUED;
     const mayAdvanceContext = !!prepared.saved || !!existingIsActionable;
     const targetContext = mayAdvanceContext
       ? (prepared.recoveryContext || canonicalDeferredContext(null))
@@ -1190,10 +1223,15 @@ export class ToolRound {
       !== canonicalJSONString(targetContext);
     if (prepared.saved) {
       for (const entry of next.deferredInputs) {
-        if (entry.state !== DeferredInputState.QUEUED && entry.state !== DeferredInputState.DELIVERING) continue;
-        const uncertain = entry.state === DeferredInputState.DELIVERING;
+        if (entry.state !== DeferredInputState.QUEUED
+            && entry.state !== DeferredInputState.DELIVERING
+            && !(entry.state === DeferredInputState.DELIVERED && !entry.deliveryFinalizedAt)) continue;
+        const uncertain = entry.state === DeferredInputState.DELIVERING
+          || entry.state === DeferredInputState.DELIVERED;
         entry.state = DeferredInputState.SUPERSEDED;
         entry.input = null;
+        delete entry.deliveryMessage;
+        delete entry.deliveryAdvertise;
         entry.supersededAt = prepared.saved.receivedAt;
         entry.supersededBy = prepared.saved.clientMessageId;
         if (uncertain) entry.supersedeReason = "delivery_uncertain_superseded";
@@ -1227,6 +1265,14 @@ export class ToolRound {
     return this.deferredInputs.find((item) => item.clientMessageId === clientMessageId) || null;
   }
 
+  actionableDeferredInput() {
+    return [...this.deferredInputs].reverse().find((item) => item && (
+      item.state === DeferredInputState.QUEUED
+      || item.state === DeferredInputState.DELIVERING
+      || (item.state === DeferredInputState.DELIVERED && !item.deliveryFinalizedAt)
+    )) || null;
+  }
+
   markDeferredInputState(clientMessageId, state, metadata = null) {
     const item = this.deferredInput(clientMessageId);
     if (!item) throw new ToolRoundError("unknown_client_message_id", `round ${this.route} does not contain client message ${clientMessageId}`, 410);
@@ -1258,16 +1304,99 @@ export class ToolRound {
       if (typeof meta.agentId === "string" && meta.agentId) saved.deliveryAgentId = meta.agentId;
       if (typeof meta.textHash === "string" && /^[a-f0-9]{64}$/.test(meta.textHash)) saved.deliveryTextHash = meta.textHash;
       if (typeof meta.hasImages === "boolean") saved.deliveryHasImages = meta.hasImages;
+      if (typeof meta.idempotencyKey === "string" && meta.idempotencyKey
+          && meta.idempotencyKey.length <= 1024
+          && !/[\u0000-\u001f\u007f]/.test(meta.idempotencyKey)) {
+        saved.deliveryIdempotencyKey = meta.idempotencyKey;
+      }
+      if (Object.prototype.hasOwnProperty.call(meta, "message")) {
+        const message = jsonValue(meta.message, "$.deliveryMessage");
+        const advertise = Array.isArray(meta.advertise)
+          ? jsonValue(meta.advertise, "$.deliveryAdvertise") : [];
+        const deliveryBytes = jsonBytes({ advertise, message });
+        if (deliveryBytes > MAX_DEFERRED_DELIVERY_BYTES) {
+          throw new ToolRoundError(
+            "deferred_delivery_too_large",
+            `exact deferred SDK delivery exceeds ${MAX_DEFERRED_DELIVERY_BYTES} bytes`,
+            413,
+          );
+        }
+        saved.deliveryMessage = message;
+        saved.deliveryAdvertise = advertise;
+        saved.deliveryMessageHash = createHash("sha256")
+          .update(canonicalJSONString(message))
+          .digest("hex");
+        saved.deliveryEnvelopeHash = createHash("sha256")
+          .update(canonicalJSONString({
+            advertise,
+            message,
+            model: typeof meta.model === "string" ? meta.model : "",
+            toolChoice: typeof meta.toolChoice === "string" ? meta.toolChoice : "",
+          }))
+          .digest("hex");
+      }
+      if (typeof meta.inventoryEpoch === "string" && meta.inventoryEpoch) {
+        saved.deliveryInventoryEpoch = meta.inventoryEpoch;
+      }
+      if (typeof meta.model === "string" && meta.model) saved.deliveryModel = meta.model;
+      if (typeof meta.toolChoice === "string") saved.deliveryToolChoice = meta.toolChoice;
+      if (typeof meta.seededSystem === "string") saved.deliverySeededSystem = meta.seededSystem;
     }
     if (state === DeferredInputState.DELIVERED) {
       saved.deliveredAt ||= at;
       if (typeof meta.evidence === "string" && meta.evidence) saved.deliveryEvidence ||= meta.evidence;
+      if (meta.finalized === true) {
+        saved.deliveryFinalizedAt ||= at;
+        // The id/key/hash are enough after the whole model turn—not merely
+        // agent.send—has reached a durable final response.
+        delete saved.deliveryMessage;
+        delete saved.deliveryAdvertise;
+      }
     }
     if (state === DeferredInputState.SUPERSEDED) {
       saved.supersededAt = at;
       if (typeof meta.reason === "string" && meta.reason) saved.supersedeReason = meta.reason;
       saved.input = null;
+      delete saved.deliveryMessage;
+      delete saved.deliveryAdvertise;
     }
+    this.persistRecord(next);
+    Object.assign(item, saved);
+    if (state === DeferredInputState.DELIVERED && meta.finalized === true) {
+      delete item.deliveryMessage;
+      delete item.deliveryAdvertise;
+    }
+    if (state === DeferredInputState.SUPERSEDED) {
+      delete item.deliveryMessage;
+      delete item.deliveryAdvertise;
+    }
+    return item;
+  }
+
+  requeueUncertainDeferredInput(clientMessageId, reason = "idempotent_delivery_retry") {
+    const item = this.deferredInput(clientMessageId);
+    if (!item) throw new ToolRoundError("unknown_client_message_id", `round ${this.route} does not contain client message ${clientMessageId}`, 410);
+    if (item.state === DeferredInputState.QUEUED) return item;
+    if (item.state === DeferredInputState.DELIVERED && item.deliveryFinalizedAt) {
+      throw new ToolRoundError(
+        "client_message_already_finalized",
+        `client message ${clientMessageId} already has a final response receipt`,
+        409,
+      );
+    }
+    if (item.state !== DeferredInputState.DELIVERING && item.state !== DeferredInputState.DELIVERED) {
+      throw new ToolRoundError(
+        "client_message_state_conflict",
+        `client message ${clientMessageId} cannot be retried from ${item.state}`,
+        409,
+      );
+    }
+    const next = this.toRecord();
+    const saved = next.deferredInputs.find((entry) => entry.clientMessageId === clientMessageId);
+    saved.state = DeferredInputState.QUEUED;
+    saved.input ||= { text: "", images: [] };
+    saved.retryQueuedAt = this.clock();
+    saved.retryReason = String(reason || "idempotent_delivery_retry");
     this.persistRecord(next);
     Object.assign(item, saved);
     return item;

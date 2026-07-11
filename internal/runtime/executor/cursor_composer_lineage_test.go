@@ -2,6 +2,8 @@ package executor
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -628,6 +630,70 @@ func TestConcurrencyLeaseLifecycle(t *testing.T) {
 	// A different sid is independently claimable.
 	if _, ok := store.claim("t", "sB"); !ok {
 		t.Fatalf("a different sid must be independently claimable while sA is held")
+	}
+}
+
+func TestContinuationTerminalReleasesOnlyItsOpeningLease(t *testing.T) {
+	tenant := "continuation-lease-tenant"
+	sid := "sess_continuationlease"
+	owner, ok := composerInflight.claim(tenant, sid)
+	if !ok || owner == 0 {
+		t.Fatalf("setup: fresh turn must claim a lease (owner=%d ok=%v)", owner, ok)
+	}
+	t.Cleanup(func() { composerInflight.release(tenant, sid, owner) })
+
+	// The first HTTP turn pauses for a client tool and keeps the lease held.
+	composerApplyLeaseStop(tenant, sid, "tool_use", owner)
+	if _, ok := composerInflight.claim(tenant, sid); ok {
+		t.Fatal("tool_use must retain the opening fresh-turn lease")
+	}
+
+	terminal := gjson.Parse(fmt.Sprintf(
+		`{"type":"turn_end","stop_reason":"end_turn","clientLease":{"sessionId":%q,"token":%q,"terminal":true}}`,
+		sid, strconv.FormatUint(owner, 10),
+	))
+	leaseSID, leaseStop, leaseOwner := composerContinuationLeaseStop(terminal)
+	if leaseSID != sid || leaseStop != "end_turn" || leaseOwner != owner {
+		t.Fatalf("continuation lease echo did not round-trip: sid=%q stop=%q owner=%d", leaseSID, leaseStop, leaseOwner)
+	}
+	composerApplyLeaseStop(tenant, leaseSID, leaseStop, leaseOwner)
+
+	newOwner, ok := composerInflight.claim(tenant, sid)
+	if !ok || newOwner == 0 || newOwner == owner {
+		t.Fatalf("terminal continuation must free the paused session for immediate reuse (owner=%d old=%d ok=%v)", newOwner, owner, ok)
+	}
+	t.Cleanup(func() { composerInflight.release(tenant, sid, newOwner) })
+
+	// A delayed replay from the old round carries the old owner token and must
+	// never evict the newer logical run.
+	composerApplyLeaseStop(tenant, leaseSID, leaseStop, leaseOwner)
+	if _, ok := composerInflight.claim(tenant, sid); ok {
+		t.Fatal("a late continuation terminal evicted a newer lease")
+	}
+}
+
+func TestContinuationLeaseMetadataFailsSafe(t *testing.T) {
+	cases := []string{
+		`{"type":"turn_end","stop_reason":"end_turn"}`,
+		`{"type":"turn_end","stop_reason":"end_turn","clientLease":{"sessionId":"bad","token":"1","terminal":true}}`,
+		`{"type":"turn_end","stop_reason":"end_turn","clientLease":{"sessionId":"sess_valid123","token":"18446744073709551616","terminal":true}}`,
+		`{"type":"turn_end","stop_reason":"end_turn","clientLease":{"sessionId":"sess_valid123","token":"1","terminal":"true"}}`,
+	}
+	for _, raw := range cases {
+		sid, stop, owner := composerContinuationLeaseStop(gjson.Parse(raw))
+		if sid != "" || stop != "" || owner != 0 {
+			t.Fatalf("malformed continuation lease must be ignored, got sid=%q stop=%q owner=%d for %s", sid, stop, owner, raw)
+		}
+	}
+
+	// A typed retry/ack may carry the exact owner but explicitly state that the
+	// logical SDK run is not terminal. It can refresh a tool pause, but it must
+	// not release the lease as an end_turn/error.
+	sid, stop, owner := composerContinuationLeaseStop(gjson.Parse(
+		`{"type":"turn_end","stop_reason":"error","clientLease":{"sessionId":"sess_valid123","token":"9","terminal":false}}`,
+	))
+	if sid != "sess_valid123" || stop != "" || owner != 9 {
+		t.Fatalf("nonterminal continuation receipt must retain, not release, the lease: sid=%q stop=%q owner=%d", sid, stop, owner)
 	}
 }
 

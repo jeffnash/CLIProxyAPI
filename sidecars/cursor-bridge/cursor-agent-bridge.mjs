@@ -34,8 +34,10 @@ import {
   closeSync,
   constants,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -47,9 +49,12 @@ import path from "node:path";
 import {
   ToolRound,
   ToolRoundError,
+  canonicalJSONString,
+  canonicalResult,
   RoundState,
   CallState,
   DeferredInputState,
+  ROUTING_TOKEN_VERSION,
   TerminalReason,
   createRoundInfrastructure,
   probeStateRoot,
@@ -158,16 +163,15 @@ const COMPOSER_DEBUG = process.env.CURSOR_COMPOSER_DEBUG === "1" || process.env.
 // The /mcp route is dialed by the in-process SDK runtime over loopback only.
 const MCP_SHIM_RAW = String(process.env.CURSOR_COMPOSER_MCP_SHIM ?? "").trim().toLowerCase();
 const MCP_SHIM_ENABLED = !(MCP_SHIM_RAW === "0" || MCP_SHIM_RAW === "false");
-// EX3 (clean image path): a tool-result IMAGE is encoded in the proto McpToolResult as McpImageContent, so the
-// model sees it on RESUME — no fresh-send side-channel, and multi-tool/partial batches need no special handling
-// (each tool's image rides its OWN dispatchMcp result). ON by default — VERIFIED end-to-end that Cursor forwards
-// McpImageContent to composer-2.5 (composer read a token image returned this way). Set
-// CURSOR_COMPOSER_MCP_IMAGE_RESULTS=0 to fall back to a separate recovery send (kept as the escape hatch, and
-// always used for url-form images, which McpImageContent's base64 `data` field cannot carry). Read at call time
-// (not a load-time const) so tests can exercise both paths.
+// The pinned SDK can serialize McpImageContent, but live Cursor model routes do not all consume that shape
+// reliably: Grok 4.5 has terminated an otherwise valid resumed run with `[unavailable] Error`. Keep inline MCP
+// images as an explicit compatibility opt-in only. The default path journals every sibling result and performs
+// one faithful fresh send carrying the images after the whole logical tool round is receipted. URL-form images
+// always use that recovery path because McpImageContent's base64 `data` field cannot carry them. Read at call
+// time (not a load-time const) so tests can exercise both paths.
 function mcpImageResultsEnabled() {
-  const v = process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
-  return v !== "0" && v !== "false";
+  const v = String(process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS || "").trim().toLowerCase();
+  return v === "1" || v === "true";
 }
 // These identifiers are intentionally harness-neutral. They are visible to the
 // Cursor SDK/model as the provider/server that hosts client-owned tools, so a
@@ -235,6 +239,20 @@ const COMPOSER_SCHEMA_INLINE_MAX_BYTES = envInt("CURSOR_AGENT_SCHEMA_INLINE_MAX_
 // Shared SSE response headers (unbuffered, so keepalives reach the wire end-to-end).
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "X-Accel-Buffering": "no" };
 function formatSseData(obj) { return `data: ${JSON.stringify(obj)}\n\n`; }
+function normalizeClientLeaseToken(value) {
+  const token = typeof value === "string" ? value.trim() : "";
+  return /^[1-9][0-9]{0,19}$/.test(token) ? token : "";
+}
+function withClientLease(event, source, terminal) {
+  const token = normalizeClientLeaseToken(source && source.clientLeaseToken);
+  const sessionId = typeof (source && source.sessionId) === "string"
+    ? source.sessionId : typeof (source && source.id) === "string" ? source.id : "";
+  if (!token || !sessionId) return event;
+  return {
+    ...event,
+    clientLease: { sessionId, token, terminal: terminal === true },
+  };
+}
 // Multi-tenant (opt-in): when CURSOR_AGENT_BRIDGE_TOKEN is set, X-Bridge-Auth gates access and the
 // Authorization bearer is the PER-USER Cursor key (each gets an isolated SDK platform + stateRoot).
 // When unset (default), behavior is single-tenant: the bearer must equal CURSOR_API_KEY and is the key.
@@ -421,6 +439,33 @@ function collectToolResultImages(input) {
     if (Array.isArray(tr.images)) for (const im of tr.images) if (im) out.push(im);
   }
   return out;
+}
+
+// A malformed optional result projection must not strand a tool that already
+// executed on the user's machine. Keep signed ID routing strict, but degrade a
+// representation-only 422 (bad image envelope, conflicting aliases, etc.) to
+// a model-visible error result with the original textual content. The durable
+// first receipt remains authoritative on retries.
+function accommodateContinuationResults(results) {
+  return results.map((raw) => {
+    try {
+      canonicalResult(raw);
+      return raw;
+    } catch (error) {
+      if (!(error instanceof ToolRoundError) || error.status !== 422) throw error;
+      let content = raw && raw.content;
+      if (typeof content !== "string") {
+        try { content = content === undefined ? "" : JSON.stringify(content); }
+        catch { content = ""; }
+      }
+      const marker = `[proxy accommodated malformed client-tool result: ${error.code || "invalid_tool_result"}; ${error.message}]`;
+      return {
+        toolCallId: raw && raw.toolCallId,
+        content: content ? `${content}\n\n${marker}` : marker,
+        isError: true,
+      };
+    }
+  });
 }
 
 // truncateLiveToolResult is the BRIDGE BACKSTOP for ADD-95: it caps a live tool-result STRING the bridge is
@@ -1215,7 +1260,7 @@ globalThis.__CC_EXEC_U = function (n, e, s, t) {
   }
   const spec = CC_CASES[cas];
   if (!spec || spec.stream || !spec.buildResult || !store) {
-    return Promise.reject(new Error(`[bridge] tool '${cas}' not supported by the Claude Code bridge`));
+    return Promise.reject(new Error(`[bridge] tool '${cas}' is not supported by the client-tools bridge`));
   }
   const blocked = blockedNativeExecIfNeeded(store, cas, s, false);
   if (blocked) return blocked;
@@ -1226,7 +1271,7 @@ globalThis.__CC_EXEC_S = function (n, e, s, t) {
   const spec = CC_CASES[cas];
   const store = als.getStore();
   if (!spec || !spec.stream || !spec.buildChunks || !store) {
-      return (async function* () { throw new Error(`[bridge] streaming tool '${cas}' not supported by the Claude Code bridge`); })();
+      return (async function* () { throw new Error(`[bridge] streaming tool '${cas}' is not supported by the client-tools bridge`); })();
   }
   const synthetic = blockedSyntheticNativeExecIfNeeded(store, cas, s, true);
   if (synthetic) return synthetic;
@@ -1286,52 +1331,410 @@ function keyHash(k) { return createHash("sha256").update(String(k || "")).digest
 // + durable state — a truncated-collision-but-different-full-key is rejected in getPlatform/platformHasSession.
 function keyFingerprint(k) { return createHash("sha256").update(String(k || "")).digest("hex"); }
 
+// A recovery or rotation can deliberately move one external conversation onto a replacement durable Cursor
+// agent. Persist that indirection under STATE_ROOT so a bridge restart does not silently fall back to the
+// original agent and lose the recovered context. The credential itself is never written; its full one-way
+// fingerprint scopes the alias. Unlike the history fingerprint (an optimization), this mapping is continuity
+// state and therefore fails closed on corrupt/unreadable records.
+const AGENT_ALIAS_DIR = path.join(STATE_ROOT, ".cct-agent-alias");
+const COMPLETED_TURN_DIR = path.join(STATE_ROOT, ".cct-completed-turns");
+const completedTurnReceipts = new Map();
+function agentAliasPathFor(cursorKey, sessionId) {
+  const scope = createHash("sha256")
+    .update(keyFingerprint(cursorKey))
+    .update("\0")
+    .update(String(sessionId || ""))
+    .digest("hex");
+  return path.join(AGENT_ALIAS_DIR, `${scope}.json`);
+}
+function validateDurableAgentAlias(record, cursorKey, sessionId) {
+  const expectedSessionId = String(sessionId || "");
+  const epochValid = (value) => value === undefined
+    || (Number.isSafeInteger(value) && value >= 0 && value <= 1024);
+  if (!record || typeof record !== "object" || Array.isArray(record)
+      || record.version !== 1
+      || record.keyFingerprint !== keyFingerprint(cursorKey)
+      || record.sessionId !== expectedSessionId
+      || typeof record.agentId !== "string"
+      || record.agentId.length === 0
+      || record.agentId.length > 512
+      || !record.agentId.startsWith(`${expectedSessionId}_`)
+      || !epochValid(record.recoveryEpoch)
+      || !epochValid(record.modelEpoch)
+      || !epochValid(record.keyEpoch)) {
+    throw new Error("durable Cursor agent alias is malformed or belongs to another session/credential");
+  }
+  return record;
+}
+function readDurableAgentAlias(cursorKey, sessionId) {
+  const file = agentAliasPathFor(cursorKey, sessionId);
+  let raw;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw new Error(`cannot read durable Cursor agent alias: ${(error && error.message) || String(error)}`);
+  }
+  try {
+    return validateDurableAgentAlias(JSON.parse(raw), cursorKey, sessionId);
+  } catch (error) {
+    throw new Error(`cannot validate durable Cursor agent alias: ${(error && error.message) || String(error)}`);
+  }
+}
+function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
+  const record = {
+    version: 1,
+    keyFingerprint: keyFingerprint(cursorKey),
+    sessionId: String(sessionId || ""),
+    agentId: String(agentId || ""),
+    recoveryEpoch: Number.isSafeInteger(epochs.recoveryEpoch) ? epochs.recoveryEpoch : 0,
+    modelEpoch: Number.isSafeInteger(epochs.modelEpoch) ? epochs.modelEpoch : 0,
+    keyEpoch: Number.isSafeInteger(epochs.keyEpoch) ? epochs.keyEpoch : 0,
+  };
+  validateDurableAgentAlias(record, cursorKey, sessionId);
+  mkdirSync(AGENT_ALIAS_DIR, { recursive: true, mode: 0o700 });
+  const file = agentAliasPathFor(cursorKey, sessionId);
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  const bytes = Buffer.from(JSON.stringify(record) + "\n", "utf8");
+  let fd = null;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    let offset = 0;
+    while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(temp, file);
+    const dirFD = openSync(AGENT_ALIAS_DIR, "r");
+    try { fsyncSync(dirFD); } finally { closeSync(dirFD); }
+    const persisted = readDurableAgentAlias(cursorKey, sessionId);
+    if (persisted.agentId !== record.agentId
+        || persisted.recoveryEpoch !== record.recoveryEpoch
+        || persisted.modelEpoch !== record.modelEpoch
+        || persisted.keyEpoch !== record.keyEpoch) {
+      throw new Error("durable Cursor agent alias verification failed");
+    }
+  } catch (error) {
+    if (fd !== null) {
+      try { closeSync(fd); } catch {}
+    }
+    try { rmSync(temp, { force: true }); } catch {}
+    throw new Error(`cannot persist durable Cursor agent alias: ${(error && error.message) || String(error)}`);
+  }
+}
+
+function completedTurnRequestHash(input) {
+  const value = input && typeof input === "object" ? input : {};
+  const toolCallIds = [...new Set((Array.isArray(value.results) ? value.results : [])
+    .map((result) => typeof result?.toolCallId === "string" ? result.toolCallId : "")
+    .filter(Boolean))].sort();
+  const text = value.type === "tool_results"
+    ? (typeof value.userText === "string" ? value.userText : "")
+    : (typeof value.text === "string" ? value.text : "");
+  const semantic = {
+    ...(value.type === "user" ? {
+      history: typeof value.history === "string" ? value.history : "",
+      system: typeof value.system === "string" ? value.system : "",
+    } : {}),
+    images: Array.isArray(value.images) ? value.images : [],
+    text,
+    toolCallIds,
+    version: 1,
+  };
+  return createHash("sha256").update(canonicalJSONString(semantic)).digest("hex");
+}
+
+function completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash = "") {
+  const scope = createHash("sha256")
+    .update(keyFingerprint(cursorKey))
+    .update("\0")
+    .update(String(sessionId || ""))
+    .update("\0")
+    .update(String(clientMessageId || ""))
+    .update(requestHash ? "\0" : "")
+    .update(requestHash)
+    .digest("hex");
+  return path.join(COMPLETED_TURN_DIR, `${scope}.json`);
+}
+
+function validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId, requestHash = "") {
+  return !!record && typeof record === "object" && !Array.isArray(record)
+    && (record.version === 1 || record.version === 2 || record.version === 3)
+    && record.keyFingerprint === keyFingerprint(cursorKey)
+    && record.sessionId === String(sessionId || "")
+    && record.clientMessageId === String(clientMessageId || "")
+    && (record.version === 1
+      // An unscoped v1 receipt cannot prove equivalence to a current request.
+      // Never replay it merely because the client id happens to match.
+      ? !requestHash || (typeof record.requestHash === "string" && record.requestHash === requestHash)
+      : /^[a-f0-9]{64}$/.test(record.requestHash) && (!requestHash || record.requestHash === requestHash))
+    && (record.version !== 3 || (Number.isSafeInteger(record.generation) && record.generation >= 1))
+    && record.status === "completed"
+    && typeof record.text === "string"
+    && Buffer.byteLength(record.text, "utf8") <= MAX_AGENT_TURN_BYTES
+    && record.usage && typeof record.usage === "object" && !Array.isArray(record.usage);
+}
+
+function readCompletedTurnReceipt(cursorKey, sessionId, clientMessageId, requestHash = "") {
+  if (!clientMessageId) return null;
+  const scopedFile = requestHash
+    ? completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash)
+    : "";
+  const files = requestHash
+    ? [
+      scopedFile,
+      completedTurnReceiptPath(cursorKey, sessionId, clientMessageId),
+    ]
+    : [completedTurnReceiptPath(cursorKey, sessionId, clientMessageId)];
+  for (const file of files) {
+    const cached = completedTurnReceipts.get(file);
+    if (cached && validCompletedTurnReceipt(cached, cursorKey, sessionId, clientMessageId, requestHash)) return cached;
+    try {
+      const record = JSON.parse(readFileSync(file, "utf8"));
+      if (!validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
+        // A valid in-progress fresh-send receipt deliberately shares this
+        // exact path and will be replaced by the final receipt. Any other
+        // malformed exact-path record is ambiguous continuity evidence: do
+        // not silently resend work as though the file did not exist.
+        const validFresh = validFreshDeliveryReceipt(
+          record, cursorKey, sessionId, clientMessageId, requestHash,
+        );
+        if (file === scopedFile && !validFresh) {
+          throw new Error("the exact durable turn receipt is malformed");
+        }
+        if (validFresh) continue;
+        dbg("ignoring mismatched completed-turn receipt", "session=" + sessionId, "clientMessageId=" + clientMessageId);
+        continue;
+      }
+      completedTurnReceipts.set(file, record);
+      return record;
+    } catch (error) {
+      if (error && error.code === "ENOENT") continue;
+      if (file === scopedFile) {
+        throw new Error(`cannot validate exact durable turn receipt: ${(error && error.message) || String(error)}`);
+      }
+      dbg("legacy completed-turn receipt unavailable; ignoring unscoped compatibility record",
+        "session=" + sessionId, "clientMessageId=" + clientMessageId,
+        (error && error.message) || String(error));
+    }
+  }
+  return null;
+}
+
+function writeCompletedTurnReceipt(
+  cursorKey,
+  sessionId,
+  clientMessageId,
+  requestHash,
+  text,
+  usage,
+  { generation = 1, replace = false, requestKind = "continuation", clientLeaseToken = "" } = {},
+) {
+  if (!clientMessageId) return null;
+  const record = {
+    version: 3,
+    keyFingerprint: keyFingerprint(cursorKey),
+    sessionId: String(sessionId || ""),
+    clientMessageId: String(clientMessageId),
+    requestHash: String(requestHash || ""),
+    generation: Number.isSafeInteger(generation) && generation >= 1 ? generation : 1,
+    requestKind: requestKind === "fresh" ? "fresh" : "continuation",
+    clientLeaseToken: normalizeClientLeaseToken(clientLeaseToken),
+    status: "completed",
+    text: String(text || ""),
+    usage: usage && typeof usage === "object" && !Array.isArray(usage)
+      ? JSON.parse(JSON.stringify(usage))
+      : {},
+    completedAt: nowMs(),
+  };
+  if (!validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
+    throw new Error("completed-turn receipt exceeds the durable replay contract");
+  }
+  mkdirSync(COMPLETED_TURN_DIR, { recursive: true, mode: 0o700 });
+  const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
+  const existing = readCompletedTurnReceipt(cursorKey, sessionId, clientMessageId, requestHash);
+  if (existing && (!replace || (existing.generation || 1) >= record.generation)) return existing;
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  const bytes = Buffer.from(JSON.stringify(record) + "\n", "utf8");
+  let fd = null;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    let offset = 0;
+    while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    if (replace) renameSync(temp, file);
+    else {
+      linkSync(temp, file);
+      rmSync(temp, { force: true });
+    }
+    const dirFD = openSync(COMPLETED_TURN_DIR, "r");
+    try { fsyncSync(dirFD); } finally { closeSync(dirFD); }
+    completedTurnReceipts.set(file, record);
+    return record;
+  } catch (error) {
+    if (fd !== null) {
+      try { closeSync(fd); } catch {}
+    }
+    try { rmSync(temp, { force: true }); } catch {}
+    // A concurrent writer may have won the atomic publication race. Its first
+    // receipt is authoritative and is safe to replay.
+    completedTurnReceipts.delete(file);
+    const winner = readCompletedTurnReceipt(cursorKey, sessionId, clientMessageId, requestHash);
+    if (winner) return winner;
+    throw new Error(`cannot persist completed-turn receipt: ${(error && error.message) || String(error)}`);
+  }
+}
+
+function validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash = "") {
+  return !!record && typeof record === "object" && !Array.isArray(record)
+    && record.version === 3
+    && record.status === "delivering"
+    && record.requestKind === "fresh"
+    && record.keyFingerprint === keyFingerprint(cursorKey)
+    && record.sessionId === String(sessionId || "")
+    && record.clientMessageId === String(clientMessageId || "")
+    && /^[a-f0-9]{64}$/.test(record.requestHash)
+    && (!requestHash || record.requestHash === requestHash)
+    && Number.isSafeInteger(record.generation) && record.generation >= 1
+    && typeof record.agentId === "string" && record.agentId
+    && typeof record.deliveryIdempotencyKey === "string" && record.deliveryIdempotencyKey
+    && Object.prototype.hasOwnProperty.call(record, "deliveryMessage")
+    && Array.isArray(record.deliveryAdvertise);
+}
+
+function readFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash = "") {
+  if (!clientMessageId || !requestHash) return null;
+  const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
+  const cached = completedTurnReceipts.get(file);
+  if (cached && validFreshDeliveryReceipt(cached, cursorKey, sessionId, clientMessageId, requestHash)) {
+    return cached;
+  }
+  try {
+    const record = JSON.parse(readFileSync(file, "utf8"));
+    if (!validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
+      // A completed receipt at the same path is handled by the completed
+      // reader. Any other existing record means we cannot prove whether the
+      // SDK accepted the send, so fail closed instead of duplicating it.
+      if (validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) return null;
+      throw new Error("the exact durable fresh-delivery receipt is malformed");
+    }
+    completedTurnReceipts.set(file, record);
+    return record;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw new Error(`cannot validate exact durable fresh-delivery receipt: ${(error && error.message) || String(error)}`);
+  }
+}
+
+function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, {
+  generation,
+  agentId,
+  idempotencyKey,
+  message,
+  advertise,
+  model,
+  toolChoice,
+  seededSystem,
+  hasImages,
+}) {
+  const record = {
+    version: 3,
+    keyFingerprint: keyFingerprint(cursorKey),
+    sessionId: String(sessionId || ""),
+    clientMessageId: String(clientMessageId || ""),
+    requestHash: String(requestHash || ""),
+    generation: Number.isSafeInteger(generation) && generation >= 1 ? generation : 1,
+    requestKind: "fresh",
+    status: "delivering",
+    agentId: String(agentId || ""),
+    deliveryIdempotencyKey: String(idempotencyKey || ""),
+    deliveryMessage: JSON.parse(canonicalJSONString(message)),
+    deliveryAdvertise: JSON.parse(canonicalJSONString(Array.isArray(advertise) ? advertise : [])),
+    deliveryModel: String(model || ""),
+    deliveryToolChoice: String(toolChoice || ""),
+    deliverySeededSystem: String(seededSystem || ""),
+    deliveryHasImages: hasImages === true,
+    startedAt: nowMs(),
+  };
+  if (!validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
+    throw new Error("fresh delivery receipt violates the durable send contract");
+  }
+  const bytes = Buffer.from(JSON.stringify(record) + "\n", "utf8");
+  if (bytes.length > MAX_AGENT_TURN_BYTES * 2) {
+    throw new Error("fresh delivery receipt exceeds twice the bounded request size");
+  }
+  mkdirSync(COMPLETED_TURN_DIR, { recursive: true, mode: 0o700 });
+  const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  let fd = null;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    let offset = 0;
+    while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(temp, file);
+    const dirFD = openSync(COMPLETED_TURN_DIR, "r");
+    try { fsyncSync(dirFD); } finally { closeSync(dirFD); }
+    completedTurnReceipts.set(file, record);
+    return record;
+  } catch (error) {
+    if (fd !== null) { try { closeSync(fd); } catch {} }
+    try { rmSync(temp, { force: true }); } catch {}
+    throw new Error(`cannot persist fresh delivery receipt: ${(error && error.message) || String(error)}`);
+  }
+}
+
+function cleanupCompletedTurnReceipts({ ttlMs = TERMINAL_ROUND_TTL_MS, maxTerminal = TERMINAL_ROUND_MAX } = {}) {
+  let entries;
+  try {
+    entries = readdirSync(COMPLETED_TURN_DIR)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => {
+        const file = path.join(COMPLETED_TURN_DIR, name);
+        return { file, mtimeMs: statSync(file).mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    dbg("completed-turn receipt cleanup skipped", (error && error.message) || String(error));
+    return;
+  }
+  const cutoff = ttlMs > 0 ? nowMs() - ttlMs : Number.NEGATIVE_INFINITY;
+  for (let i = 0; i < entries.length; i++) {
+    if ((ttlMs > 0 && entries[i].mtimeMs < cutoff) || (maxTerminal >= 0 && i >= maxTerminal)) {
+      try { rmSync(entries[i].file, { force: true }); } catch {}
+      completedTurnReceipts.delete(entries[i].file);
+    }
+  }
+}
+
 function sdkUserTextHash(message) {
   const text = typeof message === "string" ? message : String(message && message.text || "");
   return createHash("sha256").update(text).digest("hex");
 }
 
-// Cursor's public Agent.messages.list() returns protobuf-derived conversation
-// turns whose exact wrapper has changed across SDK builds. Walk only the small,
-// JSON-like checkpoint object and recognize the documented user-message keys;
-// do not couple crash recovery to one generated wrapper spelling.
-function checkpointUserTexts(value, out = [], depth = 0, seen = new Set()) {
-  if (depth > 12 || value == null || typeof value !== "object" || seen.has(value)) return out;
-  seen.add(value);
-  if ((value.type === "user_message" || value.role === "user") && typeof value.text === "string") out.push(value.text);
-  for (const key of ["userMessage", "user_message"]) {
-    const user = value[key];
-    if (user && typeof user === "object" && typeof user.text === "string") out.push(user.text);
+function sdkSendIdempotencyKey(session, clientMessageId, requestHash, deferred = null, generation = 1) {
+  if (!clientMessageId) return "";
+  if (typeof deferred?.deliveryIdempotencyKey === "string" && deferred.deliveryIdempotencyKey) {
+    return deferred.deliveryIdempotencyKey;
   }
-  for (const nested of Array.isArray(value) ? value : Object.values(value)) {
-    checkpointUserTexts(nested, out, depth + 1, seen);
-  }
-  return out;
-}
-
-async function reconcileDeferredDelivery(round, deferred, cursorKey) {
-  if (!deferred || deferred.state !== DeferredInputState.DELIVERING) return false;
-  const agentId = typeof deferred.deliveryAgentId === "string" ? deferred.deliveryAgentId : "";
-  const textHash = typeof deferred.deliveryTextHash === "string" ? deferred.deliveryTextHash : "";
-  // The SDK checkpoint message API currently omits image bytes. Do not claim a
-  // match from text alone when two image-bearing sends could share the text.
-  if (!agentId || !/^[a-f0-9]{64}$/.test(textHash) || deferred.deliveryHasImages) return false;
-  try {
-    const platform = await getPlatform(cursorKey);
-    if (!platform || typeof platform.getAgentMessages !== "function") return false;
-    const messages = await platform.getAgentMessages(agentId);
-    const found = Array.isArray(messages) && messages.some((message) =>
-      checkpointUserTexts(message && message.message).some((text) => sdkUserTextHash(text) === textHash));
-    if (!found) return false;
-    round.markDeferredInputState(deferred.clientMessageId, DeferredInputState.DELIVERED, {
-      evidence: "durable_checkpoint",
-    });
-    return true;
-  } catch (error) {
-    dbg("deferred delivery checkpoint reconciliation failed", "route=" + round.route,
-      (error && error.message) || String(error));
-    return false;
-  }
+  // Records written before scoped send keys were introduced already used the
+  // raw client message id. Preserve that exact key across an upgrade so an
+  // uncertain in-flight send cannot be duplicated during migration.
+  if ((deferred?.deliveryAttempts || 0) > 0) return clientMessageId;
+  const agentScope = createHash("sha256")
+    .update(keyFingerprint(session.cursorKey))
+    .update("\0")
+    .update(String(session.agentId || session.id || ""))
+    .digest("base64url")
+    .slice(0, 24);
+  const inputScope = /^[a-f0-9]{64}$/.test(requestHash) ? requestHash.slice(0, 24) : "unknown_input";
+  const turnGeneration = Number.isSafeInteger(generation) && generation >= 1 ? generation : 1;
+  return `ccsend2_${agentScope}_${inputScope}_g${turnGeneration}_${clientMessageId}`;
 }
 
 function canonicalAttemptSignature(value) {
@@ -1584,6 +1987,20 @@ function soleStreamingSession(sessionsMap) {
   return victim;
 }
 
+// SDK AbortError attribution may happen while a run is paused between HTTP
+// turns (activeRes is intentionally null while the client executes tools).
+// Keep that separate from soleStreamingSession: transport-close and
+// rate-limit heuristics must remain conservative, but an abort handler should
+// clean up the one live/paused SDK run when it is unambiguous.
+function soleSdkRunSession(sessionsMap) {
+  if (!sessionsMap || typeof sessionsMap.values !== "function") return null;
+  let victim = null;
+  for (const s of sessionsMap.values()) {
+    if (s && s.run && !s.done) { if (victim) return null; victim = s; }
+  }
+  return victim;
+}
+
 // rateLimitedKeyToRecycle picks the key hash whose connection to recycle on an ENHANCE_YOUR_CALM rejection that
 // carries no key. Single-tenant (the common case) — exactly one platform — is unambiguous. Otherwise attribute
 // via the lone in-flight session; if still ambiguous (2+ tenants mid-run), return null (log-only) rather than
@@ -1601,16 +2018,18 @@ class AdvertisedToolRegistry extends ToolContractRegistry {
 class Session {
   constructor(id, cursorKey) {
     this.id = id;
+    this.cursorKey = cursorKey || API_KEY; // the Cursor key whose platform this session runs on
+    const durableAlias = readDurableAgentAlias(this.cursorKey, id);
     // C05: the DURABLE Cursor agent id is DECOUPLED from the external sessionID. `id` is the stable routing
     // key the Go executor derives (continuations keep routing here); `agentId` is what we hand to
     // resumeAgent/createAgent. They start equal, but on ERROR_CONVERSATION_TOO_LONG we ROTATE `agentId`
     // (e.g. <id>_r2) and tombstone the poisoned durable agent, so the next turn seeds a FRESH agent under a
     // new id and never resumeAgent()s the over-budget one — while the external sessionID is unchanged.
-    this.agentId = `${id}_${DURABLE_AGENT_CONTEXT_EPOCH}`;
-    this.recoveryEpoch = 0;       // C05: increments each too-long rotation; suffixes the rotated agentId
-    this.modelEpoch = 0;          // ADD-62: increments each MODEL-CHANGE rotation; a SEPARATE budget from
+    this.agentId = durableAlias?.agentId || `${id}_${DURABLE_AGENT_CONTEXT_EPOCH}`;
+    this.recoveryEpoch = durableAlias?.recoveryEpoch || 0; // C05: increments each too-long rotation
+    this.modelEpoch = durableAlias?.modelEpoch || 0; // ADD-62: increments each MODEL-CHANGE rotation; a SEPARATE budget from
                                   // recoveryEpoch so toggling models never burns the crash-recovery rotations
-    this.keyEpoch = 0;            // ADD-79: increments each CURSOR-KEY-CHANGE rotation; a SEPARATE budget so a
+    this.keyEpoch = durableAlias?.keyEpoch || 0; // ADD-79: increments each CURSOR-KEY-CHANGE rotation; a SEPARATE budget so a
                                   // key rotation never burns the crash-recovery / model-change rotations. A turn
                                   // whose upstream Cursor key fingerprint differs from this session's tombstones
                                   // the durable agent (bound to the old account) + seeds a fresh agent under the
@@ -1618,12 +2037,19 @@ class Session {
     this.model = null;            // ADD-62: the model the durable agent was created/resumed under. A turn that
                                   // requests a DIFFERENT model rotates the durable agent (the old agent is bound
                                   // to the old model) + forces a re-seed, instead of silently answering from it.
-    this.cursorKey = cursorKey || API_KEY; // the Cursor key whose platform this session runs on
     this.agent = null; this.agentPromise = null; this.run = null;
     this.activeRes = null; this.responseWriter = null;
     this.sendPending = false;
     this.activeClientMessageId = "";
+    this.activeClientMessageHash = "";
+    this.activeClientMessageGeneration = 1;
+    this.activeClientMessageKind = "";
     this.activeDeferredInputId = "";
+    // Opaque Go fresh-turn lease owner. It is never interpreted by the
+    // bridge: ToolRound journals preserve it and terminal SSE frames echo it
+    // so a signed /continue can close exactly the lease that opened the SDK
+    // callback, even after a sidecar-only restart.
+    this.clientLeaseToken = "";
     this.currentRound = null; this.roundSeq = 0;
     // When a continuation lands after the paused callback process is gone, the
     // replacement run keeps this terminal source round attached until it
@@ -1767,6 +2193,7 @@ class Session {
       roundSeq: ++this.roundSeq,
       tenantFingerprint: keyFingerprint(this.cursorKey),
       model: this.model || "",
+      clientLeaseToken: this.clientLeaseToken,
       journal,
       codec,
       clock: nowMs,
@@ -1817,7 +2244,16 @@ class Session {
     return writer;
   }
   sse(obj) { return this.sseReceipt(obj).ok; }
-  sseReceipt(obj) { return this.writePayload(formatSseData(obj)); }
+  sseReceipt(obj) {
+    let value = obj;
+    if (obj && obj.type === "turn_end") {
+      const { _clientLeaseTerminal, ...wire } = obj;
+      const terminal = typeof _clientLeaseTerminal === "boolean"
+        ? _clientLeaseTerminal : obj.stop_reason !== "tool_use";
+      value = withClientLease(wire, this, terminal);
+    }
+    return this.writePayload(formatSseData(value));
+  }
   writePayload(payload) {
     if (!this.responseWriter && this.activeRes) this.beginResponse(this.activeRes);
     if (!this.responseWriter || this.writeFailed) {
@@ -2368,8 +2804,17 @@ class Session {
 
   onRunComplete(res) {
     if (this.done) return;
+    const completedClientMessageId = this.activeClientMessageId;
+    const completedClientMessageHash = this.activeClientMessageHash;
+    const completedClientMessageGeneration = this.activeClientMessageGeneration;
+    const completedClientMessageKind = this.activeClientMessageKind;
+    const completedDeferredInputId = this.activeDeferredInputId;
+    const completedDeferredRound = completedDeferredInputId
+      ? (this.recoverySourceRound
+        || (this.currentRound && this.currentRound.deferredInput(completedDeferredInputId)
+          ? this.currentRound : null))
+      : null;
     this.done = true; this.run = null; this.sendPending = false;
-    this.activeClientMessageId = ""; this.activeDeferredInputId = "";
     const runError = res && res.error != null ? res.error : null;
     // BR2: a non-"finished" terminal means the upstream run failed; remember it so a tool_results turn that
     // finds nothing to resume surfaces the real error instead of a false-success empty turn.
@@ -2437,7 +2882,51 @@ class Session {
     this.rejectAllPending("run completed while client tools remained unresolved", TerminalReason.RUN_ERROR);
     const terminal = { type: "turn_end", stop_reason: stopReason, status: res && res.status, usage: (res && res.usage) || {} };
     if (turnError != null && turnError !== "") terminal.error = turnError;
+    let completedReceiptPersisted = false;
+    if (stopReason === "end_turn" && completedClientMessageId) {
+      try {
+        writeCompletedTurnReceipt(
+          this.cursorKey,
+          this.id,
+          completedClientMessageId,
+          completedClientMessageHash,
+          this.streamedText || fullResult,
+          terminal.usage,
+          {
+            generation: completedClientMessageGeneration,
+            replace: completedClientMessageKind === "fresh",
+            requestKind: completedClientMessageKind,
+            clientLeaseToken: this.clientLeaseToken,
+          },
+        );
+        completedReceiptPersisted = true;
+      } catch (error) {
+        // Availability-first fallback for the private/single-replica setup:
+        // keep the real successful answer and log the loss of restart-level
+        // deduplication instead of converting it into a client-visible error.
+        dbg("completed-turn receipt persistence failed; in-process SDK idempotency remains active",
+          "session=" + this.id, "clientMessageId=" + completedClientMessageId,
+          (error && error.message) || String(error));
+      }
+    }
+    if (completedReceiptPersisted && completedDeferredRound && completedDeferredInputId) {
+      try {
+        completedDeferredRound.markDeferredInputState(
+          completedDeferredInputId,
+          DeferredInputState.DELIVERED,
+          { finalized: true, evidence: "completed_turn_receipt" },
+        );
+      } catch (error) {
+        // The final response receipt is authoritative. Failure to compact the
+        // larger delivery envelope is a storage-retention issue, not a reason
+        // to hide a completed model answer.
+        dbg("deferred delivery finalization cleanup failed", "session=" + this.id,
+          (error && error.message) || String(error));
+      }
+    }
     this.sse(terminal);
+    this.activeClientMessageId = ""; this.activeClientMessageHash = "";
+    this.activeClientMessageGeneration = 1; this.activeClientMessageKind = ""; this.activeDeferredInputId = "";
     this.clearTurnState();
     this.settle();
     this.notifyLogicalDone(); // real completion -> admit the next queued new-user turn
@@ -2445,7 +2934,8 @@ class Session {
   onRunError(err) {
     if (this.done) return;
     this.done = true; this.run = null; this.sendPending = false;
-    this.activeClientMessageId = ""; this.activeDeferredInputId = "";
+    this.activeClientMessageId = ""; this.activeClientMessageHash = "";
+    this.activeClientMessageGeneration = 1; this.activeClientMessageKind = ""; this.activeDeferredInputId = "";
     const msg = (err && err.message) || String(err);
     this.lastRunError = msg; // BR2: a tool_results turn that finds the run gone surfaces this real error
     if (this.recoverySourceRound) {
@@ -2471,17 +2961,52 @@ class Session {
     // a FRESH agent from the client's bounded history and NEVER calls resumeAgent(oldAgentId). The error turn
     // was already surfaced above (no false success). Bounded rotations avoid unbounded agentId churn if even
     // the bounded history is too large; past the cap we stop rotating and the user keeps seeing the real error.
-    if (isConversationTooLong(msg)) void this.rotateDurableAgent();
+    if (isConversationTooLong(msg)) {
+      void this.rotateDurableAgent().catch((error) => {
+        dbg("rotateDurableAgent failed", "session=" + this.id, (error && error.message) || String(error));
+        sessions.delete(this.id);
+        void this.cancel({
+          terminalReason: TerminalReason.RUN_ERROR,
+          detail: "durable agent rotation failed",
+        }).catch((cancelError) => {
+          dbg("failed rotation cleanup also failed", "session=" + this.id,
+            (cancelError && cancelError.message) || String(cancelError));
+        });
+      });
+    }
+  }
+  // A floating SDK AbortError is not the normal run.wait() rejection and does
+  // not carry the Session. Once the process-level handler has safely
+  // attributed it, discard the SDK agent as well as the run: reusing an agent
+  // whose transport just aborted can turn one interrupted turn into a
+  // permanent active-run wedge.
+  abortFromSdk(err) {
+    if (this.done) return;
+    const agentToClose = this.agent;
+    this.onRunError(err);
+    this.agent = null;
+    this.agentPromise = null;
+    this.mcpServerKeys = null;
+    if (agentToClose && typeof agentToClose.close === "function") {
+      Promise.resolve()
+        .then(() => agentToClose.close())
+        .catch((closeError) => dbg("SDK abort agent cleanup failed", "session=" + this.id,
+          (closeError && closeError.message) || String(closeError)));
+    }
   }
   // composeAgentId derives the durable agentId from the external id plus BOTH rotation epochs (C05 too-long
   // rotation + ADD-62 model-change rotation). Epoch 0/0 keeps the id == external id (the original behavior, so
   // existing durable state is unchanged); any rotation appends a stable, unique suffix (`_rN` and/or `_mN`).
   // Combining both epochs guarantees a fresh unique id even when a model change follows a too-long rotation.
-  composeAgentId() {
+  composeAgentId({
+    recoveryEpoch = this.recoveryEpoch,
+    modelEpoch = this.modelEpoch,
+    keyEpoch = this.keyEpoch,
+  } = {}) {
     let aid = `${this.id}_${DURABLE_AGENT_CONTEXT_EPOCH}`;
-    if (this.recoveryEpoch > 0) aid += `_r${this.recoveryEpoch + 1}`; // first too-long rotation -> _r2
-    if (this.modelEpoch > 0) aid += `_m${this.modelEpoch}`;           // first model change   -> _m1
-    if (this.keyEpoch > 0) aid += `_k${this.keyEpoch}`;               // ADD-79: first key change -> _k1
+    if (recoveryEpoch > 0) aid += `_r${recoveryEpoch + 1}`; // first too-long rotation -> _r2
+    if (modelEpoch > 0) aid += `_m${modelEpoch}`;           // first model change   -> _m1
+    if (keyEpoch > 0) aid += `_k${keyEpoch}`;               // ADD-79: first key change -> _k1
     return aid;
   }
   // rotateDurableAgent tombstones the poisoned durable agent and allocates a fresh agentId (C05). The session
@@ -2498,12 +3023,18 @@ class Session {
       await this.cancel();
       return;
     }
-    // Set the rotation state SYNCHRONOUSLY (before any await) so the rotated agentId / reset seeded are
-    // observable the moment onRunError returns — the next turn must not race a half-applied rotation. The
-    // async teardown (cancel) follows; only `done` flips after it (a fresh send re-opens the session).
     const oldAgentId = this.agentId;
-    this.recoveryEpoch++;
-    this.agentId = this.composeAgentId(); // first rotation -> <id>_r2 (+ _mN if a model change also happened)
+    const nextRecoveryEpoch = this.recoveryEpoch + 1;
+    const targetAgentId = this.composeAgentId({ recoveryEpoch: nextRecoveryEpoch });
+    // The durable alias is the rotation commit point. If fsync/rename fails,
+    // no in-memory identity changes and the next request can retry safely.
+    writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
+      recoveryEpoch: nextRecoveryEpoch,
+      modelEpoch: this.modelEpoch,
+      keyEpoch: this.keyEpoch,
+    });
+    this.recoveryEpoch = nextRecoveryEpoch;
+    this.agentId = targetAgentId;
     this.resetSeedState();
     dbg("rotateDurableAgent CONVERSATION_TOO_LONG -> rotate durable agentId (no resumeAgent(old))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId);
     // Tear down the poisoned live agent/run WITHOUT deleting the session. cancel() nulls agent/run + rejects
@@ -2522,12 +3053,19 @@ class Session {
     const COMPOSER_MAX_MODEL_ROTATIONS = 8;
     const oldAgentId = this.agentId;
     const oldModel = this.model;
-    if (this.modelEpoch < COMPOSER_MAX_MODEL_ROTATIONS) {
-      this.modelEpoch++;
-      this.agentId = this.composeAgentId(); // first model change -> <id>_m1 (+ _rN if a too-long rotation also happened)
-    } else {
+    const nextModelEpoch = this.modelEpoch < COMPOSER_MAX_MODEL_ROTATIONS
+      ? this.modelEpoch + 1 : this.modelEpoch;
+    const targetAgentId = this.composeAgentId({ modelEpoch: nextModelEpoch });
+    if (nextModelEpoch === this.modelEpoch) {
       dbg("rotateForModelChange cap reached -> keep last agentId, force re-seed", "session=" + this.id, "agentId=" + this.agentId, "epoch=" + this.modelEpoch);
     }
+    writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
+      recoveryEpoch: this.recoveryEpoch,
+      modelEpoch: nextModelEpoch,
+      keyEpoch: this.keyEpoch,
+    });
+    this.modelEpoch = nextModelEpoch;
+    this.agentId = targetAgentId;
     this.model = newModel;
     this.resetSeedState();
     dbg("rotateForModelChange -> rotate durable agentId for new model (no resumeAgent(old model's agent))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId, "oldModel=" + oldModel, "newModel=" + newModel);
@@ -2547,16 +3085,46 @@ class Session {
   async rotateForKeyChange(newKey) {
     const COMPOSER_MAX_KEY_ROTATIONS = 8;
     const oldAgentId = this.agentId;
-    if (this.keyEpoch < COMPOSER_MAX_KEY_ROTATIONS) {
-      this.keyEpoch++;
-      this.agentId = this.composeAgentId(); // first key change -> <id>_k1 (+ _rN/_mN if those also happened)
-    } else {
+    const nextKeyEpoch = this.keyEpoch < COMPOSER_MAX_KEY_ROTATIONS
+      ? this.keyEpoch + 1 : this.keyEpoch;
+    const targetAgentId = this.composeAgentId({ keyEpoch: nextKeyEpoch });
+    const targetKey = newKey || API_KEY;
+    if (nextKeyEpoch === this.keyEpoch) {
       dbg("rotateForKeyChange cap reached -> keep last agentId, force re-seed", "session=" + this.id, "agentId=" + this.agentId, "epoch=" + this.keyEpoch);
     }
-    this.cursorKey = newKey || API_KEY; // run subsequent turns on the NEW key's platform/account
+    writeDurableAgentAlias(targetKey, this.id, targetAgentId, {
+      recoveryEpoch: this.recoveryEpoch,
+      modelEpoch: this.modelEpoch,
+      keyEpoch: nextKeyEpoch,
+    });
+    this.keyEpoch = nextKeyEpoch;
+    this.agentId = targetAgentId;
+    this.cursorKey = targetKey; // run subsequent turns on the NEW key's platform/account
     this.resetSeedState();
     dbg("rotateForKeyChange -> rotate durable agentId for new key (no resumeAgent(old key's agent))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId);
     await this.finishRotationCancel();
+  }
+  // An all-legacy `call_*` continuation has no signed ToolRound to resume after the bridge upgrade. Move it
+  // to one deterministic replacement agent, persist the alias before the first SDK send, and seed that agent
+  // from the faithful client replay. Retrying the same request selects the same agent and SDK idempotency key.
+  async rotateForLegacyRecovery(recoveryKey) {
+    if (!/^clr1_[0-9a-f]{24}$/.test(String(recoveryKey || ""))) {
+      throw new Error("legacy recovery key is malformed");
+    }
+    const target = `${this.id}_legacy_${recoveryKey.slice("clr1_".length)}`;
+    if (this.agentId === target) {
+      writeDurableAgentAlias(this.cursorKey, this.id, target, this);
+      return;
+    }
+    const oldAgentId = this.agentId;
+    writeDurableAgentAlias(this.cursorKey, this.id, target, this);
+    this.agentId = target;
+    this.model = null;
+    this.resetSeedState();
+    dbg("rotateForLegacyRecovery -> deterministic faithful replay agent", "session=" + this.id, "old=" + oldAgentId, "new=" + target);
+    await this.finishRotationCancel();
+    this.currentRound = null;
+    this.recoverySourceRound = null;
   }
   rejectAllPending(why, reason = TerminalReason.RUN_ERROR) {
     if (this.currentRound && this.currentRound.state !== RoundState.TERMINAL) {
@@ -2575,15 +3143,36 @@ class Session {
   // notify:false so a queued new-user turn is NOT promoted before driveUserSend installs the replacement
   // session.run — otherwise the queued turn and the replacement send would race on the same durable agent.
   async cancel({ notify = true, terminalReason = TerminalReason.CLIENT_CANCELLED, detail = "session cancelled" } = {}) {
+    const wasDone = this.done;
+    const runToCancel = this.run;
+    // The SDK's AbortError has no Session/request identity. Record the local
+    // cancellation cause before invoking the SDK so a later floating abort
+    // can be correlated with a disconnect, supersession, transport failure,
+    // eviction, or shutdown in production logs.
+    dbg("session.cancel",
+      "session=" + this.id,
+      "reason=" + terminalReason,
+      "detail=" + String(detail || "").replace(/\s+/g, " ").slice(0, 256),
+      "wasDone=" + wasDone,
+      "run=" + !!runToCancel,
+      "activeRes=" + !!this.activeRes,
+      "round=" + (this.currentRound ? this.currentRound.state : "none"),
+      "pending=" + this.pendingCount(),
+      "waiters=" + this.waiters,
+      "notify=" + notify);
     this.done = true;     // short-circuit any late run.wait() settlement (onRunComplete/onRunError no-op on done)
     this.runEpoch++;      // invalidate the in-flight run's completion callback so it can't mutate a successor turn
     this.rejectAllPending(detail, terminalReason);
     this.clearTurnState();
-    try { await (this.run && this.run.cancel && this.run.cancel()); } catch {}
+    if (runToCancel && typeof runToCancel.cancel === "function") noteExpectedSdkAbort(this.id);
+    try { await (runToCancel && runToCancel.cancel && runToCancel.cancel()); } catch {}
     try { await (this.agent && this.agent.close && this.agent.close()); } catch {}
     this.run = null;
     this.sendPending = false;
     this.activeClientMessageId = "";
+    this.activeClientMessageHash = "";
+    this.activeClientMessageGeneration = 1;
+    this.activeClientMessageKind = "";
     this.activeDeferredInputId = "";
     // Null the closed agent handle so a surviving queued waiter (the session is kept when waiters remain)
     // re-resumes/recreates a live agent via ensureAgent instead of reusing this dead one.
@@ -3579,10 +4168,12 @@ async function readBodyBounded(req) {
   return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, bytes));
 }
 
-async function writeShortSse(res, terminal) {
+async function writeShortSse(res, terminal, leaseSource = null, leaseTerminal = false) {
   res.writeHead(200, SSE_HEADERS);
   const writer = new SseWriter(res, { maxQueueBytes: COMPOSER_OUT_QUEUE_MAX_BYTES });
-  const receipt = writer.write(formatSseData(terminal));
+  const receipt = writer.write(formatSseData(
+    leaseSource ? withClientLease(terminal, leaseSource, leaseTerminal) : terminal,
+  ));
   if (receipt.ok) await receipt.handedToNode.catch(() => {});
   await writer.endAfter("data: [DONE]\n\n");
 }
@@ -3666,9 +4257,50 @@ async function replayPausedFreshTurn(res, session, clientMessageId) {
   for (const call of calls) {
     await write({ type: "tool_call", id: call.wireId, name: call.name, input: call.input });
   }
-  await write({ type: "turn_end", stop_reason: "tool_use", tool_calls: calls.map((call) => call.wireId) });
+  await write(withClientLease(
+    { type: "turn_end", stop_reason: "tool_use", tool_calls: calls.map((call) => call.wireId) },
+    session,
+    false,
+  ));
   await writer.endAfter("data: [DONE]\n\n");
   return true;
+}
+
+async function replayCompletedTurn(res, receipt) {
+  res.writeHead(200, SSE_HEADERS);
+  const writer = new SseWriter(res, { maxQueueBytes: COMPOSER_OUT_QUEUE_MAX_BYTES });
+  const write = async (value) => {
+    const handed = writer.write(formatSseData(value));
+    if (!handed.ok) throw new Error("completed-turn replay transport failed");
+    await handed.handedToNode;
+  };
+  await write({
+    type: "session",
+    sessionId: receipt.sessionId,
+    continuationReceipt: {
+      contractVersion: CLIENT_TOOL_CONTRACT_VERSION,
+      clientMessageId: receipt.clientMessageId,
+      receipt: "completed_turn_replay",
+    },
+  });
+  // Keep each frame small enough to survive backpressure and preserve UTF-16
+  // surrogate pairs while replaying the durable final text.
+  for (let offset = 0; offset < receipt.text.length;) {
+    let end = Math.min(receipt.text.length, offset + 32768);
+    if (end < receipt.text.length
+        && receipt.text.charCodeAt(end - 1) >= 0xD800 && receipt.text.charCodeAt(end - 1) <= 0xDBFF
+        && receipt.text.charCodeAt(end) >= 0xDC00 && receipt.text.charCodeAt(end) <= 0xDFFF) {
+      end--;
+    }
+    await write({ type: "text", delta: receipt.text.slice(offset, end) });
+    offset = end;
+  }
+  await write(withClientLease(
+    { type: "turn_end", stop_reason: "end_turn", status: "finished", usage: receipt.usage || {} },
+    receipt,
+    true,
+  ));
+  await writer.endAfter("data: [DONE]\n\n");
 }
 
 function continuationFailure(res, status, code, message, details = null) {
@@ -3677,7 +4309,12 @@ function continuationFailure(res, status, code, message, details = null) {
 }
 
 function durableRecoveryResults(round, input) {
-  return (input.results || []).map((submitted) => {
+  // Validate that every result named by this request crossed the durable
+  // receipt boundary. The recovery payload itself is then rebuilt from ALL
+  // receipts in call order, not merely from this HTTP projection: clients may
+  // submit parallel results incrementally and omit already-acknowledged
+  // siblings from the final request.
+  for (const submitted of input.results || []) {
     const call = round.calls.get(submitted.toolCallId);
     if (!call || !call.receipt || !call.receipt.result) {
       throw new ToolRoundError(
@@ -3686,8 +4323,14 @@ function durableRecoveryResults(round, input) {
         500,
       );
     }
-    return { toolCallId: submitted.toolCallId, ...call.receipt.result };
-  });
+  }
+  const recovered = [];
+  for (const id of round.fifo) {
+    const call = round.calls.get(id);
+    if (!call || !call.receipt || !call.receipt.result) continue;
+    recovered.push({ toolCallId: id, ...call.receipt.result });
+  }
+  return recovered;
 }
 
 function recoveryResultSummary(round, input) {
@@ -3742,7 +4385,9 @@ function buildResultRecoveryInput(round, input, { requireHistory = false } = {})
     JSON.stringify(summary),
     "Continue the original task from the previous conversation. Do not treat the recovered results as a new unrelated request.",
   ].join("\n");
-  const trailing = typeof input.userText === "string" ? input.userText : "";
+  const trailing = typeof input.userText === "string"
+    ? input.userText
+    : (input.type === "user" && typeof input.text === "string" ? input.text : "");
   return {
     ...input,
     type: "user",
@@ -3753,6 +4398,27 @@ function buildResultRecoveryInput(round, input, { requireHistory = false } = {})
 
 function buildRestartRecoveryInput(round, input) {
   return buildResultRecoveryInput(round, input, { requireHistory: true });
+}
+
+function toolResultRecoveryPlan(round, input, seededSystem = "") {
+  const durableResults = durableRecoveryResults(round, input);
+  const resultImages = collectToolResultImages({ results: durableResults });
+  const fallbackImages = mcpImageResultsEnabled()
+    ? resultImages.filter((image) => !(image && typeof image.data === "string" && image.data))
+    : resultImages;
+  const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
+  const hasUserImages = Array.isArray(input.images) && input.images.length > 0;
+  const systemChanged = !!(input.system && input.system !== seededSystem);
+  return {
+    durableResults,
+    resultImages,
+    fallbackImages,
+    hasUserText,
+    hasUserImages,
+    systemChanged,
+    remainingUnreceipted: round.unreceiptedOwedCallCount,
+    requiresFreshRecovery: fallbackImages.length > 0 || systemChanged || hasUserText || hasUserImages,
+  };
 }
 
 function continuationHasDeferredInput(input) {
@@ -3810,20 +4476,131 @@ function continuationTenantMismatch(round, cursorKey, multiTenant = MULTI_TENANT
   return stored !== "" && stored !== keyFingerprint(cursorKey);
 }
 
+function legacyRecoveryKeyFor(sessionId, clientMessageId) {
+  return "clr1_" + createHash("sha256")
+    .update(String(sessionId || ""))
+    .update("\0")
+    .update(String(clientMessageId || ""))
+    .digest("hex")
+    .slice(0, 24);
+}
+
+// Before signed routing tokens existed, a harness-visible call id was an opaque `call_*` value. There is no
+// durable ToolRound route to parse or callback to resolve after an upgrade/restart, but a stateless harness can
+// still supply a faithful bounded replay containing the calls and completed results. Accept only an explicitly
+// marked, entirely unsigned batch. Any signed/future-routed or mixed batch falls through to strict parsing.
+function legacyUnsignedRecoveryBody(body, input, results) {
+  if (!input || input.legacyUnsignedReplay !== true) return null;
+  const ids = results.map((result) => typeof result?.toolCallId === "string" ? result.toolCallId.trim() : "");
+  if (ids.some((id) => !id)
+      || ids.some((id) => id.startsWith(`${ROUTING_TOKEN_VERSION}_`) || /^cct[0-9]+_/.test(id))) return null;
+
+  const sessionId = typeof body?.sessionId === "string" ? body.sessionId.trim() : "";
+  const clientMessageId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+  const history = typeof input.history === "string" ? input.history : "";
+  if (!sessionId || !clientMessageId || !history.trim()) {
+    throw new ToolRoundError(
+      "legacy_recovery_unavailable",
+      "unsigned legacy tool results require a stable client message id and bounded conversation replay",
+      410,
+    );
+  }
+  const missingIds = ids.filter((id) => !history.includes(id));
+  if (missingIds.length > 0) {
+    throw new ToolRoundError(
+      "legacy_recovery_unavailable",
+      "bounded conversation replay does not contain every unsigned legacy tool call/result",
+      410,
+      { missingToolCallIds: missingIds },
+    );
+  }
+  const images = [
+    ...(Array.isArray(input.images) ? input.images : []),
+    ...collectToolResultImages(input),
+  ];
+  const userText = typeof input.userText === "string" && input.userText.trim()
+    ? input.userText
+    : "Continue from the recovered conversation. The completed client-tool results are present in the replayed history.";
+  return {
+    ...body,
+    input: {
+      type: "user",
+      text: userText,
+      history,
+      ...(typeof input.historyFingerprint === "string" && input.historyFingerprint
+        ? { historyFingerprint: input.historyFingerprint }
+        : {}),
+      ...(typeof input.system === "string" && input.system ? { system: input.system } : {}),
+      ...(images.length > 0 ? { images } : {}),
+      clientMessageId,
+      legacyRecoveryKey: legacyRecoveryKeyFor(sessionId, clientMessageId),
+      legacyRecoveredToolCallIds: ids,
+    },
+  };
+}
+
 // `/agent/continue` is the sole continuation ingress. It routes by the signed tool-call ids, validates and
 // journals the complete batch before writing SSE headers, and only then settles the paused SDK callbacks.
 async function handleContinue(req, res, body, cursorKey, casAttempt = 0, historicalDispositions = []) {
   const input = body && body.input;
   if (body && !validClientEnv(body.clientEnv)) body.clientEnv = { workspaceUnknown: true };
-  const results = input && input.type === "tool_results" && Array.isArray(input.results) ? input.results : null;
+  let results = input && input.type === "tool_results" && Array.isArray(input.results) ? input.results : null;
   if (!results || results.length === 0) {
     continuationFailure(res, 422, "empty_tool_results", "a continuation requires at least one tool result");
+    return;
+  }
+  const continuationClientMessageId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+  const continuationClientMessageHash = completedTurnRequestHash(input);
+  if (continuationClientMessageId && body && body.sessionId) {
+    let completed;
+    try {
+      completed = readCompletedTurnReceipt(
+        cursorKey,
+        body.sessionId,
+        continuationClientMessageId,
+        continuationClientMessageHash,
+      );
+    } catch (error) {
+      continuationFailure(
+        res,
+        503,
+        "durable_turn_receipt_unavailable",
+        (error && error.message) || String(error),
+      );
+      return;
+    }
+    if (completed) {
+      await replayCompletedTurn(res, completed);
+      return;
+    }
+  }
+  try {
+    const legacyBody = legacyUnsignedRecoveryBody(body, input, results);
+    if (legacyBody) {
+      dbg("legacy unsigned continuation -> faithful deterministic recovery",
+        "session=" + legacyBody.sessionId, "results=" + results.length,
+        "clientMessageId=" + legacyBody.input.clientMessageId);
+      return handleTurn(req, res, legacyBody, cursorKey);
+    }
+  } catch (error) {
+    if (error instanceof ToolRoundError) {
+      continuationFailure(res, error.status, error.code, error.message, error.details);
+      return;
+    }
+    continuationFailure(res, 500, "legacy_recovery_failed", (error && error.message) || String(error));
+    return;
+  }
+  try {
+    results = accommodateContinuationResults(results);
+  } catch (error) {
+    continuationFailure(res, 422, "invalid_tool_results", (error && error.message) || String(error));
     return;
   }
   let preparedToolRegistry;
   let inventoryWarning = "";
   let deferredRound = null;
   let deferredInputId = "";
+  let uncertainDeliveryAgentId = "";
   let routedRound = null;
   try {
     // A replacement inventory governs the *next* model step; it is not part of
@@ -3848,24 +4625,27 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       }
       const loaded = [...grouped].map(([groupRoute, groupResults]) => {
         const groupRound = liveToolRounds.get(groupRoute) || ToolRound.load(journal, codec, groupRoute);
-        if (!groupRound) throw new ToolRoundError("round_lost", `signed tool round ${groupRoute} is absent`, 410);
-        if (continuationTenantMismatch(groupRound, cursorKey)) {
+        if (groupRound && continuationTenantMismatch(groupRound, cursorKey)) {
           throw new ToolRoundError("tenant_mismatch", "a signed tool round belongs to a different Cursor credential", 403);
         }
         return { groupRoute, groupResults, groupRound };
       });
+      const present = loaded.filter(({ groupRound }) => !!groupRound);
+      if (present.length === 0) {
+        throw new ToolRoundError("round_lost", "none of the signed tool rounds remain in the durable journal", 410);
+      }
       // Validate every route before mutating any journal. A stateless harness
       // may project old and current tool results into one request; terminal or
       // process-orphaned routes can be receipted independently and recovered
       // later. Only two *in-memory callback-owning* rounds are fundamentally
       // ambiguous because one HTTP response cannot carry two SDK continuations.
-      for (const group of loaded) {
+      for (const group of present) {
         group.groupRound.preflightResults(group.groupResults, {
           allowRegisteredReceipt: !liveToolRounds.has(group.groupRoute),
           preferDurableReceipt: true,
         });
       }
-      const live = loaded.filter(({ groupRoute, groupRound }) =>
+      const live = present.filter(({ groupRoute, groupRound }) =>
         groupRound.state !== RoundState.TERMINAL && liveToolRounds.get(groupRoute) === groupRound);
       if (live.length > 1) {
         await writeShortSse(res, {
@@ -3878,12 +4658,19 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         });
         return;
       }
-      const active = loaded.filter(({ groupRound }) => groupRound.state !== RoundState.TERMINAL);
+      const active = present.filter(({ groupRound }) => groupRound.state !== RoundState.TERMINAL);
       const bodyMatches = active.filter(({ groupRound }) => body && body.sessionId === groupRound.sessionId);
-      const primary = live[0] || (bodyMatches.length === 1 ? bodyMatches[0] : active.at(-1)) || loaded.at(-1);
+      const primary = live[0] || (bodyMatches.length === 1 ? bodyMatches[0] : active.at(-1)) || present.at(-1);
       const acknowledged = [];
       for (const group of loaded) {
         if (group === primary) continue;
+        if (!group.groupRound) {
+          acknowledged.push(...group.groupResults.map((result) => ({
+            toolCallId: result.toolCallId,
+            status: "historical_route_absent_not_applied",
+          })));
+          continue;
+        }
         const terminal = group.groupRound.state === RoundState.TERMINAL;
         const committedGroup = group.groupRound.commitResults(group.groupResults, {
           allowTerminalReceipt: terminal,
@@ -3922,6 +4709,8 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
     if (continuationTenantMismatch(round, cursorKey)) {
       throw new ToolRoundError("tenant_mismatch", "the signed tool round belongs to a different Cursor credential", 403);
     }
+    const liveRoundSession = sessions.get(round.sessionId);
+    if (liveRoundSession) liveRoundSession.clientLeaseToken = round.clientLeaseToken;
 
     const wasTerminal = round.state === RoundState.TERMINAL;
     const hasDeferredInput = continuationHasDeferredInput(input);
@@ -3962,7 +4751,65 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       committed.dispositions = [...historicalDispositions, ...committed.dispositions];
     }
     const committedIds = [...new Set([...committed.additions, ...committed.duplicates])];
-    const deferred = deferredInputId ? round.deferredInput(deferredInputId) : null;
+    let deferred = deferredInputId ? round.deferredInput(deferredInputId) : null;
+    if (!deferred) {
+      // A client may stream a parallel result batch across multiple HTTP
+      // requests. The request that carries the final sibling need not repeat
+      // the trailing user intent from the first request; recover the one
+      // actionable journal entry instead of silently dropping it.
+      deferred = round.actionableDeferredInput();
+      if (deferred) {
+        deferredRound = round;
+        deferredInputId = deferred.clientMessageId;
+      }
+    }
+    const remainingUnreceipted = round.unreceiptedOwedCallCount;
+
+    // A retry of a pure tool-result continuation owns the same resumed model
+    // turn even though it has no deferred user input. Hand the live response
+    // writer to the retry before any terminal-round acknowledgement; otherwise
+    // the actual answer keeps streaming to an abandoned socket while the retry
+    // receives a misleading short success.
+    const activeContinuationSession = sessions.get(round.sessionId);
+    if (continuationClientMessageId
+        && activeContinuationSession
+        && activeContinuationSession.activeClientMessageId === continuationClientMessageId
+        && activeContinuationSession.activeClientMessageHash === continuationClientMessageHash
+        && (activeContinuationSession.run || activeContinuationSession.sendPending)
+        && activeContinuationSession.lastSettledTurnToken < activeContinuationSession.turnToken) {
+      await handoffActiveTurn(
+        req,
+        res,
+        activeContinuationSession,
+        round,
+        committed,
+        continuationClientMessageId,
+      );
+      return;
+    }
+
+    // A trailing user turn is a fresh-send boundary. Do not cross it until
+    // every client-visible sibling call has a durable result receipt. The
+    // callbacks intentionally remain paused; the final incremental request
+    // rebuilds recovery from the complete journal, even when it contains only
+    // the last sibling result.
+    if (deferred
+        && (deferred.state === DeferredInputState.QUEUED
+          || deferred.state === DeferredInputState.DELIVERING
+          || (deferred.state === DeferredInputState.DELIVERED && !deferred.deliveryFinalizedAt))
+        && remainingUnreceipted > 0) {
+      await writeShortSse(res, {
+        type: "turn_end",
+        stop_reason: "tool_use",
+        receipt: "partial_results_deferred_for_fidelity",
+        outstandingToolCalls: remainingUnreceipted,
+        ...continuationReceipt(round, committed, {
+          clientMessageId: deferredInputId,
+          userInputStatus: String(deferred.state || "").toLowerCase(),
+        }),
+      }, round, false);
+      return;
+    }
 
     if (deferred && deferred.state === DeferredInputState.SUPERSEDED) {
       const uncertain = typeof deferred.supersedeReason === "string"
@@ -4002,21 +4849,30 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       return;
     }
 
-    // `DELIVERING` is the deliberate crash boundary around agent.send. First
-    // reconcile against the SDK's durable conversation checkpoint. If neither
-    // a live turn nor a checkpoint can prove delivery, retire this one message
-    // with an explicit error receipt. It must never poison the whole session
-    // with an unbounded 409 loop, and it must never be blindly re-executed.
-    if (deferred && deferred.state === DeferredInputState.DELIVERING) {
-      if (!(await reconcileDeferredDelivery(round, deferred, cursorKey))) {
+    // `DELIVERING` is the deliberate crash boundary around agent.send. Text
+    // found anywhere in agent history is not delivery evidence—a previous
+    // identical "continue" is indistinguishable. Retry only the exact persisted
+    // envelope, key, inventory epoch, and durable agent. The SDK patch maps
+    // that key to one stable request id on that same agent.
+    if (deferred && (deferred.state === DeferredInputState.DELIVERING
+        || (deferred.state === DeferredInputState.DELIVERED && !deferred.deliveryFinalizedAt))) {
+      uncertainDeliveryAgentId = typeof deferred.deliveryAgentId === "string"
+        ? deferred.deliveryAgentId : "";
+      const replayable = uncertainDeliveryAgentId
+        && typeof deferred.deliveryIdempotencyKey === "string"
+        && deferred.deliveryIdempotencyKey
+        && Object.prototype.hasOwnProperty.call(deferred, "deliveryMessage")
+        && Array.isArray(deferred.deliveryAdvertise);
+      if (!replayable) {
         round.markDeferredInputState(deferredInputId, DeferredInputState.SUPERSEDED, {
-          reason: "delivery_uncertain_retired",
+          reason: "delivery_uncertain_missing_exact_envelope",
         });
         await writeShortSse(res, {
           type: "turn_end",
           stop_reason: "error",
-          error: "the prior bridge process ended during SDK delivery; the durable checkpoint could not prove whether this input ran",
           receipt: "user_input_delivery_unknown",
+          retryable: false,
+          error: "the prior bridge stopped during SDK delivery and the exact durable send envelope is unavailable; the proxy will not guess or duplicate it",
           ...continuationReceipt(round, committed, {
             clientMessageId: deferredInputId,
             userInputStatus: "superseded",
@@ -4024,17 +4880,55 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         });
         return;
       }
+      if (deferred.deliveryInventoryEpoch
+          && body.toolInventoryEpoch !== deferred.deliveryInventoryEpoch) {
+        dbg("uncertain delivery retry carries a newer tool inventory; replaying the persisted send snapshot",
+          "route=" + round.route, "original=" + deferred.deliveryInventoryEpoch,
+          "current=" + body.toolInventoryEpoch);
+      }
+      round.requeueUncertainDeferredInput(deferredInputId);
+      dbg("uncertain deferred delivery -> retry exact envelope on exact durable agent",
+        "route=" + round.route, "clientMessageId=" + deferredInputId,
+        "agentId=" + uncertainDeliveryAgentId);
     }
-    if (deferred && deferred.state === DeferredInputState.DELIVERED) {
+    if (deferred && deferred.state === DeferredInputState.DELIVERED && deferred.deliveryFinalizedAt) {
+      let completed;
+      try {
+        completed = readCompletedTurnReceipt(
+          cursorKey,
+          round.sessionId,
+          deferredInputId,
+          completedTurnRequestHash(input),
+        );
+      } catch (error) {
+        await writeShortSse(res, {
+          type: "turn_end",
+          stop_reason: "error",
+          receipt: "durable_turn_receipt_unavailable",
+          retryable: false,
+          error: (error && error.message) || String(error),
+          ...continuationReceipt(round, committed, {
+            clientMessageId: deferredInputId,
+            userInputStatus: "delivered",
+          }),
+        });
+        return;
+      }
+      if (completed) {
+        await replayCompletedTurn(res, completed);
+        return;
+      }
       await writeShortSse(res, {
         type: "turn_end",
-        stop_reason: "end_turn",
-        receipt: "user_input_already_delivered",
+        stop_reason: "error",
+        receipt: "completed_response_receipt_unavailable",
+        retryable: false,
+        error: "the user input reached a final model response, but its durable answer receipt is no longer available; the proxy will not report an empty success or repeat side effects",
         ...continuationReceipt(round, committed, {
           clientMessageId: deferredInputId,
           userInputStatus: "delivered",
         }),
-      });
+      }, round, true);
       return;
     }
 
@@ -4053,6 +4947,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       let session = existing || null;
       let freshInput;
       let isRecovery = !completedReceipt;
+      const exactDeliveryRetry = !!uncertainDeliveryAgentId;
 
       if (session && session.currentRound && session.currentRound !== round) {
         if (session.currentRound.route !== round.route && !completedReceipt) {
@@ -4075,12 +4970,17 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         throw new ToolRoundError("tenant_mismatch", "the active Session belongs to a different Cursor credential", 403);
       }
 
+      const storedInput = deferredUserInput(round, deferred, input);
       if (completedReceipt) {
-        freshInput = deferredUserInput(round, deferred, input);
+        freshInput = storedInput;
       } else if (session) {
-        freshInput = buildResultRecoveryInput(round, input);
+        freshInput = buildResultRecoveryInput(round, storedInput);
+      } else if (exactDeliveryRetry) {
+        // The exact SDK envelope already contains the original seed/recovery
+        // text. Do not require or rebuild a newer history snapshot.
+        freshInput = storedInput;
       } else {
-        freshInput = buildRestartRecoveryInput(round, input);
+        freshInput = buildRestartRecoveryInput(round, storedInput);
         if (!freshInput) {
           round.recordRecovery({ at: nowMs(), decision: "refused", reason: "bounded conversation history is absent" });
           throw new ToolRoundError(
@@ -4094,17 +4994,40 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       if (!session) {
         if (!sessionCapHasRoomForNew()) throw new ToolRoundError("session_capacity", "session capacity is full", 429);
         session = new Session(round.sessionId, cursorKey);
-        if (isRecovery) {
-          session.agentId = `${round.agentId || round.sessionId}_ctrecover_${round.route.slice(0, 10)}`;
+        if (exactDeliveryRetry) {
+          writeDurableAgentAlias(session.cursorKey, session.id, uncertainDeliveryAgentId, session);
+          session.agentId = uncertainDeliveryAgentId;
+        } else if (isRecovery) {
+          const targetAgentId = `${round.agentId || round.sessionId}_ctrecover_${round.route.slice(0, 10)}`;
+          writeDurableAgentAlias(session.cursorKey, session.id, targetAgentId, session);
+          session.agentId = targetAgentId;
           session.resetSeedState();
         } else if (round.agentId) {
+          writeDurableAgentAlias(session.cursorKey, session.id, round.agentId, session);
           session.agentId = round.agentId;
         }
         sessions.set(session.id, session);
-      } else if (session.run || (session.currentRound && session.currentRound.state !== RoundState.TERMINAL)) {
-        await session.cancel({ terminalReason: TerminalReason.INTERRUPTED, detail: "superseded by durable deferred user input" });
+      } else {
+        if (exactDeliveryRetry && session.agentId !== uncertainDeliveryAgentId) {
+          if (session.run || session.activeRes) {
+            throw new ToolRoundError(
+              "delivery_agent_busy",
+              "the exact durable delivery agent is not available while another run owns this session",
+              409,
+            );
+          }
+          try { await (session.agent && session.agent.close && session.agent.close()); } catch {}
+          session.agent = null;
+          session.agentPromise = null;
+          session.agentId = uncertainDeliveryAgentId;
+          session.resetSeedState();
+        }
+        if (session.run || (session.currentRound && session.currentRound.state !== RoundState.TERMINAL)) {
+          await session.cancel({ terminalReason: TerminalReason.INTERRUPTED, detail: "superseded by durable deferred user input" });
+        }
       }
 
+      session.clientLeaseToken = round.clientLeaseToken;
       refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
       if (isRecovery) {
         if (round.state !== RoundState.TERMINAL) {
@@ -4112,7 +5035,9 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         }
         round.recordRecovery({
           at: nowMs(),
-          decision: existing ? "in_process_redirect" : "faithful_reseed",
+          decision: exactDeliveryRetry
+            ? "exact_delivery_retry"
+            : existing ? "in_process_redirect" : "faithful_reseed",
           replacementAgentId: session.agentId,
           clientMessageId: deferredInputId,
           resultHashes: results.map((result) => round.calls.get(result.toolCallId).resultHash),
@@ -4126,12 +5051,15 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         maxTokens: body.maxTokens,
         unsupportedHardGuarantees: body.unsupportedHardGuarantees,
       };
-      return enqueueTurn(req, res, session, body.model || round.model || "composer-2.5", freshInput, constraints, {
+      return enqueueTurn(req, res, session,
+        (exactDeliveryRetry && deferred.deliveryModel) || body.model || round.model || "composer-2.5",
+        freshInput, constraints, {
         round,
         committedIds,
         deferredInputId,
         deferredReceipt: committed.deferredReceipt,
         dispositions: committed.dispositions,
+        requestHash: continuationClientMessageHash,
       });
     }
 
@@ -4140,8 +5068,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       if (!session || session.currentRound !== round) {
         try { round.terminalize(TerminalReason.RESTART_LOST, "live round lost its owning Session"); } catch {}
       } else {
-        const callbacksAnswered = committedIds.filter((id) => round.callbacks.has(id)).length;
-        const completesLogicalToolRound = Math.max(0, round.pendingCount - callbacksAnswered) === 0;
+        const completesLogicalToolRound = round.unreceiptedOwedCallCount === 0;
         // A tool inventory is a logical-turn contract, not mutable metadata on
         // each partial HTTP receipt. Applying partial snapshots lets delayed
         // continuations reorder schema updates or resurrect removed tools.
@@ -4160,7 +5087,36 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
           maxTokens: body.maxTokens,
           unsupportedHardGuarantees: body.unsupportedHardGuarantees,
         };
-        if (session.activeRes) {
+        const recoveryPlan = toolResultRecoveryPlan(round, input, session.seededSystem);
+        if (session.activeRes && recoveryPlan.requiresFreshRecovery
+            && recoveryPlan.remainingUnreceipted > 0) {
+          await writeShortSse(res, {
+            type: "turn_end",
+            stop_reason: "tool_use",
+            receipt: "partial_results_deferred_for_fidelity",
+            outstandingToolCalls: recoveryPlan.remainingUnreceipted,
+            ...continuationReceipt(round, committed),
+          }, round, false);
+          return;
+        }
+        if (session.activeRes && recoveryPlan.requiresFreshRecovery) {
+          // A concurrent continuation may still own the previous response
+          // while this request supplies the final image/system/user payload.
+          // End that paused run truthfully, reject every callback exactly
+          // once, then let this request own the faithful journal recovery.
+          session.sse({
+            type: "turn_end",
+            stop_reason: "error",
+            error: "turn superseded by a complete client-tool recovery batch",
+            _clientLeaseTerminal: false,
+          });
+          await session.cancel({
+            terminalReason: TerminalReason.INTERRUPTED,
+            detail: "superseded by a complete client-tool recovery batch",
+          });
+          session.done = false;
+          session.currentRound = round;
+        } else if (session.activeRes) {
           round.applyCommittedResults(committedIds);
           await writeShortSse(res, {
             type: "turn_end",
@@ -4171,23 +5127,29 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
           return;
         }
         res.writeHead(200, SSE_HEADERS);
-        await runTurn(req, res, session, body.model || round.model || "composer-2.5", input, constraints, { round, committedIds });
+        await runTurn(req, res, session, body.model || round.model || "composer-2.5", input, constraints, {
+          round,
+          committedIds,
+          requestHash: continuationClientMessageHash,
+        });
         return;
       }
     }
 
-    // A completed round may be retried after its response was lost. Its durable receipt is authoritative; an
-    // identical retry is acknowledged without rerunning either the harness tool or an SDK callback.
-    if (wasTerminal && round.terminal && round.terminal.reason === TerminalReason.COMPLETED && committed.additions.length === 0) {
-      await writeShortSse(res, {
-        type: "turn_end", stop_reason: "end_turn", receipt: "already_applied", ...continuationReceipt(round, committed),
-      });
-      return;
-    }
+    // ToolRound COMPLETED means only that every paused SDK callback received
+    // its client result. It does not prove that the resumed model turn reached
+    // a final answer. A completed-turn receipt was checked at ingress; absent
+    // that receipt, continue through faithful recovery instead of returning a
+    // fake `already_applied` success.
     if (wasTerminal && round.recovery && round.recovery.decision === "completed" && committed.additions.length === 0) {
       await writeShortSse(res, {
-        type: "turn_end", stop_reason: "end_turn", receipt: "already_recovered", ...continuationReceipt(round, committed),
-      });
+        type: "turn_end",
+        stop_reason: "error",
+        receipt: "completed_response_receipt_unavailable",
+        retryable: false,
+        error: "the recovery run reached a final response, but no durable answer receipt is available; the proxy will not report an empty success or repeat side effects",
+        ...continuationReceipt(round, committed),
+      }, round, true);
       return;
     }
 
@@ -4229,7 +5191,10 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       session = new Session(round.sessionId, cursorKey);
       sessions.set(session.id, session);
     }
-    session.agentId = `${round.agentId || round.sessionId}_ctrecover_${round.route.slice(0, 10)}`;
+    session.clientLeaseToken = round.clientLeaseToken;
+    const recoveryAgentId = `${round.agentId || round.sessionId}_ctrecover_${round.route.slice(0, 10)}`;
+    writeDurableAgentAlias(session.cursorKey, session.id, recoveryAgentId, session);
+    session.agentId = recoveryAgentId;
     session.recoverySourceRound = round;
     session.resetSeedState();
     refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
@@ -4247,7 +5212,12 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       unsupportedHardGuarantees: body.unsupportedHardGuarantees,
     };
     res.writeHead(200, SSE_HEADERS);
-    await runTurn(req, res, session, body.model || round.model || "composer-2.5", recoveryInput, constraints);
+    await runTurn(req, res, session, body.model || round.model || "composer-2.5", recoveryInput, constraints, {
+      round,
+      committedIds,
+      dispositions: committed.dispositions,
+      requestHash: continuationClientMessageHash,
+    });
   } catch (error) {
     if (res.headersSent) {
       try { res.end(); } catch {}
@@ -4334,13 +5304,79 @@ async function handleTurn(req, res, body, cursorKey) {
   };
   // Validate BEFORE opening the SSE so we can return a real HTTP status.
   if (!sessionId) { fail(400, "sessionId is required"); return; }
+  const requestClientMessageId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+  const requestClientMessageHash = completedTurnRequestHash(input);
+  let freshDeliveryGeneration = 1;
+  let freshDeliveryReceipt = null;
+  if (requestClientMessageId) {
+    let completed = null;
+    try {
+      if (input.type === "user") {
+        freshDeliveryReceipt = readFreshDeliveryReceipt(
+          cursorKey,
+          sessionId,
+          requestClientMessageId,
+          requestClientMessageHash,
+        );
+      }
+      completed = freshDeliveryReceipt ? null
+        : readCompletedTurnReceipt(cursorKey, sessionId, requestClientMessageId, requestClientMessageHash);
+    } catch (error) {
+      fail(503, `durable turn continuity state is unavailable: ${(error && error.message) || String(error)}`);
+      return;
+    }
+    if (freshDeliveryReceipt) {
+      freshDeliveryGeneration = freshDeliveryReceipt.generation;
+    } else if (completed) {
+      const provenLegacyRecovery = input.type === "user"
+        && typeof input.legacyRecoveryKey === "string"
+        && input.legacyRecoveryKey === legacyRecoveryKeyFor(sessionId, requestClientMessageId);
+      if (input.type !== "user" || provenLegacyRecovery) {
+        await replayCompletedTurn(res, completed);
+        return;
+      }
+      // A byte-identical fresh request after completion is ambiguous without a
+      // client-supplied request nonce: it may be a lost-response retry or an
+      // intentional repeated instruction. Prefer executing the user's current
+      // instruction over replaying an old answer. A durable generation keeps
+      // its SDK idempotency key distinct while remaining stable across an
+      // ambiguous transport retry before this generation completes.
+      freshDeliveryGeneration = (Number.isSafeInteger(completed.generation)
+        ? completed.generation : 1) + 1;
+    }
+  }
+  if (input.type === "user") {
+    input.deliveryGeneration = freshDeliveryGeneration;
+    delete input.freshDeliveryReceipt;
+    if (freshDeliveryReceipt) input.freshDeliveryReceipt = freshDeliveryReceipt;
+  }
+  const legacyRecoveryKey = typeof input.legacyRecoveryKey === "string" ? input.legacyRecoveryKey.trim() : "";
+  if (legacyRecoveryKey) {
+    const clientMessageId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+    if (input.type !== "user" || !clientMessageId
+        || legacyRecoveryKey !== legacyRecoveryKeyFor(sessionId, clientMessageId)) {
+      fail(422, "legacy recovery identity is malformed");
+      return;
+    }
+  }
   if (!validClientEnv(body.clientEnv)) body.clientEnv = { workspaceUnknown: true };
   let preparedToolRegistry;
+  let inventoryWarning = "";
   try {
     preparedToolRegistry = prepareAdvertisedToolRegistry(body);
   } catch (error) {
-    fail(422, (error && error.message) || String(error));
-    return;
+    inventoryWarning = (error && error.message) || String(error);
+    // A malformed dynamic replacement must not kill an established
+    // conversation. Keep the last known-good registry and let the harness
+    // correct its next snapshot. A brand-new session has no safe tool contract
+    // to retain, so it still receives the explicit configuration error.
+    if (!sessions.has(sessionId)) {
+      fail(422, inventoryWarning);
+      return;
+    }
+    preparedToolRegistry = undefined;
+    dbg("new-turn replacement inventory rejected; preserving prior registry",
+      "session=" + sessionId, inventoryWarning);
   }
 
   // Upstream rate-limit circuit breaker: while OPEN for this key, fast-fail NEW runs with a clear 429 so client
@@ -4377,7 +5413,13 @@ async function handleTurn(req, res, body, cursorKey) {
     // paused session to admit this one. ADD-75: likewise reject a NEW tenant (new platform) at the platform cap.
     if (!sessionCapHasRoomForNew()) { fail(429, `session capacity reached (${MAX_SESSIONS}); all sessions are active or paused — retry later`); return; }
     if (MULTI_TENANT && !platformCapHasRoomForNew(cursorKey)) { fail(429, `platform capacity reached (${MAX_PLATFORMS}); all tenant platforms are in use — retry later`); return; }
-    session = new Session(sessionId, cursorKey); sessions.set(sessionId, session); dbg("handleTurn NEW session", sessionId);
+    try {
+      session = new Session(sessionId, cursorKey);
+    } catch (error) {
+      fail(503, `durable session continuity state is unavailable: ${(error && error.message) || String(error)}`);
+      return;
+    }
+    sessions.set(sessionId, session); dbg("handleTurn NEW session", sessionId);
   }
   else {
     dbg("handleTurn REUSE session", sessionId, "runActive=" + !!session.run, "activeRes=" + !!session.activeRes, "waiters=" + session.waiters);
@@ -4395,8 +5437,10 @@ async function handleTurn(req, res, body, cursorKey) {
     }
   }
   const incomingClientMessageId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+  const incomingClientMessageHash = completedTurnRequestHash(input);
   if (incomingClientMessageId
       && session.activeClientMessageId === incomingClientMessageId
+      && session.activeClientMessageHash === incomingClientMessageHash
       && (session.run || session.sendPending)) {
     if (session.activeRes && session.lastSettledTurnToken < session.turnToken) {
       await handoffActiveTurn(req, res, session, null, null, incomingClientMessageId);
@@ -4407,7 +5451,18 @@ async function handleTurn(req, res, body, cursorKey) {
     // before a replayable boundary. Fall through to the ordinary interrupt +
     // resend path using the same SDK idempotency key.
   }
-  refreshSessionFromBody(session, body, preparedToolRegistry);
+  if (legacyRecoveryKey) {
+    try {
+      await session.rotateForLegacyRecovery(legacyRecoveryKey);
+    } catch (error) {
+      fail(503, `cannot establish durable legacy recovery: ${(error && error.message) || String(error)}`);
+      return;
+    }
+  }
+  // A new logical user turn replaces the prior lease token. Exact active
+  // retries returned above keep the token already attached to that run.
+  session.clientLeaseToken = normalizeClientLeaseToken(body.clientLeaseToken);
+  refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
   // ADD-37 (extended by ADD-106): a plain NEW-USER turn that arrives while a run is still LIVE on this session
   // is an INTERRUPTION, not a concurrent generation — the user is steering, so the old run must yield to the
   // new instruction. Two sub-cases, both now interrupted:
@@ -4443,8 +5498,22 @@ async function handleTurn(req, res, body, cursorKey) {
     dbg("handleTurn USER INTERRUPT of a live run -> cancel stale run + drive new turn", sessionId, "streaming=" + !!session.activeRes, "pending=" + session.pendingCount(), "waiters=" + session.waiters);
     await session.cancel({ terminalReason: TerminalReason.INTERRUPTED, detail: "superseded by a new user turn" });
   }
+  if (freshDeliveryReceipt && session.agentId !== freshDeliveryReceipt.agentId) {
+    try { await (session.agent && session.agent.close && session.agent.close()); } catch {}
+    session.agent = null;
+    session.agentPromise = null;
+    session.agentId = freshDeliveryReceipt.agentId;
+    session.resetSeedState();
+  }
   if (session.waiters >= MAX_QUEUE_DEPTH) { fail(429, "too many concurrent turns queued for this session"); return; }
-  return enqueueTurn(req, res, session, model, input, constraints);
+  return enqueueTurn(
+    req,
+    res,
+    session,
+    (freshDeliveryReceipt && freshDeliveryReceipt.deliveryModel) || model,
+    input,
+    constraints,
+  );
 }
 
 // enqueueTurn serializes a new-user turn on the session's FIFO chain. It opens the SSE + a client-facing
@@ -4542,34 +5611,76 @@ function prepareAdvertisedToolRegistry(body) {
   }
   if (!Array.isArray(tools)) return undefined;
   const registry = new AdvertisedToolRegistry();
-  registry.replace(tools.map((t) => {
-    let aliases = [];
-    if (t.aliases !== undefined) {
-      if (!Array.isArray(t.aliases) || t.aliases.length > 64
-        || t.aliases.some((alias) => typeof alias !== "string" || !alias.trim() || alias.length > 256)) {
-        throw new Error(`advertised tool '${t && t.name}' has invalid private aliases`);
-      }
-      aliases = [...new Set(t.aliases.map((alias) => alias.trim()))];
+  const normalized = [];
+  const seenNames = new Set();
+  const permissiveSchema = Object.freeze({ type: "object", additionalProperties: true });
+  let rejectedCount = 0;
+  for (const rawTool of tools) {
+    if (!rawTool || typeof rawTool !== "object" || Array.isArray(rawTool)
+        || typeof rawTool.name !== "string" || !rawTool.name.trim()) {
+      dbg("skipping an unrouteable advertised tool descriptor without a string name");
+      rejectedCount++;
+      continue;
     }
-    const suppliedSchema = Object.hasOwn(t, "inputSchema")
-      ? t.inputSchema
-      : (Object.hasOwn(t, "parameters") ? t.parameters : undefined);
-    if (suppliedSchema === false) {
-      throw new Error(`advertised tool '${t && t.name}' has inputSchema:false, which cannot be represented by the SDK object-argument contract`);
+    const name = rawTool.name.trim();
+    if (seenNames.has(name)) {
+      // OpenAI/Anthropic tool results route by name, so two descriptors with
+      // one name are not independently addressable. Retaining the first stable
+      // descriptor keeps every other client tool functional without rejecting
+      // the entire turn for one malformed inventory entry.
+      dbg("ignoring duplicate advertised tool descriptor", "name=" + name);
+      rejectedCount++;
+      continue;
     }
-    if (suppliedSchema !== undefined && suppliedSchema !== true
-      && (!suppliedSchema || typeof suppliedSchema !== "object" || Array.isArray(suppliedSchema))) {
-      throw new Error(`advertised tool '${t && t.name}' has an invalid inputSchema`);
+    seenNames.add(name);
+    const aliases = Array.isArray(rawTool.aliases)
+      ? [...new Set(rawTool.aliases
+        .filter((alias) => typeof alias === "string" && alias.trim() && alias.length <= 256)
+        .slice(0, 64)
+        .map((alias) => alias.trim()))]
+      : [];
+    if (rawTool.aliases !== undefined && aliases.length === 0) {
+      dbg("ignoring malformed private tool aliases", "name=" + name);
+    }
+    const suppliedSchema = Object.hasOwn(rawTool, "inputSchema")
+      ? rawTool.inputSchema
+      : (Object.hasOwn(rawTool, "parameters") ? rawTool.parameters : undefined);
+    // JSON Schema `true` really is an unconstrained schema. `false`, a
+    // primitive, or an invalid schema is not. Widening those failures to a
+    // permissive object made Cursor omit required arguments and pushed the
+    // resulting validation error into the harness. Quarantine only the bad
+    // descriptor so every independent valid client tool remains available.
+    if (suppliedSchema === false
+        || (suppliedSchema !== undefined && suppliedSchema !== true
+          && (!suppliedSchema || typeof suppliedSchema !== "object" || Array.isArray(suppliedSchema)))) {
+      rejectedCount++;
+      dbg("quarantining advertised tool with a non-object input schema", "name=" + name);
+      continue;
     }
     const inputSchema = suppliedSchema === true
-      ? { type: "object", additionalProperties: true }
-      : augmentUnderspecifiedToolSchema(t.name, suppliedSchema);
-    return {
-      name: t.name, toolName: t.name, providerIdentifier: CLIENT_TOOL_PROVIDER_ID, description: t.description || "",
+      ? permissiveSchema
+      : augmentUnderspecifiedToolSchema(name, suppliedSchema);
+    const descriptor = {
+      name,
+      toolName: name,
+      providerIdentifier: CLIENT_TOOL_PROVIDER_ID,
+      description: typeof rawTool.description === "string" ? rawTool.description : "",
       inputSchema,
       ...(aliases.length ? { aliases } : {}),
     };
-  }));
+    try {
+      const probe = new AdvertisedToolRegistry();
+      probe.replace([descriptor]);
+    } catch (error) {
+      rejectedCount++;
+      dbg("quarantining advertised tool with an invalid input schema", "name=" + name,
+        (error && error.message) || String(error));
+      continue;
+    }
+    normalized.push(descriptor);
+  }
+  registry.replace(normalized);
+  registry.rejectedCount = rejectedCount;
   return registry;
 }
 
@@ -4577,8 +5688,18 @@ function refreshSessionFromBody(session, body, preparedToolRegistry = undefined,
   const hasAuthoritativeSnapshot = body && body.contractVersion === CLIENT_TOOL_CONTRACT_VERSION
     && typeof body.toolInventoryJSON === "string";
   if (!ignoreToolInventory && (Array.isArray(body && body.tools) || hasAuthoritativeSnapshot)) {
-    session.toolRegistry = preparedToolRegistry || prepareAdvertisedToolRegistry(body);
-    session.toolInventoryEpoch = typeof body.toolInventoryEpoch === "string" ? body.toolInventoryEpoch : null;
+    const candidate = preparedToolRegistry || prepareAdvertisedToolRegistry(body);
+    const preserveLastKnownGood = candidate
+      && candidate.rejectedCount > 0
+      && candidate.all().length === 0
+      && session.toolRegistry.all().length > 0;
+    if (preserveLastKnownGood) {
+      dbg("all replacement tool descriptors were quarantined; preserving the last-known-good registry",
+        "session=" + session.id, "rejected=" + candidate.rejectedCount);
+    } else {
+      session.toolRegistry = candidate;
+      session.toolInventoryEpoch = typeof body.toolInventoryEpoch === "string" ? body.toolInventoryEpoch : null;
+    }
     session.toolChoice = typeof body.toolChoice === "string" ? body.toolChoice : "";
     if (session.activeAdvertise !== null) {
       session.activeAdvertise = effectiveAdvertise(session.advertise, session.toolChoice);
@@ -4600,7 +5721,16 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   const settleOnce = () => { if (!settled) { settled = true; resolveTurn(); } };
   const deferredRound = continuation && continuation.round;
   const deferredInputId = continuation && continuation.deferredInputId;
-  const clientMessageId = typeof input?.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+  const requestedClientMessageId = typeof input?.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+  const clientMessageId = deferredInputId || requestedClientMessageId;
+  const clientMessageHash = continuation
+      && typeof continuation.requestHash === "string"
+      && /^[a-f0-9]{64}$/.test(continuation.requestHash)
+    ? continuation.requestHash
+    : completedTurnRequestHash(input);
+  const clientMessageGeneration = Number.isSafeInteger(input?.deliveryGeneration)
+    && input.deliveryGeneration >= 1 ? input.deliveryGeneration : 1;
+  const clientMessageKind = continuation ? "continuation" : "fresh";
   const markDeferred = (state, metadata = null) => {
     if (!deferredRound || !deferredInputId) return;
     deferredRound.markDeferredInputState(deferredInputId, state, metadata);
@@ -4610,6 +5740,9 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   // response instead of queuing a second send for the same client message.
   if (clientMessageId) {
     session.activeClientMessageId = clientMessageId;
+    session.activeClientMessageHash = clientMessageHash;
+    session.activeClientMessageGeneration = clientMessageGeneration;
+    session.activeClientMessageKind = clientMessageKind;
     session.sendPending = true;
   }
   if (deferredInputId) {
@@ -4625,6 +5758,12 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     // A same-message retry may have atomically handed this live turn to a new
     // response sink. The superseded socket no longer owns cancellation.
     if (session.activeRes !== res) return;
+    dbg("response.close -> cancel",
+      "session=" + session.id,
+      "turnToken=" + session.turnToken,
+      "run=" + !!session.run,
+      "pending=" + session.pendingCount(),
+      "waiters=" + session.waiters);
     settleOnce();
     // Reject receipts before clearing queue on close (transport failure path)
     session.failWrite("response closed");
@@ -4685,64 +5824,107 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   // new-user turn, the C1 mixed-turn fresh-send, and the C2/C3 re-seed — so they never drift. extraImages
   // (BR9) are merged in addition to input.images (e.g. images carried inside tool results).
   const driveUserSend = async (userText, extraImages) => {
-    userText = appendRulesReminder(userText); // CURSOR_COMPOSER_USER_MSG_REMINDER: standing per-turn nudge (off by default)
+    const deferredDelivery = deferredRound && deferredInputId
+      ? deferredRound.deferredInput(deferredInputId)
+      : null;
+    const freshDelivery = clientMessageKind === "fresh"
+      && input.freshDeliveryReceipt && typeof input.freshDeliveryReceipt === "object"
+      ? input.freshDeliveryReceipt : null;
+    const deliveryRecord = deferredDelivery || freshDelivery;
+    const frozenDelivery = deliveryRecord
+      && (freshDelivery || (deliveryRecord.deliveryAttempts || 0) > 0)
+      && Object.prototype.hasOwnProperty.call(deliveryRecord, "deliveryMessage")
+      && Array.isArray(deliveryRecord.deliveryAdvertise);
+    const advertiseBeforeFrozenRetry = session.advertise;
+    if (frozenDelivery) session.advertise = deliveryRecord.deliveryAdvertise;
+    if (!frozenDelivery) {
+      userText = appendRulesReminder(userText); // CURSOR_COMPOSER_USER_MSG_REMINDER: standing per-turn nudge (off by default)
+    }
     session.streamedText = "";   // reset per user turn (NOT across tool-result continuations within a run)
     session.reasonedThisRun = false; // #15: mirror streamedText — reasoning-produced tracking spans this run
     session.lastSdkActivityAt = nowMs();
     session.resetLoopBounds();   // ADD-106: a fresh send begins a new logical run -> reset the agentic-loop counters
     session.done = false;
     session.lastRunError = null;  // BR2: a fresh run starts clean; a prior run's error must not leak forward
-    const agent = await ensureAgent(session, model);
+    let agent;
+    try {
+      agent = await ensureAgent(session, model);
+    } catch (error) {
+      if (frozenDelivery) session.advertise = advertiseBeforeFrozenRetry;
+      throw error;
+    }
     // ensureAgent's resume/create is a network round-trip; if the client disconnected during it, onClose
     // already settled+cancelled this turn. Bail BEFORE agent.send so we don't spawn an orphan run.
-    if (settled) return;
+    if (settled) {
+      if (frozenDelivery) session.advertise = advertiseBeforeFrozenRetry;
+      return;
+    }
     let text = userText || "";
     // H11: snapshot the seed flags so we can ROLL BACK if agent.send rejects — otherwise a failed first send
     // would leave seeded=true and the retry (reusing this in-memory session) would omit the system + history
     // prelude, answering with missing context. They are committed only after agent.send resolves.
     const seededBefore = session.seeded;
     const seededSystemBefore = session.seededSystem;
-    if (!session.seeded) {
-      const parts = [];
-      if (input.system) parts.push(input.system);
-      if (input.history) parts.push("Previous conversation:\n" + input.history);
-      if (text) parts.push(text);
-      text = parts.join("\n\n");
+    if (!frozenDelivery) {
+      if (!session.seeded) {
+        const parts = [];
+        if (input.system) parts.push(input.system);
+        if (input.history) parts.push("Previous conversation:\n" + input.history);
+        if (text) parts.push(text);
+        text = parts.join("\n\n");
+        session.seeded = true;
+        session.seededSystem = input.system || "";   // C3/BR6: remember the seeded system for swap detection
+      } else if (input.system && input.system !== session.seededSystem) {
+        // C3/BR6: a continuation carried a NEW system prompt (e.g. ExitPlanMode) on an already-seeded session.
+        // Prepend it as an updated instruction block so the swap reaches the model, and remember it.
+        text = "Updated system instructions:\n" + input.system + (text ? "\n\n" + text : "");
+        session.seededSystem = input.system;
+      }
+    } else {
+      // The first agent.send crossed the durable DELIVERING boundary. Reuse
+      // the exact persisted SDK envelope; never rebuild it from a retry's
+      // potentially changed system/history/constraints.
       session.seeded = true;
-      session.seededSystem = input.system || "";   // C3/BR6: remember the seeded system for swap detection
-    } else if (input.system && input.system !== session.seededSystem) {
-      // C3/BR6: a continuation carried a NEW system prompt (e.g. ExitPlanMode) on an already-seeded session.
-      // Prepend it as an updated instruction block so the swap reaches the model, and remember it.
-      text = "Updated system instructions:\n" + input.system + (text ? "\n\n" + text : "");
-      session.seededSystem = input.system;
+      session.seededSystem = typeof deliveryRecord.deliverySeededSystem === "string"
+        ? deliveryRecord.deliverySeededSystem : session.seededSystem;
     }
     // Enforced per-turn constraints (response_format / stop / token limit / tool_choice) as instructions.
     // H08: record the resolved tool_choice on the session so the dispatch seam can best-effort gate native
     // tools for THIS turn. H09: if a forced specific:<name> tool is not advertised, tell the model it is
     // unavailable (and effectiveAdvertise advertises nothing) instead of widening to other tools.
-    const turnToolChoice = (constraints && constraints.toolChoice) || "";
+    const turnToolChoice = frozenDelivery
+      ? (deliveryRecord.deliveryToolChoice || "")
+      : (constraints && constraints.toolChoice) || "";
     session.toolChoice = turnToolChoice;
     const forcedUnavailable = forcedToolUnavailable(session.advertise, turnToolChoice);
-    const ci = constraintInstructions({ ...constraints, forcedUnavailable });
-    if (ci) text = text ? text + "\n\n" + ci : ci;
+    if (!frozenDelivery) {
+      const ci = constraintInstructions({ ...constraints, forcedUnavailable });
+      if (ci) text = text ? text + "\n\n" + ci : ci;
+    }
     // Tool-awareness hardening (prompt mode only — the "rule" mode delivers this via requestContext.rules instead).
     // Append a manifest of EVERY offered tool (tool_choice-effective set) so composer treats the client's
     // advertised/MCP tools as first-class and CALLS them instead of self-executing. Client-agnostic.
-    if (TOOL_MANIFEST_IN_PROMPT) {
+    if (!frozenDelivery && TOOL_MANIFEST_IN_PROMPT) {
       const manifest = toolManifest(effectiveAdvertise(session.advertise, turnToolChoice));
       if (manifest) { text = text ? text + "\n\n" + manifest : manifest; dbg("toolManifest injected (prompt)", "session=" + session.id, "bytes=" + manifest.length); }
     }
     // Merge images from the input with any extra images (BR9: tool-result images folded into the send).
-    const allImages = [...(Array.isArray(input.images) ? input.images : []), ...(Array.isArray(extraImages) ? extraImages : [])];
+    const allImages = frozenDelivery
+      ? (deliveryRecord.deliveryHasImages ? [{}] : [])
+      : [...(Array.isArray(input.images) ? input.images : []), ...(Array.isArray(extraImages) ? extraImages : [])];
     // Build the message first (toSdkImages may throw on a malformed image) BEFORE gating advertisement,
     // so a bad image never leaves session.advertise in the restricted state.
-    const msg = allImages.length ? { text, images: toSdkImages(allImages) } : text;
+    const msg = frozenDelivery
+      ? JSON.parse(canonicalJSONString(deliveryRecord.deliveryMessage))
+      : (allImages.length ? { text, images: toSdkImages(allImages) } : text);
     // tool_choice gates what tools the model SEES this turn (none -> none; specific -> just that one; H09: a
     // missed forced tool -> none, never widened). Restore the full advertised set right after send: the
     // run-request advertisement is built during send, and reconcileToolName still resolves any tool the model
     // calls against the full set.
-    const savedAdvertise = session.advertise;
-    const effAdv = effectiveAdvertise(session.advertise, turnToolChoice);
+    const savedAdvertise = frozenDelivery ? advertiseBeforeFrozenRetry : session.advertise;
+    const effAdv = frozenDelivery
+      ? session.advertise
+      : effectiveAdvertise(session.advertise, turnToolChoice);
     session.advertise = effAdv;
     // ADD-40: pin the turn-scoped effective set for the LIFETIME of this run. `advertise` is restored to the
     // full set in the finally (needed for cross-turn refresh + re-seed), but the model's ASYNC MCP dispatch
@@ -4754,10 +5936,43 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       "images=" + allImages.length, "effAdvertise=" + session.advertise.length, "model=" + model);
     const ep = ++session.runEpoch; // this run's epoch; its completion callback must ignore a result if cancel() (or a later run) advanced it
     const expectedUserTextHash = sdkUserTextHash(msg);
+    const sendIdempotencyKey = sdkSendIdempotencyKey(
+      session,
+      clientMessageId,
+      clientMessageHash,
+      deliveryRecord,
+      clientMessageGeneration,
+    );
+    if (clientMessageKind === "fresh" && clientMessageId && !frozenDelivery) {
+      writeFreshDeliveryReceipt(
+        session.cursorKey,
+        session.id,
+        clientMessageId,
+        clientMessageHash,
+        {
+          generation: clientMessageGeneration,
+          agentId: session.agentId,
+          idempotencyKey: sendIdempotencyKey,
+          message: msg,
+          advertise: effAdv,
+          model,
+          toolChoice: turnToolChoice,
+          seededSystem: session.seededSystem || "",
+          hasImages: allImages.length > 0,
+        },
+      );
+    }
     markDeferred(DeferredInputState.DELIVERING, {
       agentId: session.agentId,
       textHash: expectedUserTextHash,
       hasImages: allImages.length > 0,
+      idempotencyKey: sendIdempotencyKey,
+      message: msg,
+      advertise: effAdv,
+      inventoryEpoch: session.toolInventoryEpoch || "",
+      model,
+      toolChoice: turnToolChoice,
+      seededSystem: session.seededSystem || "",
     });
     const observeUserMessage = (userMessage) => {
       // Ignore an unrelated or structurally drifted SDK update. agent.send's
@@ -4770,7 +5985,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     };
     const sendCallbacks = {
       ...streamCallbacks(session, ep, observeUserMessage),
-      ...(clientMessageId ? { idempotencyKey: clientMessageId } : {}),
+      ...(sendIdempotencyKey ? { idempotencyKey: sendIdempotencyKey } : {}),
     };
     try {
       await als.run({ session }, async () => {
@@ -4827,8 +6042,9 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     } catch (error) {
       session.sendPending = false;
       // Once agent.send starts, a transport rejection cannot prove the remote
-      // durable agent did not accept the message. Keep DELIVERING as an
-      // explicit uncertain state; retrying automatically could duplicate work.
+      // durable agent did not accept the message. Keep DELIVERING with the
+      // exact envelope/agent/key persisted above; a later continuation retries
+      // only that identical logical SDK request.
       throw error;
     }
     markDeferred(DeferredInputState.DELIVERED, { evidence: "agent_send_resolved" });
@@ -4933,27 +6149,32 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       const round = continuation.round;
       if (!round || round.sessionId !== session.id) throw new ToolRoundError("round_lost", "continuation round is not owned by this Session", 410);
       const committedIds = continuation.committedIds || [];
-      const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
-      const allResultImages = collectToolResultImages(input);
-      const fallbackImages = mcpImageResultsEnabled()
-        ? allResultImages.filter((image) => !(image && typeof image.data === "string" && image.data))
-        : allResultImages;
-      const hasUserImages = (Array.isArray(input.images) && input.images.length > 0) || fallbackImages.length > 0;
-      const resultIds = new Set(committedIds);
-      let answeredLive = 0;
-      for (const id of resultIds) if (round.callbacks.has(id)) answeredLive++;
-      const remainingAfterApply = Math.max(0, round.pendingCount - answeredLive);
-      const systemChanged = !!(input.system && input.system !== session.seededSystem);
-      const requiresFreshRecovery = fallbackImages.length > 0 || systemChanged || hasUserText || hasUserImages;
+      const recoveryPlan = toolResultRecoveryPlan(round, input, session.seededSystem);
 
-      if (requiresFreshRecovery) {
+      if (recoveryPlan.requiresFreshRecovery && recoveryPlan.remainingUnreceipted > 0) {
+        // Do not resolve only part of a parallel callback wave and do not
+        // cancel its unanswered siblings. Receipts are already durable; a
+        // later incremental continuation will recover from the complete set.
+        const receipt = session.sseReceipt({
+          type: "turn_end",
+          stop_reason: "tool_use",
+          receipt: "partial_results_deferred_for_fidelity",
+          outstandingToolCalls: recoveryPlan.remainingUnreceipted,
+        });
+        if (receipt.ok) receipt.handedToNode.then(() => session.settle()).catch(() => {});
+      } else if (recoveryPlan.requiresFreshRecovery) {
         const detail = "tool continuation redirected to a faithful fresh send because the paused run could not accept all new payload";
         if (round.state !== RoundState.TERMINAL) round.terminalize(TerminalReason.INTERRUPTED, detail);
         await cancelStaleRun(TerminalReason.INTERRUPTED, detail);
-        session.agentId = `${session.id}_redirect_${round.route.slice(0, 10)}`;
+        const redirectedAgentId = `${session.id}_redirect_${round.route.slice(0, 10)}`;
+        writeDurableAgentAlias(session.cursorKey, session.id, redirectedAgentId, session);
+        session.agentId = redirectedAgentId;
         session.resetSeedState();
         const redirected = buildResultRecoveryInput(round, input);
-        await driveUserSend(redirected.text, allResultImages);
+        // driveUserSend already merges input.images (the trailing user
+        // payload); pass only images recovered from durable tool receipts so
+        // the user images are not duplicated.
+        await driveUserSend(redirected.text, recoveryPlan.resultImages);
       } else {
         const applied = round.applyCommittedResults(committedIds);
         if (applied.length > 0) session.lastSdkActivityAt = nowMs();
@@ -4977,7 +6198,12 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       // would spawn a second concurrent SDK run and orphan the first. CLIProxy should serialize
       // turns per sessionId; reject here as a backstop.
       dbg("runTurn RE-ENTRANT new user turn while run in flight -> reject", "session=" + session.id);
-      session.sse({ type: "turn_end", stop_reason: "error", error: "a turn is already in progress for this session" });
+      session.sse({
+        type: "turn_end",
+        stop_reason: "error",
+        error: "a turn is already in progress for this session",
+        _clientLeaseTerminal: false,
+      });
       settleOnce();
     } else {
       await driveUserSend(input.text || "", null);
@@ -5025,6 +6251,9 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     }
     if (session.run === null && session.activeClientMessageId === clientMessageId) {
       session.activeClientMessageId = "";
+      session.activeClientMessageHash = "";
+      session.activeClientMessageGeneration = 1;
+      session.activeClientMessageKind = "";
     }
     clearInterval(keepalive);
     res.off("close", onClose);
@@ -5037,7 +6266,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   }
 }
 
-const server = createServer(async (req, res) => {
+async function handleHttpRequest(req, res) {
   if (req.method === "OPTIONS") { res.setHeader("Access-Control-Allow-Origin", "*"); res.writeHead(204); res.end(); return; }
   if (req.method === "GET" && req.url === "/health") {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -5086,6 +6315,33 @@ const server = createServer(async (req, res) => {
     return;
   }
   res.writeHead(404); res.end(JSON.stringify({ error: "not found" }));
+}
+
+async function handleHttpRequestSafely(req, res, dispatch = handleHttpRequest) {
+  // Node does not observe a rejected Promise returned by an async request
+  // listener. Contain every request-local transport/backpressure failure here
+  // so a client closing a replay socket cannot reach the process-wide fatal
+  // unhandledRejection handler and restart the bridge for every other client.
+  try {
+    await dispatch(req, res);
+  } catch (error) {
+    dbg("request-local bridge failure contained", req.method, req.url,
+      (error && error.stack) || (error && error.message) || String(error));
+    if (!res.headersSent) {
+      try {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "request failed" }));
+      } catch {}
+      return false;
+    }
+    try { if (!res.writableEnded) res.destroy(); } catch {}
+    return false;
+  }
+  return true;
+}
+
+const server = createServer((req, res) => {
+  void handleHttpRequestSafely(req, res);
 });
 
 // ---- idle session eviction (bounded sessions Map; no leaked agents) ----
@@ -5165,8 +6421,64 @@ function sessionForClosedInputStream(reason, sessionsMap) {
   return closed ? soleStreamingSession(sessionsMap) : null;
 }
 
+// @cursor/sdk surfaces an expected run.cancel() as an unhandled DOM
+// AbortError from its internal abort listener rather than as the promise that
+// cancel() returns. Keep a short-lived, session-scoped ticket for each explicit
+// cancellation so the process-wide rejection hook cannot turn normal
+// interrupt/redeploy cleanup into a bridge-wide crash. Unexpected AbortErrors
+// still go through the normal single-session teardown below when no ticket
+// exists. Scoping tickets to sessions avoids swallowing an unrelated abort
+// from a concurrent turn merely because another turn was just cancelled.
+const expectedSdkAbortTickets = [];
+function noteExpectedSdkAbort(sessionId = "") {
+  expectedSdkAbortTickets.push({ sessionId: String(sessionId || ""), expiresAt: nowMs() + 60_000 });
+}
+function consumeExpectedSdkAbort(sessionsMap = sessions) {
+  const now = nowMs();
+  for (let i = expectedSdkAbortTickets.length - 1; i >= 0; i--) {
+    if (expectedSdkAbortTickets[i].expiresAt <= now) expectedSdkAbortTickets.splice(i, 1);
+  }
+  const index = expectedSdkAbortTickets.findIndex((ticket) => {
+    const session = sessionsMap && typeof sessionsMap.get === "function"
+      ? sessionsMap.get(ticket.sessionId) : null;
+    // Session.cancel marks done before calling run.cancel. If the session has
+    // already been removed, that cancellation is also unambiguously complete.
+    return !session || session.done || session.run === null;
+  });
+  if (index < 0) return false;
+  expectedSdkAbortTickets.splice(index, 1);
+  return true;
+}
+function isSdkAbortError(reason) {
+  return !!reason && (reason.name === "AbortError" || /operation was aborted/i.test(String(reason.message || "")));
+}
+function sessionForSdkAbort(reason, sessionsMap) {
+  return isSdkAbortError(reason) ? soleSdkRunSession(sessionsMap) : null;
+}
+
 process.on("unhandledRejection", (reason) => {
   try {
+    if (isSdkAbortError(reason) && consumeExpectedSdkAbort(sessions)) {
+      console.error("[cursor-agent-bridge] expected SDK cancellation AbortError ignored:", (reason && reason.message) || reason);
+      return;
+    }
+    if (isSdkAbortError(reason)) {
+      const victim = sessionForSdkAbort(reason, sessions);
+      if (victim) {
+        // An SDK-side abort can originate below agent.cancel(), so it may not
+        // have an explicit ticket. With one unambiguous live/paused session we
+        // can still terminalize that run locally; with multiple sessions we
+        // refuse to guess and leave each bounded watchdog/lease to self-heal.
+        console.error("[cursor-agent-bridge] SDK run aborted mid-turn -> clean teardown session=" + victim.id + ":", (reason && reason.message) || reason);
+        try {
+          if (typeof victim.abortFromSdk === "function") victim.abortFromSdk(new Error("Cursor SDK aborted the active run; the turn was interrupted"));
+          else victim.onRunError(new Error("Cursor SDK aborted the active run; the turn was interrupted"));
+        } catch { /* never throw from the handler */ }
+      } else {
+        console.error("[cursor-agent-bridge] SDK AbortError without an unambiguous session; keeping the bridge alive:", (reason && reason.message) || reason);
+      }
+      return;
+    }
     const victim = sessionForClosedInputStream(reason, sessions);
     if (victim) {
       // Convert the leaked input-pipe closure into a clean run teardown: the in-flight turn ends with a typed
@@ -5350,8 +6662,9 @@ async function selfTestResultSerialization() {
   add("mcpResult", "mcp:ok", mcpDispatchResult("ok", false));
   add("mcpResult", "mcp:isError", mcpDispatchResult("tool failed", true));
   add("mcpResult", "mcp:object", mcpDispatchResult({ k: "v" }, false));
-  // EX3: validate the McpImageContent variant ({image:{data:<base64>,mimeType}}) serializes through the REAL
-  // proto at startup, so a wrong shape fails fast here (fail-closed) instead of crashing on the first real image.
+  // Validate the opt-in McpImageContent variant ({image:{data:<base64>,mimeType}}) through the REAL proto.
+  // Serialization compatibility is necessary but not sufficient for a model route to consume it; the default
+  // image path therefore remains durable fresh-send recovery.
   add("mcpResult", "mcp:image", mcpDispatchResult("here is the image", false, [{ data: "iVBORw0KGgo=", mimeType: "image/png" }]));
   // 8) Headless request context (the SDK's first exec on every run).
   add("requestContextResult", "requestContext", headlessRequestContext(null).__ccJson);
@@ -5417,6 +6730,7 @@ if (RUN_AS_MAIN) {
     const { journal, codec } = getRoundInfrastructure();
     terminalizeOrphanedRounds(journal, codec);
     journal.cleanupTerminal({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
+    cleanupCompletedTurnReceipts({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
   }
   catch (e) { console.error(`[bridge] STATE_ROOT ${path.resolve(STATE_ROOT)} is not writable: ${e.message}`); process.exit(1); }
   console.log(`[bridge] mode=${MULTI_TENANT ? "multi-tenant (per-key platforms, X-Bridge-Auth gated)" : "single-tenant (one CURSOR_API_KEY)"} durable stateRoot=${path.resolve(STATE_ROOT)} (sqlite session+checkpoint state is written here; NOT a 'zero-FS' guarantee — only TOOL EXECUTION is FS-isolated to the client)`);
@@ -5441,5 +6755,5 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, buildRestartRecoveryInput, continuationTenantMismatch, sessions, liveToolRounds, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, sessions, liveToolRounds, completedTurnReceipts, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, sessionForSdkAbort, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, toolResultRecoveryPlan, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

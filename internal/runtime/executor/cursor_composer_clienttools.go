@@ -2954,7 +2954,44 @@ func composerToolResultsHinted(messages []gjson.Result, hint composerContinuatio
 	return nil, "", false
 }
 
-func composerClientMessageID(results []map[string]any, userText string, images []map[string]any) string {
+// composerLegacyUnsignedResultReplay identifies a continuation batch emitted before signed cct1 routing was
+// introduced. It is deliberately all-or-nothing: a batch containing even one signed id still belongs to the
+// durable ToolRound path and must never be downgraded to replay recovery merely because another id is malformed.
+func composerLegacyUnsignedResultReplay(results []map[string]any, hint composerContinuationHint) bool {
+	if len(results) == 0 || hint.hasClientToolID == nil {
+		return false
+	}
+	for _, result := range results {
+		id, _ := result["toolCallId"].(string)
+		id = strings.TrimSpace(id)
+		if id == "" || hint.hasClientToolID(id) {
+			return false
+		}
+	}
+	return true
+}
+
+// composerLegacyReplayHistoryBound keeps completed legacy tool calls/results and subsequent injected notices in
+// the bounded replay while excluding the latest user instruction, which is sent separately. With no trailing
+// user instruction, the complete message list is replayed.
+func composerLegacyReplayHistoryBound(messages []gjson.Result) int {
+	lastTool := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Get("role").String() == "tool" {
+			lastTool = i
+			break
+		}
+	}
+	for i := len(messages) - 1; i > lastTool; i-- {
+		if messages[i].Get("role").String() == "user" &&
+			(cursorMessageText(messages[i]) != "" || messageHasImageParts(messages[i])) {
+			return i
+		}
+	}
+	return len(messages)
+}
+
+func composerClientMessageID(results []map[string]any, userText string, images []map[string]any, turnAnchor ...string) string {
 	toolCallIDSet := make(map[string]struct{}, len(results))
 	for _, result := range results {
 		if id, ok := result["toolCallId"].(string); ok && strings.TrimSpace(id) != "" {
@@ -2974,6 +3011,14 @@ func composerClientMessageID(results []map[string]any, userText string, images [
 		"text":        userText,
 		"toolCallIds": toolCallIDs,
 		"version":     2,
+	}
+	if len(turnAnchor) > 0 && turnAnchor[0] != "" {
+		// A fresh message may legitimately repeat the same text ("continue" is
+		// common). Bind its retry id to the semantic transcript before that
+		// message so exact HTTP retries remain stable but a later identical turn
+		// does not reuse the prior SDK idempotency key. Tool-result ids already
+		// supply their own immutable turn anchor and therefore omit this field.
+		payload["turnAnchor"] = turnAnchor[0]
 	}
 	encoded, _ := json.Marshal(payload)
 	sum := sha256.Sum256(encoded)
@@ -2999,6 +3044,13 @@ func composerInputHinted(oai []byte, hint composerContinuationHint) map[string]a
 	// user text; carry that text intentionally.
 	if results, trailing, ok := composerToolResultsHinted(messages, hint); ok {
 		inp := map[string]any{"type": "tool_results", "results": results}
+		legacyUnsignedReplay := composerLegacyUnsignedResultReplay(results, hint)
+		if legacyUnsignedReplay {
+			// The bridge owns the compatibility decision. Go supplies a complete bounded replay and marker, but
+			// still forwards every opaque id unchanged to /agent/continue. Signed or mixed batches never enter
+			// this path and retain strict durable ToolRound validation.
+			inp["legacyUnsignedReplay"] = true
+		}
 		// Tool results are immutable receipts. A trailing user message is a
 		// separate durable input and must never be folded into a receipted result
 		// under the same signed id.
@@ -3025,9 +3077,12 @@ func composerInputHinted(oai []byte, hint composerContinuationHint) map[string]a
 		if len(trailingImages) > 0 {
 			inp["images"] = trailingImages
 		}
-		if _, hasText := inp["userText"]; hasText || len(trailingImages) > 0 {
-			userText, _ := inp["userText"].(string)
-			inp["clientMessageId"] = composerClientMessageID(results, userText, trailingImages)
+		// Every result batch gets a stable semantic request identity, including a
+		// result-only continuation. The bridge uses it to replay a completed
+		// response after a lost HTTP response instead of invoking agent.send twice.
+		userText, hasText := inp["userText"].(string)
+		inp["clientMessageId"] = composerClientMessageID(results, userText, trailingImages)
+		if hasText || len(trailingImages) > 0 {
 			inp["interruptRequested"] = true
 		}
 		// EX8 (C3): a system-prompt swap (e.g. post-ExitPlanMode) on a continuation must reach the model.
@@ -3043,7 +3098,14 @@ func composerInputHinted(oai []byte, hint composerContinuationHint) map[string]a
 		}
 		// EX10: carry rendered history so the bridge can seed a fresh session before applying these results
 		// (recovers an evicted/restarted/410'd session). Bounded per EX13 inside renderComposerHistory.
-		if hist := renderComposerHistory(messages, continuationHistoryBound(messages)); hist != "" {
+		historyBound := continuationHistoryBound(messages)
+		if legacyUnsignedReplay {
+			// A live signed continuation replays history only before its current batch because structured results
+			// are applied to SDK callbacks. An unsigned legacy batch has no callback after a bridge upgrade/restart,
+			// so its replay must include the assistant calls plus completed results or the model would repeat them.
+			historyBound = composerLegacyReplayHistoryBound(messages)
+		}
+		if hist := renderComposerHistory(messages, historyBound); hist != "" {
 			inp["history"] = hist
 		}
 		// EX7 (C2): fingerprint the non-system history so a /compact-style rewrite re-seeds the bridge.
@@ -3061,6 +3123,8 @@ func composerInputHinted(oai []byte, hint composerContinuationHint) map[string]a
 	}
 	inp := map[string]any{"type": "user", "text": ""}
 	var currentImages []map[string]any
+	priorHistory := renderComposerHistory(messages, lastUserIdx)
+	systemPrompt := extractComposerSystem(messages)
 	if lastUserIdx >= 0 {
 		m := messages[lastUserIdx]
 		text := cursorMessageText(m)
@@ -3081,18 +3145,23 @@ func composerInputHinted(oai []byte, hint composerContinuationHint) map[string]a
 		}
 		inp["text"] = text
 		if text != "" || len(currentImages) > 0 {
-			// Fresh turns need the same transport-retry identity as mixed
-			// continuations. The bridge keeps this id only for the active logical
-			// run, so a later intentional repeat remains a new turn after the
-			// prior run has completed.
-			inp["clientMessageId"] = composerClientMessageID(nil, text, currentImages)
+			// Fresh turns need a transport-retry identity that is also distinct
+			// from a later intentional repetition of the same text. The bounded
+			// semantic prior transcript provides that turn anchor without relying
+			// on JSON key order or process-local counters.
+			inp["clientMessageId"] = composerClientMessageID(
+				nil,
+				text,
+				currentImages,
+				systemPrompt+"\x00"+priorHistory,
+			)
 		}
 	}
-	if sys := extractComposerSystem(messages); sys != "" {
-		inp["system"] = sys
+	if systemPrompt != "" {
+		inp["system"] = systemPrompt
 	}
-	if hist := renderComposerHistory(messages, lastUserIdx); hist != "" {
-		inp["history"] = hist
+	if priorHistory != "" {
+		inp["history"] = priorHistory
 	}
 	// EX7 (C2): fingerprint the non-system history on the new-user path too.
 	if fp := composerHistoryFingerprint(messages); fp != "" {
@@ -3430,13 +3499,21 @@ func composerToolInventoryEpoch(advertise []map[string]any) string {
 	return epoch
 }
 
-func composerTurnBody(sessionID, model string, input map[string]any, advertise []map[string]any, toolChoice string, clientEnv map[string]any, constraints map[string]any) []byte {
+func composerTurnBody(sessionID, model string, input map[string]any, advertise []map[string]any, toolChoice string, clientEnv map[string]any, constraints map[string]any, leaseOwner uint64) []byte {
 	body := map[string]any{
 		"sessionId":          sessionID,
 		"model":              model,
 		"input":              input,
 		"contractVersion":    2,
 		"toolsAuthoritative": true,
+	}
+	// The bridge persists this opaque owner token with every ToolRound and
+	// echoes it on continuation terminals. That lets a signed /continue finish
+	// the exact fresh-turn lease which opened the paused SDK callback without
+	// teaching Go how to decode or own tool-call routing ids. Decimal text is
+	// lossless across the Go/JavaScript boundary (uint64 exceeds JS Number).
+	if leaseOwner != 0 {
+		body["clientLeaseToken"] = strconv.FormatUint(leaseOwner, 10)
 	}
 	// H10 (C-CONTINUATION-TOOLS): attach the current tool inventory on EVERY turn when advertised, not only
 	// on a new-user turn. The bridge refreshes session.advertise from the authoritative snapshot on tool_results turns too, so
@@ -3689,15 +3766,47 @@ func composerStreamResponseHeaders() http.Header {
 	return http.Header{}
 }
 
-// composerApplyLeaseStop extends a lease across a tool pause and releases it only after a true terminal stop
-// or caller cancellation. Error stops no longer force-forget any tool ownership; ownership lives in the bridge.
-func composerApplyLeaseStop(tenant, sessionID, leaseStop string, leaseOwner uint64, ctx context.Context) {
+// composerContinuationLeaseStop validates the bridge's opaque fresh-lease
+// echo. A continuation is allowed to mutate only the exact owner token which
+// opened its signed ToolRound. Missing/malformed metadata is availability-safe:
+// leave the lease for stale-TTL recovery instead of risking a newer run.
+func composerContinuationLeaseStop(ev gjson.Result) (sessionID, leaseStop string, leaseOwner uint64) {
+	lease := ev.Get("clientLease")
+	if !lease.Exists() || !lease.IsObject() {
+		return "", "", 0
+	}
+	sessionID = strings.TrimSpace(lease.Get("sessionId").String())
+	if !composerRoutedSessionIDPattern.MatchString(sessionID) {
+		return "", "", 0
+	}
+	token := strings.TrimSpace(lease.Get("token").String())
+	owner, err := strconv.ParseUint(token, 10, 64)
+	if err != nil || owner == 0 {
+		return "", "", 0
+	}
+	terminalRaw := lease.Get("terminal").Raw
+	if terminalRaw != "true" && terminalRaw != "false" {
+		return "", "", 0
+	}
+	stop := ev.Get("stop_reason").String()
+	if stop == "" {
+		stop = "end_turn"
+	}
+	if stop != "tool_use" && terminalRaw != "true" {
+		return sessionID, "", owner
+	}
+	return sessionID, stop, owner
+}
+
+// composerApplyLeaseStop extends a lease across a tool pause and releases it
+// only after a proven terminal stop. A response that disappears without a
+// terminal is ambiguous: the bridge run may still be alive, so the lease is
+// deliberately left for its bounded stale-TTL self-heal.
+func composerApplyLeaseStop(tenant, sessionID, leaseStop string, leaseOwner uint64) {
 	switch {
 	case leaseStop == "tool_use":
 		composerInflight.touch(tenant, sessionID, leaseOwner)
 	case leaseStop != "":
-		composerInflight.release(tenant, sessionID, leaseOwner)
-	case ctx.Err() != nil:
 		composerInflight.release(tenant, sessionID, leaseOwner)
 	}
 }
@@ -3721,16 +3830,17 @@ func composerDebugLogAdvertisedTools(responseID string, advertise []map[string]a
 
 // composerInboundTurn holds validated per-turn state shared by executeComposer and executeComposerStream.
 type composerInboundTurn struct {
-	model       string
-	responseID  string
-	tenant      string
-	contHint    composerContinuationHint
-	oai         []byte
-	defs        []cursorToolDefinition
-	toolAliases map[string]string
-	sessionID   string
-	leaseOwner  uint64
-	clientEnv   map[string]any
+	model        string
+	responseID   string
+	tenant       string
+	contHint     composerContinuationHint
+	oai          []byte
+	defs         []cursorToolDefinition
+	toolAliases  map[string]string
+	sessionID    string
+	leaseOwner   uint64
+	continuation bool
+	clientEnv    map[string]any
 }
 
 func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (composerInboundTurn, error) {
@@ -3744,6 +3854,7 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	turn.oai = composerForceStoreTrue(turn.oai)
 	turn.tenant = composerTenant(auth, opts)
 	turn.contHint = composerContinuationHintFor(turn.tenant, turn.oai)
+	_, _, turn.continuation = composerToolResultsHinted(gjson.GetBytes(turn.oai, "messages").Array(), turn.contHint)
 	if lastUserTurnImageOnlyInvalid(gjson.GetBytes(turn.oai, "messages").Array(), turn.contHint) {
 		return turn, errComposerImageOnlyInvalid
 	}
@@ -3843,6 +3954,8 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 	toolAliases := turn.toolAliases
 	sessionID := turn.sessionID
 	leaseOwner := turn.leaseOwner
+	leaseSessionID := sessionID
+	continuation := turn.continuation
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	// H16/#21 (C-RESPID): the outward-response-id -> sessionID mapping is recorded AFTER the bridge accepts a
@@ -3854,7 +3967,7 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 	// server-side-chained [..., tool, user] turn is sent as tool_results (with userText) — not a fresh user turn
 	// behind a paused run.
 	inp := composerInputHinted(oai, contHint)
-	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, turn.clientEnv, constraints)
+	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, turn.clientEnv, constraints, leaseOwner)
 	composerDebugf("[composer %s] STREAM sessionID=%s inputType=%v toolChoice=%q advertise=%d -> POST /agent/turn", responseID, sessionID, inp["type"], toolChoice, len(advertise))
 	composerDebugLogAdvertisedTools(responseID, advertise)
 
@@ -3901,8 +4014,8 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		}()
 		defer reporter.EnsurePublished(ctx)
 		defer func() {
-			// No terminal AND not a disconnect: leave the lease for TTL self-heal (see composerApplyLeaseStop).
-			composerApplyLeaseStop(tenant, sessionID, leaseStop, leaseOwner, ctx)
+			// No terminal, including a disconnect: leave the lease for TTL self-heal (see composerApplyLeaseStop).
+			composerApplyLeaseStop(tenant, leaseSessionID, leaseStop, leaseOwner)
 		}()
 
 		// CC's auto-compact reads message.usage.input_tokens; the openai->claude translator hard-codes it to 0, so
@@ -3920,7 +4033,7 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		}
 
 		scanner := bufio.NewScanner(httpResp.Body)
-		scanner.Buffer(nil, composerSSEMaxLineBytes) // ADD-68: align the single-line cap with the 64 MB body cap
+		scanner.Buffer(nil, composerSSEMaxLineBytes) // shared Node/Go SSE-frame contract
 		var param any
 		toolIdx := 0
 		evCount := 0         // P0-3: throttle in-stream lease touches (refresh the TTL on long single-turn streams)
@@ -3986,6 +4099,9 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 				leaseStop = ev.Get("stop_reason").String()
 				if leaseStop == "" {
 					leaseStop = "end_turn"
+				}
+				if continuation {
+					leaseSessionID, leaseStop, leaseOwner = composerContinuationLeaseStop(ev)
 				}
 				// The bridge reports upstream Cursor failures (auth/quota/network/run error) as
 				// turn_end{stop_reason:"error"}. Propagate them as a real stream error instead of
@@ -4198,13 +4314,15 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 	toolAliases := turn.toolAliases
 	sessionID := turn.sessionID
 	leaseOwner := turn.leaseOwner
+	leaseSessionID := sessionID
+	continuation := turn.continuation
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	// leaseStop mirrors the streaming path: free the session's logical-run lease on a terminal end, touch it on
 	// a tool_use pause, and on no terminal ("") leave it for the TTL (the bridge run may still be alive). All
 	// touch/release calls carry leaseOwner so only the claiming run can mutate the lease (P0-1: no clobber).
 	leaseStop := ""
-	defer func() { composerApplyLeaseStop(tenant, sessionID, leaseStop, leaseOwner, ctx) }()
+	defer func() { composerApplyLeaseStop(tenant, leaseSessionID, leaseStop, leaseOwner) }()
 	// H16/#21 (C-RESPID): the outward-response-id -> sessionID mapping is recorded AFTER the bridge accepts a
 	// valid SSE stream (below), not here — a failed dispatch must leave no phantom mapping (mirrors the stream path).
 	prep := prepareComposerAdvertise(oai, defs, toolAliases)
@@ -4213,7 +4331,7 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 	// server-side-chained [..., tool, user] turn is sent as tool_results (with userText) — not a fresh user turn
 	// behind a paused run.
 	inp := composerInputHinted(oai, contHint)
-	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, turn.clientEnv, constraints)
+	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, turn.clientEnv, constraints, leaseOwner)
 
 	httpResp, err := e.composerAgentTurnDial(ctx, auth, apiKey, body)
 	if err != nil {
@@ -4249,7 +4367,7 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 	sawTerminal := false // ADD-88/96 (RBT-012): a turn_end (of ANY stop_reason) was observed before EOF
 	evCount := 0         // P0-3: throttle in-stream lease touches (refresh the TTL on long single-turn streams)
 	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, composerSSEMaxLineBytes) // ADD-68: align the single-line cap with the 64 MB body cap
+	scanner.Buffer(nil, composerSSEMaxLineBytes) // shared Node/Go SSE-frame contract
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if !bytes.HasPrefix(line, []byte("data: ")) {
@@ -4291,6 +4409,9 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 			leaseStop = ev.Get("stop_reason").String()
 			if leaseStop == "" {
 				leaseStop = "end_turn"
+			}
+			if continuation {
+				leaseSessionID, leaseStop, leaseOwner = composerContinuationLeaseStop(ev)
 			}
 			switch ev.Get("stop_reason").String() {
 			case "tool_use":

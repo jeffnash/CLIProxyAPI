@@ -241,6 +241,18 @@ func TestComposerFreshUserTurnHasRetryStableMessageID(t *testing.T) {
 	if changed["clientMessageId"] == id {
 		t.Fatalf("distinct active user intent reused message id %q", id)
 	}
+	changedSystem := composerInput([]byte(`{"messages":[{"role":"system","content":"different system"},{"role":"user","content":"do one thing"}]}`))
+	if changedSystem["clientMessageId"] == id {
+		t.Fatalf("a system-contract change must not reuse the prior turn id %q", id)
+	}
+	repeatedLater := composerInput([]byte(`{"messages":[
+		{"role":"user","content":"do one thing"},
+		{"role":"assistant","content":"done"},
+		{"role":"user","content":"do one thing"}
+	]}`))
+	if repeatedLater["clientMessageId"] == id {
+		t.Fatalf("a later intentional repetition must not reuse the first turn id %q", id)
+	}
 }
 
 func TestComposerInputHistoryAndImages(t *testing.T) {
@@ -282,7 +294,7 @@ func TestExtractComposerToolChoice(t *testing.T) {
 func TestComposerTurnBody(t *testing.T) {
 	// tool_choice=none path: caller passes advertise=nil => an explicit empty
 	// inventory clears any tools cached by a reused bridge session.
-	none := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "user", "text": "x"}, nil, "none", nil, nil)
+	none := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "user", "text": "x"}, nil, "none", nil, nil, 0)
 	if gjson.GetBytes(none, "tools").Exists() {
 		t.Fatalf("tool inventory must not be serialized twice: %s", none)
 	}
@@ -295,7 +307,7 @@ func TestComposerTurnBody(t *testing.T) {
 	// With advertised tools + clientEnv + enforced constraints.
 	adv := []map[string]any{{"name": "Read", "toolName": "Read"}}
 	full := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "user", "text": "x"}, adv, "auto", map[string]any{"shell": "zsh"},
-		map[string]any{"responseFormat": map[string]any{"type": "json_object"}, "stop": []string{"STOP"}, "maxTokens": 256})
+		map[string]any{"responseFormat": map[string]any{"type": "json_object"}, "stop": []string{"STOP"}, "maxTokens": 256}, 17)
 	if gjson.Parse(gjson.GetBytes(full, "toolInventoryJSON").String()).Get("0.name").String() != "Read" {
 		t.Fatalf("advertised tool missing: %s", full)
 	}
@@ -308,13 +320,16 @@ func TestComposerTurnBody(t *testing.T) {
 	if gjson.GetBytes(full, "stop.0").String() != "STOP" || gjson.GetBytes(full, "maxTokens").Int() != 256 {
 		t.Fatalf("stop/maxTokens not forwarded: %s", full)
 	}
+	if gjson.GetBytes(full, "clientLeaseToken").String() != "17" {
+		t.Fatalf("fresh-turn lease token must cross the JS boundary as lossless decimal text: %s", full)
+	}
 }
 
 // Comment 2: a data-URI image sent through cursor_composer.go must reach the sidecar in the SDK image
 // shape {data, mimeType} — the MIME type must survive the Go->bridge translation.
 func TestComposerImageCarriesMimeType(t *testing.T) {
 	oai := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,SkZJRg=="}}]}]}`)
-	body := composerTurnBody("s1", "composer-2.5", composerInput(oai), nil, "", nil, composerConstraints(oai))
+	body := composerTurnBody("s1", "composer-2.5", composerInput(oai), nil, "", nil, composerConstraints(oai), 0)
 	if got := gjson.GetBytes(body, "input.images.0.data").String(); got != "SkZJRg==" {
 		t.Fatalf("image data not on the wire: %s", body)
 	}
@@ -495,7 +510,9 @@ func TestComposerMixedTurnSeparatesTrailingText(t *testing.T) {
 	if id, _ := mixed["clientMessageId"].(string); !strings.HasPrefix(id, "ccm2_") {
 		t.Fatalf("mixed input needs a stable client message id, got %q", id)
 	}
-	// A pure tool_results turn (no trailing text) must NOT be modified.
+	// A pure tool_results turn keeps its result immutable and still receives a
+	// stable request id so a lost final response can be replayed without a
+	// second SDK send.
 	pure := composerInput([]byte(`{"messages":[{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},{"role":"tool","tool_call_id":"tc_1","content":"R"}]}`))
 	pres, _ := pure["results"].([]map[string]any)
 	if len(pres) != 1 {
@@ -503,6 +520,9 @@ func TestComposerMixedTurnSeparatesTrailingText(t *testing.T) {
 	}
 	if c, _ := pres[0]["content"].(string); c != "R" {
 		t.Fatalf("a pure tool_results turn must NOT be modified, got content %q", c)
+	}
+	if id, _ := pure["clientMessageId"].(string); !strings.HasPrefix(id, "ccm2_") {
+		t.Fatalf("pure result continuation needs a stable response-replay id, got %q", id)
 	}
 }
 
@@ -1143,7 +1163,7 @@ func TestValidatedComposerClientEnvHeaderlessAndInvalidAreNeutral(t *testing.T) 
 
 func TestComposerTurnBodyNeutralWorkspaceNeverInventsSentinel(t *testing.T) {
 	env := validatedComposerClientEnv(cliproxyexecutor.Options{})
-	body := composerTurnBody("sess_test", "cursor-grok-4.5", map[string]any{"type": "user", "text": "inspect this repo"}, nil, "auto", env, nil)
+	body := composerTurnBody("sess_test", "cursor-grok-4.5", map[string]any{"type": "user", "text": "inspect this repo"}, nil, "auto", env, nil, 0)
 	if !gjson.GetBytes(body, "clientEnv.workspaceUnknown").Bool() {
 		t.Fatalf("neutral workspace marker missing: %s", body)
 	}
@@ -1184,7 +1204,7 @@ func TestComposerToolInventoryEpochMatchesBridgeCanonicalContract(t *testing.T) 
 	if got := composerToolInventoryEpoch(tools); got != wantEpoch {
 		t.Fatalf("Go/bridge inventory fingerprint contract drifted: got %q want %q", got, wantEpoch)
 	}
-	body := composerTurnBody("s1", "cursor-grok-4.5", map[string]any{"type": "user", "text": "x"}, tools, "auto", nil, nil)
+	body := composerTurnBody("s1", "cursor-grok-4.5", map[string]any{"type": "user", "text": "x"}, tools, "auto", nil, nil, 0)
 	if got := gjson.GetBytes(body, "toolInventoryJSON").String(); got != wantJSON {
 		t.Fatalf("outer turn envelope changed the authoritative snapshot:\n got %q\nwant %q", got, wantJSON)
 	}
@@ -1450,6 +1470,93 @@ func TestComposerMixedTurnUsesLatestUnresolvedUserSnapshot(t *testing.T) {
 	}
 	if strings.Contains(inp["userText"].(string), "first failed retry") {
 		t.Fatalf("failed retry history was concatenated into current intent: %q", inp["userText"])
+	}
+}
+
+func TestComposerLegacyUnsignedContinuationCarriesFaithfulRecoveryReplay(t *testing.T) {
+	oai := []byte(`{"messages":[
+		{"role":"user","content":"start the implementation"},
+		{"role":"assistant","tool_calls":[
+			{"id":"call_old_a","type":"function","function":{"name":"todo","arguments":"{\"op\":\"view\"}"}},
+			{"id":"call_old_b","type":"function","function":{"name":"job","arguments":"{\"action\":\"list\"}"}}
+		]},
+		{"role":"tool","tool_call_id":"call_old_a","content":"todo snapshot"},
+		{"role":"tool","tool_call_id":"call_old_b","content":"subagent interrupted"},
+		{"role":"user","content":"<system-notice>background task stopped</system-notice>"},
+		{"role":"user","content":"resume every interrupted subagent"}
+	]}`)
+	hint := composerContinuationHintFor("", oai)
+	inp := composerInputHinted(oai, hint)
+	if inp["type"] != "tool_results" {
+		t.Fatalf("legacy replay must still enter through /continue, got %#v", inp)
+	}
+	if inp["legacyUnsignedReplay"] != true {
+		t.Fatalf("all-legacy result batch was not marked for bridge-owned recovery: %#v", inp)
+	}
+	if got := inp["userText"]; got != "resume every interrupted subagent" {
+		t.Fatalf("latest recovery instruction = %#v", got)
+	}
+	if got, _ := inp["clientMessageId"].(string); !strings.HasPrefix(got, "ccm2_") {
+		t.Fatalf("legacy recovery lacks deterministic request identity: %#v", inp)
+	}
+	history, _ := inp["history"].(string)
+	for _, want := range []string{
+		"call_old_a:todo", "call_old_b:job", "TOOL[call_old_a]: todo snapshot",
+		"TOOL[call_old_b]: subagent interrupted", "background task stopped",
+	} {
+		if !strings.Contains(history, want) {
+			t.Fatalf("legacy recovery history dropped %q: %s", want, history)
+		}
+	}
+	if strings.Contains(history, "resume every interrupted subagent") {
+		t.Fatalf("latest instruction must be sent once, not duplicated into recovery history: %s", history)
+	}
+}
+
+func TestComposerSignedOrMixedContinuationNeverDowngradesToLegacyReplay(t *testing.T) {
+	hint := composerContinuationHintFor("", nil)
+	cases := map[string][]map[string]any{
+		"signed": {
+			{"toolCallId": composerClientToolRoutingTokenPrefix + "route_0_signature"},
+		},
+		"mixed": {
+			{"toolCallId": "call_old"},
+			{"toolCallId": composerClientToolRoutingTokenPrefix + "route_0_signature"},
+		},
+		"missing": {
+			{"toolCallId": ""},
+		},
+	}
+	for name, results := range cases {
+		t.Run(name, func(t *testing.T) {
+			if composerLegacyUnsignedResultReplay(results, hint) {
+				t.Fatalf("%s batch must remain on strict signed validation: %#v", name, results)
+			}
+		})
+	}
+	if !composerLegacyUnsignedResultReplay([]map[string]any{{"toolCallId": "call_old"}}, hint) {
+		t.Fatal("an all-legacy non-empty batch must be recoverable from faithful replay")
+	}
+}
+
+func TestComposerLegacyResultOnlyContinuationReplaysEntireConversation(t *testing.T) {
+	oai := []byte(`{"messages":[
+		{"role":"user","content":"inspect the repository"},
+		{"role":"assistant","tool_calls":[{"id":"call_old","type":"function","function":{"name":"Read","arguments":"{\"path\":\"README.md\"}"}}]},
+		{"role":"tool","tool_call_id":"call_old","content":"repository overview"}
+	]}`)
+	inp := composerInputHinted(oai, composerContinuationHintFor("", oai))
+	if inp["legacyUnsignedReplay"] != true {
+		t.Fatalf("result-only legacy continuation was not recoverable: %#v", inp)
+	}
+	history, _ := inp["history"].(string)
+	for _, want := range []string{"inspect the repository", "call_old:Read", "TOOL[call_old]: repository overview"} {
+		if !strings.Contains(history, want) {
+			t.Fatalf("result-only replay dropped %q: %s", want, history)
+		}
+	}
+	if _, ok := inp["userText"]; ok {
+		t.Fatalf("result-only continuation invented a user instruction: %#v", inp)
 	}
 }
 
@@ -1752,17 +1859,17 @@ func TestRenderComposerHistoryImagePlaceholder(t *testing.T) {
 func TestComposerTurnBodyToolsOnContinuation(t *testing.T) {
 	adv := []map[string]any{{"name": "Read", "toolName": "Read"}}
 	// A tool_results continuation MUST still carry the current tool inventory.
-	cont := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "tool_results", "results": []any{}}, adv, "auto", nil, nil)
+	cont := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "tool_results", "results": []any{}}, adv, "auto", nil, nil, 0)
 	if gjson.Parse(gjson.GetBytes(cont, "toolInventoryJSON").String()).Get("0.name").String() != "Read" {
 		t.Fatalf("H10: continuation turn must include the current tools array, got %s", cont)
 	}
 	// A new-user turn still carries tools (unchanged behavior).
-	user := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "user", "text": "x"}, adv, "auto", nil, nil)
+	user := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "user", "text": "x"}, adv, "auto", nil, nil, 0)
 	if gjson.Parse(gjson.GetBytes(user, "toolInventoryJSON").String()).Get("0.name").String() != "Read" {
 		t.Fatalf("H10: user turn must include tools, got %s", user)
 	}
 	// tool_choice=none gating (advertise=nil) still wins and explicitly clears.
-	none := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "tool_results", "results": []any{}}, nil, "none", nil, nil)
+	none := composerTurnBody("s1", "composer-2.5", map[string]any{"type": "tool_results", "results": []any{}}, nil, "none", nil, nil, 0)
 	if tools := gjson.Parse(gjson.GetBytes(none, "toolInventoryJSON").String()); !tools.IsArray() || len(tools.Array()) != 0 {
 		t.Fatalf("H10: tool_choice=none must clear tools even on a continuation, got %s", none)
 	}
@@ -2640,7 +2747,7 @@ func TestADD83_ContinuationBodyCarriesConstraintsAndSystem(t *testing.T) {
 	if inp["system"] != "NEW SYSTEM" {
 		t.Fatalf("ADD-83: continuation input must carry the (possibly swapped) system, got %v", inp["system"])
 	}
-	body := composerTurnBody("s1", "composer-2.5", inp, nil, "", nil, composerConstraints(oai))
+	body := composerTurnBody("s1", "composer-2.5", inp, nil, "", nil, composerConstraints(oai), 0)
 	if gjson.GetBytes(body, "input.system").String() != "NEW SYSTEM" {
 		t.Fatalf("ADD-83: bridge body must carry input.system on a continuation, got %s", body)
 	}

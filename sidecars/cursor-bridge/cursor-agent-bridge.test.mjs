@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -34,12 +34,16 @@ const {
   collectToolResultImages,
   composerModelSelection,
   composerWorkspaceCwd,
+  completedTurnReceipts,
+  completedTurnRequestHash,
+  validCompletedTurnReceipt,
   continuationTenantMismatch,
   constraintInstructions,
   dispatchMcpBatch,
   effectiveAdvertise,
   envInt,
   handleContinue,
+  handleHttpRequestSafely,
   handleTurn,
   headlessMcpState,
   headlessRequestContext,
@@ -52,6 +56,7 @@ const {
   liveToolRounds,
   mcpDispatch,
   mcpDispatchResult,
+  mcpImageResultsEnabled,
   mcpServerKeyForTool,
   mcpToolsForServer,
   sseFrameSizeError,
@@ -64,11 +69,17 @@ const {
   reconcileExport,
   refreshSessionFromBody,
   sessions,
+  sessionForSdkAbort,
   sdkAdvertisedTools,
+  sdkSendIdempotencyKey,
   syntheticAgentArtifactFailure,
   syntheticAgentArtifactRequest,
   toolManifest,
   toolManifestRule,
+  toolResultRecoveryPlan,
+  consumeExpectedSdkAbort,
+  isSdkAbortError,
+  noteExpectedSdkAbort,
   toSdkImages,
   truncateLiveToolResult,
   typedUnavailableResult,
@@ -134,6 +145,63 @@ function advertised(name = "Lookup") {
   return [{ name, toolName: name, description: `${name} tool`, inputSchema: { type: "object", properties: { q: { type: "string" } } } }];
 }
 
+test("continuation terminals echo the exact durable fresh-turn lease", async (t) => {
+  const decode = (res) => JSON.parse(
+    res.text().split("\n").find((line) => line.startsWith("data: {")).slice("data: ".length),
+  );
+
+  const paused = new Session("sess_leaseecho_paused");
+  paused.clientLeaseToken = "18446744073709551615";
+  const round = paused.ensureToolRound();
+  t.after(() => {
+    try { round.terminalize(TerminalReason.CLIENT_CANCELLED, "test cleanup"); } catch {}
+    sessions.delete(paused.id);
+  });
+  assert.equal(round.clientLeaseToken, "18446744073709551615");
+  assert.equal(ToolRound.load(
+    createRoundInfrastructure(TEST_STATE_ROOT).journal,
+    createRoundInfrastructure(TEST_STATE_ROOT).codec,
+    round.route,
+  ).clientLeaseToken, "18446744073709551615");
+
+  const pausedRes = new MockResponse();
+  paused.beginResponse(pausedRes);
+  assert.equal(paused.sse({ type: "turn_end", stop_reason: "tool_use" }), true);
+  await paused.finishResponse();
+  assert.deepEqual(decode(pausedRes).clientLease, {
+    sessionId: paused.id,
+    token: "18446744073709551615",
+    terminal: false,
+  });
+
+  const finished = new Session("sess_leaseecho_finished");
+  finished.clientLeaseToken = "42";
+  t.after(() => sessions.delete(finished.id));
+  const finishedRes = new MockResponse();
+  finished.beginResponse(finishedRes);
+  assert.equal(finished.sse({ type: "turn_end", stop_reason: "end_turn" }), true);
+  await finished.finishResponse();
+  assert.deepEqual(decode(finishedRes).clientLease, {
+    sessionId: finished.id,
+    token: "42",
+    terminal: true,
+  });
+
+  const rejectedRes = new MockResponse();
+  finished.responseWriter = null;
+  finished.activeRes = null;
+  finished.beginResponse(rejectedRes);
+  assert.equal(finished.sse({
+    type: "turn_end",
+    stop_reason: "error",
+    _clientLeaseTerminal: false,
+  }), true);
+  await finished.finishResponse();
+  const rejected = decode(rejectedRes);
+  assert.equal(rejected.clientLease.terminal, false);
+  assert.equal(rejected._clientLeaseTerminal, undefined, "bridge-only lease controls must never leak to clients");
+});
+
 function seedSession(id, key = "cursor-key", tools = advertised()) {
   const session = new Session(id, key);
   session.clientEnv = { workspaceUnknown: true };
@@ -176,6 +244,20 @@ function journalRecord(route) {
   return JSON.parse(readFileSync(path.join(TEST_STATE_ROOT, "client-tool-rounds", `${route}.json`), "utf8"));
 }
 
+function exactTurnReceiptFile(cursorKey, sessionId, clientMessageId, input) {
+  const requestHash = completedTurnRequestHash(input);
+  const scope = createHash("sha256")
+    .update(keyFingerprint(cursorKey))
+    .update("\0")
+    .update(String(sessionId))
+    .update("\0")
+    .update(String(clientMessageId))
+    .update("\0")
+    .update(requestHash)
+    .digest("hex");
+  return path.join(TEST_STATE_ROOT, ".cct-completed-turns", `${scope}.json`);
+}
+
 async function cleanupState() {
   for (const session of sessions.values()) {
     try { await session.cancel(); } catch {}
@@ -183,12 +265,36 @@ async function cleanupState() {
   sessions.clear();
   liveToolRounds.clear();
   platforms.clear();
+  completedTurnReceipts.clear();
 }
 
 test.beforeEach(cleanupState);
 test.after(async () => {
   await cleanupState();
   rmSync(TEST_STATE_ROOT, { recursive: true, force: true });
+});
+
+test("expected SDK cancellation AbortErrors are classified without consuming fatal paths", () => {
+  assert.equal(isSdkAbortError({ name: "AbortError", message: "This operation was aborted" }), true);
+  assert.equal(isSdkAbortError(new Error("ordinary SDK failure")), false);
+  const sessionsMap = new Map([["cancelled", { done: true, run: null }], ["live", { done: false, run: {} }]]);
+  noteExpectedSdkAbort("cancelled");
+  assert.equal(consumeExpectedSdkAbort(sessionsMap), true);
+  noteExpectedSdkAbort("live");
+  assert.equal(consumeExpectedSdkAbort(sessionsMap), false);
+  sessionsMap.get("live").done = true;
+  assert.equal(consumeExpectedSdkAbort(sessionsMap), true);
+});
+
+test("unexpected SDK AbortError is attributed only when one session is unambiguous", () => {
+  const reason = { name: "AbortError", message: "This operation was aborted" };
+  const one = { run: {}, activeRes: {}, done: false };
+  const paused = { run: {}, activeRes: null, done: false };
+  const two = { run: {}, activeRes: {}, done: false };
+  assert.equal(sessionForSdkAbort(reason, new Map([["one", one]])), one);
+  assert.equal(sessionForSdkAbort(reason, new Map([["paused", paused]])), paused);
+  assert.equal(sessionForSdkAbort(reason, new Map([["one", one], ["two", two]])), null);
+  assert.equal(sessionForSdkAbort(new Error("ordinary SDK failure"), new Map([["one", one]])), null);
 });
 
 test("workspace identity is advisory and unknown context never invents a server path", () => {
@@ -239,16 +345,89 @@ test("malformed supplied workspace degrades to neutral context instead of reject
   assert.deepEqual(sessions.get("bad-workspace"), undefined);
 });
 
-test("invalid advertised schemas fail before creating a turn session", async () => {
+test("an invalid advertised schema is quarantined without rejecting a new turn or widening it", async () => {
+  const cursorKey = "invalid-schema-key";
+  const agent = {
+    async send() {
+      return {
+        async wait() { return { status: "finished", result: "schema drift accommodated" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
   const res = new MockResponse();
   await handleTurn(request(), res, neutralBody({
     sessionId: "invalid-tool-schema",
-    input: { type: "user", text: "hello" },
+    input: { type: "user", text: "hello", clientMessageId: "ccm2_invalid_schema" },
+    tools: [{ name: "Broken", inputSchema: { type: "not-a-json-schema-type" } }],
+  }), cursorKey);
+  await waitFor(() => res.ended, "schema accommodation response");
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /schema drift accommodated/);
+  assert.deepEqual(sessions.get("invalid-tool-schema").advertise, []);
+});
+
+test("an all-invalid dynamic inventory preserves the established last-known-good registry", async () => {
+  const session = new Session("invalid-dynamic-schema", "key");
+  session.clientEnv = { workspaceUnknown: true };
+  session.toolRegistry.replace(advertised("KnownGood"));
+  session.seeded = true;
+  let sends = 0;
+  session.agent = {
+    async send() {
+      sends++;
+      return {
+        async wait() { return { status: "finished", result: "continued with adapted tools" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  sessions.set(session.id, session);
+  const res = new MockResponse();
+  await handleTurn(request(), res, neutralBody({
+    sessionId: session.id,
+    input: { type: "user", text: "continue despite one bad tool update", clientMessageId: "ccm2_bad_inventory" },
     tools: [{ name: "Broken", inputSchema: { type: "not-a-json-schema-type" } }],
   }), "key");
-  assert.equal(res.status, 422);
-  assert.match(res.text(), /invalid inputSchema/);
-  assert.equal(sessions.has("invalid-tool-schema"), false);
+  await waitFor(() => res.ended, "last-known-good inventory response");
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /continued with adapted tools/);
+  assert.deepEqual(session.advertise.map((tool) => tool.name), ["KnownGood"]);
+  assert.equal(sends, 1);
+});
+
+test("mixed tool inventories keep valid structural schemas and quarantine impossible descriptors", () => {
+  const registry = prepareAdvertisedToolRegistry({ tools: [
+    {
+      name: "Search",
+      inputSchema: {
+        type: "object",
+        properties: { repo_path: { type: "string" }, project: { type: "string" } },
+        required: ["repo_path", "project"],
+        additionalProperties: false,
+      },
+    },
+    { name: "Never", inputSchema: false },
+    { name: "Broken", inputSchema: { type: "not-a-json-schema-type" } },
+  ] });
+  assert.deepEqual(registry.all().map((tool) => tool.name), ["Search"]);
+  assert.deepEqual(registry.find("Search").inputSchema.required, ["repo_path", "project"]);
+  assert.equal(registry.rejectedCount, 2);
+  const normalized = registry.normalize("Search", {});
+  const failure = registry.validate("Search", normalized.value);
+  assert.deepEqual(failure.structuredContent.errors.map((error) => error.path).sort(), ["project", "repo_path"]);
 });
 
 test("unknown workspace never leaks the SDK isolation directory through shell result metadata", () => {
@@ -288,9 +467,10 @@ test("private descriptor aliases survive body refresh, route explicitly, and nev
   assert.equal(session.reconcileToolName("shell"), "RunCommand");
   assert.equal(session.reconcileToolName("terminal"), "RunCommand");
   assert.equal(Object.hasOwn(sdkAdvertisedTools(session)[0], "aliases"), false);
-  assert.throws(() => prepareAdvertisedToolRegistry({
+  const malformedAliases = prepareAdvertisedToolRegistry({
     tools: [{ name: "Bad", aliases: "shell", inputSchema: { type: "object" } }],
-  }), /invalid private aliases/);
+  });
+  assert.equal(Object.hasOwn(malformedAliases.find("Bad"), "aliases"), false);
 });
 
 test("tool inventory refresh replaces live gating, including an explicit empty clear", () => {
@@ -491,15 +671,28 @@ test("partial continuations cannot reorder tool inventory; refresh occurs only a
   assert.equal((await secondPromise).content, "second");
 });
 
-test("boolean false tool schemas fail closed instead of widening to an executable object", () => {
-  assert.throws(() => prepareAdvertisedToolRegistry({
+test("boolean false tool schemas are never widened into model-callable permissive contracts", () => {
+  const prepared = prepareAdvertisedToolRegistry({
     tools: [{ name: "Never", inputSchema: false }],
-  }), /inputSchema:false/);
+  });
+  assert.equal(prepared.find("Never"), null);
+  assert.equal(prepared.rejectedCount, 1);
   const registry = new AdvertisedToolRegistry();
   registry.replace([{ name: "Never", inputSchema: false }]);
   const normalized = registry.normalize("Never", {});
   const failure = registry.validate("Never", normalized.value);
   assert.equal(failure.structuredContent.executed, false);
+});
+
+test("boolean true tool schemas remain valid unconstrained client tools", () => {
+  const registry = prepareAdvertisedToolRegistry({
+    tools: [{ name: "Anything", description: "accepts any object arguments", inputSchema: true }],
+  });
+  assert.deepEqual(registry.all().map((tool) => tool.name), ["Anything"]);
+  assert.deepEqual(registry.find("Anything").inputSchema, {
+    type: "object",
+    additionalProperties: true,
+  });
 });
 
 test("advertised schema validation honors declared modern JSON Schema dialects", () => {
@@ -1083,7 +1276,28 @@ test("signed continuation receipts are persisted before the live callback resolv
   assert.equal(saved.terminal.reason, "completed");
 });
 
-test("invalid replacement inventory cannot strand an already-executed tool result", async () => {
+test("malformed optional result projections become model-visible errors instead of client 422", async () => {
+  const { session } = seedSession("accommodate-result-envelope", "cursor-key");
+  const opened = await openTool(session);
+  const res = new MockResponse();
+  const handling = handleContinue(request(), res, continuationBody([{
+    toolCallId: opened.call.wireId,
+    content: "the useful textual result",
+    isError: "false",
+    images: [{ data: "not base64!", mimeType: 7 }],
+  }]), "cursor-key");
+  const applied = await opened.promise;
+  await handling;
+  assert.equal(res.status, 200);
+  assert.equal(applied.isError, true);
+  assert.match(applied.content, /the useful textual result/);
+  assert.match(applied.content, /proxy accommodated malformed client-tool result/);
+  const saved = journalRecord(opened.round.route).calls[0].receipt.result;
+  assert.equal(saved.isError, true);
+  assert.deepEqual(saved.images, []);
+});
+
+test("invalid replacement inventory is adapted without stranding an already-executed tool result", async () => {
   const { session } = seedSession("invalid-continuation-schema", "cursor-key");
   const opened = await openTool(session);
   let callbackSettled = false;
@@ -1095,12 +1309,11 @@ test("invalid replacement inventory cannot strand an already-executed tool resul
     tools: [{ name: "Broken", inputSchema: { type: "not-a-json-schema-type" } }],
   }), "cursor-key");
   assert.equal(res.status, 200);
-  assert.match(res.text(), /"toolInventory":\{"status":"rejected"/);
+  assert.doesNotMatch(res.text(), /"toolInventory":\{"status":"rejected"/);
   assert.equal((await opened.promise).content, "must-commit");
   assert.equal(callbackSettled, true);
   assert.ok(journalRecord(opened.round.route).calls[0].resultHash);
-  assert.equal(session.advertise.some((tool) => tool.name === "Lookup"), true);
-  assert.equal(session.advertise.some((tool) => tool.name === "Broken"), false);
+  assert.deepEqual(session.advertise.map((tool) => tool.name), ["Lookup"]);
 });
 
 test("whole-batch token validation is atomic: one tampered id commits nothing", async () => {
@@ -1127,7 +1340,7 @@ test("whole-batch token validation is atomic: one tampered id commits nothing", 
   await assert.rejects(secondPromise);
 });
 
-test("journal CAS races are reconciled internally instead of leaking a permanent 409", async () => {
+test("journal CAS races are reconciled without 409 or a fake whole-turn success", async () => {
   const { session } = seedSession("cas-reconcile", "cursor-key");
   const opened = await openTool(session);
   const other = createRoundInfrastructure(TEST_STATE_ROOT);
@@ -1138,8 +1351,8 @@ test("journal CAS races are reconciled internally instead of leaking a permanent
 
   const res = new MockResponse();
   await handleContinue(request(), res, continuationBody([result]), "cursor-key");
-  assert.equal(res.status, 200);
-  assert.match(res.text(), /already_applied/);
+  assert.equal(res.status, 410);
+  assert.doesNotMatch(res.text(), /already_applied|\"stop_reason\":\"end_turn\"/);
   await assert.rejects(opened.promise, /ownership advanced/);
 });
 
@@ -1250,6 +1463,24 @@ test("mixed-route continuation acknowledges terminal history and applies the one
   assert.match(res.text(), /historical_receipt_acknowledged/);
   assert.match(res.text(), new RegExp(oldCall.call.wireId));
   assert.equal(journalRecord(oldCall.round.route).calls[0].receipt.result.content, "old durable value");
+});
+
+test("an expired historical route cannot make a valid mixed-route continuation fail wholesale", async () => {
+  const { codec } = createRoundInfrastructure(TEST_STATE_ROOT);
+  const absentRoute = codec.newRoute();
+  const absentId = codec.issue(absentRoute, 0);
+  const liveSession = seedSession("mixed-route-with-expired-history", "cursor-key").session;
+  const liveCall = await openTool(liveSession, { rawId: "live" });
+  const res = new MockResponse();
+  const handling = handleContinue(request(), res, continuationBody([
+    { toolCallId: absentId, content: "expired historical result" },
+    { toolCallId: liveCall.call.wireId, content: "current live result" },
+  ]), "cursor-key");
+  assert.equal((await liveCall.promise).content, "current live result");
+  await handling;
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /historical_route_absent_not_applied/);
+  assert.match(res.text(), new RegExp(absentId));
 });
 
 test("signed round tenant fingerprint prevents cross-credential result injection", async () => {
@@ -1400,7 +1631,7 @@ test("restart recovery is rendered only from durable receipts, never contradicto
   await assert.rejects(opened.promise);
 });
 
-test("terminal durable receipt is authoritative across byte-different stateless replays", async () => {
+test("terminal callback receipt is authoritative but never faked as whole-turn success", async () => {
   const { session } = seedSession("late", "cursor-key");
   const opened = await openTool(session);
   const result = { toolCallId: opened.call.wireId, content: "once", isError: false };
@@ -1411,13 +1642,14 @@ test("terminal durable receipt is authoritative across byte-different stateless 
 
   const duplicate = new MockResponse();
   await handleContinue(request(), duplicate, continuationBody([result]), "cursor-key");
-  assert.equal(duplicate.status, 200);
-  assert.match(duplicate.text(), /already_applied/);
+  assert.equal(duplicate.status, 410);
+  assert.doesNotMatch(duplicate.text(), /already_applied|\"stop_reason\":\"end_turn\"/);
+  assert.equal(journalRecord(opened.round.route).calls[0].receipt.result.content, "once");
 
   const conflict = new MockResponse();
   await handleContinue(request(), conflict, continuationBody([{ ...result, content: "different" }]), "cursor-key");
-  assert.equal(conflict.status, 200);
-  assert.match(conflict.text(), /durable_receipt_retained/);
+  assert.equal(conflict.status, 410);
+  assert.doesNotMatch(conflict.text(), /already_applied|\"stop_reason\":\"end_turn\"/);
   assert.equal(journalRecord(opened.round.route).calls[0].receipt.result.content, "once");
 });
 
@@ -1498,8 +1730,22 @@ test("mixed continuation retains terminal receipt and delivers new user intent e
   const duplicate = new MockResponse();
   await handleContinue(request(), duplicate, continuationBody([accepted], mixedInput), "cursor-key");
   assert.equal(duplicate.status, 200);
-  assert.match(duplicate.text(), /user_input_already_delivered/);
+  assert.match(duplicate.text(), /completed_turn_replay/);
+  assert.match(duplicate.text(), /continued/);
   assert.equal(sent.length, 1);
+
+  const completedEntry = [...completedTurnReceipts.entries()]
+    .find(([, record]) => record.clientMessageId === mixedInput.clientMessageId && record.status === "completed");
+  assert.ok(completedEntry, "the final answer must have a durable replay receipt");
+  rmSync(completedEntry[0], { force: true });
+  completedTurnReceipts.delete(completedEntry[0]);
+  const missingReceipt = new MockResponse();
+  await handleContinue(request(), missingReceipt, continuationBody([accepted], mixedInput), "cursor-key");
+  assert.equal(missingReceipt.status, 200);
+  assert.match(missingReceipt.text(), /completed_response_receipt_unavailable/);
+  assert.match(missingReceipt.text(), /"stop_reason":"error"/);
+  assert.doesNotMatch(missingReceipt.text(), /user_input_already_delivered/);
+  assert.equal(sent.length, 1, "missing answer evidence must not repeat already-finalized side effects");
 
   const reusedId = new MockResponse();
   await handleContinue(request(), reusedId, continuationBody([accepted], {
@@ -1516,7 +1762,7 @@ test("mixed continuation retains terminal receipt and delivers new user intent e
   assert.equal(deferred.at(-1).requestedClientMessageId, mixedInput.clientMessageId);
 });
 
-test("ambiguous agent.send failure retires only that message and never bricks the session", async () => {
+test("ambiguous agent.send failure retries the exact message with one stable SDK idempotency key", async () => {
   const { session } = seedSession("mixed-send-uncertain", "cursor-key");
   const opened = await openTool(session);
   const accepted = { toolCallId: opened.call.wireId, content: "accepted", isError: false };
@@ -1524,11 +1770,21 @@ test("ambiguous agent.send failure retires only that message and never bricks th
   await opened.promise;
 
   let sends = 0;
+  const sendMessages = [];
+  const sendKeys = [];
+  const sendAdvertised = [];
   session.seeded = true;
   session.agent = {
-    async send() {
+    async send(message, options) {
       sends++;
-      throw new Error("connection closed after request write");
+      sendMessages.push(message);
+      sendKeys.push(options.idempotencyKey);
+      sendAdvertised.push(session.advertise.map((tool) => tool.name));
+      if (sends === 1) throw new Error("connection closed after request write");
+      return {
+        async wait() { return { status: "finished", result: "recovered exactly once" }; },
+        async cancel() {},
+      };
     },
     async close() {},
   };
@@ -1537,6 +1793,7 @@ test("ambiguous agent.send failure retires only that message and never bricks th
     clientMessageId: "ccm1_uncertain_once",
     interruptRequested: true,
     history: "bounded prior conversation",
+    system: "original system",
   };
   const first = new MockResponse();
   await handleContinue(request(), first, continuationBody([accepted], mixedInput), "cursor-key");
@@ -1545,12 +1802,24 @@ test("ambiguous agent.send failure retires only that message and never bricks th
   assert.equal(sends, 1);
 
   const retry = new MockResponse();
-  await handleContinue(request(), retry, continuationBody([accepted], mixedInput), "cursor-key");
+  await handleContinue(request(), retry, continuationBody([accepted], {
+    ...mixedInput,
+    history: "a changed retry history that must not alter the SDK envelope",
+    system: "changed retry system",
+  }, authoritativeToolsBody(advertised("NewlyRegisteredTool"), { toolChoice: "auto" })), "cursor-key");
+  await waitFor(() => retry.ended, "idempotent uncertain-send retry terminal");
   assert.equal(retry.status, 200);
-  assert.match(retry.text(), /user_input_delivery_unknown/);
-  assert.match(retry.text(), /"stop_reason":"error"/);
-  assert.equal(journalRecord(opened.round.route).deferredInputs[0].state, "SUPERSEDED");
-  assert.equal(sends, 1);
+  assert.match(retry.text(), /recovered exactly once/);
+  assert.match(retry.text(), /"stop_reason":"end_turn"/);
+  assert.equal(journalRecord(opened.round.route).deferredInputs[0].state, "DELIVERED");
+  assert.equal(sends, 2, "the bridge may retry the transport call; the SDK key makes both calls one logical send");
+  assert.equal(sendKeys[0], sendKeys[1]);
+  assert.equal(sendMessages[0], sendMessages[1]);
+  assert.deepEqual(sendAdvertised, [["Lookup"], ["Lookup"]],
+    "an uncertain retry must use the persisted tool snapshot even when the client registers a new tool");
+  assert.deepEqual(session.advertise.map((tool) => tool.name), ["NewlyRegisteredTool"],
+    "the newer client inventory must remain available for the following turn");
+  assert.match(sendKeys[0], /^ccsend2_[A-Za-z0-9_-]{24}_[a-f0-9]{24}_g1_/);
 
   const laterMessages = [];
   session.agent = {
@@ -1575,7 +1844,7 @@ test("ambiguous agent.send failure retires only that message and never bricks th
   assert.match(laterMessages[0], /^a later independent message/);
 });
 
-test("cold retry reconciles DELIVERING from the durable SDK checkpoint", async () => {
+test("an old identical checkpoint message never suppresses the current exact DELIVERING retry", async () => {
   const cursorKey = "checkpoint-key";
   const { session } = seedSession("checkpoint-delivery", cursorKey);
   const opened = await openTool(session);
@@ -1594,11 +1863,30 @@ test("cold retry reconciles DELIVERING from the durable SDK checkpoint", async (
     agentId: session.agentId,
     textHash: createHash("sha256").update(input.userText).digest("hex"),
     hasImages: false,
+    idempotencyKey: "ccsend2_checkpoint_collision_guard",
+    message: input.userText,
+    advertise: session.advertise,
+    model: "cursor-grok-4.5",
   });
   sessions.delete(session.id);
   liveToolRounds.delete(opened.round.route);
+  const sends = [];
+  const agent = {
+    async send(message, options) {
+      sends.push({ message, options });
+      return {
+        async wait() { return { status: "finished", result: "current message delivered" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
   platforms.set(keyHash(cursorKey), {
     promise: Promise.resolve({
+      async resumeAgent(agentId) {
+        assert.equal(agentId, session.agentId);
+        return agent;
+      },
       async getAgentMessages() {
         return [{
           type: "user",
@@ -1618,11 +1906,81 @@ test("cold retry reconciles DELIVERING from the durable SDK checkpoint", async (
 
   const retry = new MockResponse();
   await handleContinue(request(), retry, continuationBody([accepted], input), cursorKey);
+  await waitFor(() => retry.ended, "checkpoint collision retry terminal");
   assert.equal(retry.status, 200);
-  assert.match(retry.text(), /user_input_already_delivered/);
+  assert.match(retry.text(), /current message delivered/);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].options.idempotencyKey, "ccsend2_checkpoint_collision_guard");
   const saved = journalRecord(opened.round.route).deferredInputs.find((entry) => entry.clientMessageId === input.clientMessageId);
   assert.equal(saved.state, "DELIVERED");
-  assert.equal(saved.deliveryEvidence, "durable_checkpoint");
+  assert.notEqual(saved.deliveryEvidence, "durable_checkpoint");
+});
+
+test("cold retry resends unresolved DELIVERING with the exact persisted SDK idempotency key", async () => {
+  const cursorKey = "cold-idempotent-key";
+  const { session } = seedSession("cold-idempotent-delivery", cursorKey);
+  const opened = await openTool(session);
+  const accepted = { toolCallId: opened.call.wireId, content: "accepted", isError: false };
+  opened.round.applyResults([accepted]);
+  await opened.promise;
+
+  const input = {
+    userText: "deliver this exact stored input",
+    clientMessageId: "ccm2_cold_delivery_retry",
+    interruptRequested: true,
+    history: "bounded history",
+  };
+  const persistedKey = "ccsend2_persisted_crash_boundary_key";
+  opened.round.queueDeferredInput(input.clientMessageId, input);
+  opened.round.markDeferredInputState(input.clientMessageId, "DELIVERING", {
+    agentId: session.agentId,
+    textHash: createHash("sha256").update(input.userText).digest("hex"),
+    hasImages: false,
+    idempotencyKey: persistedKey,
+    message: input.userText,
+    advertise: session.advertise,
+    model: "cursor-grok-4.5",
+  });
+  sessions.delete(session.id);
+  liveToolRounds.delete(opened.round.route);
+
+  const sends = [];
+  const agent = {
+    async send(message, options) {
+      sends.push({ message, options });
+      return {
+        async wait() { return { status: "finished", result: "cold retry completed" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent(agentId) {
+        assert.equal(agentId, session.agentId, "uncertain retry must resume the original durable agent");
+        return agent;
+      },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  const retry = new MockResponse();
+  await handleContinue(request(), retry, continuationBody([accepted], input), cursorKey);
+  await waitFor(() => retry.ended, "cold idempotent delivery retry terminal");
+  assert.equal(retry.status, 200);
+  assert.match(retry.text(), /cold retry completed/);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].options.idempotencyKey, persistedKey);
+  assert.match(String(sends[0].message), /deliver this exact stored input/);
+  const saved = journalRecord(opened.round.route).deferredInputs
+    .find((entry) => entry.clientMessageId === input.clientMessageId);
+  assert.equal(saved.state, "DELIVERED");
+  assert.equal(saved.deliveryIdempotencyKey, persistedKey);
 });
 
 test("same-message retry hands off to the active SDK turn instead of sending twice", async () => {
@@ -1707,10 +2065,356 @@ test("duplicate fresh POST attaches to the active SDK send instead of interrupti
   assert.equal(sends, 1);
   releaseSend();
   await Promise.all([firstRun, retryRun]);
-  assert.equal(observedIdempotencyKey, "ccm2_fresh_active");
+  assert.match(observedIdempotencyKey, /^ccsend2_[A-Za-z0-9_-]{24}_[a-f0-9]{24}_g1_ccm2_fresh_active$/);
   assert.match(retry.text(), /active_turn_handoff/);
   assert.match(retry.text(), /fresh answer/);
   assert.equal(sends, 1);
+});
+
+test("ambiguous fresh send retries the exact persisted envelope, agent, key, and tool snapshot after restart", async () => {
+  const cursorKey = "fresh-uncertain-key";
+  const session = new Session("fresh-uncertain-restart", cursorKey);
+  session.clientEnv = { workspaceUnknown: true };
+  session.seeded = true;
+  sessions.set(session.id, session);
+  const sends = [];
+  let attempt = 0;
+  const agent = {
+    async send(message, options) {
+      attempt++;
+      const active = sessions.get(session.id);
+      sends.push({
+        agentId: active.agentId,
+        advertised: active.advertise.map((tool) => tool.name),
+        key: options.idempotencyKey,
+        message,
+      });
+      if (attempt === 1) throw new Error("connection closed after fresh request write");
+      return {
+        async wait() { return { status: "finished", result: "fresh retry recovered" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  session.agent = agent;
+  const firstBody = neutralBody({
+    ...authoritativeToolsBody(advertised("OriginalTool"), { toolChoice: "auto" }),
+    sessionId: session.id,
+    model: "cursor-grok-4.5",
+    input: {
+      type: "user",
+      text: "perform this fresh task once",
+      system: "original system",
+      history: "original history",
+      clientMessageId: "ccm2_fresh_uncertain",
+    },
+  });
+  const first = new MockResponse();
+  await handleTurn(request(), first, firstBody, cursorKey);
+  await waitFor(() => first.ended, "ambiguous fresh failure terminal");
+  assert.equal(sends.length, 1);
+
+  const originalAgentId = session.agentId;
+  sessions.delete(session.id);
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent(agentId) {
+        assert.equal(agentId, originalAgentId);
+        return agent;
+      },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  const retryBody = neutralBody({
+    ...authoritativeToolsBody(advertised("NewlyRegisteredTool"), { toolChoice: "auto" }),
+    sessionId: session.id,
+    model: "cursor-grok-4.5",
+    input: {
+      type: "user",
+      text: "perform this fresh task once",
+      system: "original system",
+      history: "original history",
+      clientMessageId: "ccm2_fresh_uncertain",
+    },
+  });
+  const retry = new MockResponse();
+  await handleTurn(request(), retry, retryBody, cursorKey);
+  await waitFor(() => retry.ended, "fresh exact retry terminal");
+
+  assert.match(retry.text(), /fresh retry recovered/);
+  assert.equal(sends.length, 2);
+  assert.equal(sends[0].key, sends[1].key);
+  assert.deepEqual(sends[0].message, sends[1].message);
+  assert.deepEqual(sends[0].advertised, ["OriginalTool"]);
+  assert.deepEqual(sends[1].advertised, ["OriginalTool"]);
+  assert.deepEqual(sessions.get(session.id).advertise.map((tool) => tool.name), ["NewlyRegisteredTool"]);
+});
+
+test("a duplicate pure tool-result continuation hands off the resumed answer instead of short-acking", async () => {
+  const { session } = seedSession("pure-continuation-handoff", "cursor-key");
+  session.clientLeaseToken = "73";
+  const opened = await openTool(session);
+  session.activeRes = null;
+  session.responseWriter = null;
+  let finishRun;
+  const runResult = new Promise((resolve) => { finishRun = resolve; });
+  session.run = {
+    wait() { return runResult; },
+    async cancel() {},
+  };
+  void runResult.then((result) => session.onRunComplete(result));
+  const result = { toolCallId: opened.call.wireId, content: "tool completed" };
+  const input = { clientMessageId: "ccm2_pure_continuation_handoff" };
+  const first = new MockResponse();
+  const firstHandling = handleContinue(request(), first, continuationBody([result], input), "cursor-key");
+  await waitFor(() => session.activeClientMessageId === input.clientMessageId && opened.round.callbacks.size === 0,
+    "pure continuation resumed turn");
+
+  const retry = new MockResponse();
+  const retryHandling = handleContinue(request(), retry, continuationBody([result], input), "cursor-key");
+  await waitFor(() => retry.text().includes("active_turn_handoff"), "pure continuation response handoff");
+  finishRun({ status: "finished", result: "the resumed final answer" });
+  await Promise.all([firstHandling, retryHandling]);
+
+  assert.equal((await opened.promise).content, "tool completed");
+  assert.match(retry.text(), /active_turn_handoff/);
+  assert.match(retry.text(), /the resumed final answer/);
+  assert.match(retry.text(), /"clientLease":\{"sessionId":"pure-continuation-handoff","token":"73","terminal":true\}/);
+  assert.doesNotMatch(retry.text(), /already_applied|duplicate_or_concurrent/);
+});
+
+test("sequential identical fresh POSTs are distinct durable generations, including after restart", async () => {
+  const cursorKey = "cursor-key";
+  const sessionId = "fresh-completed-replay";
+  let sends = 0;
+  const sendKeys = [];
+  const agent = {
+    async send(_message, options) {
+      sends++;
+      sendKeys.push(options.idempotencyKey);
+      return {
+        async wait() { return { status: "finished", result: `completed response ${sends}` }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  const body = neutralBody({
+    sessionId,
+    model: "cursor-grok-4.5",
+    input: { type: "user", text: "one completed request", clientMessageId: "ccm2_fresh_completed" },
+  });
+  const first = new MockResponse();
+  await handleTurn(request(), first, body, cursorKey);
+  await waitFor(() => first.ended, "completed fresh response");
+  assert.equal(first.status, 200);
+  assert.match(first.text(), /completed response 1/);
+  assert.equal(sends, 1);
+
+  const retry = new MockResponse();
+  await handleTurn(request(), retry, body, cursorKey);
+  await waitFor(() => retry.ended, "second repeated fresh response");
+  assert.equal(retry.status, 200);
+  assert.doesNotMatch(retry.text(), /completed_turn_replay/);
+  assert.match(retry.text(), /completed response 2/);
+  assert.equal(sends, 2);
+  assert.notEqual(sendKeys[0], sendKeys[1]);
+  assert.match(sendKeys[0], /_g1_/);
+  assert.match(sendKeys[1], /_g2_/);
+
+  const live = sessions.get(sessionId);
+  sessions.delete(sessionId);
+  await live.cancel({ terminalReason: "test_cleanup", detail: "simulate bridge restart" });
+  completedTurnReceipts.clear();
+  const coldRetry = new MockResponse();
+  await handleTurn(request(), coldRetry, body, cursorKey);
+  await waitFor(() => coldRetry.ended, "cold repeated fresh response");
+  assert.equal(coldRetry.status, 200);
+  assert.doesNotMatch(coldRetry.text(), /completed_turn_replay/);
+  assert.match(coldRetry.text(), /completed response 3/);
+  assert.equal(sends, 3);
+  assert.match(sendKeys[2], /_g3_/);
+});
+
+test("reusing a client message id with different input cannot replay or deduplicate the wrong turn", async () => {
+  const cursorKey = "cursor-key";
+  const session = new Session("completed-reuse-different-input", cursorKey);
+  session.clientEnv = { workspaceUnknown: true };
+  session.seeded = true;
+  const sends = [];
+  const sendKeys = [];
+  session.agent = {
+    async send(message, options) {
+      sends.push(String(message));
+      sendKeys.push(options.idempotencyKey);
+      const result = String(message).includes("second payload") ? "second answer" : "first answer";
+      return {
+        async wait() { return { status: "finished", result }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  sessions.set(session.id, session);
+  const firstBody = neutralBody({
+    sessionId: session.id,
+    input: { type: "user", text: "first payload", clientMessageId: "client-reused-id" },
+  });
+  const secondBody = neutralBody({
+    sessionId: session.id,
+    input: { type: "user", text: "second payload", clientMessageId: "client-reused-id" },
+  });
+
+  const first = new MockResponse();
+  await handleTurn(request(), first, firstBody, cursorKey);
+  await waitFor(() => first.ended, "first reused-id response");
+  const second = new MockResponse();
+  await handleTurn(request(), second, secondBody, cursorKey);
+  await waitFor(() => second.ended, "second reused-id response");
+
+  assert.match(first.text(), /first answer/);
+  assert.match(second.text(), /second answer/);
+  assert.doesNotMatch(second.text(), /completed_turn_replay/);
+  assert.equal(sends.length, 2);
+  assert.notEqual(sendKeys[0], sendKeys[1]);
+});
+
+test("SDK idempotency keys are scoped to the durable agent as well as the input", () => {
+  const first = new Session("idempotency-scope-a", "cursor-key");
+  const second = new Session("idempotency-scope-b", "cursor-key");
+  const requestHash = completedTurnRequestHash({ type: "user", text: "same" });
+  const firstKey = sdkSendIdempotencyKey(first, "same-client-id", requestHash);
+  const retryKey = sdkSendIdempotencyKey(first, "same-client-id", requestHash);
+  const secondKey = sdkSendIdempotencyKey(second, "same-client-id", requestHash);
+  assert.equal(firstKey, retryKey);
+  assert.notEqual(firstKey, secondKey);
+});
+
+test("fresh request hashes include system and history while ignoring JSON object key order", () => {
+  const baseline = completedTurnRequestHash({
+    type: "user",
+    text: "same text",
+    system: "system A",
+    history: "history A",
+    images: [{ mimeType: "image/png", data: "QUJD" }],
+  });
+  assert.equal(baseline, completedTurnRequestHash({
+    images: [{ data: "QUJD", mimeType: "image/png" }],
+    history: "history A",
+    system: "system A",
+    text: "same text",
+    type: "user",
+  }));
+  assert.notEqual(baseline, completedTurnRequestHash({
+    type: "user",
+    text: "same text",
+    system: "system B",
+    history: "history A",
+    images: [{ mimeType: "image/png", data: "QUJD" }],
+  }));
+  assert.notEqual(baseline, completedTurnRequestHash({
+    type: "user",
+    text: "same text",
+    system: "system A",
+    history: "history B",
+    images: [{ mimeType: "image/png", data: "QUJD" }],
+  }));
+});
+
+test("a malformed exact fresh-delivery receipt fails closed before any SDK send", async (t) => {
+  const cursorKey = "corrupt-fresh-receipt-key";
+  const sessionId = "corrupt-fresh-receipt";
+  const input = {
+    type: "user",
+    text: "do not duplicate this",
+    clientMessageId: "ccm2_corrupt_fresh",
+  };
+  const file = exactTurnReceiptFile(cursorKey, sessionId, input.clientMessageId, input);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, "{\"status\":\"delivering\",\"truncated\":true}\n");
+  t.after(() => rmSync(file, { force: true }));
+
+  const response = new MockResponse();
+  await handleTurn(request(), response, neutralBody({ sessionId, input }), cursorKey);
+  assert.equal(response.status, 503);
+  assert.match(response.text(), /durable turn continuity state is unavailable/);
+  assert.equal(sessions.has(sessionId), false);
+});
+
+test("a malformed exact continuation receipt cannot apply the tool result again", async (t) => {
+  const cursorKey = "corrupt-continuation-receipt-key";
+  const { session } = seedSession("corrupt-continuation-receipt", cursorKey);
+  const opened = await openTool(session);
+  const input = {
+    type: "tool_results",
+    results: [{ toolCallId: opened.call.wireId, content: "locally executed result" }],
+    clientMessageId: "ccm2_corrupt_continuation",
+  };
+  const file = exactTurnReceiptFile(cursorKey, session.id, input.clientMessageId, input);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, "not-json\n");
+  t.after(() => rmSync(file, { force: true }));
+
+  const response = new MockResponse();
+  await handleContinue(request(), response, neutralBody({
+    sessionId: session.id,
+    model: "cursor-grok-4.5",
+    input,
+  }), cursorKey);
+  assert.equal(response.status, 503);
+  assert.equal(response.json().error.code, "durable_turn_receipt_unavailable");
+  assert.equal(journalRecord(opened.round.route).calls[0].receipt, null);
+});
+
+test("unscoped legacy completed receipts never authorize a current hashed replay", () => {
+  const cursorKey = "cursor-key";
+  const sessionId = "legacy-receipt-scope";
+  const clientMessageId = "same-client-id";
+  const record = {
+    version: 1,
+    keyFingerprint: keyFingerprint(cursorKey),
+    sessionId,
+    clientMessageId,
+    status: "completed",
+    text: "old answer",
+    usage: {},
+  };
+  const currentHash = completedTurnRequestHash({ type: "user", text: "different request" });
+  assert.equal(validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId, currentHash), false);
+});
+
+test("request-local replay failures are contained and never escape to process-wide unhandled rejection", async () => {
+  const beforeHeaders = new MockResponse();
+  const first = await handleHttpRequestSafely(request(), beforeHeaders, async () => {
+    throw new Error("synthetic replay write failure");
+  });
+  assert.equal(first, false);
+  assert.equal(beforeHeaders.status, 500);
+  assert.equal(beforeHeaders.ended, true);
+
+  const afterHeaders = new MockResponse();
+  afterHeaders.headersSent = true;
+  let destroyed = false;
+  afterHeaders.destroy = () => { destroyed = true; };
+  const second = await handleHttpRequestSafely(request(), afterHeaders, async () => {
+    throw new Error("synthetic replay backpressure failure");
+  });
+  assert.equal(second, false);
+  assert.equal(destroyed, true);
 });
 
 test("lost fresh response replays paused signed tool calls without a second SDK send", async () => {
@@ -1719,6 +2423,11 @@ test("lost fresh response replays paused signed tool calls without a second SDK 
   session.activeRes = null;
   session.responseWriter = null;
   session.activeClientMessageId = "ccm2_fresh_paused";
+  session.activeClientMessageHash = completedTurnRequestHash({
+    type: "user",
+    text: "original request",
+    clientMessageId: "ccm2_fresh_paused",
+  });
   let cancels = 0;
   session.run = { async cancel() { cancels++; } };
 
@@ -1736,6 +2445,148 @@ test("lost fresh response replays paused signed tool calls without a second SDK 
 
   await session.cancel({ terminalReason: "test_cleanup", detail: "paused replay complete" });
   await assert.rejects(opened.promise, /paused replay complete/);
+});
+
+test("all-legacy tool results recover from faithful replay and retain the replacement agent across restart", async () => {
+  const cursorKey = "cursor-key";
+  const sessionId = "legacy-unsigned-recovery";
+  const sent = [];
+  const createdAgentIds = [];
+  const agent = {
+    async send(message, options) {
+      sent.push({ message, options });
+      return {
+        async wait() { return { status: "finished", result: "legacy work resumed" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent(options) {
+        createdAgentIds.push(options.agentId);
+        return agent;
+      },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  const results = [
+    { toolCallId: "call_old_todo", content: "todo state retained" },
+    { toolCallId: "call_old_job", content: "subagents were interrupted" },
+  ];
+  const input = {
+    legacyUnsignedReplay: true,
+    history: "ASSISTANT: [tool_calls: call_old_todo:todo({}); call_old_job:job({})]\nTOOL[call_old_todo]: todo state retained\nTOOL[call_old_job]: subagents were interrupted",
+    historyFingerprint: "legacy-history-fingerprint",
+    userText: "resume every interrupted subagent",
+    clientMessageId: "ccm2_legacy_resume_once",
+  };
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody(results, input, { sessionId }), cursorKey);
+  await waitFor(() => response.ended, "legacy replay recovery terminal");
+
+  assert.equal(response.status, 200);
+  assert.equal(sent.length, 1);
+  assert.match(String(sent[0].message), /call_old_todo/);
+  assert.match(String(sent[0].message), /todo state retained/);
+  assert.match(String(sent[0].message), /resume every interrupted subagent/);
+  assert.match(sent[0].options.idempotencyKey, /^ccsend2_[A-Za-z0-9_-]{24}_[a-f0-9]{24}_g1_ccm2_legacy_resume_once$/);
+  assert.equal(createdAgentIds.length, 1);
+  assert.match(createdAgentIds[0], /^legacy-unsigned-recovery_legacy_[0-9a-f]{24}$/);
+
+  const duplicate = new MockResponse();
+  await handleContinue(request(), duplicate, continuationBody(results, input, { sessionId }), cursorKey);
+  assert.equal(duplicate.status, 200);
+  assert.match(duplicate.text(), /completed_turn_replay/);
+  assert.match(duplicate.text(), /legacy work resumed/);
+  assert.equal(sent.length, 1);
+
+  const recovered = sessions.get(sessionId);
+  assert.ok(recovered);
+  const replacementAgentId = recovered.agentId;
+  sessions.delete(sessionId);
+  await recovered.cancel({ terminalReason: "test_cleanup", detail: "simulate bridge restart" });
+  completedTurnReceipts.clear();
+  platforms.clear();
+  const coldDuplicate = new MockResponse();
+  await handleContinue(request(), coldDuplicate, continuationBody(results, input, { sessionId }), cursorKey);
+  assert.equal(coldDuplicate.status, 200);
+  assert.match(coldDuplicate.text(), /completed_turn_replay/);
+  assert.match(coldDuplicate.text(), /legacy work resumed/);
+  assert.equal(sent.length, 1);
+  const cold = new Session(sessionId, cursorKey);
+  assert.equal(cold.agentId, replacementAgentId);
+});
+
+test("a failed durable alias publication cannot half-rotate a session onto a new credential", async (t) => {
+  const session = new Session("atomic-key-rotation", "old-cursor-key");
+  session.seeded = true;
+  session.seededSystem = "old system";
+  session.historyFingerprint = "old-history";
+  const before = {
+    agentId: session.agentId,
+    cursorKey: session.cursorKey,
+    keyEpoch: session.keyEpoch,
+    seeded: session.seeded,
+    seededSystem: session.seededSystem,
+    historyFingerprint: session.historyFingerprint,
+  };
+  const newKey = "new-cursor-key";
+  const scope = createHash("sha256")
+    .update(keyFingerprint(newKey))
+    .update("\0")
+    .update(session.id)
+    .digest("hex");
+  const blockedAlias = path.join(TEST_STATE_ROOT, ".cct-agent-alias", `${scope}.json`);
+  mkdirSync(blockedAlias, { recursive: true });
+  t.after(() => rmSync(blockedAlias, { recursive: true, force: true }));
+
+  await assert.rejects(
+    session.rotateForKeyChange(newKey),
+    /cannot persist durable Cursor agent alias/,
+  );
+  assert.deepEqual({
+    agentId: session.agentId,
+    cursorKey: session.cursorKey,
+    keyEpoch: session.keyEpoch,
+    seeded: session.seeded,
+    seededSystem: session.seededSystem,
+    historyFingerprint: session.historyFingerprint,
+  }, before);
+});
+
+test("legacy recovery refuses missing replay and never downgrades a signed or mixed batch", async () => {
+  const cursorKey = "cursor-key";
+  const sessionId = "legacy-recovery-refusals";
+  const missingReplay = new MockResponse();
+  await handleContinue(request(), missingReplay, continuationBody([
+    { toolCallId: "call_old", content: "completed" },
+  ], {
+    legacyUnsignedReplay: true,
+    clientMessageId: "ccm2_missing_replay",
+  }, { sessionId }), cursorKey);
+  assert.equal(missingReplay.status, 410);
+  assert.equal(missingReplay.json().error.code, "legacy_recovery_unavailable");
+  assert.equal(sessions.has(sessionId), false);
+
+  const mixed = new MockResponse();
+  await handleContinue(request(), mixed, continuationBody([
+    { toolCallId: "call_old", content: "legacy" },
+    { toolCallId: "cct1_not_a_valid_signature", content: "signed" },
+  ], {
+    legacyUnsignedReplay: true,
+    history: "call_old cct1_not_a_valid_signature",
+    clientMessageId: "ccm2_mixed_strict",
+  }, { sessionId }), cursorKey);
+  assert.equal(mixed.status, 400);
+  assert.equal(mixed.json().error.code, "invalid_tool_call_id");
+  assert.equal(sessions.has(sessionId), false);
 });
 
 test("cold restart delivers a journaled mixed user turn exactly once after faithful result recovery", async () => {
@@ -1793,11 +2644,12 @@ test("cold restart delivers a journaled mixed user turn exactly once after faith
   const duplicate = new MockResponse();
   await handleContinue(request(), duplicate, continuationBody([result], mixedInput), cursorKey);
   assert.equal(duplicate.status, 200);
-  assert.match(duplicate.text(), /user_input_already_delivered/);
+  assert.match(duplicate.text(), /completed_turn_replay/);
+  assert.match(duplicate.text(), /continued after restart/);
   assert.equal(sent.length, 1);
 });
 
-test("partial parallel results plus user input terminalize the unanswered call and recover once", async () => {
+test("partial parallel results wait for every sibling and recover journaled user intent once", async () => {
   const cursorKey = "cursor-key";
   const { session } = seedSession("mixed-partial-parallel", cursorKey);
   const first = await openTool(session, { rawId: "parallel-first" });
@@ -1814,6 +2666,8 @@ test("partial parallel results plus user input terminalize the unanswered call a
   const second = first.round.calls.get(first.round.fifo[1]);
   await waitFor(() => second.handedAt != null, "second parallel call handoff");
   first.round.markAwaitingResults();
+  session.activeRes = null;
+  session.responseWriter = null;
 
   const sent = [];
   const agent = {
@@ -1836,16 +2690,32 @@ test("partial parallel results plus user input terminalize the unanswered call a
     fp: keyFingerprint(cursorKey),
   });
 
-  const result = { toolCallId: first.call.wireId, content: "first completed locally", isError: false };
+  const firstResult = { toolCallId: first.call.wireId, content: "first completed locally", isError: false };
   const mixedInput = {
     history: "bounded prior conversation",
-    userText: "continue without the unanswered parallel call",
+    userText: "continue after both parallel calls complete",
     clientMessageId: "ccm1_partial_parallel_once",
     interruptRequested: true,
   };
-  const response = new MockResponse();
-  await handleContinue(request(), response, continuationBody([result], mixedInput), cursorKey);
-  await waitFor(() => response.ended, "partial parallel recovery terminal");
+  const partial = new MockResponse();
+  await handleContinue(request(), partial, continuationBody([firstResult], mixedInput), cursorKey);
+  assert.equal(partial.status, 200);
+  assert.match(partial.text(), /partial_results_deferred_for_fidelity/);
+  assert.match(partial.text(), /"stop_reason":"tool_use"/);
+  assert.equal(first.round.pendingCount, 2, "no callback may resolve before every sibling is receipted");
+  assert.equal(first.round.unreceiptedOwedCallCount, 1);
+  assert.equal(sent.length, 0);
+
+  const savedPartial = journalRecord(first.round.route);
+  assert.equal(savedPartial.calls.find((call) => call.wireId === first.call.wireId).receipt.result.content,
+    "first completed locally");
+  assert.equal(savedPartial.calls.find((call) => call.wireId === second.wireId).receipt, null);
+  assert.equal(savedPartial.deferredInputs[0].state, "QUEUED");
+
+  const secondResult = { toolCallId: second.wireId, content: "second completed locally", isError: false };
+  const final = new MockResponse();
+  await handleContinue(request(), final, continuationBody([secondResult]), cursorKey);
+  await waitFor(() => final.ended, "complete parallel recovery terminal");
   await assert.rejects(first.promise, /superseded by durable deferred user input/);
   await assert.rejects(secondPromise, /superseded by durable deferred user input/);
 
@@ -1853,15 +2723,17 @@ test("partial parallel results plus user input terminalize the unanswered call a
   const savedFirst = saved.calls.find((call) => call.wireId === first.call.wireId);
   const savedSecond = saved.calls.find((call) => call.wireId === second.wireId);
   assert.equal(savedFirst.receipt.result.content, "first completed locally");
-  assert.equal(savedSecond.receipt, null);
-  assert.equal(savedSecond.state, "TERMINAL");
+  assert.equal(savedSecond.receipt.result.content, "second completed locally");
   assert.equal(saved.deferredInputs[0].state, "DELIVERED");
   assert.equal(sent.length, 1);
   assert.match(sent[0], /first completed locally/);
-  assert.match(sent[0], /continue without the unanswered parallel call/);
+  assert.match(sent[0], /second completed locally/);
+  assert.match(sent[0], /continue after both parallel calls complete/);
+  assert.equal(final.status, 200);
+  assert.match(final.text(), /continued after partial batch/);
 });
 
-test("a completed restart recovery durably acknowledges an identical lost-response retry", async () => {
+test("a completed restart recovery without an answer receipt never fabricates retry success", async () => {
   const { session } = seedSession("recovery-idempotent", "cursor-key");
   const opened = await openTool(session);
   opened.round.terminalize("shutdown", "bridge restarted");
@@ -1894,7 +2766,9 @@ test("a completed restart recovery durably acknowledges an identical lost-respon
   const duplicate = new MockResponse();
   await handleContinue(request(), duplicate, continuationBody([result], { history: "bounded prior conversation" }), "cursor-key");
   assert.equal(duplicate.status, 200);
-  assert.match(duplicate.text(), /already_recovered/);
+  assert.match(duplicate.text(), /completed_response_receipt_unavailable/);
+  assert.match(duplicate.text(), /"stop_reason":"error"/);
+  assert.doesNotMatch(duplicate.text(), /already_recovered/);
 });
 
 test("a failed restart recovery is journaled and releases its replacement session for retry", async () => {
@@ -2138,28 +3012,35 @@ test("shutdown cancellation terminal-resolves every open callback", async () => 
 });
 
 test("HTTP MCP tools/call uses ToolRound and preserves isError, structuredContent, and image output", async () => {
+  const previous = process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+  process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = "1";
   const { session } = seedSession("mcp-http", "key");
-  const responsePromise = mcpDispatch({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "Lookup", arguments: { q: "x" } } }, session.id, DEFAULT_MCP_SERVER_KEY);
-  await waitFor(() => session.currentRound?.fifo.length === 1 && session.currentRound.calls.get(session.currentRound.fifo[0]).handedAt, "HTTP MCP handoff");
-  if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
-  const round = session.currentRound;
-  const call = round.calls.get(round.fifo[0]);
-  assert.equal(call.source, "http-mcp");
-  round.markAwaitingResults();
-  round.applyResults([{
-    toolCallId: call.wireId,
-    content: "failed",
-    isError: true,
-    structuredContent: { code: "E_LOOKUP" },
-    images: [{ data: "QUJD", mimeType: "image/png" }],
-  }]);
-  const response = await responsePromise;
-  assert.equal(response.result.isError, true);
-  assert.deepEqual(response.result.structuredContent, { code: "E_LOOKUP" });
-  assert.deepEqual(response.result.content, [
-    { type: "text", text: "failed" },
-    { type: "image", data: "QUJD", mimeType: "image/png" },
-  ]);
+  try {
+    const responsePromise = mcpDispatch({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "Lookup", arguments: { q: "x" } } }, session.id, DEFAULT_MCP_SERVER_KEY);
+    await waitFor(() => session.currentRound?.fifo.length === 1 && session.currentRound.calls.get(session.currentRound.fifo[0]).handedAt, "HTTP MCP handoff");
+    if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
+    const round = session.currentRound;
+    const call = round.calls.get(round.fifo[0]);
+    assert.equal(call.source, "http-mcp");
+    round.markAwaitingResults();
+    round.applyResults([{
+      toolCallId: call.wireId,
+      content: "failed",
+      isError: true,
+      structuredContent: { code: "E_LOOKUP" },
+      images: [{ data: "QUJD", mimeType: "image/png" }],
+    }]);
+    const response = await responsePromise;
+    assert.equal(response.result.isError, true);
+    assert.deepEqual(response.result.structuredContent, { code: "E_LOOKUP" });
+    assert.deepEqual(response.result.content, [
+      { type: "text", text: "failed" },
+      { type: "image", data: "QUJD", mimeType: "image/png" },
+    ]);
+  } finally {
+    if (previous === undefined) delete process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+    else process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = previous;
+  }
 });
 
 test("HTTP MCP calls are server-scoped and equal JSON-RPC ids cannot collide across servers", async () => {
@@ -2467,6 +3348,225 @@ test("MCP result builder preserves images, errors, and structured content", () =
   assert.ok(result.success.content.some((part) => part.image));
   const unavailable = typedUnavailableResult("grepArgs");
   assert.match(JSON.stringify(unavailable), /not available|unavailable/i);
+});
+
+test("inline MCP result images are opt-in because serialization does not prove model-route support", () => {
+  const previous = process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+  try {
+    delete process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+    assert.equal(mcpImageResultsEnabled(), false);
+    process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = "1";
+    assert.equal(mcpImageResultsEnabled(), true);
+    process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = "true";
+    assert.equal(mcpImageResultsEnabled(), true);
+    process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = "0";
+    assert.equal(mcpImageResultsEnabled(), false);
+  } finally {
+    if (previous === undefined) delete process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+    else process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = previous;
+  }
+});
+
+test("default image continuation bypasses the paused MCP callback and performs faithful recovery", async () => {
+  const previous = process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+  delete process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+  const cursorKey = "image-recovery-key";
+  const { session } = seedSession("image-result-recovery", cursorKey);
+  let adapterCalls = 0;
+  const opened = await openTool(session, {
+    adapter(value) {
+      adapterCalls++;
+      return value;
+    },
+  });
+  session.activeRes = null;
+  session.responseWriter = null;
+
+  const sent = [];
+  const agent = {
+    async send(message) {
+      sent.push(message);
+      return {
+        async wait() { return { status: "finished", result: "IMAGE_RECOVERY_OK" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  try {
+    const input = {
+      type: "tool_results",
+      results: [{
+        toolCallId: opened.call.wireId,
+        content: "generated image",
+        images: [{ data: "QUJD", mimeType: "image/png" }],
+      }],
+    };
+    opened.round.commitResults(input.results);
+    const plan = toolResultRecoveryPlan(opened.round, input, session.seededSystem);
+    assert.equal(plan.requiresFreshRecovery, true);
+    assert.equal(plan.remainingUnreceipted, 0);
+    assert.equal(plan.resultImages.length, 1);
+
+    const response = new MockResponse();
+    await handleContinue(request(), response, continuationBody(input.results), cursorKey);
+    await waitFor(() => response.ended, "image recovery terminal");
+    await assert.rejects(opened.promise, /faithful fresh send/);
+
+    assert.equal(adapterCalls, 0, "the unreliable inline MCP image callback must not be invoked by default");
+    assert.equal(sent.length, 1);
+    assert.equal(typeof sent[0], "object");
+    assert.deepEqual(sent[0].images, [{ data: "QUJD", mimeType: "image/png" }]);
+    assert.match(sent[0].text, /generated image/);
+    assert.match(sent[0].text, new RegExp(opened.call.wireId));
+    assert.match(response.text(), /IMAGE_RECOVERY_OK/);
+  } finally {
+    platforms.delete(keyHash(cursorKey));
+    if (previous === undefined) delete process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+    else process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = previous;
+  }
+});
+
+test("incremental parallel image results wait for siblings and recover from all durable receipts", async () => {
+  const previous = process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+  delete process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+  const cursorKey = "parallel-image-recovery-key";
+  const { session } = seedSession("parallel-image-result-recovery", cursorKey);
+  const first = await openTool(session, { rawId: "parallel-image-first", awaiting: false });
+  const secondPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "parallel-image-second",
+    name: "Lookup",
+    input: { q: "second" },
+    resultAdapter: (value) => value,
+  });
+  secondPromise.catch(() => {});
+  await waitFor(() => first.round.fifo.length === 2, "parallel image call registration");
+  session.flushJournaledCalls();
+  const second = first.round.calls.get(first.round.fifo[1]);
+  await waitFor(() => second.handedAt != null, "parallel image sibling handoff");
+  first.round.markAwaitingResults();
+  session.activeRes = null;
+  session.responseWriter = null;
+
+  const sent = [];
+  const agent = {
+    async send(message) {
+      sent.push(message);
+      return {
+        async wait() { return { status: "finished", result: "PARALLEL_IMAGE_RECOVERY_OK" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  try {
+    const partial = new MockResponse();
+    await handleContinue(request(), partial, continuationBody([{
+      toolCallId: first.call.wireId,
+      content: "first image result",
+      images: [{ data: "QUJD", mimeType: "image/png" }],
+    }]), cursorKey);
+    assert.match(partial.text(), /partial_results_deferred_for_fidelity/);
+    assert.equal(first.round.pendingCount, 2);
+    assert.equal(first.round.unreceiptedOwedCallCount, 1);
+    assert.equal(sent.length, 0);
+
+    const final = new MockResponse();
+    await handleContinue(request(), final, continuationBody([{
+      toolCallId: second.wireId,
+      content: "second text result",
+    }]), cursorKey);
+    await waitFor(() => final.ended, "parallel image recovery terminal");
+    await assert.rejects(first.promise, /faithful fresh send/);
+    await assert.rejects(secondPromise, /faithful fresh send/);
+
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].images, [{ data: "QUJD", mimeType: "image/png" }]);
+    assert.match(sent[0].text, /first image result/);
+    assert.match(sent[0].text, /second text result/);
+    assert.match(final.text(), /PARALLEL_IMAGE_RECOVERY_OK/);
+  } finally {
+    platforms.delete(keyHash(cursorKey));
+    if (previous === undefined) delete process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+    else process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = previous;
+  }
+});
+
+test("a concurrent final image result supersedes the old response and owns faithful recovery", async () => {
+  const previous = process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+  delete process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+  const cursorKey = "concurrent-image-recovery-key";
+  const { session, output } = seedSession("concurrent-image-result-recovery", cursorKey);
+  const opened = await openTool(session);
+  let oldRunCancels = 0;
+  session.run = { async cancel() { oldRunCancels++; } };
+  session.agent = { async close() {} };
+
+  const sent = [];
+  const agent = {
+    async send(message) {
+      sent.push(message);
+      return {
+        async wait() { return { status: "finished", result: "CONCURRENT_IMAGE_RECOVERY_OK" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  try {
+    const response = new MockResponse();
+    await handleContinue(request(), response, continuationBody([{
+      toolCallId: opened.call.wireId,
+      content: "concurrent image result",
+      images: [{ data: "QUJD", mimeType: "image/png" }],
+    }]), cursorKey);
+    await waitFor(() => response.ended, "concurrent image recovery terminal");
+    await assert.rejects(opened.promise, /complete client-tool recovery batch/);
+
+    assert.equal(oldRunCancels, 1);
+    assert.match(output.text(), /superseded by a complete client-tool recovery batch/);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0].images, [{ data: "QUJD", mimeType: "image/png" }]);
+    assert.match(response.text(), /CONCURRENT_IMAGE_RECOVERY_OK/);
+  } finally {
+    platforms.delete(keyHash(cursorKey));
+    if (previous === undefined) delete process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS;
+    else process.env.CURSOR_COMPOSER_MCP_IMAGE_RESULTS = previous;
+  }
 });
 
 test("images retain both supported wire envelopes", () => {
