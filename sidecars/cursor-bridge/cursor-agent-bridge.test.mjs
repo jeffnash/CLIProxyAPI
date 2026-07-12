@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -12,6 +12,36 @@ const TEST_STATE_ROOT = mkdtempSync(path.join(tmpdir(), "cursor-bridge-state-"))
 process.env.CURSOR_AGENT_STATE_ROOT = TEST_STATE_ROOT;
 process.env.CURSOR_AGENT_TOOL_BATCH_MS = "60000";
 process.env.CURSOR_AGENT_PENDING_TIMEOUT_MS = "60000";
+
+async function spawnNodeCaptured(args, options = {}) {
+  const captureDir = mkdtempSync(path.join(tmpdir(), "cursor-bridge-child-"));
+  const stdoutPath = path.join(captureDir, "stdout.log");
+  const stderrPath = path.join(captureDir, "stderr.log");
+  const stdoutFD = openSync(stdoutPath, "w");
+  const stderrFD = openSync(stderrPath, "w");
+  let child;
+  try {
+    child = spawn(process.execPath, args, {
+      ...options,
+      stdio: ["ignore", stdoutFD, stderrFD],
+    });
+    const result = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    closeSync(stdoutFD);
+    closeSync(stderrFD);
+    return {
+      ...result,
+      stdout: readFileSync(stdoutPath, "utf8"),
+      stderr: readFileSync(stderrPath, "utf8"),
+    };
+  } finally {
+    try { closeSync(stdoutFD); } catch {}
+    try { closeSync(stderrFD); } catch {}
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+}
 
 const bridge = await import("./cursor-agent-bridge.mjs");
 const { createRoundInfrastructure, ToolRound, ToolRoundError, TerminalReason } = await import("./tool-round.mjs");
@@ -422,24 +452,15 @@ test("exact cancellation async context absorbs a multi-error leak after the same
       process.exit(0);
     }, 100);
   `;
-  const child = spawn(process.execPath, ["--input-type=module", "--eval", code], {
+  const exit = await spawnNodeCaptured(["--input-type=module", "--eval", code], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
     env: { ...process.env, CURSOR_AGENT_STATE_ROOT: TEST_STATE_ROOT },
-    stdio: ["ignore", "pipe", "pipe"],
   });
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk) => { stdout += chunk; });
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const exit = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (codeValue, signal) => resolve({ code: codeValue, signal }));
-  });
-  assert.deepEqual(exit, { code: 0, signal: null });
-  assert.match(stdout, /BRIDGE_ALIVE sessions=1 successorAborted=false/);
-  assert.doesNotMatch(stderr, /FATAL unhandledRejection/);
-  assert.doesNotMatch(stderr, /restarting isolated sidecar/);
-  assert.match(stderr, /expected SDK cancellation/);
+  assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 0, signal: null });
+  assert.match(exit.stdout, /BRIDGE_ALIVE sessions=1 successorAborted=false/);
+  assert.doesNotMatch(exit.stderr, /FATAL unhandledRejection/);
+  assert.doesNotMatch(exit.stderr, /restarting isolated sidecar/);
+  assert.match(exit.stderr, /expected SDK cancellation/);
 });
 
 test("a global cancellation ticket cannot mask an unrelated live SDK failure", async () => {
@@ -452,19 +473,12 @@ test("a global cancellation ticket cannot mask an unrelated live SDK failure", a
     Promise.reject(closed);
     setTimeout(() => process.exit(9), 1000);
   `;
-  const child = spawn(process.execPath, ["--input-type=module", "--eval", code], {
+  const exit = await spawnNodeCaptured(["--input-type=module", "--eval", code], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
     env: { ...process.env, CURSOR_AGENT_STATE_ROOT: TEST_STATE_ROOT },
-    stdio: ["ignore", "pipe", "pipe"],
   });
-  let stderr = "";
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const exit = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (codeValue, signal) => resolve({ code: codeValue, signal }));
-  });
-  assert.deepEqual(exit, { code: 1, signal: null });
-  assert.match(stderr, /ambiguous SDK input-stream closure; restarting isolated sidecar/);
+  assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 1, signal: null });
+  assert.match(exit.stderr, /ambiguous SDK input-stream closure; restarting isolated sidecar/);
 });
 
 test("an unticketed identity-less SDK closure restarts only the sidecar instead of stranding a run", async () => {
@@ -475,19 +489,12 @@ test("an unticketed identity-less SDK closure restarts only the sidecar instead 
     Promise.reject(closed);
     setTimeout(() => process.exit(9), 1000);
   `;
-  const child = spawn(process.execPath, ["--input-type=module", "--eval", code], {
+  const exit = await spawnNodeCaptured(["--input-type=module", "--eval", code], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
     env: { ...process.env, CURSOR_AGENT_STATE_ROOT: TEST_STATE_ROOT },
-    stdio: ["ignore", "pipe", "pipe"],
   });
-  let stderr = "";
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const exit = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (codeValue, signal) => resolve({ code: codeValue, signal }));
-  });
-  assert.deepEqual(exit, { code: 1, signal: null });
-  assert.match(stderr, /unattributed SDK input-stream closure; restarting isolated sidecar/);
+  assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 1, signal: null });
+  assert.match(exit.stderr, /unattributed SDK input-stream closure; restarting isolated sidecar/);
 });
 
 test("concurrent Session.cancel calls share one SDK teardown and upgrade notify", async () => {
@@ -584,19 +591,12 @@ test("a wedged SDK cancellation cleanup triggers a bounded isolated sidecar rest
     session.cancel().catch(() => {});
     setTimeout(() => process.exit(9), 2000);
   `;
-  const child = spawn(process.execPath, ["--input-type=module", "--eval", code], {
+  const exit = await spawnNodeCaptured(["--input-type=module", "--eval", code], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
     env: { ...process.env, CURSOR_AGENT_STATE_ROOT: TEST_STATE_ROOT, CURSOR_AGENT_CANCEL_CLEANUP_MS: "100" },
-    stdio: ["ignore", "pipe", "pipe"],
   });
-  let stderr = "";
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const exit = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (codeValue, signal) => resolve({ code: codeValue, signal }));
-  });
-  assert.deepEqual(exit, { code: 1, signal: null });
-  assert.match(stderr, /SDK cancellation cleanup abandoned; restarting isolated sidecar/);
+  assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 1, signal: null });
+  assert.match(exit.stderr, /SDK cancellation cleanup abandoned; restarting isolated sidecar/);
 });
 
 test("planned shutdown has one global deadline even when many session cancels never settle", async () => {
@@ -3120,18 +3120,9 @@ test("cross-process receipt races elect one fresh owner and completed state is a
   const clientMessageId = "ccm2_receipt_race";
   const requestHash = "a".repeat(64);
 
-  const runChild = (source) => new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ["--input-type=module", "--eval", source], {
-      cwd: path.dirname(new URL(import.meta.url).pathname),
-      env: { ...process.env, CURSOR_AGENT_STATE_ROOT: raceRoot },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.once("error", reject);
-    child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+  const runChild = (source) => spawnNodeCaptured(["--input-type=module", "--eval", source], {
+    cwd: path.dirname(new URL(import.meta.url).pathname),
+    env: { ...process.env, CURSOR_AGENT_STATE_ROOT: raceRoot },
   });
   const waitUntil = (at) => `
     const view = new Int32Array(new SharedArrayBuffer(4));
@@ -4924,25 +4915,16 @@ test("disk-pressure admission rejects new turns before creating recoverability s
       replayBody: replay.body,
     }));
   `;
-  const child = spawn(process.execPath, ["--input-type=module", "--eval", code], {
+  const exit = await spawnNodeCaptured(["--input-type=module", "--eval", code], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
     env: {
       ...process.env,
       CURSOR_AGENT_STATE_ROOT: diskPressureRoot,
       CURSOR_COMPOSER_STATE_ROOT_MIN_FREE_BYTES: String(Number.MAX_SAFE_INTEGER),
     },
-    stdio: ["ignore", "pipe", "pipe"],
   });
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk) => { stdout += chunk; });
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  const exit = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", (exitCode, signal) => resolve({ code: exitCode, signal }));
-  });
-  assert.deepEqual(exit, { code: 0, signal: null }, stderr);
-  const result = JSON.parse(stdout);
+  assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 0, signal: null }, exit.stderr);
+  const result = JSON.parse(exit.stdout);
   assert.equal(result.status, 507);
   assert.equal(result.body.error.code, "durable_state_capacity");
   assert.equal(result.sessions, 0);
