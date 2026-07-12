@@ -20,7 +20,7 @@ function registryFor(name, inputSchema) {
   return registry;
 }
 
-test("schema adapter repairs OMP todo array wrappers before validation", () => {
+test("schema adapter repairs nested tool argument wrappers before validation", () => {
   const schema = {
     type: "object",
     properties: {
@@ -138,17 +138,17 @@ test("native argument keys map to unique client schema keys without overwriting 
   });
   assert.equal(translated.transforms.filter((entry) => entry.kind === "rename-key").length, 3);
 
-  const exactWins = normalizeToolArguments({ path: "/correct", filePath: "/wrong", old_string: "a", new_string: "b" }, schema);
-  assert.equal(exactWins.value.path, "/correct");
-  assert.equal(Object.hasOwn(exactWins.value, "filePath"), false);
-  assert.ok(exactWins.transforms.some((entry) => entry.kind === "discard-conflicting-alias" && entry.source === "filePath"));
+  assert.throws(
+    () => normalizeToolArguments({ path: "/correct", filePath: "/wrong", old_string: "a", new_string: "b" }, schema),
+    (error) => error instanceof ToolContractNormalizationError && error.code === "ambiguous_alias",
+  );
   const equalAliases = normalizeToolArguments({ path: "/same", filePath: { value: "/same" }, old_string: "a", new_string: "b" }, schema);
   assert.equal(equalAliases.value.path, "/same");
   assert.equal(Object.hasOwn(equalAliases.value, "filePath"), false);
   assert.ok(equalAliases.transforms.some((entry) => entry.kind === "deduplicate-alias" && entry.source === "filePath"));
 });
 
-test("exact OMP grep fields win over redundant Cursor aliases without weakening the client schema", () => {
+test("conflicting exact fields and aliases fail closed without weakening the client schema", () => {
   const schema = {
     type: "object",
     properties: {
@@ -163,30 +163,15 @@ test("exact OMP grep fields win over redundant Cursor aliases without weakening 
     required: ["i", "pattern"],
     additionalProperties: false,
   };
-  const registry = registryFor("_grep", schema);
-  const normalized = registry.normalize("_grep", {
-    i: "Find turn lifecycle symbols",
-    pattern: "_active_turns\\[",
-    query: "different native search wording",
-    path: "omnigent/runner/app.py",
-    filePath: "/incorrect/native/path",
-    head_limit: 100,
-    output_mode: "content",
-    limit: 20,
-  });
-  assert.deepEqual(normalized.value, {
-    i: "Find turn lifecycle symbols",
-    pattern: "_active_turns\\[",
-    path: "omnigent/runner/app.py",
-  });
-  assert.equal(registry.validate("_grep", normalized.value, normalized.transforms), null);
-  assert.deepEqual(
-    normalized.transforms.filter((entry) => entry.kind === "discard-conflicting-alias").map((entry) => entry.source).sort(),
-    ["filePath", "query"],
-  );
-  assert.deepEqual(
-    normalized.transforms.filter((entry) => entry.kind === "strip-presentation").map((entry) => entry.path).sort(),
-    ["head_limit", "limit", "output_mode"],
+  assert.throws(
+    () => registryFor("search", schema).normalize("search", {
+      i: "Find lifecycle symbols",
+      pattern: "primary",
+      query: "different",
+      path: "src/main.go",
+      filePath: "/different/path",
+    }),
+    (error) => error instanceof ToolContractNormalizationError && error.code === "ambiguous_alias",
   );
 
   const clientOwnedLimit = registryFor("_grep", {
@@ -200,6 +185,228 @@ test("exact OMP grep fields win over redundant Cursor aliases without weakening 
     (error) => error instanceof ToolContractNormalizationError && error.code === "ambiguous_alias",
     "two aliases without an exact client field remain unsafe to guess",
   );
+});
+
+test("production compatibility matrix repairs only schema-proven lossless variants", () => {
+  const cases = [
+    {
+      name: "_read",
+      schema: {
+        type: "object",
+        properties: { path: { type: "string" }, selector: { type: "string" } },
+        required: ["path"],
+        additionalProperties: false,
+      },
+      input: { path: "/repo/a.mjs", selector: { startLine: 4, endLine: 8 }, limit: 5 },
+      expected: { path: "/repo/a.mjs", selector: "4-8" },
+      transformKinds: ["normalize-read-selector", "strip-presentation"],
+    },
+    {
+      name: "_bash",
+      schema: {
+        type: "object",
+        properties: { command: { type: "string" }, timeout: { type: "number" } },
+        required: ["command"],
+        additionalProperties: false,
+      },
+      input: { command: "pwd", timeout: { kind: "30" } },
+      expected: { command: "pwd", timeout: 30 },
+      transformKinds: ["unwrap"],
+    },
+    {
+      name: "_job",
+      schema: {
+        type: "object",
+        properties: { poll: { type: "array", items: { type: "string" } } },
+        additionalProperties: false,
+      },
+      input: { poll: { job_id: "job_2" } },
+      expected: { poll: ["job_2"] },
+      transformKinds: ["wrap-singleton-list"],
+    },
+    {
+      name: "_mcp__codebase_memory_mcp_search_code",
+      schema: {
+        type: "object",
+        properties: { mode: { type: "string", enum: ["compact", "full", "files"] } },
+        required: ["mode"],
+        additionalProperties: false,
+      },
+      input: { mode: { kind: "compact" } },
+      expected: { mode: "compact" },
+      transformKinds: ["unwrap"],
+    },
+  ];
+
+  for (const item of cases) {
+    const registry = registryFor(item.name, item.schema);
+    const normalized = registry.normalize(item.name, item.input);
+    assert.deepEqual(normalized.value, item.expected, item.name);
+    assert.equal(registry.validate(item.name, normalized.value, normalized.transforms), null, item.name);
+    for (const kind of item.transformKinds) {
+      assert.ok(normalized.transforms.some((entry) => entry.kind === kind), `${item.name} missing ${kind}`);
+    }
+  }
+
+  const job = registryFor("_job", cases.find((item) => item.name === "_job").schema);
+  assert.deepEqual(job.normalize("_job", { poll: "job_1" }).value, { poll: ["job_1"] });
+
+  const schemaOwnedYield = registryFor("_yield", {
+    type: "object",
+    properties: {
+      type: { type: "string" },
+      result: {
+        type: "object",
+        properties: { kind: { type: "string", enum: ["last_turn"] } },
+        required: ["kind"],
+        additionalProperties: false,
+      },
+    },
+    required: ["result"],
+    additionalProperties: false,
+  });
+  const owned = schemaOwnedYield.normalize("_yield", { type: "result", result: { kind: "last_turn" } });
+  assert.deepEqual(owned.value, { type: "result", result: { kind: "last_turn" } });
+  assert.equal(schemaOwnedYield.validate("_yield", owned.value, owned.transforms), null);
+  assert.ok(!owned.transforms.some((entry) => entry.kind === "normalize-yield-last-turn"));
+});
+
+test("unsafe compatibility guesses and missing semantic fields remain contained model-visible errors", () => {
+  const unsafeCases = [
+    {
+      name: "_read",
+      schema: {
+        type: "object",
+        properties: { path: { type: "string" }, selector: { type: "string" } },
+        required: ["path"],
+        additionalProperties: false,
+      },
+      input: { path: "/repo/a", limit: 20 },
+      path: "limit",
+    },
+    {
+      name: "_read",
+      schema: {
+        type: "object",
+        properties: { path: { type: "string" }, selector: { type: "string" } },
+        required: ["path"],
+        additionalProperties: false,
+      },
+      input: { path: "/repo/a", selector: { offset: 0, limit: 20 } },
+      path: "selector",
+    },
+    {
+      name: "_grep",
+      schema: {
+        type: "object",
+        properties: { pattern: { type: "string" }, path: { type: "string" } },
+        required: ["pattern"],
+        additionalProperties: false,
+      },
+      input: { pattern: "x", path_filter: "^src/(foo|bar)" },
+      path: "path_filter",
+    },
+    {
+      name: "_grep",
+      schema: {
+        type: "object",
+        properties: { pattern: { type: "string" }, path: { type: "string" } },
+        required: ["pattern"],
+        additionalProperties: false,
+      },
+      input: { pattern: "x", path_filter: "src/.*" },
+      path: "path_filter",
+    },
+    {
+      name: "_glob",
+      schema: {
+        type: "object",
+        properties: { path: { type: "string" } },
+        additionalProperties: false,
+      },
+      input: { path: "src/a", glob_pattern: "src/b" },
+      path: "glob_pattern",
+    },
+    {
+      name: "_yield",
+      schema: {
+        type: "object",
+        properties: {
+          type: { type: "string" },
+          result: { type: "object", properties: {}, additionalProperties: false },
+        },
+        required: ["result"],
+        additionalProperties: false,
+      },
+      input: { type: "result", result: { kind: "unknown_variant" } },
+      path: "result.kind",
+    },
+    {
+      name: "_mcp__codebase_memory_mcp_search_code",
+      schema: {
+        type: "object",
+        properties: { mode: { type: "string", enum: ["compact", "full", "files"] } },
+        required: ["mode"],
+        additionalProperties: false,
+      },
+      input: { mode: { kind: "compact", explanation: "not a scalar wrapper" } },
+      path: "mode",
+    },
+  ];
+
+  for (const item of unsafeCases) {
+    const registry = registryFor(item.name, item.schema);
+    const normalized = registry.normalize(item.name, item.input);
+    const failure = registry.validate(item.name, normalized.value, normalized.transforms);
+    assert.equal(failure.isError, true, item.name);
+    assert.equal(failure.structuredContent.code, "client_tool_invalid_arguments", item.name);
+    assert.equal(failure.structuredContent.executed, false, item.name);
+    assert.ok(failure.structuredContent.errors.some((error) => error.path === item.path), item.name);
+  }
+
+  const semantic = new ToolContractRegistry();
+  semantic.replace([
+    {
+      name: "_write",
+      inputSchema: {
+        type: "object",
+        properties: { path: { type: "string" }, content: { type: "string" } },
+        required: ["path", "content"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "_irc",
+      inputSchema: {
+        type: "object",
+        properties: { op: { type: "string" }, message: { type: "string" } },
+        required: ["op"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "_mcp__codebase_memory_mcp_list_projects",
+      inputSchema: {
+        type: "object",
+        properties: { repo_path: { type: "string" } },
+        required: ["repo_path"],
+        additionalProperties: false,
+      },
+    },
+  ]);
+  for (const [name, input, missing] of [
+    ["_write", { content: "body" }, "path"],
+    ["_irc", { message: "hello" }, "op"],
+    ["_mcp__codebase_memory_mcp_list_projects", {}, "repo_path"],
+  ]) {
+    const normalized = semantic.normalize(name, input);
+    const failure = semantic.validate(name, normalized.value, normalized.transforms);
+    assert.equal(failure.isError, true, name);
+    assert.equal(failure.structuredContent.executed, false, name);
+    assert.ok(failure.structuredContent.errors.some((error) => error.path === missing), name);
+  }
+  assert.equal(semantic.validate("_write", { path: "/tmp/a", content: "body" }), null,
+    "a contained invalid call must not poison a corrective retry");
 });
 
 test("prototype-named client fields remain own JSON properties and inherited values never satisfy schemas", () => {
@@ -316,7 +523,11 @@ test("local $defs and allOf schemas normalize with the same structure Ajv valida
             type: "object",
             properties: {
               values: { $ref: "#/$defs/values" },
-              i: { type: "string", description: "concise intent" },
+              i: {
+                type: "string",
+                description: "concise intent",
+                "x-cliproxy-client-decoration": true,
+              },
             },
             required: ["values", "i"],
           },
@@ -392,16 +603,19 @@ test("bare SDK values map to a schema's sole root property", () => {
   assert.deepEqual(normalizeToolArguments("needle", schema).value, { query: "needle" });
 });
 
-test("OMP intent decoration is optional for execution while semantic fields remain required", () => {
+test("explicit schema decoration is optional while semantic fields remain required", () => {
   const schema = {
     type: "object",
-    properties: { i: intentProperty, repo_path: { type: "string" } },
-    required: ["i", "repo_path"],
+    properties: {
+      trace_label: { ...intentProperty, "x-cliproxy-client-decoration": true },
+      repo_path: { type: "string" },
+    },
+    required: ["trace_label", "repo_path"],
     additionalProperties: false,
   };
   const registry = registryFor("mcp__memory__status", schema);
   assert.equal(registry.validate("mcp__memory__status", { repo_path: "/repo" }), null);
-  assert.equal(registry.validate("mcp__memory__status", { i: { sdk: "wrapper" }, repo_path: "/repo" }), null);
+  assert.equal(registry.validate("mcp__memory__status", { trace_label: { sdk: "wrapper" }, repo_path: "/repo" }), null);
   const failure = registry.validate("mcp__memory__status", {});
   assert.deepEqual(failure.structuredContent.errors.map((error) => error.path), ["repo_path"]);
   assert.deepEqual(acceptanceSchemaFor(schema).required, ["repo_path"]);
@@ -417,7 +631,7 @@ test("a real tool parameter named i is not relaxed without the decoration marker
   assert.equal(registry.validate("real-i", {}).structuredContent.errors[0].path, "i");
 });
 
-test("description-pruned intent is relaxed only when the whole inventory corroborates it", () => {
+test("repeated short fields are never relaxed without an explicit schema annotation", () => {
   const schema = (field) => ({
     type: "object",
     properties: {
@@ -432,14 +646,14 @@ test("description-pruned intent is relaxed only when the whole inventory corrobo
     { name: "read", description: "", inputSchema: schema("path") },
     { name: "search", description: "", inputSchema: schema("query") },
   ]);
-  assert.equal(registry.validate("read", { path: "/repo/a" }), null);
-  assert.equal(registry.validate("search", { query: "needle" }), null);
+  assert.equal(registry.validate("read", { path: "/repo/a" }).structuredContent.errors[0].path, "i");
+  assert.equal(registry.validate("search", { query: "needle" }).structuredContent.errors[0].path, "i");
 
   const single = registryFor("real-pruned-i", schema("value"));
   assert.equal(single.validate("real-pruned-i", { value: "semantic" }).structuredContent.errors[0].path, "i");
 });
 
-test("description-pruned intent detection ignores semantically irrelevant property and required ordering", () => {
+test("required ordering does not make a short field presentation-only", () => {
   const registry = new ToolContractRegistry();
   registry.replace([
     {
@@ -464,8 +678,8 @@ test("description-pruned intent detection ignores semantically irrelevant proper
       },
     },
   ]);
-  assert.equal(registry.validate("_write", { command: "pwd" }), null);
-  assert.equal(registry.validate("_read", { file_path: "/repo/a" }), null);
+  assert.equal(registry.validate("_write", { command: "pwd" }).structuredContent.errors[0].path, "i");
+  assert.equal(registry.validate("_read", { file_path: "/repo/a" }).structuredContent.errors[0].path, "i");
 });
 
 test("explicit client-decoration extension works for any harness and field name", () => {

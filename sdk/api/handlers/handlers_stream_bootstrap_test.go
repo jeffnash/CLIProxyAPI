@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -82,6 +83,64 @@ func (e *failOnceStreamExecutor) Calls() int {
 type payloadThenErrorStreamExecutor struct {
 	mu    sync.Mutex
 	calls int
+}
+
+type selectedExecutionStreamError struct{}
+
+func (e *selectedExecutionStreamError) Error() string {
+	return "selected execution may already be accepted"
+}
+func (e *selectedExecutionStreamError) StatusCode() int { return http.StatusServiceUnavailable }
+func (e *selectedExecutionStreamError) RetryScope() coreexecutor.RetryScope {
+	return coreexecutor.RetryScopeSelectedExecution
+}
+func (e *selectedExecutionStreamError) AuthAttributable() bool { return false }
+
+type commentThenErrorStreamExecutor struct {
+	mu       sync.Mutex
+	calls    int
+	selected bool
+}
+
+func (e *commentThenErrorStreamExecutor) Identifier() string { return "codex" }
+func (e *commentThenErrorStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+func (e *commentThenErrorStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	call := e.calls
+	e.mu.Unlock()
+	ch := make(chan coreexecutor.StreamChunk, 2)
+	if call == 1 {
+		ch <- coreexecutor.StreamChunk{Payload: []byte(": keepalive\n\n")}
+		if e.selected {
+			ch <- coreexecutor.StreamChunk{Err: &selectedExecutionStreamError{}}
+		} else {
+			ch <- coreexecutor.StreamChunk{Err: &coreauth.Error{HTTPStatus: http.StatusServiceUnavailable, Message: "temporary"}}
+		}
+	} else {
+		ch <- coreexecutor.StreamChunk{Payload: []byte("ok")}
+	}
+	close(ch)
+	return &coreexecutor.StreamResult{
+		Headers: http.Header{"X-Upstream-Attempt": {fmt.Sprint(call)}},
+		Chunks:  ch,
+	}, nil
+}
+func (e *commentThenErrorStreamExecutor) Refresh(context.Context, *coreauth.Auth) (*coreauth.Auth, error) {
+	return nil, errors.New("refresh not expected")
+}
+func (e *commentThenErrorStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+func (e *commentThenErrorStreamExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+func (e *commentThenErrorStreamExecutor) Calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
 }
 
 func (e *payloadThenErrorStreamExecutor) Identifier() string { return "codex" }
@@ -333,6 +392,88 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	upstreamAttemptHeader := upstreamHeaders.Get("X-Upstream-Attempt")
 	if upstreamAttemptHeader != "2" {
 		t.Fatalf("expected upstream header from retry attempt, got %q", upstreamAttemptHeader)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_CommentThenSelectedExecutionErrorDoesNotRetry(t *testing.T) {
+	executor := &commentThenErrorStreamExecutor{selected: true}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	for _, id := range []string{"selected-auth-1", "selected-auth-2"} {
+		auth := &coreauth.Auth{ID: id, Provider: "codex", Status: coreauth.StatusActive}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(id, "codex", []*registry.ModelInfo{{ID: "test-model"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		PassthroughHeaders: true,
+		Streaming:          sdkconfig.StreamingConfig{BootstrapRetries: 2},
+	}, manager)
+	dataChan, headers, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "",
+	)
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	if string(got) != ": keepalive\n\n" {
+		t.Fatalf("comment keepalive = %q", got)
+	}
+	var gotErr *interfaces.ErrorMessage
+	for msg := range errChan {
+		if msg != nil {
+			gotErr = msg
+		}
+	}
+	if gotErr == nil || gotErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected selected-execution 503, got %#v", gotErr)
+	}
+	if executor.Calls() != 1 {
+		t.Fatalf("selected execution must not re-enter auth selection, calls=%d", executor.Calls())
+	}
+	if got := headers.Get("X-Upstream-Attempt"); got != "1" {
+		t.Fatalf("committed keepalive headers changed: %q", got)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_CommentRetryPreservesCommittedHeaders(t *testing.T) {
+	executor := &commentThenErrorStreamExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	for _, id := range []string{"ordinary-comment-auth-1", "ordinary-comment-auth-2"} {
+		auth := &coreauth.Auth{ID: id, Provider: "codex", Status: coreauth.StatusActive}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth: %v", err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		PassthroughHeaders: true,
+		Streaming:          sdkconfig.StreamingConfig{BootstrapRetries: 1},
+	}, manager)
+	dataChan, headers, errChan := handler.ExecuteStreamWithAuthManager(
+		context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "",
+	)
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected error: %#v", msg)
+		}
+	}
+	if string(got) != ": keepalive\n\nok" {
+		t.Fatalf("retried payload = %q", got)
+	}
+	if executor.Calls() != 2 {
+		t.Fatalf("ordinary bootstrap failure should retry once, calls=%d", executor.Calls())
+	}
+	if got := headers.Get("X-Upstream-Attempt"); got != "1" {
+		t.Fatalf("headers committed by keepalive must stay on attempt 1, got %q", got)
 	}
 }
 

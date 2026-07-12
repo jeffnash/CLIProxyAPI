@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -60,14 +61,10 @@ type cursorDirectSession struct {
 	mode           string
 }
 
-// prepareCursorDirect exchanges the API key, normalizes the request to OpenAI shape, and parses the chat payload.
+// prepareCursorDirect normalizes and validates the request before acquiring
+// credentials or contacting an upstream. This preserves the same provenance
+// fail-closed boundary as the SDK sidecar path.
 func (e *CursorExecutor) prepareCursorDirect(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, req *cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*cursorDirectSession, error) {
-	proxyClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	accessToken, err := cursorauth.ExchangeCursorApiKey(ctx, apiKey, proxyClient)
-	if err != nil {
-		return nil, fmt.Errorf("cursor executor: failed to exchange API key: %w", err)
-	}
-
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	originalBytes := len(req.Payload)
@@ -75,6 +72,15 @@ func (e *CursorExecutor) prepareCursorDirect(ctx context.Context, auth *cliproxy
 	req.Payload = sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
 	log.Infof("cursor e2e (xlate): from=%s to=openai original=%d bytes msgs=%d translated=%d bytes msgs=%d",
 		from, originalBytes, originalMsgs, len(req.Payload), countJSONMessages(req.Payload))
+	if composerAmbiguousTrailingUserSegments(gjson.GetBytes(req.Payload, "messages").Array()) {
+		return nil, &composerInvalidRequestError{msg: "cursor: ambiguous adjacent user-role segments at the current-turn suffix; preserve injected context as system/developer or merge intentional user fragments"}
+	}
+
+	proxyClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	accessToken, err := cursorauth.ExchangeCursorApiKey(ctx, apiKey, proxyClient)
+	if err != nil {
+		return nil, fmt.Errorf("cursor executor: failed to exchange API key: %w", err)
+	}
 
 	chatPayload := parseCursorChatPayload(*req)
 	if errMsg := cursorImageErrorMessage(chatPayload); errMsg != "" {

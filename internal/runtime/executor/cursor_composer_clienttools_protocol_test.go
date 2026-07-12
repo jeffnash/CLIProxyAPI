@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -328,8 +331,10 @@ func TestRBT012_Non2xxSSEIsProtocolError(t *testing.T) {
 // closed with no terminal), not a synthetic [DONE] / empty completion.
 func TestRBT012_EOFWithoutTerminalIsProtocolError(t *testing.T) {
 	e := NewCursorExecutor(&config.Config{})
-	// Valid SSE content type, a benign session + ping frame, then EOF — no turn_end.
-	body := "data: {\"type\":\"session\",\"sessionId\":\"s\"}\n\ndata: {\"type\":\"ping\"}\n\n"
+	// Valid SSE content type, a partial model frame + ping, then EOF — no
+	// turn_end. The streaming client may see the comment, but never the partial
+	// assistant bytes held behind the durable commit barrier.
+	body := "data: {\"type\":\"session\",\"sessionId\":\"s\"}\n\ndata: {\"type\":\"text\",\"delta\":\"PARTIAL-MUST-NOT-COMMIT\"}\n\ndata: {\"type\":\"ping\"}\n\n"
 	br := newComposerProtoBridge(t, 200, "text/event-stream", body)
 	auth := protoAuth(br.srv.URL)
 
@@ -353,6 +358,9 @@ func TestRBT012_EOFWithoutTerminalIsProtocolError(t *testing.T) {
 	var peS *composerBridgeProtocolError
 	if !errors.As(streamErr, &peS) {
 		t.Fatalf("RBT-012b: stream chunk error must be a protocol error, got %T %v", streamErr, streamErr)
+	}
+	if strings.Contains(payload, "PARTIAL-MUST-NOT-COMMIT") {
+		t.Fatalf("RBT-012b: partial model output escaped before durable terminal: %q", payload)
 	}
 }
 
@@ -718,6 +726,7 @@ func TestP01_Reseed410ThinMixedContinuationRecoversUserText(t *testing.T) {
 // never an opaque 500, and must produce no response (so no phantom response-session mapping is recorded —
 // recordComposerResponseSession runs only after SSE acceptance, which a transport failure never reaches).
 func TestP04_BridgeTransportFailureIsTyped503(t *testing.T) {
+	t.Setenv("CURSOR_COMPOSER_BRIDGE_RECONNECT_MAX_MS", "0")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	url := srv.URL
 	srv.Close() // the port now refuses connections -> a transport failure on dial
@@ -740,6 +749,83 @@ func TestP04_BridgeTransportFailureIsTyped503(t *testing.T) {
 	}
 	if sr != nil {
 		t.Fatalf("P0-4: a pre-stream transport failure must return no StreamResult, got %#v", sr)
+	}
+}
+
+func TestP04_BridgeRestartReconnectsReplaySafeTurnBeforeSurfacing503(t *testing.T) {
+	t.Setenv("CURSOR_COMPOSER_BRIDGE_RECONNECT_MAX_MS", "3000")
+	probe, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("reserve bridge address: %v", errListen)
+	}
+	addr := probe.Addr().String()
+	if errClose := probe.Close(); errClose != nil {
+		t.Fatalf("release bridge address: %v", errClose)
+	}
+
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"type\":\"session\",\"sessionId\":\"recovered\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"text\",\"delta\":\"seamless\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})}
+	serveErr := make(chan error, 1)
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			serveErr <- err
+			return
+		}
+		serveErr <- server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		select {
+		case err := <-serveErr:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				t.Errorf("recovery bridge serve: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("recovery bridge did not stop")
+		}
+	})
+
+	e := NewCursorExecutor(&config.Config{})
+	auth := protoAuth("http://" + addr)
+	opts := protoOpts("p04-reconnect")
+	opts.Headers.Set("Idempotency-Key", "inv1_p04-reconnect")
+	resp, err := e.executeComposer(context.Background(), auth, "k", protoToolReq("recover without client-visible failure"), opts)
+	if err != nil {
+		t.Fatalf("replay-safe turn should survive a local sidecar restart: %v", err)
+	}
+	if !strings.Contains(string(resp.Payload), "seamless") {
+		t.Fatalf("reconnected response lost content: %s", string(resp.Payload))
+	}
+}
+
+func TestComposerBridgeRequestReplaySafeRequiresDurableIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "fresh", body: `{"input":{"type":"user","clientMessageId":"ccm1_fresh","invocationId":"inv1_fresh"}}`, want: true},
+		{name: "continuation", body: `{"input":{"type":"tool_results","clientMessageId":"ccm1_tools","invocationId":"inv1_tools"}}`, want: true},
+		{name: "versioned stock-client identity", body: `{"input":{"type":"user","clientMessageId":"ccm2_fresh"}}`, want: true},
+		{name: "versioned stock-client continuation", body: `{"input":{"type":"tool_results","clientMessageId":"ccm2_tools"}}`, want: true},
+		{name: "unversioned semantic identity is ambiguous", body: `{"input":{"type":"user","clientMessageId":"ccm1_fresh"}}`, want: false},
+		{name: "legacy missing identity", body: `{"input":{"type":"user","text":"ambiguous"}}`, want: false},
+		{name: "blank identity", body: `{"input":{"type":"tool_results","clientMessageId":"ccm1_tools","invocationId":"  "}}`, want: false},
+		{name: "unknown shape", body: `{"input":{"type":"other","clientMessageId":"ccm1_other","invocationId":"inv1_other"}}`, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := composerBridgeRequestReplaySafe([]byte(tc.body)); got != tc.want {
+				t.Fatalf("replaySafe=%v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -780,8 +866,8 @@ func TestP03_HistoryAggregateCap(t *testing.T) {
 	}
 	lines = append(lines, "TAILMSG "+big)
 	out := boundComposerHistoryLines(lines, 4096)
-	if len(out) > 4096+256 {
-		t.Fatalf("P0-3: bounded history must stay near the cap, got %d bytes", len(out))
+	if len(out) > 4096 {
+		t.Fatalf("P0-3: bounded history must stay within the strict cap, got %d bytes", len(out))
 	}
 	if !strings.Contains(out, "OPENER") || !strings.Contains(out, "TAILMSG") {
 		t.Fatalf("P0-3: bounded history must keep both the opener (head) and the recent tail")
@@ -802,11 +888,22 @@ func TestP03_HistoryAggregateCap(t *testing.T) {
 	sb.WriteString(`,{"role":"user","content":"LASTMSG ` + big + `"}]}`)
 	msgs := gjson.Get(sb.String(), "messages").Array()
 	rendered := renderComposerHistory(msgs, len(msgs))
-	if len(rendered) > 8192+512 {
+	if len(rendered) > 8192 {
 		t.Fatalf("P0-3: renderComposerHistory must respect the aggregate cap, got %d bytes", len(rendered))
 	}
 	if !strings.Contains(rendered, "OPENERMSG") || !strings.Contains(rendered, "LASTMSG") || !strings.Contains(rendered, "omitted to bound the replayed history") {
 		t.Fatalf("P0-3: rendered long history must keep the opener + tail and mark the truncation")
+	}
+
+	// A tiny number of giant UTF-8 lines used to bypass the cap entirely because
+	// the old whole-line selector always admitted one head and one tail line.
+	giant := strings.Repeat("界", 300000)
+	giantOut := boundComposerHistoryLines([]string{"OPENER " + giant, giant + " TAILMSG"}, 512<<10)
+	if len(giantOut) > 512<<10 {
+		t.Fatalf("P0-3: giant lines must not bypass the strict cap, got %d bytes", len(giantOut))
+	}
+	if !utf8.ValidString(giantOut) || !strings.Contains(giantOut, "OPENER") || !strings.Contains(giantOut, "TAILMSG") {
+		t.Fatalf("P0-3: giant-line bounding must preserve valid UTF-8 head and tail")
 	}
 }
 

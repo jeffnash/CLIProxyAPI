@@ -1329,6 +1329,10 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		}
 
 		bootstrapEligible := func(err error) bool {
+			if disposition, ok := errors.AsType[coreexecutor.ErrorDisposition](err); ok && disposition != nil &&
+				disposition.RetryScope() == coreexecutor.RetryScopeSelectedExecution {
+				return false
+			}
 			status := statusFromError(err)
 			if status == 0 {
 				return true
@@ -1369,11 +1373,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
-								rawStreamHeaders = cloneHeader(retryResult.Headers)
-								baseStreamHeaders = cloneHeader(retryResult.Headers)
-								replaceHeader(upstreamHeaders, downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled))
-								streamHeaderInitialized = false
-								streamHeadersCommitted = false
+								if !streamHeadersCommitted {
+									rawStreamHeaders = cloneHeader(retryResult.Headers)
+									baseStreamHeaders = cloneHeader(retryResult.Headers)
+									replaceHeader(upstreamHeaders, downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled))
+									streamHeaderInitialized = false
+								}
 								pendingChunks = nil
 								streamClosedBeforeRead = false
 								chunks = retryResult.Chunks
@@ -1429,7 +1434,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 					if len(payload) == 0 {
 						continue
 					}
-					sentPayload = true
+					if !coreexecutor.IsSSECommentOnlyPayload(payload) {
+						sentPayload = true
+					}
 					streamHeadersCommitted = true
 					if okSendData := sendData(payload); !okSendData {
 						return

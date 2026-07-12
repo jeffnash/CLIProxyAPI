@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Cursor Agent Bridge (Cursor Composer Client-Tools) — the official @cursor/sdk drives the Cursor agent, but EVERY tool
 // executes in the calling harness on the end user's machine (through CLIProxy), and the sidecar filesystem is
-// never touched for tool execution. The harness may be Claude Code, OMP/Pi, Codex, or any compatible client.
+// never touched for tool execution. Any compatible client can own the harness boundary.
 //
 // TOPOLOGY (the sidecar ONLY talks to CLIProxy, never to the client directly):
 //   Harness <-OpenAI/Anthropic-> CLIProxy (Go) <-HTTP/SSE /agent/turn + /agent/continue-> THIS sidecar <-@cursor/sdk-> Cursor API
@@ -19,6 +19,7 @@
 //      CURSOR_AGENT_STATE_ROOT (default ./.cursor-agent-store — a writable volume on Railway),
 //      CURSOR_AGENT_PENDING_TIMEOUT_MS (default 600000 in-process abandonment watchdog; NOT an upstream deadline),
 //      CURSOR_AGENT_SESSION_TTL_MS (default 1800000 idle session eviction),
+//      CURSOR_AGENT_CANCEL_CLEANUP_MS (default 5000; bounds already-requested SDK teardown, never live data),
 //      CURSOR_COMPOSER_MCP_SHIM (default ON; "0"/"false" disables registering the client's tools via the SDK's
 //        official mcpServers path — the in-bridge /mcp streamable-http server),
 //      CURSOR_COMPOSER_MCP_GROUPING (one|natural|per-tool, default natural — how advertised tools are
@@ -42,6 +43,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  statfsSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -58,9 +60,9 @@ import {
   TerminalReason,
   createRoundInfrastructure,
   probeStateRoot,
-  terminalizeOrphanedRounds,
 } from "./tool-round.mjs";
 import { SseWriter } from "./sse-writer.mjs";
+import { DurableCASConflict, DurableJSONCAS } from "./durable-json-cas.mjs";
 import {
   ToolContractRegistry,
   ToolContractNormalizationError,
@@ -133,9 +135,11 @@ const INTERNAL_ATTEMPT_MAX_BYTES = 4 << 20;
 // emitted; a 0 TTL would evict a session immediately) — floor them at 1ms via min:1.
 const PENDING_TIMEOUT_MS = envInt("CURSOR_AGENT_PENDING_TIMEOUT_MS", 600000, { min: 1 });
 const SESSION_TTL_MS = envInt("CURSOR_AGENT_SESSION_TTL_MS", 1800000, { min: 1 });
+const CANCEL_CLEANUP_MS = envInt("CURSOR_AGENT_CANCEL_CLEANUP_MS", 5000, { min: 100, max: 60000 });
 const MAX_SESSIONS = envInt("CURSOR_AGENT_MAX_SESSIONS", 1000, { min: 1 });
 const TERMINAL_ROUND_TTL_MS = envInt("CURSOR_AGENT_TERMINAL_ROUND_TTL_MS", 7 * 24 * 60 * 60 * 1000, { min: 0 });
 const TERMINAL_ROUND_MAX = envInt("CURSOR_AGENT_TERMINAL_ROUND_MAX", 10000, { min: 0 });
+const DURABLE_MAINTENANCE_MS = envInt("CURSOR_AGENT_DURABLE_MAINTENANCE_MS", 5 * 60 * 1000, { min: 10_000 });
 const SSE_KEEPALIVE_MS = 15000;
 // Tool-batch coalescing window. The @cursor/sdk never pauses for tools — it streams tool calls in waves —
 // so this debounce merges a wave (emits <window apart) into ONE turn_end. It is a pure latency<->round-trip
@@ -205,6 +209,10 @@ const MAX_QUEUE_DEPTH = envInt("CURSOR_AGENT_MAX_QUEUE_DEPTH", 32, { min: 1 });
 // ADD-64: generalized to the shared envInt guard (was a bespoke Number.isFinite check); min:1 so a 0/blank
 // can never disable the OOM bound (it falls back to the 64 MB default).
 const MAX_AGENT_TURN_BYTES = envInt("MAX_AGENT_TURN_BYTES", 64 * 1024 * 1024, { min: 1 });
+const replayMemoryBudget = {
+  limit: envInt("CURSOR_COMPOSER_REPLAY_GLOBAL_MAX_BYTES", 256 * 1024 * 1024, { min: 1 }),
+  used: 0,
+};
 // Shared with Go's bufio.Scanner. The extra MiB covers `data:` framing and
 // JSON envelope overhead above the largest accepted request body. If an
 // operator raises MAX_AGENT_TURN_BYTES, they must raise this shared contract
@@ -236,6 +244,36 @@ const SYNTHETIC_ARTIFACT_RESULT_WINDOW = 8;
 // best-effort anyway (the unsupportedHardGuarantees advisory still tells the model it is non-enforced). Past
 // the cap we inline a short note instead of the full schema. A SIZE bound on prompt text, not a timeout.
 const COMPOSER_SCHEMA_INLINE_MAX_BYTES = envInt("CURSOR_AGENT_SCHEMA_INLINE_MAX_BYTES", 8 * 1024, { min: 1 });
+const STATE_ROOT_MIN_FREE_BYTES = envInt(
+  "CURSOR_COMPOSER_STATE_ROOT_MIN_FREE_BYTES",
+  64 * 1024 * 1024,
+  { min: 1024 * 1024 },
+);
+const UNRESOLVED_RECEIPT_MAX_BYTES = envInt(
+  "CURSOR_COMPOSER_UNRESOLVED_RECEIPT_MAX_BYTES",
+  1024 * 1024 * 1024,
+  { min: 1024 * 1024 },
+);
+const UNRESOLVED_RESERVATION_ORPHAN_MS = envInt(
+  "CURSOR_COMPOSER_UNRESOLVED_RESERVATION_ORPHAN_MS",
+  60 * 60 * 1000,
+  { min: 60_000 },
+);
+
+function stateRootDiskStatus(requiredBytes = 0, statfs = statfsSync) {
+  try {
+    const stats = statfs(STATE_ROOT);
+    const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+    const required = STATE_ROOT_MIN_FREE_BYTES + Math.max(0, Number(requiredBytes) || 0);
+    return {
+      ok: Number.isFinite(freeBytes) && freeBytes >= required,
+      freeBytes: Number.isFinite(freeBytes) ? freeBytes : 0,
+      requiredBytes: required,
+    };
+  } catch {
+    return { ok: false, freeBytes: 0, requiredBytes: STATE_ROOT_MIN_FREE_BYTES };
+  }
+}
 // Shared SSE response headers (unbuffered, so keepalives reach the wire end-to-end).
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "X-Accel-Buffering": "no" };
 function formatSseData(obj) { return `data: ${JSON.stringify(obj)}\n\n`; }
@@ -742,13 +780,14 @@ function toolManifest(advertised) {
   }
   if (!lines.length) return "";
   if (truncated) lines.push("- …more client tools are available");
-  return "Available client tools this turn:\n"
+  return "Available client tools this turn (reference inventory; it does not replace or extend the user's request):\n"
     + lines.join("\n")
     + "\nThese are direct client capabilities executed by the calling harness on the user's machine. "
     + "Call the matching tool by its exact advertised name and declared schema; do not invent wrapper or transport tool names. "
     + "Invalid calls are not executed. Wait for each returned result, and treat an error result as a real failure rather than success. "
     + "Consume returned content directly; do not create scratch files merely to relay tool output unless the user explicitly requested a file. "
-    + "When a task requires delegation and a delegation capability is advertised, call it rather than only narrating delegation.";
+    + "When a task requires delegation and a delegation capability is advertised, call it rather than only narrating delegation. "
+    + "Always return to the current user instruction after consulting this inventory.";
 }
 
 // toolManifestRule wraps the manifest text in a valid always-apply agent.v1.CursorRule for delivery via
@@ -949,7 +988,7 @@ function buildWriteSuccess(c, s) {
     if (s && s.returnFileContentAfterWrite) r.success.fileContentAfterWrite = actual;
     return r;
   }
-  // A harness normally returns a human status string (OMP: "[path#hash]\nSuccessfully wrote N bytes") rather
+  // A harness normally returns a human status string (for example, a path/hash plus byte count) rather
   // than the post-write bytes. A plain string therefore cannot prove actual
   // content and must never be reported back to Cursor as fileContentAfterWrite.
   // Use the requested bytes; only the structured envelope above is an explicit
@@ -1307,7 +1346,7 @@ function enforceSessionCap() {
   for (const s of evictable) {
     if (sessions.size <= MAX_SESSIONS) break;
     sessions.delete(s.id);
-    void s.cancel({ terminalReason: TerminalReason.SESSION_EVICTED, detail: "session capacity eviction" });
+    cancelSessionDetached(s, { terminalReason: TerminalReason.SESSION_EVICTED, detail: "session capacity eviction" });
   }
 }
 // ADD-63 (LOAD-SHED, never evict live work): before admitting a NEW session, try to make room by evicting
@@ -1339,6 +1378,72 @@ function keyFingerprint(k) { return createHash("sha256").update(String(k || ""))
 const AGENT_ALIAS_DIR = path.join(STATE_ROOT, ".cct-agent-alias");
 const COMPLETED_TURN_DIR = path.join(STATE_ROOT, ".cct-completed-turns");
 const completedTurnReceipts = new Map();
+const TURN_RECEIPT_VERSION = 5;
+const TURN_IDENTITY_POLICY = Object.freeze({
+  INVOCATION_V1: "invocation-v1",
+  LEGACY_CLIENT_MESSAGE_V1: "legacy-client-message-v1",
+  NONE: "none",
+});
+const FRESH_ATTEMPT_STATE = Object.freeze({
+  UNKNOWN: "unknown",
+  RUNNING: "running",
+  FAILED: "failed",
+});
+const INVOCATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
+const SYSTEM_BLOCK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+const MAX_SYSTEM_BLOCKS = 4096;
+function validSystemBlockIds(value) {
+  return Array.isArray(value)
+    && value.length <= MAX_SYSTEM_BLOCKS
+    && value.every((id) => typeof id === "string" && SYSTEM_BLOCK_ID_RE.test(id))
+    && new Set(value).size === value.length;
+}
+function normalizeSystemBlocks(input) {
+  const value = input && typeof input === "object" ? input : {};
+  if (!Object.prototype.hasOwnProperty.call(value, "systemBlocks")) return null;
+  if (!Array.isArray(value.systemBlocks) || value.systemBlocks.length > MAX_SYSTEM_BLOCKS) {
+    throw new ToolRoundError("invalid_system_blocks", "systemBlocks must be a bounded array", 422);
+  }
+  const blocks = value.systemBlocks.map((block) => {
+    if (!block || typeof block !== "object" || Array.isArray(block)
+        || typeof block.id !== "string" || !SYSTEM_BLOCK_ID_RE.test(block.id)
+        || typeof block.text !== "string" || !block.text) {
+      throw new ToolRoundError(
+        "invalid_system_blocks",
+        "every system block requires an opaque 8-128 character id and non-empty text",
+        422,
+      );
+    }
+    return { id: block.id, text: block.text };
+  });
+  const ids = blocks.map((block) => block.id);
+  if (!validSystemBlockIds(ids)) {
+    throw new ToolRoundError("invalid_system_blocks", "system block ids must be unique", 422);
+  }
+  const aggregate = blocks.map((block) => block.text).join("\n\n");
+  if (aggregate !== String(value.system || "")) {
+    throw new ToolRoundError(
+      "invalid_system_blocks",
+      "systemBlocks must exactly describe the aggregate system text",
+      422,
+    );
+  }
+  return blocks;
+}
+function systemBlockIds(input) {
+  const blocks = normalizeSystemBlocks(input);
+  return blocks === null ? null : blocks.map((block) => block.id);
+}
+function sameStringArray(left, right) {
+  return Array.isArray(left) && Array.isArray(right)
+    && left.length === right.length
+    && left.every((value, index) => value === right[index]);
+}
+function isStringArrayPrefix(prefix, whole) {
+  return Array.isArray(prefix) && Array.isArray(whole)
+    && prefix.length <= whole.length
+    && prefix.every((value, index) => value === whole[index]);
+}
 function agentAliasPathFor(cursorKey, sessionId) {
   const scope = createHash("sha256")
     .update(keyFingerprint(cursorKey))
@@ -1361,7 +1466,9 @@ function validateDurableAgentAlias(record, cursorKey, sessionId) {
       || !record.agentId.startsWith(`${expectedSessionId}_`)
       || !epochValid(record.recoveryEpoch)
       || !epochValid(record.modelEpoch)
-      || !epochValid(record.keyEpoch)) {
+      || !epochValid(record.keyEpoch)
+      || !epochValid(record.contextEpoch)
+      || (record.systemBlockIds !== undefined && !validSystemBlockIds(record.systemBlockIds))) {
     throw new Error("durable Cursor agent alias is malformed or belongs to another session/credential");
   }
   return record;
@@ -1390,6 +1497,8 @@ function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
     recoveryEpoch: Number.isSafeInteger(epochs.recoveryEpoch) ? epochs.recoveryEpoch : 0,
     modelEpoch: Number.isSafeInteger(epochs.modelEpoch) ? epochs.modelEpoch : 0,
     keyEpoch: Number.isSafeInteger(epochs.keyEpoch) ? epochs.keyEpoch : 0,
+    contextEpoch: Number.isSafeInteger(epochs.contextEpoch) ? epochs.contextEpoch : 0,
+    systemBlockIds: validSystemBlockIds(epochs.systemBlockIds) ? [...epochs.systemBlockIds] : [],
   };
   validateDurableAgentAlias(record, cursorKey, sessionId);
   mkdirSync(AGENT_ALIAS_DIR, { recursive: true, mode: 0o700 });
@@ -1411,7 +1520,9 @@ function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
     if (persisted.agentId !== record.agentId
         || persisted.recoveryEpoch !== record.recoveryEpoch
         || persisted.modelEpoch !== record.modelEpoch
-        || persisted.keyEpoch !== record.keyEpoch) {
+        || persisted.keyEpoch !== record.keyEpoch
+        || persisted.contextEpoch !== record.contextEpoch
+        || !sameStringArray(persisted.systemBlockIds, record.systemBlockIds)) {
       throw new Error("durable Cursor agent alias verification failed");
     }
   } catch (error) {
@@ -1423,25 +1534,197 @@ function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
   }
 }
 
+// Invocation identity and semantic request equivalence are deliberately
+// separate contracts. invocationId is minted by the harness once per
+// independently initiated provider call and remains stable only across that
+// call's transport retries. Old clients did not send it, so the explicitly
+// versioned compatibility policy falls back to clientMessageId. A supplied but
+// malformed invocationId is never silently downgraded: doing so would merge an
+// independently initiated turn with a content-derived legacy identity.
+function turnInvocationIdentity(input) {
+  const value = input && typeof input === "object" ? input : {};
+  if (Object.prototype.hasOwnProperty.call(value, "invocationId")) {
+    if (typeof value.invocationId !== "string" || !INVOCATION_ID_RE.test(value.invocationId)) {
+      throw new ToolRoundError(
+        "invalid_invocation_id",
+        "invocationId must be an opaque 8-256 character token containing only letters, digits, dot, underscore, colon, or hyphen",
+        422,
+      );
+    }
+    return { id: value.invocationId, policy: TURN_IDENTITY_POLICY.INVOCATION_V1 };
+  }
+  const legacy = typeof value.clientMessageId === "string" ? value.clientMessageId.trim() : "";
+  if (legacy) {
+    if (legacy.length > 512 || /[\u0000-\u001f\u007f]/.test(legacy)) {
+      throw new ToolRoundError("invalid_client_message_id", "clientMessageId is malformed", 422);
+    }
+    return { id: legacy, policy: TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1 };
+  }
+  return { id: "", policy: TURN_IDENTITY_POLICY.NONE };
+}
+
+function versionedFreshReplayIdentity(identity) {
+  return identity.policy === TURN_IDENTITY_POLICY.INVOCATION_V1
+    || (identity.policy === TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1
+      && /^ccm2_[A-Za-z0-9_-]+$/.test(identity.id));
+}
+
 function completedTurnRequestHash(input) {
   const value = input && typeof input === "object" ? input : {};
-  const toolCallIds = [...new Set((Array.isArray(value.results) ? value.results : [])
-    .map((result) => typeof result?.toolCallId === "string" ? result.toolCallId : "")
-    .filter(Boolean))].sort();
-  const text = value.type === "tool_results"
-    ? (typeof value.userText === "string" ? value.userText : "")
-    : (typeof value.text === "string" ? value.text : "");
+  const normalizedSystemBlocks = normalizeSystemBlocks(value);
+  const results = (Array.isArray(value.results) ? value.results : []).map((result) => ({
+    toolCallId: typeof result?.toolCallId === "string" ? result.toolCallId : "",
+    result: canonicalResult(result),
+  })).sort((a, b) => {
+    const byId = a.toolCallId.localeCompare(b.toolCallId);
+    return byId || canonicalJSONString(a.result).localeCompare(canonicalJSONString(b.result));
+  });
+  // Do not include invocationId/clientMessageId: they answer "which logical
+  // call is this?", while this digest proves the complete model-visible
+  // payload is equivalent. Keeping the two axes separate is what lets an exact
+  // retry replay while an independently initiated identical turn stays unique.
   const semantic = {
-    ...(value.type === "user" ? {
-      history: typeof value.history === "string" ? value.history : "",
-      system: typeof value.system === "string" ? value.system : "",
-    } : {}),
+    history: typeof value.history === "string" ? value.history : "",
+    historyFingerprint: typeof value.historyFingerprint === "string" ? value.historyFingerprint : "",
     images: Array.isArray(value.images) ? value.images : [],
-    text,
-    toolCallIds,
-    version: 1,
+    interruptRequested: value.interruptRequested === true,
+    legacyUnsignedReplay: value.legacyUnsignedReplay === true,
+    recoveryContext: typeof value.recoveryContext === "string" ? value.recoveryContext : "",
+    results,
+    system: typeof value.system === "string" ? value.system : "",
+    systemBlocks: normalizedSystemBlocks || [],
+    text: typeof value.text === "string" ? value.text : "",
+    type: typeof value.type === "string" ? value.type : "",
+    userText: typeof value.userText === "string" ? value.userText : "",
+    version: 2,
   };
   return createHash("sha256").update(canonicalJSONString(semantic)).digest("hex");
+}
+
+function invocationBindingPath(cursorKey, sessionId, invocationId) {
+  const scope = createHash("sha256")
+    .update(keyFingerprint(cursorKey))
+    .update("\0")
+    .update(String(sessionId || ""))
+    .update("\0")
+    .update(String(invocationId || ""))
+    .digest("hex");
+  return path.join(COMPLETED_TURN_DIR, `${scope}.binding.json`);
+}
+
+// Bind an explicit invocation identity to exactly one semantic payload before
+// any session mutation. Atomic link publication makes concurrent replicas
+// converge on the first binding; reuse with changed content is a conflict,
+// never a second SDK send.
+function bindInvocationRequestHash(cursorKey, sessionId, identity, requestHash) {
+  if (!identity || identity.policy !== TURN_IDENTITY_POLICY.INVOCATION_V1) return null;
+  if (!/^[a-f0-9]{64}$/.test(requestHash)) throw new Error("invocation request hash is invalid");
+  const file = invocationBindingPath(cursorKey, sessionId, identity.id);
+  const validate = (record) => !!record && record.version === 1
+    && record.status === "identity_bound"
+    && record.keyFingerprint === keyFingerprint(cursorKey)
+    && record.sessionId === String(sessionId || "")
+    && record.invocationId === identity.id
+    && /^[a-f0-9]{64}$/.test(record.requestHash);
+  const readWinner = () => {
+    let record;
+    try { record = JSON.parse(readFileSync(file, "utf8")); }
+    catch (error) {
+      if (error && error.code === "ENOENT") return null;
+      throw new Error(`cannot read invocation binding: ${(error && error.message) || String(error)}`);
+    }
+    if (!validate(record)) throw new Error("durable invocation binding is malformed");
+    if (record.requestHash !== requestHash) {
+      throw new ToolRoundError(
+        "invocation_payload_conflict",
+        "the invocation identity is already bound to a different request payload",
+        409,
+      );
+    }
+    return record;
+  };
+  const existing = readWinner();
+  if (existing) return existing;
+  const record = {
+    version: 1,
+    status: "identity_bound",
+    keyFingerprint: keyFingerprint(cursorKey),
+    sessionId: String(sessionId || ""),
+    invocationId: identity.id,
+    requestHash,
+    boundAt: nowMs(),
+  };
+  mkdirSync(COMPLETED_TURN_DIR, { recursive: true, mode: 0o700 });
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  let fd = null;
+  try {
+    const bytes = Buffer.from(JSON.stringify(record) + "\n", "utf8");
+    fd = openSync(temp, "wx", 0o600);
+    let offset = 0;
+    while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    linkSync(temp, file);
+    rmSync(temp, { force: true });
+    const dirFD = openSync(COMPLETED_TURN_DIR, "r");
+    try { fsyncSync(dirFD); } finally { closeSync(dirFD); }
+    return record;
+  } catch (error) {
+    if (fd !== null) { try { closeSync(fd); } catch {} }
+    try { rmSync(temp, { force: true }); } catch {}
+    const winner = readWinner();
+    if (winner) return winner;
+    throw new Error(`cannot persist invocation binding: ${(error && error.message) || String(error)}`);
+  }
+}
+
+function canonicalReplayEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    throw new Error("completed replay event must be an object");
+  }
+  const value = JSON.parse(canonicalJSONString(event));
+  if (value.type === "text" || value.type === "reasoning") {
+    if (typeof value.delta !== "string") throw new Error(`${value.type} replay event requires a string delta`);
+    return { type: value.type, delta: value.delta };
+  }
+  if (value.type === "tool_call") {
+    if (typeof value.id !== "string" || !value.id || typeof value.name !== "string" || !value.name) {
+      throw new Error("tool_call replay event requires id and name");
+    }
+    return {
+      type: "tool_call",
+      id: value.id,
+      name: value.name,
+      input: Object.prototype.hasOwnProperty.call(value, "input") ? value.input : {},
+    };
+  }
+  if (value.type === "turn_end") {
+    if (value.stop_reason !== "end_turn") {
+      throw new Error("a completed replay log must end with turn_end/end_turn");
+    }
+    const { _clientLeaseTerminal, ...terminal } = value;
+    return terminal;
+  }
+  throw new Error(`unsupported completed replay event type ${String(value.type || "")}`);
+}
+
+function canonicalReplayEvents(events) {
+  if (!Array.isArray(events) || events.length === 0) {
+    throw new Error("completed replay log is empty");
+  }
+  const canonical = events.map(canonicalReplayEvent);
+  const terminal = canonical.at(-1);
+  if (!terminal || terminal.type !== "turn_end" || terminal.stop_reason !== "end_turn") {
+    throw new Error("completed replay log has no final terminal");
+  }
+  if (canonical.slice(0, -1).some((event) => event.type === "turn_end")) {
+    throw new Error("completed replay log contains an early terminal");
+  }
+  if (Buffer.byteLength(canonicalJSONString(canonical), "utf8") > MAX_AGENT_TURN_BYTES) {
+    throw new Error("completed replay event log exceeds the durable replay bound");
+  }
+  return canonical;
 }
 
 function completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash = "") {
@@ -1457,9 +1740,146 @@ function completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, request
   return path.join(COMPLETED_TURN_DIR, `${scope}.json`);
 }
 
+const receiptCAS = new DurableJSONCAS();
+const unresolvedReservationFile = path.join(COMPLETED_TURN_DIR, ".unresolved-reservations.json");
+
+function mutateUnresolvedReservations(reducer) {
+  for (let attempts = 0; attempts < 64; attempts++) {
+    const state = receiptCAS.readRecover(unresolvedReservationFile);
+    const current = state.record || { version: 1, entries: {} };
+    const next = reducer(current);
+    if (!next) return current;
+    try {
+      const committed = receiptCAS.commit(unresolvedReservationFile, state, next).record;
+      receiptCAS.cleanupArtifacts(unresolvedReservationFile, { keepRevision: committed.revision });
+      return committed;
+    } catch (error) {
+      if (error instanceof DurableCASConflict) continue;
+      throw error;
+    }
+  }
+  throw new ToolRoundError("durable_state_capacity", "durable reservation ledger is changing too quickly", 503);
+}
+
+function reserveUnresolvedReceipt(file, bytes) {
+  const key = path.basename(file);
+  return mutateUnresolvedReservations((current) => {
+    const entries = current.entries && typeof current.entries === "object" ? current.entries : {};
+    const existingBytes = Math.max(0, Number(entries[key]?.bytes) || 0);
+    if (existingBytes >= bytes) return null;
+    const reserved = Object.values(entries).reduce((sum, entry) => sum + Math.max(0, Number(entry?.bytes) || 0), 0);
+    const additional = bytes - existingBytes;
+    const disk = stateRootDiskStatus();
+    if (reserved + additional > UNRESOLVED_RECEIPT_MAX_BYTES
+        || disk.freeBytes - reserved - additional < STATE_ROOT_MIN_FREE_BYTES) {
+      throw new ToolRoundError(
+        "durable_state_capacity",
+        "shared durable receipt capacity is occupied; retry this turn after prior uncertain deliveries resolve",
+        507,
+      );
+    }
+    return {
+      version: 1,
+      entries: { ...entries, [key]: { bytes, createdAt: entries[key]?.createdAt || nowMs() } },
+    };
+  });
+}
+
+function resizeUnresolvedReceipt(file, bytes) {
+  const key = path.basename(file);
+  mutateUnresolvedReservations((current) => {
+    const entries = current.entries && typeof current.entries === "object" ? current.entries : {};
+    if (!entries[key] || entries[key].bytes === bytes) return null;
+    return {
+      version: 1,
+      entries: { ...entries, [key]: { ...entries[key], bytes } },
+    };
+  });
+}
+
+function releaseUnresolvedReceipt(file) {
+  const key = path.basename(file);
+  mutateUnresolvedReservations((current) => {
+    const entries = current.entries && typeof current.entries === "object" ? current.entries : {};
+    if (!entries[key]) return null;
+    const next = { ...entries };
+    delete next[key];
+    return { version: 1, entries: next };
+  });
+}
+
+function releasePreReservationWithoutReceipt(input) {
+  const file = typeof input?.preReservedReceiptFile === "string" ? input.preReservedReceiptFile : "";
+  if (!file) return;
+  try {
+    const record = readTurnReceiptFile(file);
+    if (unresolvedFreshDeliveryReceipt(record) || record?.status === "completed") return;
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") return;
+  }
+  try { releaseUnresolvedReceipt(file); } catch {}
+  delete input.preReservedReceiptFile;
+}
+
+function reconcileUnresolvedReservations() {
+  const observed = {};
+  try {
+    for (const name of readdirSync(COMPLETED_TURN_DIR)) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+      const file = path.join(COMPLETED_TURN_DIR, name);
+      try {
+        const record = readTurnReceiptFile(file);
+        if (unresolvedFreshDeliveryReceipt(record)) {
+          observed[name] = { bytes: statSync(file).size, createdAt: Number(record.startedAt) || nowMs() };
+        }
+      } catch {}
+    }
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  mutateUnresolvedReservations((current) => {
+    const entries = current.entries && typeof current.entries === "object" ? current.entries : {};
+    const cutoff = nowMs() - UNRESOLVED_RESERVATION_ORPHAN_MS;
+    for (const [name, entry] of Object.entries(entries)) {
+      if (!observed[name] && Number(entry?.createdAt) >= cutoff) observed[name] = entry;
+    }
+    if (canonicalJSONString(entries) === canonicalJSONString(observed)) return null;
+    return { version: 1, entries: observed };
+  });
+}
+
+function readTurnReceiptFile(file) {
+  const record = receiptCAS.readRecover(file).record;
+  if (record) return record;
+  const error = new Error(`durable turn receipt ${file} does not exist`);
+  error.code = "ENOENT";
+  throw error;
+}
+
+function mutateTurnReceipt(file, reducer) {
+  for (let attempts = 0; attempts < 64; attempts++) {
+    const state = receiptCAS.readRecover(file);
+    const decision = reducer(state.record);
+    if (!decision || decision.commit === false) return decision ? decision.record : state.record;
+    try {
+      const committed = receiptCAS.commit(file, state, decision.record).record;
+      receiptCAS.cleanupArtifacts(file, { keepRevision: committed.revision });
+      return committed;
+    } catch (error) {
+      if (error instanceof DurableCASConflict) continue;
+      throw error;
+    }
+  }
+  throw new ToolRoundError(
+    "durable_receipt_update_in_progress",
+    "durable turn receipt changed too many times while committing; retry the identical request",
+    503,
+  );
+}
+
 function validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId, requestHash = "") {
-  return !!record && typeof record === "object" && !Array.isArray(record)
-    && (record.version === 1 || record.version === 2 || record.version === 3)
+  const common = !!record && typeof record === "object" && !Array.isArray(record)
+    && (record.version === 1 || record.version === 2 || record.version === 3 || record.version === 4 || record.version === TURN_RECEIPT_VERSION)
     && record.keyFingerprint === keyFingerprint(cursorKey)
     && record.sessionId === String(sessionId || "")
     && record.clientMessageId === String(clientMessageId || "")
@@ -1468,11 +1888,22 @@ function validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId
       // Never replay it merely because the client id happens to match.
       ? !requestHash || (typeof record.requestHash === "string" && record.requestHash === requestHash)
       : /^[a-f0-9]{64}$/.test(record.requestHash) && (!requestHash || record.requestHash === requestHash))
-    && (record.version !== 3 || (Number.isSafeInteger(record.generation) && record.generation >= 1))
+    && (record.version < 3 || (Number.isSafeInteger(record.generation) && record.generation >= 1))
     && record.status === "completed"
-    && typeof record.text === "string"
-    && Buffer.byteLength(record.text, "utf8") <= MAX_AGENT_TURN_BYTES
     && record.usage && typeof record.usage === "object" && !Array.isArray(record.usage);
+  if (!common) return false;
+  if (record.version < 4) {
+    return typeof record.text === "string"
+      && Buffer.byteLength(record.text, "utf8") <= MAX_AGENT_TURN_BYTES;
+  }
+  if (record.identityPolicy !== TURN_IDENTITY_POLICY.INVOCATION_V1
+      && record.identityPolicy !== TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1) return false;
+  try {
+    canonicalReplayEvents(record.events);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function readCompletedTurnReceipt(cursorKey, sessionId, clientMessageId, requestHash = "") {
@@ -1490,7 +1921,7 @@ function readCompletedTurnReceipt(cursorKey, sessionId, clientMessageId, request
     const cached = completedTurnReceipts.get(file);
     if (cached && validCompletedTurnReceipt(cached, cursorKey, sessionId, clientMessageId, requestHash)) return cached;
     try {
-      const record = JSON.parse(readFileSync(file, "utf8"));
+      const record = readTurnReceiptFile(file);
       if (!validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
         // A valid in-progress fresh-send receipt deliberately shares this
         // exact path and will be replaced by the final receipt. Any other
@@ -1526,22 +1957,30 @@ function writeCompletedTurnReceipt(
   sessionId,
   clientMessageId,
   requestHash,
-  text,
+  events,
   usage,
-  { generation = 1, replace = false, requestKind = "continuation", clientLeaseToken = "" } = {},
+  {
+    generation = 1,
+    replace = false,
+    requestKind = "continuation",
+    clientLeaseToken = "",
+    identityPolicy = TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1,
+  } = {},
 ) {
   if (!clientMessageId) return null;
+  const replayEvents = canonicalReplayEvents(events);
   const record = {
-    version: 3,
+    version: TURN_RECEIPT_VERSION,
     keyFingerprint: keyFingerprint(cursorKey),
     sessionId: String(sessionId || ""),
     clientMessageId: String(clientMessageId),
     requestHash: String(requestHash || ""),
     generation: Number.isSafeInteger(generation) && generation >= 1 ? generation : 1,
     requestKind: requestKind === "fresh" ? "fresh" : "continuation",
+    identityPolicy,
     clientLeaseToken: normalizeClientLeaseToken(clientLeaseToken),
     status: "completed",
-    text: String(text || ""),
+    events: replayEvents,
     usage: usage && typeof usage === "object" && !Array.isArray(usage)
       ? JSON.parse(JSON.stringify(usage))
       : {},
@@ -1552,45 +1991,28 @@ function writeCompletedTurnReceipt(
   }
   mkdirSync(COMPLETED_TURN_DIR, { recursive: true, mode: 0o700 });
   const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
-  const existing = readCompletedTurnReceipt(cursorKey, sessionId, clientMessageId, requestHash);
-  if (existing && (!replace || (existing.generation || 1) >= record.generation)) return existing;
-  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  const bytes = Buffer.from(JSON.stringify(record) + "\n", "utf8");
-  let fd = null;
-  try {
-    fd = openSync(temp, "wx", 0o600);
-    let offset = 0;
-    while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = null;
-    if (replace) renameSync(temp, file);
-    else {
-      linkSync(temp, file);
-      rmSync(temp, { force: true });
-    }
-    const dirFD = openSync(COMPLETED_TURN_DIR, "r");
-    try { fsyncSync(dirFD); } finally { closeSync(dirFD); }
-    completedTurnReceipts.set(file, record);
-    return record;
-  } catch (error) {
-    if (fd !== null) {
-      try { closeSync(fd); } catch {}
-    }
-    try { rmSync(temp, { force: true }); } catch {}
-    // A concurrent writer may have won the atomic publication race. Its first
-    // receipt is authoritative and is safe to replay.
+  const committed = mutateTurnReceipt(file, (raw) => {
     completedTurnReceipts.delete(file);
-    const winner = readCompletedTurnReceipt(cursorKey, sessionId, clientMessageId, requestHash);
-    if (winner) return winner;
-    throw new Error(`cannot persist completed-turn receipt: ${(error && error.message) || String(error)}`);
-  }
+    if (raw && validCompletedTurnReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash)) {
+      if (!replace || (raw.generation || 1) >= record.generation) return { commit: false, record: raw };
+    }
+    if (raw && !validFreshDeliveryReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash)
+        && !validCompletedTurnReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash)) {
+      throw new Error("cannot replace malformed durable turn receipt");
+    }
+    return { commit: true, record };
+  });
+  completedTurnReceipts.set(file, committed);
+  releaseUnresolvedReceipt(file);
+  return committed;
 }
 
 function validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash = "") {
+  const legacy = record && record.version === 3 && record.status === "delivering";
+  const current = record && (record.version === 4 || record.version === TURN_RECEIPT_VERSION)
+    && Object.values(FRESH_ATTEMPT_STATE).includes(record.status);
   return !!record && typeof record === "object" && !Array.isArray(record)
-    && record.version === 3
-    && record.status === "delivering"
+    && (legacy || current)
     && record.requestKind === "fresh"
     && record.keyFingerprint === keyFingerprint(cursorKey)
     && record.sessionId === String(sessionId || "")
@@ -1601,7 +2023,23 @@ function validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId
     && typeof record.agentId === "string" && record.agentId
     && typeof record.deliveryIdempotencyKey === "string" && record.deliveryIdempotencyKey
     && Object.prototype.hasOwnProperty.call(record, "deliveryMessage")
-    && Array.isArray(record.deliveryAdvertise);
+    && Array.isArray(record.deliveryAdvertise)
+    && (record.deliverySystemBlockIds === undefined || validSystemBlockIds(record.deliverySystemBlockIds))
+    && (record.version === 3
+      || record.identityPolicy === TURN_IDENTITY_POLICY.INVOCATION_V1
+      || record.identityPolicy === TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1)
+    && (record.status !== FRESH_ATTEMPT_STATE.FAILED
+      || (typeof record.failure === "string" && record.failure && Number.isFinite(record.failedAt)));
+}
+
+function unresolvedFreshDeliveryReceipt(record) {
+  return !!record && (record.status === "delivering"
+    || record.status === FRESH_ATTEMPT_STATE.UNKNOWN
+    || record.status === FRESH_ATTEMPT_STATE.RUNNING
+    // Older bridge builds wrote FAILED after agent.send resolved. Treat those
+    // receipts as acceptance-unknown during rolling upgrades; only a future
+    // explicit pre-accept NOT_ACCEPTED state may authorize a new generation.
+    || record.status === FRESH_ATTEMPT_STATE.FAILED);
 }
 
 function readFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash = "") {
@@ -1612,7 +2050,7 @@ function readFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, request
     return cached;
   }
   try {
-    const record = JSON.parse(readFileSync(file, "utf8"));
+    const record = readTurnReceiptFile(file);
     if (!validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
       // A completed receipt at the same path is handled by the completed
       // reader. Any other existing record means we cannot prove whether the
@@ -1637,17 +2075,23 @@ function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, reques
   model,
   toolChoice,
   seededSystem,
+  systemBlockIds: deliveredSystemBlockIds,
   hasImages,
+  identityPolicy = TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1,
 }) {
   const record = {
-    version: 3,
+    version: TURN_RECEIPT_VERSION,
     keyFingerprint: keyFingerprint(cursorKey),
     sessionId: String(sessionId || ""),
     clientMessageId: String(clientMessageId || ""),
     requestHash: String(requestHash || ""),
     generation: Number.isSafeInteger(generation) && generation >= 1 ? generation : 1,
     requestKind: "fresh",
-    status: "delivering",
+    identityPolicy,
+    // The receipt is committed immediately before agent.send. A crash or
+    // rejection at that boundary cannot prove acceptance, so UNKNOWN is the
+    // only safe initial state and must retain the exact frozen envelope.
+    status: FRESH_ATTEMPT_STATE.UNKNOWN,
     agentId: String(agentId || ""),
     deliveryIdempotencyKey: String(idempotencyKey || ""),
     deliveryMessage: JSON.parse(canonicalJSONString(message)),
@@ -1655,6 +2099,8 @@ function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, reques
     deliveryModel: String(model || ""),
     deliveryToolChoice: String(toolChoice || ""),
     deliverySeededSystem: String(seededSystem || ""),
+    deliverySystemBlockIds: validSystemBlockIds(deliveredSystemBlockIds)
+      ? [...deliveredSystemBlockIds] : [],
     deliveryHasImages: hasImages === true,
     startedAt: nowMs(),
   };
@@ -1667,35 +2113,74 @@ function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, reques
   }
   mkdirSync(COMPLETED_TURN_DIR, { recursive: true, mode: 0o700 });
   const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
-  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  let fd = null;
-  try {
-    fd = openSync(temp, "wx", 0o600);
-    let offset = 0;
-    while (offset < bytes.length) offset += writeSync(fd, bytes, offset, bytes.length - offset);
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = null;
-    renameSync(temp, file);
-    const dirFD = openSync(COMPLETED_TURN_DIR, "r");
-    try { fsyncSync(dirFD); } finally { closeSync(dirFD); }
-    completedTurnReceipts.set(file, record);
-    return record;
-  } catch (error) {
-    if (fd !== null) { try { closeSync(fd); } catch {} }
-    try { rmSync(temp, { force: true }); } catch {}
-    throw new Error(`cannot persist fresh delivery receipt: ${(error && error.message) || String(error)}`);
-  }
+  reserveUnresolvedReceipt(file, bytes.length);
+  const committed = mutateTurnReceipt(file, (raw) => {
+    completedTurnReceipts.delete(file);
+    const existingFresh = raw && validFreshDeliveryReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash);
+    const existingCompleted = raw && validCompletedTurnReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash);
+    if (existingFresh || existingCompleted) {
+      throw new ToolRoundError(
+        "fresh_delivery_ownership_conflict",
+        "another bridge process already owns or completed this exact fresh send; retry the identical request",
+        503,
+      );
+    }
+    if (raw) throw new Error("cannot replace malformed durable turn receipt");
+    return { commit: true, record };
+  });
+  completedTurnReceipts.set(file, committed);
+  resizeUnresolvedReceipt(file, bytes.length);
+  return committed;
+}
+
+function transitionFreshAttemptState(
+  cursorKey,
+  sessionId,
+  clientMessageId,
+  requestHash,
+  state,
+  details = {},
+) {
+  if (!clientMessageId || !requestHash || !Object.values(FRESH_ATTEMPT_STATE).includes(state)) return null;
+  const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
+  const committed = mutateTurnReceipt(file, (raw) => {
+    completedTurnReceipts.delete(file);
+    const existing = raw && validFreshDeliveryReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash)
+      ? raw : null;
+    if (!existing) return { commit: false, record: raw };
+    const record = {
+      ...existing,
+      version: TURN_RECEIPT_VERSION,
+      identityPolicy: existing.identityPolicy || TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1,
+      status: state,
+    };
+    delete record.failedAt;
+    delete record.failure;
+    delete record.runningAt;
+    if (state === FRESH_ATTEMPT_STATE.RUNNING) record.runningAt = nowMs();
+    if (state === FRESH_ATTEMPT_STATE.FAILED) {
+      record.failedAt = nowMs();
+      record.failure = String(details.failure || "fresh Cursor run failed").replace(/\s+/g, " ").slice(0, 4096);
+    }
+    if (!validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
+      throw new Error(`fresh attempt ${state} transition violates the durable receipt contract`);
+    }
+    return { commit: true, record };
+  });
+  if (committed) completedTurnReceipts.set(file, committed);
+  return committed;
 }
 
 function cleanupCompletedTurnReceipts({ ttlMs = TERMINAL_ROUND_TTL_MS, maxTerminal = TERMINAL_ROUND_MAX } = {}) {
   let entries;
   try {
     entries = readdirSync(COMPLETED_TURN_DIR)
-      .filter((name) => name.endsWith(".json"))
+      .filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
       .map((name) => {
         const file = path.join(COMPLETED_TURN_DIR, name);
-        return { file, mtimeMs: statSync(file).mtimeMs };
+        let status = "";
+        try { status = JSON.parse(readFileSync(file, "utf8")).status || ""; } catch {}
+        return { file, mtimeMs: statSync(file).mtimeMs, status };
       })
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
   } catch (error) {
@@ -1704,12 +2189,45 @@ function cleanupCompletedTurnReceipts({ ttlMs = TERMINAL_ROUND_TTL_MS, maxTermin
     return;
   }
   const cutoff = ttlMs > 0 ? nowMs() - ttlMs : Number.NEGATIVE_INFINITY;
+  let terminalIndex = 0;
   for (let i = 0; i < entries.length; i++) {
-    if ((ttlMs > 0 && entries[i].mtimeMs < cutoff) || (maxTerminal >= 0 && i >= maxTerminal)) {
-      try { rmSync(entries[i].file, { force: true }); } catch {}
-      completedTurnReceipts.delete(entries[i].file);
+    // UNKNOWN/RUNNING/FAILED (and legacy DELIVERING) are acceptance evidence, not a
+    // terminal cache. Age/count eviction would erase the only proof that an
+    // SDK send may already have crossed its side-effect boundary.
+    if (entries[i].status === "expired") continue;
+    if (entries[i].status === "delivering"
+        || entries[i].status === FRESH_ATTEMPT_STATE.UNKNOWN
+        || entries[i].status === FRESH_ATTEMPT_STATE.RUNNING
+        || entries[i].status === FRESH_ATTEMPT_STATE.FAILED) continue;
+    if ((ttlMs > 0 && entries[i].mtimeMs < cutoff)
+        || (maxTerminal >= 0 && terminalIndex >= maxTerminal)) {
+      try {
+        const state = receiptCAS.readRecover(entries[i].file);
+        if (state.record?.status !== "completed") continue;
+        const tombstone = receiptCAS.commit(entries[i].file, state, {
+          version: TURN_RECEIPT_VERSION,
+          status: "expired",
+          expiredAt: nowMs(),
+        }).record;
+        receiptCAS.cleanupArtifacts(entries[i].file, { keepRevision: tombstone.revision });
+        completedTurnReceipts.delete(entries[i].file);
+      } catch (error) {
+        if (!(error instanceof DurableCASConflict)) {
+          dbg("completed-turn receipt cleanup skipped a racing record", (error && error.message) || String(error));
+        }
+      }
     }
+    terminalIndex++;
   }
+}
+
+function runDurableMaintenance() {
+  const { journal } = getRoundInfrastructure();
+  journal.cas.sweepDirectory(journal.dir, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
+  receiptCAS.sweepDirectory(COMPLETED_TURN_DIR, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
+  journal.cleanupTerminal({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
+  cleanupCompletedTurnReceipts({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
+  reconcileUnresolvedReservations();
 }
 
 function sdkUserTextHash(message) {
@@ -1943,6 +2461,28 @@ function recyclePlatform(h) {
   return true;
 }
 
+function terminalizePoisonedPlatformSessions(h, reason) {
+  let affected = 0;
+  for (const session of sessions.values()) {
+    if (!session || keyHash(session.cursorKey) !== h || session.done) continue;
+    affected++;
+    const error = reason instanceof Error ? reason : new Error(String(reason || "upstream connection poisoned"));
+    if (session.run || session.sendPending) {
+      // onRunError emits the typed terminal, transitions a versioned fresh
+      // attempt to FAILED, releases FIFO waiters, and discards the agent.
+      session.abortFromSdk(error);
+      continue;
+    }
+    // A paused callback owns durable obligations even without an active HTTP
+    // response. Terminal-journal those obligations before recycling the store.
+    cancelSessionDetached(session, {
+      terminalReason: TerminalReason.RUN_ERROR,
+      detail: error.message,
+    });
+  }
+  return affected;
+}
+
 // Per-key circuit breaker for upstream rate-limiting. While OPEN (now < openUntil) handleTurn fast-fails NEW
 // runs for that key with a clear 429 so the client backs off; the window grows exponentially (capped) per
 // consecutive trip. A successful run closes it (closeBreaker in onRunComplete). This is an IN-PROCESS,
@@ -1987,20 +2527,6 @@ function soleStreamingSession(sessionsMap) {
   return victim;
 }
 
-// SDK AbortError attribution may happen while a run is paused between HTTP
-// turns (activeRes is intentionally null while the client executes tools).
-// Keep that separate from soleStreamingSession: transport-close and
-// rate-limit heuristics must remain conservative, but an abort handler should
-// clean up the one live/paused SDK run when it is unambiguous.
-function soleSdkRunSession(sessionsMap) {
-  if (!sessionsMap || typeof sessionsMap.values !== "function") return null;
-  let victim = null;
-  for (const s of sessionsMap.values()) {
-    if (s && s.run && !s.done) { if (victim) return null; victim = s; }
-  }
-  return victim;
-}
-
 // rateLimitedKeyToRecycle picks the key hash whose connection to recycle on an ENHANCE_YOUR_CALM rejection that
 // carries no key. Single-tenant (the common case) — exactly one platform — is unambiguous. Otherwise attribute
 // via the lone in-flight session; if still ambiguous (2+ tenants mid-run), return null (log-only) rather than
@@ -2034,16 +2560,21 @@ class Session {
                                   // whose upstream Cursor key fingerprint differs from this session's tombstones
                                   // the durable agent (bound to the old account) + seeds a fresh agent under the
                                   // new key, instead of silently continuing on the old (possibly revoked) account.
+    this.contextEpoch = durableAlias?.contextEpoch || 0; // System-context replacement/removal/reorder rotation.
+    this.seededSystemBlockIds = Array.isArray(durableAlias?.systemBlockIds)
+      ? [...durableAlias.systemBlockIds] : [];
     this.model = null;            // ADD-62: the model the durable agent was created/resumed under. A turn that
                                   // requests a DIFFERENT model rotates the durable agent (the old agent is bound
                                   // to the old model) + forces a re-seed, instead of silently answering from it.
     this.agent = null; this.agentPromise = null; this.run = null;
+    this.cancelPromise = null; this.cancelNotifyRequested = false;
     this.activeRes = null; this.responseWriter = null;
     this.sendPending = false;
     this.activeClientMessageId = "";
     this.activeClientMessageHash = "";
     this.activeClientMessageGeneration = 1;
     this.activeClientMessageKind = "";
+    this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE;
     this.activeDeferredInputId = "";
     // Opaque Go fresh-turn lease owner. It is never interpreted by the
     // bridge: ToolRound journals preserve it and terminal SSE frames echo it
@@ -2057,6 +2588,7 @@ class Session {
     // "reseed started" from "reseed completed" and makes a lost-response retry
     // idempotent without inventing another SDK run.
     this.recoverySourceRound = null;
+    this.roundRecoveryContext = null; // bounded seed persisted when each ToolRound opens
     this.flushTimer = null;
     this.stepToolStarted = 0;     // tool-call-started deltas seen for the CURRENT assistant step (the step's tool
                                   // count); used to wait for a slow batch before pausing. Reset at step/turn boundaries.
@@ -2074,6 +2606,16 @@ class Session {
                                   // open response instead of being DROPPED (text deltas used to vanish here while
                                   // tool calls are journaled by ToolRound). Cleared at clearTurnState.
     this.pendingDeltaBytes = 0;   // running byte size of pendingDeltas (bounded like outQueue)
+    // Ordered frames emitted for the CURRENT HTTP/request identity. The final
+    // completion receipt durably commits this segment plus its terminal before
+    // a clean end_turn is allowed onto the wire. Tool pauses start a new
+    // segment on the following /continue, so replay never re-emits tools from
+    // an earlier already-receipted request.
+    this.replayEvents = [];
+    this.replayEventBytes = 0;
+    this.replayReservationBytes = 0;
+    this.replayEventOverflow = false;
+    this.replaySegmentIdentity = "";
     this.toolRegistry = new AdvertisedToolRegistry();
     this.toolInventoryEpoch = null;
     // Exact MCP server keys passed to the current SDK agent handle. The
@@ -2116,6 +2658,7 @@ class Session {
     this._logicalDone = [];          // resolvers fired when the live run TRULY completes (onRunComplete/onRunError/cancel), NOT at a tool-pause
     this._turnDone = [];
     this.lastSettledTurnToken = 0;
+    this.lastTerminalTurnToken = -1; // prevents cancellation/error cleanup from emitting a second terminal
     this.runEpoch = 0;               // bumped per run + on cancel; a run.wait() callback ignores its result if the epoch advanced (the run was superseded/cancelled and a new turn may already own the session)
     // ADD-106 (Comment 3): per-LOGICAL-RUN agentic-loop bound counters. Reset by resetLoopBounds() when a fresh
     // send starts a new logical run; advanced once per tool-result round (pauseForTools). loopTripped latches so
@@ -2133,6 +2676,53 @@ class Session {
   set advertise(tools) { this.toolRegistry.replace(tools); }
 
   touch() { this.lastActivity = nowMs(); }
+  beginReplaySegment(identity = "") {
+    const nextIdentity = String(identity || "");
+    const reuseReservation = nextIdentity && nextIdentity === this.replaySegmentIdentity
+      && this.replayReservationBytes === MAX_AGENT_TURN_BYTES;
+    if (!reuseReservation && this.replayReservationBytes > 0) {
+      replayMemoryBudget.used = Math.max(0, replayMemoryBudget.used - this.replayReservationBytes);
+      this.replayReservationBytes = 0;
+    }
+    if (nextIdentity && !reuseReservation) {
+      if (replayMemoryBudget.used + MAX_AGENT_TURN_BYTES > replayMemoryBudget.limit) {
+        throw new ToolRoundError(
+          "local_replay_capacity",
+          "process-wide durable replay memory capacity is occupied; retry this turn shortly",
+          503,
+        );
+      }
+      replayMemoryBudget.used += MAX_AGENT_TURN_BYTES;
+      this.replayReservationBytes = MAX_AGENT_TURN_BYTES;
+    }
+    this.replayEvents = [];
+    this.replayEventBytes = 0;
+    this.replayEventOverflow = false;
+    this.replaySegmentIdentity = nextIdentity;
+  }
+  recordReplayEvent(event) {
+    try {
+      const canonical = canonicalReplayEvent(event);
+      if (canonical.type === "turn_end") return false;
+      const bytes = Buffer.byteLength(canonicalJSONString(canonical), "utf8") + 1;
+      if (this.replayEventBytes + bytes > MAX_AGENT_TURN_BYTES) {
+        this.replayEventOverflow = true;
+        return false;
+      }
+      this.replayEvents.push(canonical);
+      this.replayEventBytes += bytes;
+      return true;
+    } catch (error) {
+      this.replayEventOverflow = true;
+      dbg("completed replay event rejected", "session=" + this.id,
+        (error && error.message) || String(error));
+      return false;
+    }
+  }
+  completedReplayEvents(terminal) {
+    if (this.replayEventOverflow) throw new Error("completed replay event log overflowed its durable bound");
+    return canonicalReplayEvents([...this.replayEvents, terminal]);
+  }
   resetSyntheticArtifactGuard(userText = "") {
     this.syntheticArtifactUserText = typeof userText === "string" ? userText : "";
     this.syntheticArtifactResults = [];
@@ -2194,6 +2784,7 @@ class Session {
       tenantFingerprint: keyFingerprint(this.cursorKey),
       model: this.model || "",
       clientLeaseToken: this.clientLeaseToken,
+      recoveryContext: this.roundRecoveryContext,
       journal,
       codec,
       clock: nowMs,
@@ -2216,7 +2807,15 @@ class Session {
     return this.currentRound.outbound.map((id) => this.currentRound.calls.get(id)).filter(Boolean);
   }
   hasQueuedWaiters() { return this.waiters > 0; }
-  resetSeedState() { this.seeded = false; this.seededSystem = ""; this.historyFingerprint = null; }
+  resetSeedState() {
+    this.seeded = false;
+    this.seededSystem = "";
+    this.seededSystemBlockIds = [];
+    this.historyFingerprint = null;
+  }
+  persistDurableAlias() {
+    writeDurableAgentAlias(this.cursorKey, this.id, this.agentId, this);
+  }
   async finishRotationCancel() { await this.cancel(); this.done = false; }
   whenLogicalDone() { if (!this.run && !this.sendPending) return Promise.resolve(); return new Promise((r) => this._logicalDone.push(r)); }
   notifyLogicalDone() { const ws = this._logicalDone; this._logicalDone = []; for (const w of ws) { try { w(); } catch {} } }
@@ -2237,7 +2836,7 @@ class Session {
           try { this.currentRound.terminalize(TerminalReason.TRANSPORT_ERROR, error.message); } catch {}
         }
         this.settle();
-        void this.cancel({ terminalReason: TerminalReason.TRANSPORT_ERROR, detail: error.message });
+        cancelSessionDetached(this, { terminalReason: TerminalReason.TRANSPORT_ERROR, detail: error.message });
       },
     });
     this.responseWriter = writer;
@@ -2252,7 +2851,12 @@ class Session {
         ? _clientLeaseTerminal : obj.stop_reason !== "tool_use";
       value = withClientLease(wire, this, terminal);
     }
-    return this.writePayload(formatSseData(value));
+    const receipt = this.writePayload(formatSseData(value));
+    if (receipt.ok && obj && (obj.type === "text" || obj.type === "reasoning" || obj.type === "tool_call")) {
+      this.recordReplayEvent(obj);
+    }
+    if (obj && obj.type === "turn_end" && receipt.ok) this.lastTerminalTurnToken = this.turnToken;
+    return receipt;
   }
   writePayload(payload) {
     if (!this.responseWriter && this.activeRes) this.beginResponse(this.activeRes);
@@ -2342,7 +2946,7 @@ class Session {
     // A repetition is identical only when tool, schema epoch, normalized
     // error, transforms, and the privacy-safe argument fingerprint all match.
     // The old kind+detail signature collapsed every `_grep:ambiguous_alias`
-    // correction into one bucket and killed unrelated OMP subagent attempts.
+    // correction into one bucket and killed unrelated parallel client attempts.
     const signature = attempt.errorSignature;
     const signatureCount = (this.internalRejectionSignatures.get(signature) || 0) + 1;
     this.internalRejectionSignatures.set(signature, signatureCount);
@@ -2436,7 +3040,7 @@ class Session {
       const detail = `tool ${id} abandoned after ${PENDING_TIMEOUT_MS}ms`;
       try { round.terminalize(TerminalReason.PENDING_TIMEOUT, detail); } catch {}
       this.lastRunError = `[bridge] ${detail}`;
-      void this.cancel({ terminalReason: TerminalReason.PENDING_TIMEOUT, detail });
+      cancelSessionDetached(this, { terminalReason: TerminalReason.PENDING_TIMEOUT, detail });
     });
   }
   applyClientResults(results, round = this.currentRound) {
@@ -2571,7 +3175,7 @@ class Session {
       catch (error) {
         try { round.terminalize(TerminalReason.TRANSPORT_ERROR, error.message); } catch {}
         this.lastRunError = error.message;
-        void this.cancel({ terminalReason: TerminalReason.TRANSPORT_ERROR, detail: error.message });
+        cancelSessionDetached(this, { terminalReason: TerminalReason.TRANSPORT_ERROR, detail: error.message });
         return;
       }
       this.startPendingTimer(id);
@@ -2799,7 +3403,7 @@ class Session {
     // cancel() tears down the live run/agent, rejects every pending, bumps runEpoch (epoch-gating the dead run's
     // callbacks), and fires notifyLogicalDone so a queued new-user turn is admitted. done=true short-circuits any
     // late onRunComplete/onRunError from the cancelled run so the error terminal above is the run's only terminal.
-    void this.cancel({ terminalReason: TerminalReason.LOOP_BOUND, detail: reason });
+    cancelSessionDetached(this, { terminalReason: TerminalReason.LOOP_BOUND, detail: reason });
   }
 
   onRunComplete(res) {
@@ -2808,6 +3412,7 @@ class Session {
     const completedClientMessageHash = this.activeClientMessageHash;
     const completedClientMessageGeneration = this.activeClientMessageGeneration;
     const completedClientMessageKind = this.activeClientMessageKind;
+    const completedIdentityPolicy = this.activeIdentityPolicy;
     const completedDeferredInputId = this.activeDeferredInputId;
     const completedDeferredRound = completedDeferredInputId
       ? (this.recoverySourceRound
@@ -2876,38 +3481,62 @@ class Session {
       this.recoverySourceRound = null;
       if (sessions.get(this.id) === this) sessions.delete(this.id);
     }
-    // A successful run with every required durable receipt persisted proves
-    // the upstream connection is healthy.
-    if (stopReason === "end_turn") closeBreaker(keyHash(this.cursorKey));
     this.rejectAllPending("run completed while client tools remained unresolved", TerminalReason.RUN_ERROR);
-    const terminal = { type: "turn_end", stop_reason: stopReason, status: res && res.status, usage: (res && res.usage) || {} };
+    let terminal = { type: "turn_end", stop_reason: stopReason, status: res && res.status, usage: (res && res.usage) || {} };
     if (turnError != null && turnError !== "") terminal.error = turnError;
     let completedReceiptPersisted = false;
     if (stopReason === "end_turn" && completedClientMessageId) {
       try {
+        const replayEvents = this.completedReplayEvents(terminal);
         writeCompletedTurnReceipt(
           this.cursorKey,
           this.id,
           completedClientMessageId,
           completedClientMessageHash,
-          this.streamedText || fullResult,
+          replayEvents,
           terminal.usage,
           {
             generation: completedClientMessageGeneration,
             replace: completedClientMessageKind === "fresh",
             requestKind: completedClientMessageKind,
             clientLeaseToken: this.clientLeaseToken,
+            identityPolicy: completedIdentityPolicy,
           },
         );
         completedReceiptPersisted = true;
+        dbg("completed-turn receipt committed", "session=" + this.id,
+          "identity=" + completedClientMessageId, "hash=" + completedClientMessageHash);
       } catch (error) {
-        // Availability-first fallback for the private/single-replica setup:
-        // keep the real successful answer and log the loss of restart-level
-        // deduplication instead of converting it into a client-visible error.
-        dbg("completed-turn receipt persistence failed; in-process SDK idempotency remains active",
+        // The model may have completed, but without a durable ordered replay
+        // log the bridge cannot prove or reproduce that completion after a
+        // restart. Never acknowledge it as success: retain the UNKNOWN/RUNNING
+        // fresh attempt and surface a typed delivery-unknown terminal so the
+        // exact SDK idempotency key remains the only legal retry.
+        const detail = (error && error.message) || String(error);
+        stopReason = "error";
+        terminal = {
+          type: "turn_end",
+          stop_reason: "error",
+          receipt: "completion_not_durable",
+          retryable: true,
+          retryMode: "identical",
+          deliveryUnknown: true,
+          error: `the model completed but its durable replay receipt could not be committed: ${detail}`,
+        };
+        dbg("completed-turn receipt persistence failed; returning delivery-unknown",
           "session=" + this.id, "clientMessageId=" + completedClientMessageId,
-          (error && error.message) || String(error));
+          detail);
       }
+    }
+    // agent.send resolved before onRunComplete can run, so even a non-finished
+    // terminal is acceptance-unknown rather than a proven pre-accept failure.
+    // Retain UNKNOWN/RUNNING and the frozen SDK envelope; authorizing a new
+    // generation here could execute the same invocation twice.
+    // A successful run with its replay receipt committed proves the upstream
+    // connection is healthy. Legacy no-id turns retain their historical
+    // non-replayable behavior; every versioned turn must cross the commit.
+    if (stopReason === "end_turn" && (!completedClientMessageId || completedReceiptPersisted)) {
+      closeBreaker(keyHash(this.cursorKey));
     }
     if (completedReceiptPersisted && completedDeferredRound && completedDeferredInputId) {
       try {
@@ -2926,17 +3555,25 @@ class Session {
     }
     this.sse(terminal);
     this.activeClientMessageId = ""; this.activeClientMessageHash = "";
-    this.activeClientMessageGeneration = 1; this.activeClientMessageKind = ""; this.activeDeferredInputId = "";
+    this.activeClientMessageGeneration = 1; this.activeClientMessageKind = "";
+    this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE; this.activeDeferredInputId = "";
     this.clearTurnState();
     this.settle();
     this.notifyLogicalDone(); // real completion -> admit the next queued new-user turn
   }
   onRunError(err) {
     if (this.done) return;
+    const failedClientMessageId = this.activeClientMessageId;
+    const failedClientMessageHash = this.activeClientMessageHash;
+    const failedClientMessageKind = this.activeClientMessageKind;
     this.done = true; this.run = null; this.sendPending = false;
-    this.activeClientMessageId = ""; this.activeClientMessageHash = "";
-    this.activeClientMessageGeneration = 1; this.activeClientMessageKind = ""; this.activeDeferredInputId = "";
     const msg = (err && err.message) || String(err);
+    // run.wait() exists only after agent.send resolved. A rejection therefore
+    // cannot prove that the remote rejected the invocation before acceptance.
+    // Keep the durable attempt unresolved and retry only its frozen envelope.
+    this.activeClientMessageId = ""; this.activeClientMessageHash = "";
+    this.activeClientMessageGeneration = 1; this.activeClientMessageKind = "";
+    this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE; this.activeDeferredInputId = "";
     this.lastRunError = msg; // BR2: a tool_results turn that finds the run gone surfaces this real error
     if (this.recoverySourceRound) {
       try {
@@ -3002,11 +3639,13 @@ class Session {
     recoveryEpoch = this.recoveryEpoch,
     modelEpoch = this.modelEpoch,
     keyEpoch = this.keyEpoch,
+    contextEpoch = this.contextEpoch,
   } = {}) {
     let aid = `${this.id}_${DURABLE_AGENT_CONTEXT_EPOCH}`;
     if (recoveryEpoch > 0) aid += `_r${recoveryEpoch + 1}`; // first too-long rotation -> _r2
     if (modelEpoch > 0) aid += `_m${modelEpoch}`;           // first model change   -> _m1
     if (keyEpoch > 0) aid += `_k${keyEpoch}`;               // ADD-79: first key change -> _k1
+    if (contextEpoch > 0) aid += `_c${contextEpoch}`;       // first system-context replacement -> _c1
     return aid;
   }
   // rotateDurableAgent tombstones the poisoned durable agent and allocates a fresh agentId (C05). The session
@@ -3032,6 +3671,8 @@ class Session {
       recoveryEpoch: nextRecoveryEpoch,
       modelEpoch: this.modelEpoch,
       keyEpoch: this.keyEpoch,
+      contextEpoch: this.contextEpoch,
+      systemBlockIds: [],
     });
     this.recoveryEpoch = nextRecoveryEpoch;
     this.agentId = targetAgentId;
@@ -3063,6 +3704,8 @@ class Session {
       recoveryEpoch: this.recoveryEpoch,
       modelEpoch: nextModelEpoch,
       keyEpoch: this.keyEpoch,
+      contextEpoch: this.contextEpoch,
+      systemBlockIds: [],
     });
     this.modelEpoch = nextModelEpoch;
     this.agentId = targetAgentId;
@@ -3096,12 +3739,79 @@ class Session {
       recoveryEpoch: this.recoveryEpoch,
       modelEpoch: this.modelEpoch,
       keyEpoch: nextKeyEpoch,
+      contextEpoch: this.contextEpoch,
+      systemBlockIds: [],
     });
     this.keyEpoch = nextKeyEpoch;
     this.agentId = targetAgentId;
     this.cursorKey = targetKey; // run subsequent turns on the NEW key's platform/account
     this.resetSeedState();
     dbg("rotateForKeyChange -> rotate durable agentId for new key (no resumeAgent(old key's agent))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId);
+    await this.finishRotationCancel();
+  }
+  // A true system-context replacement/removal/reorder cannot be represented by
+  // appending another instruction to an already-contextualized model. Rotate to
+  // a fresh durable agent and faithfully re-seed bounded history instead. This
+  // is role/provenance based and independent of any client or harness name.
+  async rotateForSystemReplacement(nextBlockIds) {
+    if (!validSystemBlockIds(nextBlockIds)) {
+      throw new ToolRoundError("invalid_system_blocks", "replacement system block identity is invalid", 422);
+    }
+    if (this.contextEpoch >= 1024) {
+      throw new ToolRoundError(
+        "system_context_rotation_exhausted",
+        "system context changed too many times for this durable conversation",
+        503,
+      );
+    }
+    const oldAgentId = this.agentId;
+    const nextContextEpoch = this.contextEpoch + 1;
+    const targetAgentId = this.composeAgentId({ contextEpoch: nextContextEpoch });
+    writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
+      recoveryEpoch: this.recoveryEpoch,
+      modelEpoch: this.modelEpoch,
+      keyEpoch: this.keyEpoch,
+      contextEpoch: nextContextEpoch,
+      systemBlockIds: nextBlockIds,
+    });
+    this.contextEpoch = nextContextEpoch;
+    this.agentId = targetAgentId;
+    this.resetSeedState();
+    this.seededSystemBlockIds = [...nextBlockIds];
+    dbg("rotateForSystemReplacement -> rotate and faithfully re-seed",
+      "session=" + this.id, "old=" + oldAgentId, "new=" + targetAgentId);
+    await this.finishRotationCancel();
+  }
+  // A rewritten/compacted transcript is a context replacement just like a
+  // changed system block set: it cannot be appended to the old durable agent.
+  // Commit a fresh context epoch before closing the old handle, then re-seed
+  // the bounded replacement history into that new agent.
+  async rotateForHistoryReplacement() {
+    if (this.contextEpoch >= 1024) {
+      throw new ToolRoundError(
+        "history_context_rotation_exhausted",
+        "conversation history changed too many times for this durable conversation",
+        503,
+      );
+    }
+    const oldAgentId = this.agentId;
+    const nextContextEpoch = this.contextEpoch + 1;
+    const targetAgentId = this.composeAgentId({ contextEpoch: nextContextEpoch });
+    const systemBlockIds = validSystemBlockIds(this.seededSystemBlockIds)
+      ? [...this.seededSystemBlockIds] : [];
+    writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
+      recoveryEpoch: this.recoveryEpoch,
+      modelEpoch: this.modelEpoch,
+      keyEpoch: this.keyEpoch,
+      contextEpoch: nextContextEpoch,
+      systemBlockIds,
+    });
+    this.contextEpoch = nextContextEpoch;
+    this.agentId = targetAgentId;
+    this.resetSeedState();
+    this.seededSystemBlockIds = systemBlockIds;
+    dbg("rotateForHistoryReplacement -> rotate and faithfully re-seed",
+      "session=" + this.id, "old=" + oldAgentId, "new=" + targetAgentId);
     await this.finishRotationCancel();
   }
   // An all-legacy `call_*` continuation has no signed ToolRound to resume after the bridge upgrade. Move it
@@ -3117,7 +3827,13 @@ class Session {
       return;
     }
     const oldAgentId = this.agentId;
-    writeDurableAgentAlias(this.cursorKey, this.id, target, this);
+    writeDurableAgentAlias(this.cursorKey, this.id, target, {
+      recoveryEpoch: this.recoveryEpoch,
+      modelEpoch: this.modelEpoch,
+      keyEpoch: this.keyEpoch,
+      contextEpoch: this.contextEpoch,
+      systemBlockIds: [],
+    });
     this.agentId = target;
     this.model = null;
     this.resetSeedState();
@@ -3135,7 +3851,28 @@ class Session {
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
     this.stepToolStarted = 0; this.batchWaitExtensions = 0; // #85: reset the step batch counters at the terminal
     this.pendingDeltas = []; this.pendingDeltaBytes = 0; // #14: drop any undelivered text/reasoning; the run is over
+    this.beginReplaySegment(); // completion has committed it, or the failed/cancelled turn must release it
     this.activeAdvertise = null; // ADD-40: the turn-scoped effective tool policy ends with the run
+  }
+  emitCancellationTerminalReceipt(terminalReason, detail) {
+    if (!this.activeRes || !this.responseWriter || this.writeFailed
+        || this.activeRes.writableEnded || this.activeRes.destroyed
+        || this.lastTerminalTurnToken >= this.turnToken) {
+      return null;
+    }
+    const retryable = terminalReason === TerminalReason.SHUTDOWN;
+    return this.sseReceipt({
+      type: "turn_end",
+      stop_reason: "error",
+      receipt: "session_cancellation_terminal",
+      cancellationReason: terminalReason,
+      retryable,
+      ...(retryable ? { retryMode: "identical" } : {}),
+      error: String(detail || "session cancelled").replace(/\s+/g, " ").slice(0, 1024),
+    });
+  }
+  emitCancellationTerminal(terminalReason, detail) {
+    return !!this.emitCancellationTerminalReceipt(terminalReason, detail)?.ok;
   }
   // cancel tears down the live run/agent + rejects pendings. ADD-90: `notify` controls whether queued waiters
   // are released (notifyLogicalDone). External callers (onClose, handleTurn interrupt, rotate*, shutdown, evict,
@@ -3143,8 +3880,26 @@ class Session {
   // notify:false so a queued new-user turn is NOT promoted before driveUserSend installs the replacement
   // session.run — otherwise the queued turn and the replacement send would race on the same durable agent.
   async cancel({ notify = true, terminalReason = TerminalReason.CLIENT_CANCELLED, detail = "session cancelled" } = {}) {
+    if (notify) this.cancelNotifyRequested = true;
+    if (this.cancelPromise) {
+      await this.cancelPromise;
+      return;
+    }
+    this.cancelNotifyRequested = notify;
+    const cancelPromise = this.cancelOnce({ terminalReason, detail });
+    this.cancelPromise = cancelPromise;
+    try {
+      await cancelPromise;
+    } finally {
+      if (this.cancelPromise === cancelPromise) this.cancelPromise = null;
+      this.cancelNotifyRequested = false;
+    }
+  }
+  async cancelOnce({ terminalReason = TerminalReason.CLIENT_CANCELLED, detail = "session cancelled" } = {}) {
     const wasDone = this.done;
     const runToCancel = this.run;
+    const agentToClose = this.agent;
+    const cancelledRunEpoch = this.runEpoch;
     // The SDK's AbortError has no Session/request identity. Record the local
     // cancellation cause before invoking the SDK so a later floating abort
     // can be correlated with a disconnect, supersession, transport failure,
@@ -3159,31 +3914,84 @@ class Session {
       "round=" + (this.currentRound ? this.currentRound.state : "none"),
       "pending=" + this.pendingCount(),
       "waiters=" + this.waiters,
-      "notify=" + notify);
+      "notify=" + this.cancelNotifyRequested);
+    // A live HTTP response must always receive a terminal receipt before its
+    // run state is cleared. Previously an interrupt/shutdown called settle()
+    // and finishResponse() with only [DONE], which Go correctly classified as
+    // a protocol EOF and surfaced as a client-visible 502. Queueing the typed
+    // terminal through the existing SseWriter preserves ordering/backpressure;
+    // the runTurn finally block appends [DONE] after it.
+    if (!wasDone) this.emitCancellationTerminal(terminalReason, detail);
     this.done = true;     // short-circuit any late run.wait() settlement (onRunComplete/onRunError no-op on done)
     this.runEpoch++;      // invalidate the in-flight run's completion callback so it can't mutate a successor turn
     this.rejectAllPending(detail, terminalReason);
     this.clearTurnState();
-    if (runToCancel && typeof runToCancel.cancel === "function") noteExpectedSdkAbort(this.id);
-    try { await (runToCancel && runToCancel.cancel && runToCancel.cancel()); } catch {}
-    try { await (this.agent && this.agent.close && this.agent.close()); } catch {}
+    if ((runToCancel && typeof runToCancel.cancel === "function")
+        || (agentToClose && typeof agentToClose.close === "function")) {
+      noteExpectedSdkAbort(this.id, cancelledRunEpoch);
+      // AsyncLocalStorage follows promises/timers created by SDK cleanup. When
+      // one of those detached promises later reaches unhandledRejection, this
+      // is the only exact session/run-generation correlation the SDK exposes.
+      const cleanup = als.run({
+        session: this,
+        sdkCancellation: { sessionId: this.id, runEpoch: cancelledRunEpoch },
+      }, async () => {
+        try { await (runToCancel && runToCancel.cancel && runToCancel.cancel()); } catch {}
+        try { await (agentToClose && agentToClose.close && agentToClose.close()); } catch {}
+      });
+      let cleanupTimer = null;
+      const abandoned = new Promise((_, reject) => {
+        cleanupTimer = setTimeout(() => {
+          const error = new Error(`Cursor SDK cancellation cleanup exceeded ${CANCEL_CLEANUP_MS}ms`);
+          try {
+            console.error("[cursor-agent-bridge] SDK cancellation cleanup abandoned; restarting isolated sidecar session="
+              + this.id + " runEpoch=" + cancelledRunEpoch + ":", error.message);
+          } catch {}
+          // This guard starts only after cancellation was explicitly requested;
+          // it never times out an established upstream data path. Restarting is
+          // safer than reusing an agent whose old run may still be alive.
+          void shutdown(1, false);
+          reject(error);
+        }, CANCEL_CLEANUP_MS);
+      });
+      try {
+        await Promise.race([cleanup, abandoned]);
+      } finally {
+        if (cleanupTimer) clearTimeout(cleanupTimer);
+      }
+    }
     this.run = null;
     this.sendPending = false;
     this.activeClientMessageId = "";
     this.activeClientMessageHash = "";
     this.activeClientMessageGeneration = 1;
     this.activeClientMessageKind = "";
+    this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE;
     this.activeDeferredInputId = "";
     // Null the closed agent handle so a surviving queued waiter (the session is kept when waiters remain)
     // re-resumes/recreates a live agent via ensureAgent instead of reusing this dead one.
     this.agent = null; this.agentPromise = null;
     this.mcpServerKeys = null;
     this.settle();
-    if (notify) this.notifyLogicalDone(); // run torn down -> release any queued waiter so the chain advances
+    if (this.cancelNotifyRequested) this.notifyLogicalDone(); // run torn down -> release any queued waiter so the chain advances
   }
 }
 
 function nowMs() { return Date.now(); }
+
+// Every fire-and-forget cancellation crosses this boundary. Session.cancel is
+// single-flight, and this catch prevents future journal/cleanup changes from
+// leaking a detached rejection into the process-wide fatal handler.
+function cancelSessionDetached(session, options) {
+  Promise.resolve()
+    .then(() => session.cancel(options))
+    .catch((error) => {
+      try {
+        console.error("[cursor-agent-bridge] session-local cancellation cleanup failed; failure contained session="
+          + (session && session.id || "?") + ":", (error && error.stack) || error);
+      } catch {}
+    });
+}
 
 // ── H12: durable per-agent history fingerprint (survives a bridge restart) ──────────────────────────────
 // The BR-DS optimization (resume a durable agent that has prior turns -> mark seeded, skip re-prepend) is
@@ -3956,13 +4764,20 @@ function snapWorkflowAgentTypes(script) {
   } catch { return script; }
 }
 
-// CURSOR_COMPOSER_USER_MSG_REMINDER (default empty = off): when set, its text is appended to the END of every
-// NON-EMPTY user message sent to the model (driveUserSend) — e.g. a standing "re-read the rules / tool contract
-// this turn" nudge that rides every turn live, instead of only the tool descriptions (which cache at session start).
+// CURSOR_COMPOSER_USER_MSG_REMINDER (default empty = off): when set, its text is included as standing context on
+// every non-empty user turn. The current user instruction is deliberately rendered AFTER the reminder. A hidden
+// harness reminder must never become the final model-visible instruction and silently outrank the user's words.
 const USER_MSG_REMINDER = (process.env.CURSOR_COMPOSER_USER_MSG_REMINDER || "").trim();
 function appendRulesReminder(userText, reminder = USER_MSG_REMINDER) {
-  if (!reminder || typeof userText !== "string" || userText.length === 0) return userText;
-  return userText + "\n\n" + reminder;
+  if (typeof userText !== "string" || userText.length === 0) return userText;
+  const parts = [];
+  if (reminder) {
+    parts.push("[Standing tool-use context; this is reference material, not the user's request]\n" + reminder);
+  }
+  parts.push("[CURRENT USER MESSAGE — authoritative input for this turn]\n"
+    + "Follow its literal intent. An explicit correction or replacement supersedes conflicting prior work; "
+    + "a continuation or clarification keeps relevant unfinished work.\n" + userText);
+  return parts.join("\n\n");
 }
 
 // argContractFor builds one concise, unambiguous "how to call this tool" sentence FROM the tool's own inputSchema,
@@ -4123,7 +4938,11 @@ function healthBody(req) {
 }
 
 function readinessBody() {
-  return bridgeReady ? { ok: true, ready: true } : { ok: false, ready: false };
+  if (!bridgeReady) return { ok: false, ready: false };
+  if (!stateRootDiskStatus().ok) {
+    return { ok: false, ready: false, reason: "durable_state_capacity" };
+  }
+  return { ok: true, ready: true };
 }
 
 function classifyMcpRoute(req) {
@@ -4207,8 +5026,20 @@ async function handoffActiveTurn(req, res, session, round, committed, clientMess
       receipt: "active_turn_handoff",
     },
   }));
+  // Rebuild the replacement stream from the exact ordered frames already
+  // accepted by the prior response. A cumulative text fallback loses
+  // reasoning/tool ordering and can duplicate text when later deltas were
+  // buffered after disconnect. replayEvents is the same bounded canonical log
+  // that becomes the durable completion receipt.
+  for (const event of session.replayEvents) {
+    session.writePayload(formatSseData(event));
+  }
   if (session.pendingDeltas.length > 0) session.flushPendingDeltas();
-  else if (session.streamedText) session.writePayload(formatSseData({ type: "text", delta: session.streamedText }));
+  else if (session.replayEvents.length === 0 && session.streamedText) {
+    // Compatibility for a pre-replay-log in-memory Session created before an
+    // in-process upgrade. New runs always record text in replayEvents.
+    session.writePayload(formatSseData({ type: "text", delta: session.streamedText }));
+  }
 
   let closed = false;
   const onClose = () => {
@@ -4253,9 +5084,15 @@ async function replayPausedFreshTurn(res, session, clientMessageId) {
       receipt: "paused_turn_replay",
     },
   });
-  if (session.streamedText) await write({ type: "text", delta: session.streamedText });
-  for (const call of calls) {
-    await write({ type: "tool_call", id: call.wireId, name: call.name, input: call.input });
+  if (session.replayEvents.length > 0) {
+    for (const event of session.replayEvents) await write(event);
+  } else {
+    // Compatibility for an in-memory Session created before ordered replay
+    // logging existed. New sessions never take this lossy fallback.
+    if (session.streamedText) await write({ type: "text", delta: session.streamedText });
+    for (const call of calls) {
+      await write({ type: "tool_call", id: call.wireId, name: call.name, input: call.input });
+    }
   }
   await write(withClientLease(
     { type: "turn_end", stop_reason: "tool_use", tool_calls: calls.map((call) => call.wireId) },
@@ -4283,29 +5120,67 @@ async function replayCompletedTurn(res, receipt) {
       receipt: "completed_turn_replay",
     },
   });
-  // Keep each frame small enough to survive backpressure and preserve UTF-16
-  // surrogate pairs while replaying the durable final text.
-  for (let offset = 0; offset < receipt.text.length;) {
-    let end = Math.min(receipt.text.length, offset + 32768);
-    if (end < receipt.text.length
-        && receipt.text.charCodeAt(end - 1) >= 0xD800 && receipt.text.charCodeAt(end - 1) <= 0xDBFF
-        && receipt.text.charCodeAt(end) >= 0xDC00 && receipt.text.charCodeAt(end) <= 0xDFFF) {
-      end--;
+  const events = receipt.version >= 4
+    ? canonicalReplayEvents(receipt.events)
+    : [
+      ...(receipt.text ? [{ type: "text", delta: receipt.text }] : []),
+      { type: "turn_end", stop_reason: "end_turn", status: "finished", usage: receipt.usage || {} },
+    ];
+  for (const event of events) {
+    if (event.type === "turn_end") {
+      await write(withClientLease(event, receipt, true));
+      continue;
     }
-    await write({ type: "text", delta: receipt.text.slice(offset, end) });
-    offset = end;
+    if ((event.type === "text" || event.type === "reasoning") && event.delta.length > 32768) {
+      // Preserve event order while keeping individual replay frames small and
+      // never splitting a UTF-16 surrogate pair.
+      for (let offset = 0; offset < event.delta.length;) {
+        let end = Math.min(event.delta.length, offset + 32768);
+        if (end < event.delta.length
+            && event.delta.charCodeAt(end - 1) >= 0xD800 && event.delta.charCodeAt(end - 1) <= 0xDBFF
+            && event.delta.charCodeAt(end) >= 0xDC00 && event.delta.charCodeAt(end) <= 0xDFFF) end--;
+        await write({ type: event.type, delta: event.delta.slice(offset, end) });
+        offset = end;
+      }
+      continue;
+    }
+    await write(event);
   }
-  await write(withClientLease(
-    { type: "turn_end", stop_reason: "end_turn", status: "finished", usage: receipt.usage || {} },
-    receipt,
-    true,
-  ));
   await writer.endAfter("data: [DONE]\n\n");
 }
 
 function continuationFailure(res, status, code, message, details = null) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: { code, message, ...(details ? { details } : {}) } }));
+}
+
+async function finishStartedSseWithError(res, {
+  receipt = "request_failure_after_headers",
+  retryable = false,
+  retryMode = "",
+  error = "request failed after the response stream started",
+} = {}) {
+  if (!res || res.writableEnded || res.destroyed) return false;
+  const contentType = String(res.getHeader && res.getHeader("Content-Type") || "").toLowerCase();
+  if (!contentType.includes("text/event-stream")) {
+    try { res.end(); } catch {}
+    return false;
+  }
+  try {
+    res.write(formatSseData({
+      type: "turn_end",
+      stop_reason: "error",
+      receipt,
+      retryable,
+      ...(retryMode ? { retryMode } : {}),
+      error,
+    }));
+    res.end("data: [DONE]\n\n");
+    return true;
+  } catch {
+    try { res.destroy(); } catch {}
+    return false;
+  }
 }
 
 function durableRecoveryResults(round, input) {
@@ -4376,31 +5251,103 @@ function recoveryResultSummary(round, input) {
 
 function buildResultRecoveryInput(round, input, { requireHistory = false } = {}) {
   const history = typeof input.history === "string" ? input.history.trim() : "";
-  if (requireHistory && !history) return null;
+  const currentUser = typeof input.userText === "string" && input.userText.trim()
+    ? input.userText
+    : (input.type === "user" && typeof input.text === "string" ? input.text.trim() : "");
+  if (requireHistory && !history && !currentUser) return null;
   const summary = recoveryResultSummary(round, input);
   const receiptedInput = { ...input, results: durableRecoveryResults(round, input) };
-  const recovered = [
-    "[Recovered client-tool round]",
-    "These are the exact results returned by the user-machine harness for tool calls already present in the prior conversation:",
-    JSON.stringify(summary),
-    "Continue the original task from the previous conversation. Do not treat the recovered results as a new unrelated request.",
-  ].join("\n");
   const trailing = typeof input.userText === "string"
     ? input.userText
     : (input.type === "user" && typeof input.text === "string" ? input.text : "");
+  const recoveryContext = [
+    "[Recovered client-tool results — reference context]",
+    "These are the exact results returned by the user-machine harness for tool calls already present in the prior conversation:",
+    JSON.stringify(summary),
+    trailing
+      ? "Treat these results as reference-only facts. Follow the separately framed current user message according to its literal intent; explicit corrections replace conflicting prior work, while continuation requests preserve relevant unfinished work."
+      : "Use these results only to continue the unfinished work they directly support.",
+  ].join("\n");
+  const instruction = trailing
+    || "Continue only the unfinished work directly supported by the recovered client-tool results.";
   return {
     ...input,
     type: "user",
-    text: trailing ? `${recovered}\n\n${trailing}` : recovered,
+    recoveryContext,
+    text: instruction,
     images: [...(Array.isArray(input.images) ? input.images : []), ...collectToolResultImages(receiptedInput)],
   };
 }
 
 function buildRestartRecoveryInput(round, input) {
-  return buildResultRecoveryInput(round, input, { requireHistory: true });
+  const context = round && round.recoveryContext && typeof round.recoveryContext === "object"
+    ? round.recoveryContext : {};
+  const merged = {
+    ...input,
+    history: typeof input.history === "string" && input.history.trim()
+      ? input.history : (typeof context.history === "string" ? context.history : ""),
+    historyFingerprint: typeof input.historyFingerprint === "string" && input.historyFingerprint
+      ? input.historyFingerprint
+      : (typeof context.historyFingerprint === "string" ? context.historyFingerprint : ""),
+    system: Object.prototype.hasOwnProperty.call(input, "system")
+      ? input.system : (typeof context.system === "string" ? context.system : ""),
+  };
+  if (Array.isArray(input.systemBlocks)) merged.systemBlocks = input.systemBlocks;
+  else if (Array.isArray(context.systemBlocks)) merged.systemBlocks = context.systemBlocks;
+  if (Array.isArray(input.images) && input.images.length > 0) merged.images = input.images;
+  else if (Array.isArray(context.images) && context.images.length > 0) merged.images = context.images;
+  if (!(typeof merged.userText === "string" && merged.userText.trim())
+      && !(merged.type === "user" && typeof merged.text === "string" && merged.text.trim())
+      && typeof context.currentUser === "string" && context.currentUser.trim()) {
+    merged.userText = context.currentUser;
+  }
+  return buildResultRecoveryInput(round, merged, { requireHistory: true });
 }
 
-function toolResultRecoveryPlan(round, input, seededSystem = "") {
+function systemContextPlan(session, input) {
+  const blocks = normalizeSystemBlocks(input);
+  if (blocks === null) {
+    const incoming = typeof input?.system === "string" ? input.system : "";
+    if (!incoming) return { kind: "none", blocks: null, ids: null, text: "" };
+    if (!session.seeded) return { kind: "seed", blocks: null, ids: null, text: incoming };
+    if (incoming === session.seededSystem) return { kind: "same", blocks: null, ids: null, text: "" };
+    // Compatibility for older direct bridge callers that supplied only one
+    // opaque aggregate. Without block identity the bridge cannot prove
+    // replacement versus append, so preserve the historical update behavior.
+    // Current Go clients always send structured blocks and take the safe path.
+    return { kind: "legacy_update", blocks: null, ids: null, text: incoming };
+  }
+  const ids = blocks.map((block) => block.id);
+  if (!session.seeded) {
+    return { kind: "seed", blocks, ids, text: blocks.map((block) => block.text).join("\n\n") };
+  }
+  if (sameStringArray(session.seededSystemBlockIds, ids)) {
+    return session.seededSystem === String(input.system || "")
+      ? { kind: "same", blocks, ids, text: "" }
+      : { kind: "replace", blocks, ids, text: blocks.map((block) => block.text).join("\n\n") };
+  }
+  if (session.seededSystemBlockIds.length > 0
+      && isStringArrayPrefix(session.seededSystemBlockIds, ids)) {
+    const suffix = blocks.slice(session.seededSystemBlockIds.length);
+    return { kind: "append", blocks, ids, text: suffix.map((block) => block.text).join("\n\n") };
+  }
+  // Backward-compatible migration for an in-process session seeded before
+  // structured block identity existed. Exact aggregate equality proves this
+  // request is not changing model context; future turns use block identity.
+  if (session.seededSystemBlockIds.length === 0
+      && session.seededSystem
+      && session.seededSystem === String(input.system || "")) {
+    return { kind: "same", blocks, ids, text: "" };
+  }
+  return {
+    kind: "replace",
+    blocks,
+    ids,
+    text: blocks.map((block) => block.text).join("\n\n"),
+  };
+}
+
+function toolResultRecoveryPlan(round, input, session) {
   const durableResults = durableRecoveryResults(round, input);
   const resultImages = collectToolResultImages({ results: durableResults });
   const fallbackImages = mcpImageResultsEnabled()
@@ -4408,7 +5355,10 @@ function toolResultRecoveryPlan(round, input, seededSystem = "") {
     : resultImages;
   const hasUserText = typeof input.userText === "string" && input.userText.length > 0;
   const hasUserImages = Array.isArray(input.images) && input.images.length > 0;
-  const systemChanged = !!(input.system && input.system !== seededSystem);
+  const contextPlan = systemContextPlan(session, input);
+  const systemChanged = contextPlan.kind === "append"
+    || contextPlan.kind === "replace"
+    || contextPlan.kind === "legacy_update";
   return {
     durableResults,
     resultImages,
@@ -4435,6 +5385,7 @@ function deferredUserInput(round, item, input) {
     text: typeof stored.text === "string" ? stored.text : "",
     images: Array.isArray(stored.images) ? stored.images : [],
     system: typeof context.system === "string" ? context.system : "",
+    ...(Array.isArray(context.systemBlocks) ? { systemBlocks: context.systemBlocks } : {}),
     history: typeof context.history === "string" ? context.history : "",
     historyFingerprint: typeof context.historyFingerprint === "string" ? context.historyFingerprint : "",
   };
@@ -4531,12 +5482,41 @@ function legacyUnsignedRecoveryBody(body, input, results) {
         ? { historyFingerprint: input.historyFingerprint }
         : {}),
       ...(typeof input.system === "string" && input.system ? { system: input.system } : {}),
+      ...(Array.isArray(input.systemBlocks) ? { systemBlocks: input.systemBlocks } : {}),
       ...(images.length > 0 ? { images } : {}),
       clientMessageId,
+      ...(typeof input.invocationId === "string" ? { invocationId: input.invocationId } : {}),
       legacyRecoveryKey: legacyRecoveryKeyFor(sessionId, clientMessageId),
       legacyRecoveredToolCallIds: ids,
     },
   };
+}
+
+function validateCompletedContinuationPayload(results, cursorKey) {
+  const { codec, journal } = getRoundInfrastructure();
+  const grouped = new Map();
+  for (const result of results) {
+    const parsed = codec.parse(result && result.toolCallId);
+    const group = grouped.get(parsed.route) || [];
+    group.push(result);
+    grouped.set(parsed.route, group);
+  }
+  for (const [route, group] of grouped) {
+    const round = liveToolRounds.get(route) || ToolRound.load(journal, codec, route);
+    // A completed answer receipt can outlive its terminal ToolRound journal.
+    // Its full v4 requestHash still proves byte-independent semantic
+    // equivalence. When the journal is present, however, validate against its
+    // immutable result receipt before replay; never let preferDurableReceipt
+    // silently convert a conflicting retry into the old answer.
+    if (!round) continue;
+    if (continuationTenantMismatch(round, cursorKey)) {
+      throw new ToolRoundError("tenant_mismatch", "a signed tool round belongs to a different Cursor credential", 403);
+    }
+    round.preflightResults(group, {
+      allowRegisteredReceipt: true,
+      preferDurableReceipt: false,
+    });
+  }
 }
 
 // `/agent/continue` is the sole continuation ingress. It routes by the signed tool-call ids, validates and
@@ -4549,31 +5529,26 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
     continuationFailure(res, 422, "empty_tool_results", "a continuation requires at least one tool result");
     return;
   }
-  const continuationClientMessageId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
-  const continuationClientMessageHash = completedTurnRequestHash(input);
-  if (continuationClientMessageId && body && body.sessionId) {
-    let completed;
-    try {
-      completed = readCompletedTurnReceipt(
-        cursorKey,
-        body.sessionId,
-        continuationClientMessageId,
-        continuationClientMessageHash,
-      );
-    } catch (error) {
-      continuationFailure(
-        res,
-        503,
-        "durable_turn_receipt_unavailable",
-        (error && error.message) || String(error),
-      );
-      return;
-    }
-    if (completed) {
-      await replayCompletedTurn(res, completed);
-      return;
-    }
+  let continuationIdentity;
+  let continuationClientMessageHash;
+  try {
+    continuationIdentity = turnInvocationIdentity(input);
+    // Optional representation defects are deliberately converted into the
+    // same model-visible error result that ToolRound will commit. Hash that
+    // authoritative accommodated payload, not the malformed projection that
+    // would otherwise throw before the existing compatibility boundary.
+    results = accommodateContinuationResults(results);
+    continuationClientMessageHash = completedTurnRequestHash({ ...input, results });
+  } catch (error) {
+    continuationFailure(
+      res,
+      error instanceof ToolRoundError ? error.status : 422,
+      error instanceof ToolRoundError ? error.code : "invalid_tool_results",
+      (error && error.message) || String(error),
+    );
+    return;
   }
+  const continuationClientMessageId = continuationIdentity.id;
   try {
     const legacyBody = legacyUnsignedRecoveryBody(body, input, results);
     if (legacyBody) {
@@ -4588,12 +5563,6 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       return;
     }
     continuationFailure(res, 500, "legacy_recovery_failed", (error && error.message) || String(error));
-    return;
-  }
-  try {
-    results = accommodateContinuationResults(results);
-  } catch (error) {
-    continuationFailure(res, 422, "invalid_tool_results", (error && error.message) || String(error));
     return;
   }
   let preparedToolRegistry;
@@ -4617,6 +5586,13 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
     const parsed = results.map((result) => codec.parse(result && result.toolCallId));
     const route = parsed[0].route;
     if (parsed.some((token) => token.route !== route)) {
+	  if (continuationIdentity.policy === TURN_IDENTITY_POLICY.INVOCATION_V1) {
+	    throw new ToolRoundError(
+	      "multi_route_invocation_ambiguous",
+	      "one invocation identity cannot span multiple signed tool rounds; submit each round independently",
+	      409,
+	    );
+	  }
       const grouped = new Map();
       for (let index = 0; index < parsed.length; index++) {
         const group = grouped.get(parsed[index].route) || [];
@@ -4653,6 +5629,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
           stop_reason: "error",
           receipt: "multiple_live_tool_rounds_deferred",
           retryable: true,
+          retryMode: "split",
           error: "the request combines results from multiple simultaneously live conversations; no result was consumed, so each conversation can retry independently",
           routes: live.map(({ groupRoute }) => groupRoute),
         });
@@ -4716,8 +5693,64 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
     const hasDeferredInput = continuationHasDeferredInput(input);
     if (hasDeferredInput) {
       deferredRound = round;
-      deferredInputId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+      deferredInputId = continuationClientMessageId;
     }
+    // Validate and bind the authoritative prospective payload before any
+    // journal mutation. Existing immutable receipts win over a conflicting
+    // stateless projection; an explicit invocation id can bind to only this
+    // one canonical request.
+    const prospective = round.preflightResults(results, {
+      allowTerminalReceipt: !hasLiveCallbacks && wasTerminal,
+      allowRegisteredReceipt: true,
+      preferDurableReceipt: true,
+    });
+    const prospectiveById = new Map(prospective.map((entry) => [entry.call.wireId, entry]));
+    const prospectiveAuthoritativeResults = results.map((result) => {
+      const prepared = prospectiveById.get(result && result.toolCallId);
+      return prepared ? { toolCallId: result.toolCallId, ...prepared.result } : result;
+    });
+    const prospectiveConflicts = prospective
+      .filter((entry) => entry.durableReceiptRetained)
+      .map((entry) => entry.call.wireId);
+    continuationClientMessageHash = completedTurnRequestHash({
+      ...input,
+      results: prospectiveAuthoritativeResults,
+    });
+    bindInvocationRequestHash(
+      cursorKey,
+      round.sessionId,
+      continuationIdentity,
+      continuationClientMessageHash,
+    );
+    if (continuationClientMessageId) {
+      let completed;
+      try {
+        completed = readCompletedTurnReceipt(
+          cursorKey,
+          round.sessionId,
+          continuationClientMessageId,
+          continuationClientMessageHash,
+        );
+      } catch (error) {
+        throw new ToolRoundError(
+          "durable_turn_receipt_unavailable",
+          (error && error.message) || String(error),
+          503,
+        );
+      }
+      if (completed) {
+        if (prospectiveConflicts.length > 0) {
+          throw new ToolRoundError(
+            "result_conflict",
+            `tool results ${prospectiveConflicts.join(", ")} conflict with the payload that produced the durable completed answer`,
+            409,
+          );
+        }
+        await replayCompletedTurn(res, completed);
+        return;
+      }
+    }
+
     // A restart can occur after Node accepted the tool_call frame but before the
     // handoff timestamp reached the journal. A signed result from the same
     // authenticated tenant is proof the client saw that registered call, so a
@@ -4739,6 +5772,33 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       deferredInputId,
       deferredInput: hasDeferredInput ? input : null,
     });
+    // Bind the final-answer receipt to the immutable result values that the
+    // model actually receives. A lossy/conflicting stateless projection may
+    // be tolerated before a completion exists, but ToolRound's first durable
+    // receipts remain authoritative and therefore define the request hash.
+    const authoritativeResults = results.map((result) => {
+      const stored = round.calls.get(result && result.toolCallId)?.receipt?.result;
+      return stored ? { toolCallId: result.toolCallId, ...stored } : result;
+    });
+    continuationClientMessageHash = completedTurnRequestHash({
+      ...input,
+      results: authoritativeResults,
+    });
+    if (committed.retainedConflicts.length > 0 && continuationClientMessageId) {
+      const priorCompletion = readCompletedTurnReceipt(
+        cursorKey,
+        round.sessionId,
+        continuationClientMessageId,
+        continuationClientMessageHash,
+      );
+      if (priorCompletion) {
+        throw new ToolRoundError(
+          "result_conflict",
+          `tool results ${committed.retainedConflicts.join(", ")} conflict with the payload that produced the durable completed answer`,
+          409,
+        );
+      }
+    }
     // A buggy client may reuse one clientMessageId for different immutable
     // intent. ToolRound preserves the original receipt and deterministically
     // rekeys the new intent; every subsequent delivery decision must use that
@@ -4764,6 +5824,10 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       }
     }
     const remainingUnreceipted = round.unreceiptedOwedCallCount;
+    const liveOwner = hasLiveCallbacks ? sessions.get(round.sessionId) : null;
+    const canHandRegisteredSibling = !!(liveOwner
+      && liveOwner.currentRound === round
+      && round.outbound.length > 0);
 
     // A retry of a pure tool-result continuation owns the same resumed model
     // turn even though it has no deferred user input. Hand the live response
@@ -4797,7 +5861,11 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         && (deferred.state === DeferredInputState.QUEUED
           || deferred.state === DeferredInputState.DELIVERING
           || (deferred.state === DeferredInputState.DELIVERED && !deferred.deliveryFinalizedAt))
-        && remainingUnreceipted > 0) {
+        && remainingUnreceipted > 0
+        && !(canHandRegisteredSibling && !liveOwner.activeRes)) {
+      // If an earlier response is still live, hand any newly registered tail
+      // there before acknowledging this incremental result request.
+      if (canHandRegisteredSibling && liveOwner.activeRes) liveOwner.flushJournaledCalls();
       await writeShortSse(res, {
         type: "turn_end",
         stop_reason: "tool_use",
@@ -4898,7 +5966,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
           cursorKey,
           round.sessionId,
           deferredInputId,
-          completedTurnRequestHash(input),
+          continuationClientMessageHash,
         );
       } catch (error) {
         await writeShortSse(res, {
@@ -4938,7 +6006,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
     // as a fresh SDK user message. On an in-process Session the durable agent
     // already owns the conversation, so bounded history is not required; on a
     // cold restart it is required before a new agent id may be seeded.
-    if (deferred && deferred.state === DeferredInputState.QUEUED) {
+    if (deferred && deferred.state === DeferredInputState.QUEUED && remainingUnreceipted === 0) {
       const existing = sessions.get(round.sessionId);
       const completedReceipt = wasTerminal && (
         (round.terminal && round.terminal.reason === TerminalReason.COMPLETED)
@@ -5051,7 +6119,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         maxTokens: body.maxTokens,
         unsupportedHardGuarantees: body.unsupportedHardGuarantees,
       };
-      return enqueueTurn(req, res, session,
+      return await enqueueTurn(req, res, session,
         (exactDeliveryRetry && deferred.deliveryModel) || body.model || round.model || "composer-2.5",
         freshInput, constraints, {
         round,
@@ -5060,6 +6128,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         deferredReceipt: committed.deferredReceipt,
         dispositions: committed.dispositions,
         requestHash: continuationClientMessageHash,
+        identityPolicy: continuationIdentity.policy,
       });
     }
 
@@ -5087,7 +6156,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
           maxTokens: body.maxTokens,
           unsupportedHardGuarantees: body.unsupportedHardGuarantees,
         };
-        const recoveryPlan = toolResultRecoveryPlan(round, input, session.seededSystem);
+        const recoveryPlan = toolResultRecoveryPlan(round, input, session);
         if (session.activeRes && recoveryPlan.requiresFreshRecovery
             && recoveryPlan.remainingUnreceipted > 0) {
           await writeShortSse(res, {
@@ -5131,6 +6200,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
           round,
           committedIds,
           requestHash: continuationClientMessageHash,
+          identityPolicy: continuationIdentity.policy,
         });
         return;
       }
@@ -5217,10 +6287,18 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       committedIds,
       dispositions: committed.dispositions,
       requestHash: continuationClientMessageHash,
+      identityPolicy: continuationIdentity.policy,
     });
   } catch (error) {
     if (res.headersSent) {
-      try { res.end(); } catch {}
+      dbg("continuation failed after SSE headers; emitting typed terminal",
+        (error && error.stack) || (error && error.message) || String(error));
+      await finishStartedSseWithError(res, {
+        receipt: "continuation_failure_after_headers",
+        retryable: true,
+        retryMode: "identical",
+        error: "the continuation failed after its response stream started; retry the identical continuation",
+      });
       return;
     }
     if (error instanceof ToolRoundError) {
@@ -5241,16 +6319,11 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
             routedRound.callbacks.clear();
             staleSession.currentRound = null;
             staleSession.lastRunError = fenced.message;
-            staleSession.sse({ type: "turn_end", stop_reason: "error", error: fenced.message });
-            staleSession.settle();
-            staleSession.runEpoch++;
-            const staleRun = staleSession.run;
-            staleSession.run = null;
-            staleSession.agent = null;
-            staleSession.agentPromise = null;
-            staleSession.notifyLogicalDone();
-            try { void (staleRun && staleRun.cancel && staleRun.cancel()); } catch {}
             sessions.delete(staleSession.id);
+            cancelSessionDetached(staleSession, {
+              terminalReason: TerminalReason.RUN_ERROR,
+              detail: fenced.message,
+            });
           }
         }
         dbg("continuation CAS changed concurrently -> reload and retry",
@@ -5263,13 +6336,15 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       // consuming any additional client intent, preserving the durable round
       // for an independent retry and keeping generic harnesses operational.
       if (error.status === 409) {
+        const replayIdentical = error.code === "journal_revision_conflict";
         dbg("contained residual continuation conflict as typed SSE receipt",
           "code=" + error.code, (error && error.message) || String(error));
         await writeShortSse(res, {
           type: "turn_end",
           stop_reason: "error",
           receipt: "continuation_conflict_contained",
-          retryable: true,
+          retryable: replayIdentical,
+          retryMode: replayIdentical ? "identical" : "repair",
           errorCode: error.code,
           error: error.message,
           ...(routedRound ? { toolEpochState: routedRound.toolEpochState() } : {}),
@@ -5298,14 +6373,23 @@ async function handleTurn(req, res, body, cursorKey) {
   const input = body.input || (body.text != null ? { type: "user", text: body.text } : { type: "user", text: "" });
   const model = body.model || "composer-2.5";
   const sessionId = body.sessionId;
-  const fail = (code, msg) => {
+  const fail = (code, msg, errorCode = "") => {
     dbg("handleTurn FAIL", code, "session=" + sessionId, "inputType=" + (input && input.type), msg);
-    res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: msg }));
+    res.writeHead(code, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: errorCode ? { code: errorCode, message: msg } : msg }));
   };
   // Validate BEFORE opening the SSE so we can return a real HTTP status.
   if (!sessionId) { fail(400, "sessionId is required"); return; }
-  const requestClientMessageId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
-  const requestClientMessageHash = completedTurnRequestHash(input);
+  let requestIdentity;
+  let requestClientMessageHash;
+  try {
+    requestIdentity = turnInvocationIdentity(input);
+    requestClientMessageHash = completedTurnRequestHash(input);
+  } catch (error) {
+    fail(error instanceof ToolRoundError ? error.status : 422, (error && error.message) || String(error));
+    return;
+  }
+  const requestClientMessageId = requestIdentity.id;
   let freshDeliveryGeneration = 1;
   let freshDeliveryReceipt = null;
   if (requestClientMessageId) {
@@ -5325,22 +6409,24 @@ async function handleTurn(req, res, body, cursorKey) {
       fail(503, `durable turn continuity state is unavailable: ${(error && error.message) || String(error)}`);
       return;
     }
-    if (freshDeliveryReceipt) {
+    if (freshDeliveryReceipt && unresolvedFreshDeliveryReceipt(freshDeliveryReceipt)) {
       freshDeliveryGeneration = freshDeliveryReceipt.generation;
     } else if (completed) {
       const provenLegacyRecovery = input.type === "user"
         && typeof input.legacyRecoveryKey === "string"
-        && input.legacyRecoveryKey === legacyRecoveryKeyFor(sessionId, requestClientMessageId);
-      if (input.type !== "user" || provenLegacyRecovery) {
+        && input.legacyRecoveryKey === legacyRecoveryKeyFor(
+          sessionId,
+          typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : requestClientMessageId,
+        );
+      if (input.type !== "user" || provenLegacyRecovery || versionedFreshReplayIdentity(requestIdentity)) {
         await replayCompletedTurn(res, completed);
         return;
       }
-      // A byte-identical fresh request after completion is ambiguous without a
-      // client-supplied request nonce: it may be a lost-response retry or an
-      // intentional repeated instruction. Prefer executing the user's current
-      // instruction over replaying an old answer. A durable generation keeps
-      // its SDK idempotency key distinct while remaining stable across an
-      // ambiguous transport retry before this generation completes.
+      // Explicit legacy-client-message-v1 compatibility: an arbitrary old
+      // fresh ID did not define whether reuse meant retry or intentional
+      // repeat. Keep the historical execute-again behavior only for those
+      // unversioned IDs. invocation-v1 and ccm2 identities are authoritative
+      // logical calls and always replay an identical completed request.
       freshDeliveryGeneration = (Number.isSafeInteger(completed.generation)
         ? completed.generation : 1) + 1;
     }
@@ -5387,7 +6473,7 @@ async function handleTurn(req, res, body, cursorKey) {
     const kh = keyHash(cursorKey);
     if (breakerOpen(kh)) {
       const waitS = Math.ceil(breakerRetryAfterMs(kh) / 1000);
-      fail(429, `upstream is rate-limiting this account (Cursor HTTP/2 ENHANCE_YOUR_CALM); the proxy recycled the connection and is backing off — retry in ~${waitS}s and avoid rapid retries (they re-trip the limit)`);
+      fail(429, `upstream is rate-limiting this account (Cursor HTTP/2 ENHANCE_YOUR_CALM); the proxy recycled the connection and is backing off — retry in ~${waitS}s and avoid rapid retries (they re-trip the limit)`, "upstream_account_rate_limit");
       return;
     }
   }
@@ -5404,18 +6490,69 @@ async function handleTurn(req, res, body, cursorKey) {
     return;
   }
 
+  let session = sessions.get(sessionId);
+  if (!session) {
+    if (!sessionCapHasRoomForNew()) { fail(429, `session capacity reached (${MAX_SESSIONS}); all sessions are active or paused — retry later`, "session_capacity"); return; }
+    if (MULTI_TENANT && !platformCapHasRoomForNew(cursorKey)) { fail(429, `platform capacity reached (${MAX_PLATFORMS}); all tenant platforms are in use — retry later`, "platform_capacity"); return; }
+  }
+
+  let preReservedReceiptFile = "";
+  const releasePreReservedReceipt = () => {
+    if (!preReservedReceiptFile) return;
+    try { releaseUnresolvedReceipt(preReservedReceiptFile); } catch {}
+    preReservedReceiptFile = "";
+    delete input.preReservedReceiptFile;
+  };
+  // Exact retries with an existing UNKNOWN/RUNNING receipt can recover without
+  // allocating another large envelope. A genuinely fresh send reserves shared
+  // durable capacity only after every request-shape/admission preflight above,
+  // but before invocation binding, session mutation, or SDK work.
+  if (input.type === "user" && !freshDeliveryReceipt
+      && !stateRootDiskStatus(MAX_AGENT_TURN_BYTES * 2).ok) {
+    fail(507,
+      "durable state storage does not have enough free capacity to accept a new recoverable turn",
+      "durable_state_capacity");
+    return;
+  }
+  if (input.type === "user" && requestClientMessageId && !freshDeliveryReceipt) {
+    preReservedReceiptFile = completedTurnReceiptPath(
+      cursorKey, sessionId, requestClientMessageId, requestClientMessageHash,
+    );
+    try {
+      reserveUnresolvedReceipt(preReservedReceiptFile, MAX_AGENT_TURN_BYTES * 2);
+    } catch (error) {
+      fail(error instanceof ToolRoundError ? error.status : 507,
+        (error && error.message) || String(error),
+        "durable_state_capacity");
+      return;
+    }
+    input.preReservedReceiptFile = preReservedReceiptFile;
+  }
+  try {
+    bindInvocationRequestHash(
+      cursorKey,
+      sessionId,
+      requestIdentity,
+      requestClientMessageHash,
+    );
+  } catch (error) {
+    releasePreReservedReceipt();
+    fail(error instanceof ToolRoundError ? error.status : 503,
+      (error && error.message) || String(error),
+      error instanceof ToolRoundError ? error.code : "durable_invocation_binding_unavailable");
+    return;
+  }
+
   // New-user turn: get-or-create the session, refresh advertised tools/env, then enqueue on the per-session
   // FIFO. The chain serializes concurrent new-user turns (idle -> runs immediately; busy -> waits, kept
   // alive) instead of 409-rejecting them, so no client ever sees a retryable error from a collision.
-  let session = sessions.get(sessionId);
   if (!session) {
     // ADD-63 (LOAD-SHED): reject a NEW session when at cap and nothing idle can be shed. Never evict a live or
     // paused session to admit this one. ADD-75: likewise reject a NEW tenant (new platform) at the platform cap.
-    if (!sessionCapHasRoomForNew()) { fail(429, `session capacity reached (${MAX_SESSIONS}); all sessions are active or paused — retry later`); return; }
-    if (MULTI_TENANT && !platformCapHasRoomForNew(cursorKey)) { fail(429, `platform capacity reached (${MAX_PLATFORMS}); all tenant platforms are in use — retry later`); return; }
     try {
       session = new Session(sessionId, cursorKey);
     } catch (error) {
+      releasePreReservedReceipt();
       fail(503, `durable session continuity state is unavailable: ${(error && error.message) || String(error)}`);
       return;
     }
@@ -5433,11 +6570,15 @@ async function handleTurn(req, res, body, cursorKey) {
     // so a key change normally arrives as a NEW session id; this catches the same-id case (either half is safe).
     if (keyFingerprint(cursorKey) !== keyFingerprint(session.cursorKey)) {
       dbg("handleTurn REUSE with CHANGED cursor key -> rotateForKeyChange (ADD-79)", sessionId, "oldKeyHash=" + keyHash(session.cursorKey), "newKeyHash=" + keyHash(cursorKey));
-      await session.rotateForKeyChange(cursorKey);
+      try { await session.rotateForKeyChange(cursorKey); }
+      catch (error) { releasePreReservedReceipt(); throw error; }
     }
   }
-  const incomingClientMessageId = typeof input.clientMessageId === "string" ? input.clientMessageId.trim() : "";
-  const incomingClientMessageHash = completedTurnRequestHash(input);
+  // Exact active retries retain their original generation and SDK envelope.
+  // Legacy FAILED receipts remain acceptance-unknown and reach this same
+  // reattachment path; they never authorize an unproven second generation.
+  const incomingClientMessageId = requestClientMessageId;
+  const incomingClientMessageHash = requestClientMessageHash;
   if (incomingClientMessageId
       && session.activeClientMessageId === incomingClientMessageId
       && session.activeClientMessageHash === incomingClientMessageHash
@@ -5455,6 +6596,7 @@ async function handleTurn(req, res, body, cursorKey) {
     try {
       await session.rotateForLegacyRecovery(legacyRecoveryKey);
     } catch (error) {
+      releasePreReservedReceipt();
       fail(503, `cannot establish durable legacy recovery: ${(error && error.message) || String(error)}`);
       return;
     }
@@ -5462,7 +6604,12 @@ async function handleTurn(req, res, body, cursorKey) {
   // A new logical user turn replaces the prior lease token. Exact active
   // retries returned above keep the token already attached to that run.
   session.clientLeaseToken = normalizeClientLeaseToken(body.clientLeaseToken);
-  refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
+  try {
+    refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
+  } catch (error) {
+    releasePreReservedReceipt();
+    throw error;
+  }
   // ADD-37 (extended by ADD-106): a plain NEW-USER turn that arrives while a run is still LIVE on this session
   // is an INTERRUPTION, not a concurrent generation — the user is steering, so the old run must yield to the
   // new instruction. Two sub-cases, both now interrupted:
@@ -5496,7 +6643,8 @@ async function handleTurn(req, res, body, cursorKey) {
   // it belongs to the new instruction, never to the superseded tool calls.
   if (session.run) {
     dbg("handleTurn USER INTERRUPT of a live run -> cancel stale run + drive new turn", sessionId, "streaming=" + !!session.activeRes, "pending=" + session.pendingCount(), "waiters=" + session.waiters);
-    await session.cancel({ terminalReason: TerminalReason.INTERRUPTED, detail: "superseded by a new user turn" });
+    try { await session.cancel({ terminalReason: TerminalReason.INTERRUPTED, detail: "superseded by a new user turn" }); }
+    catch (error) { releasePreReservedReceipt(); throw error; }
   }
   if (freshDeliveryReceipt && session.agentId !== freshDeliveryReceipt.agentId) {
     try { await (session.agent && session.agent.close && session.agent.close()); } catch {}
@@ -5505,7 +6653,11 @@ async function handleTurn(req, res, body, cursorKey) {
     session.agentId = freshDeliveryReceipt.agentId;
     session.resetSeedState();
   }
-  if (session.waiters >= MAX_QUEUE_DEPTH) { fail(429, "too many concurrent turns queued for this session"); return; }
+  if (session.waiters >= MAX_QUEUE_DEPTH) {
+    releasePreReservedReceipt();
+    fail(429, "too many concurrent turns queued for this session", "session_queue_capacity");
+    return;
+  }
   return enqueueTurn(
     req,
     res,
@@ -5721,8 +6873,17 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   const settleOnce = () => { if (!settled) { settled = true; resolveTurn(); } };
   const deferredRound = continuation && continuation.round;
   const deferredInputId = continuation && continuation.deferredInputId;
-  const requestedClientMessageId = typeof input?.clientMessageId === "string" ? input.clientMessageId.trim() : "";
+  const requestIdentity = turnInvocationIdentity(input);
+  const requestedClientMessageId = requestIdentity.id;
   const clientMessageId = deferredInputId || requestedClientMessageId;
+  let identityPolicy = continuation?.identityPolicy || requestIdentity.policy;
+  if (identityPolicy === TURN_IDENTITY_POLICY.NONE && clientMessageId) {
+    // A later sibling-only continuation can recover an earlier journaled
+    // invocation without repeating its identity field. The durable deferred
+    // id still owns the send; legacy policy here records the compatibility
+    // provenance without changing that identity or its SDK key.
+    identityPolicy = TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1;
+  }
   const clientMessageHash = continuation
       && typeof continuation.requestHash === "string"
       && /^[a-f0-9]{64}$/.test(continuation.requestHash)
@@ -5743,6 +6904,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     session.activeClientMessageHash = clientMessageHash;
     session.activeClientMessageGeneration = clientMessageGeneration;
     session.activeClientMessageKind = clientMessageKind;
+    session.activeIdentityPolicy = identityPolicy;
     session.sendPending = true;
   }
   if (deferredInputId) {
@@ -5771,6 +6933,34 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   };
   let keepalive = null;
   try {
+    try {
+      session.beginReplaySegment(clientMessageId);
+    } catch (error) {
+      if (!error || error.code !== "local_replay_capacity") throw error;
+      if (res.headersSent) {
+        session.beginResponse(res);
+        session.sse({
+          type: "turn_end",
+          stop_reason: "error",
+          errorCode: error.code,
+          error: error.message,
+          retryable: true,
+        });
+      } else {
+        res.writeHead(error.status || 503, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ error: { code: error.code, message: error.message } }));
+      }
+      if (typeof input.preReservedReceiptFile === "string" && input.preReservedReceiptFile) {
+        try { releaseUnresolvedReceipt(input.preReservedReceiptFile); } catch {}
+        delete input.preReservedReceiptFile;
+      }
+      settleOnce();
+      session.notifyLogicalDone();
+      if (!session.seeded && session.agent === null && session.run === null
+          && session.pendingCount() === 0 && !session.hasQueuedWaiters()
+          && sessions.get(session.id) === session) sessions.delete(session.id);
+      return;
+    }
     session.beginResponse(res); session.touch(); session.turnToken++;
     session.lastStallLogAt = 0;
     session.toolChoice = (constraints && constraints.toolChoice) || "";
@@ -5823,7 +7013,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   // bound to this run's epoch (mirrors the new-user seed path). It is the single send path shared by the
   // new-user turn, the C1 mixed-turn fresh-send, and the C2/C3 re-seed — so they never drift. extraImages
   // (BR9) are merged in addition to input.images (e.g. images carried inside tool results).
-  const driveUserSend = async (userText, extraImages) => {
+  const driveUserSend = async (userText, extraImages, recoveryContext = input.recoveryContext) => {
     const deferredDelivery = deferredRound && deferredInputId
       ? deferredRound.deferredInput(deferredInputId)
       : null;
@@ -5837,9 +7027,6 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       && Array.isArray(deliveryRecord.deliveryAdvertise);
     const advertiseBeforeFrozenRetry = session.advertise;
     if (frozenDelivery) session.advertise = deliveryRecord.deliveryAdvertise;
-    if (!frozenDelivery) {
-      userText = appendRulesReminder(userText); // CURSOR_COMPOSER_USER_MSG_REMINDER: standing per-turn nudge (off by default)
-    }
     session.streamedText = "";   // reset per user turn (NOT across tool-result continuations within a run)
     session.reasonedThisRun = false; // #15: mirror streamedText — reasoning-produced tracking spans this run
     session.lastSdkActivityAt = nowMs();
@@ -5859,26 +7046,58 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       if (frozenDelivery) session.advertise = advertiseBeforeFrozenRetry;
       return;
     }
-    let text = userText || "";
+    let contextPlan = null;
+    if (!frozenDelivery) {
+      contextPlan = systemContextPlan(session, input);
+      if (contextPlan.kind === "replace") {
+        if (session.seeded && !(typeof input.history === "string" && input.history.trim())) {
+          throw new ToolRoundError(
+            "system_reseed_unavailable",
+            "system context was replaced but bounded conversation history is unavailable for a faithful re-seed",
+            410,
+          );
+        }
+        await session.rotateForSystemReplacement(contextPlan.ids || []);
+        agent = await ensureAgent(session, model);
+        if (settled) return;
+        contextPlan = systemContextPlan(session, input);
+      }
+    }
+    // Build every standing/context block first. The exact current user text is
+    // appended only after system/history/constraints/tool reference below, so
+    // no harness-generated instruction can silently become the turn's suffix.
+    let text = frozenDelivery ? (userText || "") : "";
     // H11: snapshot the seed flags so we can ROLL BACK if agent.send rejects — otherwise a failed first send
     // would leave seeded=true and the retry (reusing this in-memory session) would omit the system + history
     // prelude, answering with missing context. They are committed only after agent.send resolves.
     const seededBefore = session.seeded;
     const seededSystemBefore = session.seededSystem;
+    const seededSystemBlockIdsBefore = [...session.seededSystemBlockIds];
     if (!frozenDelivery) {
       if (!session.seeded) {
         const parts = [];
         if (input.system) parts.push(input.system);
         if (input.history) parts.push("Previous conversation:\n" + input.history);
-        if (text) parts.push(text);
         text = parts.join("\n\n");
         session.seeded = true;
-        session.seededSystem = input.system || "";   // C3/BR6: remember the seeded system for swap detection
-      } else if (input.system && input.system !== session.seededSystem) {
-        // C3/BR6: a continuation carried a NEW system prompt (e.g. ExitPlanMode) on an already-seeded session.
-        // Prepend it as an updated instruction block so the swap reaches the model, and remember it.
-        text = "Updated system instructions:\n" + input.system + (text ? "\n\n" + text : "");
+        session.seededSystem = input.system || "";
+        if (contextPlan && contextPlan.ids !== null) {
+          session.seededSystemBlockIds = [...contextPlan.ids];
+        }
+      } else if (contextPlan && contextPlan.kind === "append" && contextPlan.text) {
+        // Only an exact block-ID suffix is safe to append to a warm durable
+        // conversation. Replacements/reorders are handled by rotation above.
+        text = "Additional system instructions:\n" + contextPlan.text;
         session.seededSystem = input.system;
+        session.seededSystemBlockIds = [...contextPlan.ids];
+      } else if (contextPlan && contextPlan.kind === "legacy_update" && contextPlan.text) {
+        text = "Updated system instructions:\n" + contextPlan.text;
+        session.seededSystem = input.system;
+      } else if (contextPlan && contextPlan.ids !== null) {
+        // Same-context migration from a legacy in-process aggregate: record
+        // identity without emitting another model-visible instruction.
+        session.seededSystem = input.system || "";
+        session.seededSystemBlockIds = [...contextPlan.ids];
       }
     } else {
       // The first agent.send crossed the durable DELIVERING boundary. Reuse
@@ -5887,6 +7106,8 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       session.seeded = true;
       session.seededSystem = typeof deliveryRecord.deliverySeededSystem === "string"
         ? deliveryRecord.deliverySeededSystem : session.seededSystem;
+      session.seededSystemBlockIds = validSystemBlockIds(deliveryRecord.deliverySystemBlockIds)
+        ? [...deliveryRecord.deliverySystemBlockIds] : session.seededSystemBlockIds;
     }
     // Enforced per-turn constraints (response_format / stop / token limit / tool_choice) as instructions.
     // H08: record the resolved tool_choice on the session so the dispatch seam can best-effort gate native
@@ -5908,6 +7129,28 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       const manifest = toolManifest(effectiveAdvertise(session.advertise, turnToolChoice));
       if (manifest) { text = text ? text + "\n\n" + manifest : manifest; dbg("toolManifest injected (prompt)", "session=" + session.id, "bytes=" + manifest.length); }
     }
+    if (!frozenDelivery && typeof recoveryContext === "string" && recoveryContext.trim()) {
+      const boundedRecoveryContext = recoveryContext.trim();
+      text = text ? text + "\n\n" + boundedRecoveryContext : boundedRecoveryContext;
+    }
+    if (!frozenDelivery) {
+      const currentUser = appendRulesReminder(userText);
+      if (currentUser) text = text ? text + "\n\n" + currentUser : currentUser;
+    }
+    // Persist enough bounded, role-separated seed context at ToolRound OPEN,
+    // before any client callback is handed out. A sidecar restart can then
+    // rebuild a first-turn or thin-client continuation without guessing from
+    // a flattened byte tail or waiting for a later deferred user message.
+    const recoverySystemBlocks = normalizeSystemBlocks(input);
+    session.roundRecoveryContext = {
+      system: typeof input.system === "string" ? input.system : "",
+      ...(recoverySystemBlocks !== null ? { systemBlocks: recoverySystemBlocks } : {}),
+      history: typeof input.history === "string" ? input.history : "",
+      historyFingerprint: typeof input.historyFingerprint === "string" ? input.historyFingerprint : "",
+      currentUser: typeof userText === "string" ? userText : "",
+      toolInventoryEpoch: typeof session.toolInventoryEpoch === "string" ? session.toolInventoryEpoch : "",
+      images: Array.isArray(input.images) ? input.images : [],
+    };
     // Merge images from the input with any extra images (BR9: tool-result images folded into the send).
     const allImages = frozenDelivery
       ? (deliveryRecord.deliveryHasImages ? [{}] : [])
@@ -5958,7 +7201,9 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
           model,
           toolChoice: turnToolChoice,
           seededSystem: session.seededSystem || "",
+          systemBlockIds: session.seededSystemBlockIds,
           hasImages: allImages.length > 0,
+          identityPolicy,
         },
       );
     }
@@ -5973,6 +7218,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       model,
       toolChoice: turnToolChoice,
       seededSystem: session.seededSystem || "",
+      systemBlockIds: session.seededSystemBlockIds,
     });
     const observeUserMessage = (userMessage) => {
       // Ignore an unrelated or structurally drifted SDK update. agent.send's
@@ -5992,6 +7238,17 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       try {
         session.run = await agent.send(msg, sendCallbacks);
         session.sendPending = false;
+        if (!sameStringArray(seededSystemBlockIdsBefore, session.seededSystemBlockIds)) {
+          try {
+            session.persistDurableAlias();
+          } catch (aliasError) {
+            // The exact frozen delivery receipt still protects an invocation
+            // retry. Keep the live run available; after a process loss the
+            // conservative fallback is rotate-and-reseed, never silent reuse.
+            dbg("system block identity persistence unavailable; live run remains recoverable by exact receipt",
+              "session=" + session.id, (aliasError && aliasError.message) || String(aliasError));
+          }
+        }
       } catch (sendErr) {
         // ADD-115: a RESUMED durable agent can be wedged on a PRIOR run that died abnormally (e.g. a
         // mid-tool-call drop + bridge restart): the SDK refuses the new send with "already has active run".
@@ -6007,6 +7264,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
           } catch (forceErr) {
             session.seeded = seededBefore;
             session.seededSystem = seededSystemBefore;
+            session.seededSystemBlockIds = seededSystemBlockIdsBefore;
             dbg("runTurn force-retry THREW (rolled back seeded)", "session=" + session.id, (forceErr && forceErr.stack) || (forceErr && forceErr.message) || String(forceErr));
             throw forceErr;
           }
@@ -6015,11 +7273,28 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
           // in-memory session re-prepends the system + history prelude (the first send never actually landed).
           session.seeded = seededBefore;
           session.seededSystem = seededSystemBefore;
+          session.seededSystemBlockIds = seededSystemBlockIdsBefore;
           dbg("runTurn agent.send THREW (rolled back seeded)", "session=" + session.id, "seeded->" + session.seeded, (sendErr && sendErr.stack) || (sendErr && sendErr.message) || String(sendErr));
           throw sendErr;
         }
       } finally {
         session.advertise = savedAdvertise;
+      }
+      if (clientMessageKind === "fresh" && clientMessageId) {
+        try {
+          transitionFreshAttemptState(
+            session.cursorKey,
+            session.id,
+            clientMessageId,
+            clientMessageHash,
+            FRESH_ATTEMPT_STATE.RUNNING,
+          );
+        } catch (error) {
+          // UNKNOWN is the safer fallback: it preserves the exact envelope
+          // and never grants permission to start a new attempt generation.
+          dbg("fresh attempt running transition unavailable; retaining UNKNOWN",
+            "session=" + session.id, (error && error.message) || String(error));
+        }
       }
       // If cancel() ran DURING agent.send (client disconnected mid-send) or a newer run superseded this
       // turn, agent.send still resolved and re-assigned an orphan to session.run. Leaving it there parks
@@ -6088,7 +7363,24 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     let forceModelReseed = false;
     if (session.run === null && session.model && session.model !== model) {
       dbg("runTurn MODEL CHANGED (no live run) -> rotate durable agent + re-seed", "session=" + session.id, "from=" + session.model, "to=" + model);
-      await session.rotateForModelChange(model);
+      // Rotation cancellation belongs to the old durable agent, not to this
+      // newly-opened HTTP turn. Detach the current settle callback while the
+      // old handle closes; otherwise cancel() settles this response before the
+      // fallback send starts and driveUserSend correctly refuses to create an
+      // orphan, yielding a session frame plus empty [DONE].
+      session.settleTurn = null;
+      try { await session.rotateForModelChange(model); }
+      finally { session.settleTurn = settleOnce; }
+      if (clientMessageId) {
+        session.activeClientMessageId = clientMessageId;
+        session.activeClientMessageHash = clientMessageHash;
+        session.activeClientMessageGeneration = clientMessageGeneration;
+        session.activeClientMessageKind = clientMessageKind;
+        session.activeIdentityPolicy = identityPolicy;
+        session.sendPending = true;
+      }
+      if (deferredInputId) session.activeDeferredInputId = deferredInputId;
+      session.beginReplaySegment(clientMessageId);
       forceModelReseed = true;
     }
     // C2/BR-C2: a changed history fingerprint on an ESTABLISHED session (e.g. /compact rewrote the
@@ -6126,8 +7418,26 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       }
       if (warmChanged || coldCompact) {
         dbg("runTurn HISTORY FINGERPRINT CHANGED (no live run) -> re-seed", "session=" + session.id, "warm=" + !!warmChanged, "cold=" + !!coldCompact);
-        await cancelStaleRun();
-        session.seeded = false;
+        if (session.seeded && !(typeof input.history === "string" && input.history.trim())) {
+          throw new ToolRoundError(
+            "history_reseed_unavailable",
+            "conversation history changed but bounded replacement history is unavailable for a faithful re-seed",
+            410,
+          );
+        }
+        session.settleTurn = null;
+        try { await session.rotateForHistoryReplacement(); }
+        finally { session.settleTurn = settleOnce; }
+        if (clientMessageId) {
+          session.activeClientMessageId = clientMessageId;
+          session.activeClientMessageHash = clientMessageHash;
+          session.activeClientMessageGeneration = clientMessageGeneration;
+          session.activeClientMessageKind = clientMessageKind;
+          session.activeIdentityPolicy = identityPolicy;
+          session.sendPending = true;
+        }
+        if (deferredInputId) session.activeDeferredInputId = deferredInputId;
+        session.beginReplaySegment(clientMessageId);
         forceReseed = true;
       }
     }
@@ -6149,12 +7459,16 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       const round = continuation.round;
       if (!round || round.sessionId !== session.id) throw new ToolRoundError("round_lost", "continuation round is not owned by this Session", 410);
       const committedIds = continuation.committedIds || [];
-      const recoveryPlan = toolResultRecoveryPlan(round, input, session.seededSystem);
+      const recoveryPlan = toolResultRecoveryPlan(round, input, session);
 
       if (recoveryPlan.requiresFreshRecovery && recoveryPlan.remainingUnreceipted > 0) {
         // Do not resolve only part of a parallel callback wave and do not
         // cancel its unanswered siblings. Receipts are already durable; a
         // later incremental continuation will recover from the complete set.
+        // A REGISTERED sibling is part of the same callback wave. Hand it on
+        // this continuation response before the tool_use terminal instead of
+        // cancelling/rotating the live run with an invisible obligation.
+        session.flushJournaledCalls();
         const receipt = session.sseReceipt({
           type: "turn_end",
           stop_reason: "tool_use",
@@ -6174,7 +7488,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         // driveUserSend already merges input.images (the trailing user
         // payload); pass only images recovered from durable tool receipts so
         // the user images are not duplicated.
-        await driveUserSend(redirected.text, recoveryPlan.resultImages);
+        await driveUserSend(redirected.text, recoveryPlan.resultImages, redirected.recoveryContext);
       } else {
         const applied = round.applyCommittedResults(committedIds);
         if (applied.length > 0) session.lastSdkActivityAt = nowMs();
@@ -6220,8 +7534,17 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   } catch (e) {
     dbg("runTurn CATCH exception", "session=" + session.id, (e && e.stack) || (e && e.message) || String(e));
     const turnFailure = (e && e.message) || String(e);
+    releasePreReservationWithoutReceipt(input);
     session.rejectAllPending(`turn failed: ${turnFailure}`, TerminalReason.RUN_ERROR);
-    if (!settled) session.sse({ type: "turn_end", stop_reason: "error", error: (e && e.message) || String(e) });
+    if (!settled) session.sse({
+      type: "turn_end",
+      stop_reason: "error",
+      error: (e && e.message) || String(e),
+      ...(e && e.code === "local_replay_capacity" ? {
+        errorCode: "local_replay_capacity",
+        retryable: true,
+      } : {}),
+    });
     // ADD-101: ALWAYS settle the turn on an error so the per-turn latch (turnSettled) resolves — otherwise a
     // throw before any settle() call leaves the latch unresolved (queue/lifecycle stalls). settle() is idempotent.
     session.settle();
@@ -6242,7 +7565,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     if (!session.seeded && session.agent === null && session.run === null && session.pendingCount() === 0 && !session.hasQueuedWaiters() && sessions.get(session.id) === session) {
       dbg("runTurn drop empty failed-first-turn session (ADD-61)", "session=" + session.id);
       sessions.delete(session.id);
-      void session.cancel({ terminalReason: TerminalReason.RUN_ERROR, detail: "failed first turn" });
+      cancelSessionDetached(session, { terminalReason: TerminalReason.RUN_ERROR, detail: "failed first turn" });
     }
   } finally {
     session.sendPending = false;
@@ -6254,6 +7577,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       session.activeClientMessageHash = "";
       session.activeClientMessageGeneration = 1;
       session.activeClientMessageKind = "";
+      session.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE;
     }
     clearInterval(keepalive);
     res.off("close", onClose);
@@ -6334,6 +7658,11 @@ async function handleHttpRequestSafely(req, res, dispatch = handleHttpRequest) {
       } catch {}
       return false;
     }
+    if (await finishStartedSseWithError(res, {
+      receipt: "request_failure_after_headers",
+      retryable: false,
+      error: "the bridge request failed after its response stream started",
+    })) return false;
     try { if (!res.writableEnded) res.destroy(); } catch {}
     return false;
   }
@@ -6350,7 +7679,7 @@ const evictTimer = setInterval(() => {
   for (const [id, s] of sessions) {
     if (!s.activeRes && !s.run && !s.hasQueuedWaiters() && s.lastActivity < cut) {
       sessions.delete(id);
-      void s.cancel({ terminalReason: TerminalReason.SESSION_EVICTED, detail: "idle session eviction" });
+      cancelSessionDetached(s, { terminalReason: TerminalReason.SESSION_EVICTED, detail: "idle session eviction" });
     }
   }
   // Multi-tenant only: dispose idle per-user platforms. Single-tenant keeps its single platform resident
@@ -6359,8 +7688,16 @@ const evictTimer = setInterval(() => {
     const pcut = nowMs() - PLATFORM_TTL_MS;
     for (const [h, entry] of platforms) {
       if (entry.lastUsed < pcut && !platformHasSession(h)) {
-        platforms.delete(h); void disposePlatform(entry);
+        platforms.delete(h);
+        upstreamBreaker.delete(h);
+        void disposePlatform(entry);
       }
+    }
+  }
+  const now = nowMs();
+  for (const [h, breaker] of upstreamBreaker) {
+    if (now >= breaker.openUntil && !platforms.has(h) && !platformHasSession(h)) {
+      upstreamBreaker.delete(h);
     }
   }
 }, 60000);
@@ -6374,26 +7711,75 @@ let shuttingDown = false;
 // long, never indefinitely (set 0 to restore the old immediate-cancel behavior). Kept under a typical container
 // SIGTERM grace window so the platform never SIGKILLs us first.
 const DRAIN_MS = envInt("CURSOR_AGENT_DRAIN_MS", 20000, { min: 0 });
+const PLATFORM_DRAIN_MAX_MS = envInt("CURSOR_AGENT_PLATFORM_DRAIN_MAX_MS", 30000, { min: 2000, max: 600000 });
+const REQUESTED_SHUTDOWN_MAX_MS = envInt("CURSOR_AGENT_SHUTDOWN_MAX_MS", 28000, { min: 1000, max: 600000 });
+const SHUTDOWN_MAX_MS = Math.min(REQUESTED_SHUTDOWN_MAX_MS, PLATFORM_DRAIN_MAX_MS - 1000);
+const SHUTDOWN_CANCEL_CONCURRENCY = envInt("CURSOR_AGENT_SHUTDOWN_CANCEL_CONCURRENCY", 16, { min: 1, max: 128 });
+async function runBoundedShutdownTasks(tasks, deadline, concurrency = SHUTDOWN_CANCEL_CONCURRENCY) {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, async () => {
+    while (next < tasks.length && nowMs() < deadline) {
+      const index = next++;
+      try { await tasks[index](); } catch {}
+    }
+  });
+  if (workers.length === 0) return;
+  const remaining = Math.max(0, deadline - nowMs());
+  await Promise.race([
+    Promise.allSettled(workers),
+    new Promise((resolve) => setTimeout(resolve, remaining)),
+  ]);
+}
 async function shutdown(exitCode = 0, drain = true) {
   if (shuttingDown) return; shuttingDown = true;
+  const startedAt = nowMs();
+  const shutdownDeadline = startedAt + SHUTDOWN_MAX_MS;
+  // Planned and fatal cleanup share one global deadline below Railway's drain
+  // window. A wedged cancel/store dispose can never invite platform SIGKILL
+  // before terminal journals and other sessions get their cleanup opportunity.
+  const forcedExit = setTimeout(() => process.exit(exitCode), SHUTDOWN_MAX_MS);
   bridgeReady = false;
   try { server.close(); } catch {} // refuse NEW connections; in-flight ones keep streaming
   if (drain && DRAIN_MS > 0) {
-    const deadline = nowMs() + DRAIN_MS;
+    const cleanupReserve = Math.min(7000, Math.floor(SHUTDOWN_MAX_MS / 2));
+    const deadline = Math.min(startedAt + DRAIN_MS, shutdownDeadline - cleanupReserve);
     const anyLive = () => { for (const [, s] of sessions) { if (s && s.run && !s.done) return true; } return false; };
     try { while (anyLive() && nowMs() < deadline) { await new Promise((r) => setTimeout(r, 250)); } } catch {}
   }
   // Persist every open round's terminal state before awaiting any SDK cleanup;
   // one stuck close must not prevent later sessions from being journaled.
+  const terminalDrains = [];
   for (const [, s] of sessions) {
     try { s.rejectAllPending("bridge shutdown", TerminalReason.SHUTDOWN); } catch {}
+    try {
+      const receipt = s.emitCancellationTerminalReceipt(TerminalReason.SHUTDOWN, "bridge shutdown");
+      if (receipt?.ok) terminalDrains.push(Promise.resolve(s.finishResponse()).catch(() => {}));
+    } catch {}
   }
+  // Start every writer drain before waiting. A bounded worker queue could let
+  // one group of wedged sockets prevent tail sessions from ever receiving a
+  // terminal. SDK cancellation happens only after this fast all-session pass.
+  if (terminalDrains.length > 0) {
+    const terminalDeadline = Math.max(nowMs(), shutdownDeadline - 5000);
+    await Promise.race([
+      Promise.allSettled(terminalDrains),
+      new Promise((resolve) => setTimeout(resolve, Math.max(0, terminalDeadline - nowMs()))),
+    ]);
+  }
+  const cancelTasks = [];
   for (const [, s] of sessions) {
-    try { await s.cancel({ terminalReason: TerminalReason.SHUTDOWN, detail: "bridge shutdown" }); } catch {}
+    // A cancellation-abandonment guard may have initiated this shutdown from
+    // inside the same cancelPromise. Never self-await that wedged promise; its
+    // round was terminal-journaled above and the process is exiting.
+    if (s.cancelPromise) continue;
+    cancelTasks.push(() => s.cancel({ terminalReason: TerminalReason.SHUTDOWN, detail: "bridge shutdown" }));
   }
+  await runBoundedShutdownTasks(cancelTasks, shutdownDeadline - 1000);
   sessions.clear();
-  for (const [, entry] of platforms) { try { await disposePlatform(entry); } catch {} }
+  const disposeTasks = [...platforms.values()].map((entry) => () => disposePlatform(entry));
+  await runBoundedShutdownTasks(disposeTasks, shutdownDeadline - 250, SHUTDOWN_CANCEL_CONCURRENCY);
   platforms.clear();
+  clearTimeout(forcedExit);
   process.exit(exitCode);
 }
 process.on("SIGTERM", () => { void shutdown(0, true); });
@@ -6401,92 +7787,130 @@ process.on("SIGINT", () => { void shutdown(0, true); });
 
 // CRASH BACKSTOP: an unclassified exception means process invariants are no
 // longer trustworthy. Mark readiness false, terminal-journal every open round,
-// and exit so the parent supervisor restarts the bridge and Go as one unit.
+// and exit so the parent supervisor restarts this sidecar in isolation.
 process.on("uncaughtException", (err, origin) => {
   try { console.error("[cursor-agent-bridge] FATAL uncaughtException; terminalizing rounds and exiting origin=" + origin + ":", (err && err.stack) ? err.stack : err); } catch { /* a logger throw must never re-crash the handler */ }
   void shutdown(1, false);
 });
-// sessionForClosedInputStream attributes a FLOATING WriteIterableClosedError to the one session it can SAFELY
-// blame. The error means a run's INPUT pipe (the SDK's WritableIterable — the channel agent.send writes into)
-// was torn down by an upstream Cursor stream drop and a late write then hit it; it surfaces as an
-// unhandledRejection instead of rejecting run.wait()->onRunError, so the dead run would otherwise linger (the
-// client sees a silent "socket closed", pendings stay stranded until PENDING_TIMEOUT, and the session looks
-// busy). The reason carries NO run/session handle, so attribute ONLY when EXACTLY ONE session has an in-flight
-// STREAMING run (run set, activeRes open, not done) — the unambiguous common case (a single CC user runs one
-// turn at a time). 0 or 2+ candidates -> null (refuse to guess; blaming the wrong one would kill a healthy
-// concurrent turn — same safe degradation as before). Exported for tests.
-function sessionForClosedInputStream(reason, sessionsMap) {
-  const closed = reason && (reason.name === "WriteIterableClosedError" ||
-    /WritableIterable is closed/i.test((reason && reason.message) || ""));
-  return closed ? soleStreamingSession(sessionsMap) : null;
+// These exact errors are leaked by @cursor/sdk's internal cancellation
+// iterators. None carries a session id or cancel generation, so they must never
+// be attributed by looking at whichever session happens to be live later.
+function isClosedInputStreamError(reason) {
+  return !!reason && (reason.name === "WriteIterableClosedError"
+    || /WritableIterable is closed/i.test(String(reason.message || "")));
 }
-
+function isSdkIteratorClosedError(reason) {
+  return !!reason && /^(?:Iterator was closed|AsyncIterator was closed)$/i.test(String(reason.message || "").trim());
+}
 // @cursor/sdk surfaces an expected run.cancel() as an unhandled DOM
 // AbortError from its internal abort listener rather than as the promise that
-// cancel() returns. Keep a short-lived, session-scoped ticket for each explicit
-// cancellation so the process-wide rejection hook cannot turn normal
-// interrupt/redeploy cleanup into a bridge-wide crash. Unexpected AbortErrors
-// still go through the normal single-session teardown below when no ticket
-// exists. Scoping tickets to sessions avoids swallowing an unrelated abort
-// from a concurrent turn merely because another turn was just cancelled.
+// cancel() returns. One cancellation can leak several rejection shapes, so a
+// ticket permits a small bounded sequence rather than disappearing after the
+// first error. Tickets are short-lived, pruned on every insertion/use, and
+// hard-capped so successful cancellations that leak nothing cannot grow this
+// process-local list forever.
 const expectedSdkAbortTickets = [];
-function noteExpectedSdkAbort(sessionId = "") {
-  expectedSdkAbortTickets.push({ sessionId: String(sessionId || ""), expiresAt: nowMs() + 60_000 });
+const EXPECTED_SDK_TICKET_TTL_MS = 10_000;
+const EXPECTED_SDK_TICKET_MAX_MATCHES = 8;
+const EXPECTED_SDK_TICKET_MAX_ENTRIES = 1024;
+function pruneExpectedSdkAbortTickets(now = nowMs()) {
+  for (let i = expectedSdkAbortTickets.length - 1; i >= 0; i--) {
+    const ticket = expectedSdkAbortTickets[i];
+    if (ticket.expiresAt <= now || ticket.matchesRemaining <= 0) expectedSdkAbortTickets.splice(i, 1);
+  }
+  if (expectedSdkAbortTickets.length > EXPECTED_SDK_TICKET_MAX_ENTRIES) {
+    expectedSdkAbortTickets.splice(0, expectedSdkAbortTickets.length - EXPECTED_SDK_TICKET_MAX_ENTRIES);
+  }
+}
+function noteExpectedSdkAbort(sessionId = "", runEpoch = null) {
+  const now = nowMs();
+  pruneExpectedSdkAbortTickets(now);
+  expectedSdkAbortTickets.push({
+    sessionId: String(sessionId || ""),
+    runEpoch: Number.isSafeInteger(runEpoch) ? runEpoch : null,
+    expiresAt: now + EXPECTED_SDK_TICKET_TTL_MS,
+    matchesRemaining: EXPECTED_SDK_TICKET_MAX_MATCHES,
+  });
+  pruneExpectedSdkAbortTickets(now);
 }
 function consumeExpectedSdkAbort(sessionsMap = sessions) {
   const now = nowMs();
-  for (let i = expectedSdkAbortTickets.length - 1; i >= 0; i--) {
-    if (expectedSdkAbortTickets[i].expiresAt <= now) expectedSdkAbortTickets.splice(i, 1);
-  }
+  pruneExpectedSdkAbortTickets(now);
   const index = expectedSdkAbortTickets.findIndex((ticket) => {
     const session = sessionsMap && typeof sessionsMap.get === "function"
       ? sessionsMap.get(ticket.sessionId) : null;
     // Session.cancel marks done before calling run.cancel. If the session has
     // already been removed, that cancellation is also unambiguously complete.
-    return !session || session.done || session.run === null;
+    return !session
+      || session.done
+      || session.run === null
+      || (ticket.runEpoch !== null
+        && Number.isSafeInteger(session.runEpoch)
+        && session.runEpoch > ticket.runEpoch);
   });
   if (index < 0) return false;
-  expectedSdkAbortTickets.splice(index, 1);
+  expectedSdkAbortTickets[index].matchesRemaining--;
+  pruneExpectedSdkAbortTickets(now);
   return true;
+}
+// Cursor's SDK can leak WriteIterableClosedError / "Iterator was closed" from
+// internal async iterators after run.cancel()/agent.close(), outside the
+// promise being awaited. The rejection carries no session id. A recent
+// explicit-cancel ticket is weak temporal evidence for this SDK lifecycle
+// family. The unhandled-rejection policy may use it only when no live SDK work
+// exists; otherwise it restarts rather than letting a global ticket mask an
+// unrelated failure.
+function consumeExpectedSdkLifecycleClosure(sessionsMap = sessions) {
+  return consumeExpectedSdkAbort(sessionsMap);
 }
 function isSdkAbortError(reason) {
   return !!reason && (reason.name === "AbortError" || /operation was aborted/i.test(String(reason.message || "")));
 }
-function sessionForSdkAbort(reason, sessionsMap) {
-  return isSdkAbortError(reason) ? soleSdkRunSession(sessionsMap) : null;
+function currentSdkCancellationContext() {
+  const store = als.getStore();
+  const context = store && store.sdkCancellation;
+  if (!context || typeof context.sessionId !== "string" || !Number.isSafeInteger(context.runEpoch)) return null;
+  return context;
+}
+function hasLiveSdkWork(sessionsMap = sessions) {
+  if (!sessionsMap || typeof sessionsMap.values !== "function") return false;
+  for (const session of sessionsMap.values()) {
+    if (session && !session.done && (session.run || session.sendPending)) return true;
+  }
+  return false;
 }
 
+let fatalRejectionShutdownStarted = false;
 process.on("unhandledRejection", (reason) => {
   try {
-    if (isSdkAbortError(reason) && consumeExpectedSdkAbort(sessions)) {
-      console.error("[cursor-agent-bridge] expected SDK cancellation AbortError ignored:", (reason && reason.message) || reason);
-      return;
-    }
-    if (isSdkAbortError(reason)) {
-      const victim = sessionForSdkAbort(reason, sessions);
-      if (victim) {
-        // An SDK-side abort can originate below agent.cancel(), so it may not
-        // have an explicit ticket. With one unambiguous live/paused session we
-        // can still terminalize that run locally; with multiple sessions we
-        // refuse to guess and leave each bounded watchdog/lease to self-heal.
-        console.error("[cursor-agent-bridge] SDK run aborted mid-turn -> clean teardown session=" + victim.id + ":", (reason && reason.message) || reason);
-        try {
-          if (typeof victim.abortFromSdk === "function") victim.abortFromSdk(new Error("Cursor SDK aborted the active run; the turn was interrupted"));
-          else victim.onRunError(new Error("Cursor SDK aborted the active run; the turn was interrupted"));
-        } catch { /* never throw from the handler */ }
-      } else {
-        console.error("[cursor-agent-bridge] SDK AbortError without an unambiguous session; keeping the bridge alive:", (reason && reason.message) || reason);
+    const sdkLifecycleKind = isSdkAbortError(reason) ? "AbortError"
+      : isClosedInputStreamError(reason) ? "input-stream closure"
+        : isSdkIteratorClosedError(reason) ? "iterator closure"
+          : null;
+    if (sdkLifecycleKind) {
+      const exactCancellation = currentSdkCancellationContext();
+      if (exactCancellation) {
+        console.error("[cursor-agent-bridge] expected SDK cancellation lifecycle rejection ignored session="
+          + exactCancellation.sessionId + " runEpoch=" + exactCancellation.runEpoch + " kind=" + sdkLifecycleKind + ":",
+        (reason && reason.message) || reason);
+        return;
       }
-      return;
-    }
-    const victim = sessionForClosedInputStream(reason, sessions);
-    if (victim) {
-      // Convert the leaked input-pipe closure into a clean run teardown: the in-flight turn ends with a typed
-      // error (not a silent socket close), pendings reject at once (not stranded until PENDING_TIMEOUT), and
-      // the session is freed so the next turn routes against clean state. onRunError is idempotent on `done`,
-      // so a racing real onRunComplete/onRunError cannot double-tear-down.
-      console.error("[cursor-agent-bridge] run input stream closed mid-turn (upstream Cursor drop) -> clean teardown session=" + victim.id + ":", (reason && reason.message) || reason);
-      try { victim.onRunError(new Error("upstream Cursor stream closed mid-run; the turn was interrupted")); } catch { /* never throw from the handler */ }
+      const temporalTicket = consumeExpectedSdkLifecycleClosure(sessions);
+      if (temporalTicket && !hasLiveSdkWork(sessions)) {
+        // Some SDK builds lose async context when forwarding cleanup through a
+        // native/event-emitter boundary. It is safe to use the bounded temporal
+        // fallback only when no run can be stranded or mistaken for the source.
+        console.error("[cursor-agent-bridge] expected SDK cancellation lifecycle rejection ignored with no live SDK work kind="
+          + sdkLifecycleKind + ":", (reason && reason.message) || reason);
+        return;
+      }
+      // With live work and no exact async context, neither the global ticket nor
+      // a "sole live session" heuristic can identify the source. Restart the
+      // isolated sidecar: this avoids both killing an arbitrary session and
+      // swallowing a genuine failure that would strand a run forever.
+      console.error("[cursor-agent-bridge] " + (temporalTicket ? "ambiguous" : "unattributed")
+        + " SDK " + sdkLifecycleKind + "; restarting isolated sidecar:", (reason && reason.message) || reason);
+      void shutdown(1, false);
       return;
     }
     // Both a rate-limit flood (NGHTTP2_ENHANCE_YOUR_CALM) and an auth rejection ([unauthenticated], the session
@@ -6501,15 +7925,31 @@ process.on("unhandledRejection", (reason) => {
     if (poison) {
       const kh = rateLimitedKeyToRecycle(sessions, platforms);
       if (kh) {
+        const affected = terminalizePoisonedPlatformSessions(kh, reason);
         recyclePlatform(kh);
         const e = tripBreaker(kh);
-        console.error("[cursor-agent-bridge] upstream " + poison + " -> recycled connection (force re-auth/re-dial) + breaker OPEN key=" + kh + " fails=" + e.fails + " ~" + Math.ceil(breakerRetryAfterMs(kh) / 1000) + "s:", (reason && reason.message) || reason);
+        console.error("[cursor-agent-bridge] upstream " + poison
+          + " -> terminalized affected sessions=" + affected
+          + " + recycled connection (force re-auth/re-dial) + breaker OPEN key=" + kh
+          + " fails=" + e.fails + " ~" + Math.ceil(breakerRetryAfterMs(kh) / 1000) + "s:",
+        (reason && reason.message) || reason);
       } else {
-        console.error("[cursor-agent-bridge] upstream " + poison + " but could not safely attribute a key (multi-tenant) -> log only:", (reason && reason.message) || reason);
+        // Multiple live tenants and no async attribution means continuing could
+        // strand an arbitrary run on a poisoned shared SDK invariant. Restart
+        // only this sidecar; the parent supervisor keeps the API available.
+        console.error("[cursor-agent-bridge] upstream " + poison
+          + " could not be attributed safely in multi-tenant mode -> restarting isolated sidecar:",
+        (reason && reason.message) || reason);
+        void shutdown(1, false);
       }
       return;
     }
   } catch { /* never throw from the handler */ }
+  if (fatalRejectionShutdownStarted) {
+    try { console.error("[cursor-agent-bridge] additional unhandledRejection during fatal shutdown ignored:", (reason && reason.stack) ? reason.stack : reason); } catch {}
+    return;
+  }
+  fatalRejectionShutdownStarted = true;
   try { console.error("[cursor-agent-bridge] FATAL unhandledRejection; terminalizing rounds and exiting:", (reason && reason.stack) ? reason.stack : reason); } catch { /* never throw from the handler */ }
   void shutdown(1, false);
 });
@@ -6727,10 +8167,15 @@ if (RUN_AS_MAIN) {
     mkdirSync(EMPTY_CWD, { recursive: true });
     accessSync(STATE_ROOT, constants.W_OK);
     probeStateRoot(STATE_ROOT);
-    const { journal, codec } = getRoundInfrastructure();
-    terminalizeOrphanedRounds(journal, codec);
+    const { journal } = getRoundInfrastructure();
+    // Nonterminal rounds may still be owned by an overlapping replica or be
+    // awaiting an exact client continuation after restart. Keep them durable;
+    // signed continuation recovery, not process startup, decides their fate.
+    journal.cas.sweepDirectory(journal.dir, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
+    receiptCAS.sweepDirectory(COMPLETED_TURN_DIR, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
     journal.cleanupTerminal({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
     cleanupCompletedTurnReceipts({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
+    reconcileUnresolvedReservations();
   }
   catch (e) { console.error(`[bridge] STATE_ROOT ${path.resolve(STATE_ROOT)} is not writable: ${e.message}`); process.exit(1); }
   console.log(`[bridge] mode=${MULTI_TENANT ? "multi-tenant (per-key platforms, X-Bridge-Auth gated)" : "single-tenant (one CURSOR_API_KEY)"} durable stateRoot=${path.resolve(STATE_ROOT)} (sqlite session+checkpoint state is written here; NOT a 'zero-FS' guarantee — only TOOL EXECUTION is FS-isolated to the client)`);
@@ -6750,10 +8195,19 @@ if (RUN_AS_MAIN) {
     .then(() => selfTestResultSerialization()) // ADD-74: prove the RETURN trip (result __ccJson -> protobuf via fromJson)
     .then(() => {
       bridgeReady = true;
+      const maintenance = setInterval(() => {
+        try { runDurableMaintenance(); }
+        catch (error) {
+          console.error("[cursor-agent-bridge] durable maintenance failed; preserving state:",
+            (error && error.message) || String(error));
+        }
+      }, DURABLE_MAINTENANCE_MS);
+      maintenance.unref();
       server.listen(PORT, BRIDGE_HOST, () => console.log(`[cursor-agent-bridge] listening on http://${BRIDGE_HOST}:${PORT} (ready, patched CJS, native-unreachable + bundle-seam + result-serialization self-tests passed, durable stateRoot=${STATE_ROOT})`));
     })
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, sessions, liveToolRounds, completedTurnReceipts, sessionForClosedInputStream, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, sessionForSdkAbort, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, toolResultRecoveryPlan, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort };
+export { runDurableMaintenance };
+export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

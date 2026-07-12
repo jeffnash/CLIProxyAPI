@@ -90,6 +90,19 @@ Default merge safety rules:
 - `CURSOR_AGENT_BRIDGE_PORT` (default `9798`) - port for the `cursor-agent-bridge.mjs` HTTP server inside the container.
 - `CURSOR_AGENT_BRIDGE_URL` (default `http://127.0.0.1:9798`) - base URL the Go executor uses to reach the bridge (also settable per-key via the `cursor-api-key[].composer-client-tools-bridge-url` YAML attribute).
 - `CURSOR_AGENT_STATE_ROOT` (local default `./.cursor-agent-store`; Railway default `$RAILWAY_VOLUME_MOUNT_PATH/.cursor-agent-store`) - writable directory for SDK durable state, signed-routing key, ToolRound journals, receipts, and terminal tombstones. On Railway it must resolve beneath the attached volume or startup fails.
+- `CURSOR_COMPOSER_BRIDGE_RECONNECT_MAX_MS` (default `90000`, or 90 seconds) - bounded pre-response recovery window for replay-safe requests while the supervised loopback bridge restarts. Set to `0` to disable. It only bounds connection establishment; established bridge streams remain timeout-free.
+- `CURSOR_COMPOSER_BRIDGE_RECONNECT_REMOTE` (default unset / disabled) - when truthy, enables the same pre-response reconnect behavior for a non-loopback bridge URL. Remote reconnect remains limited to requests with durable replay identity.
+- `CURSOR_COMPOSER_STREAM_COMMIT_MAX_BYTES` (default `67108864`, or 64 MiB) - maximum translated model-visible data buffered until a typed terminal permits atomic stream commit. Exceeding the limit fails without exposing buffered assistant or tool output.
+- `CURSOR_COMPOSER_STREAM_COMMIT_GLOBAL_MAX_BYTES` (default `268435456`, or 256 MiB) - process-wide cap across all atomic stream buffers. Admission failures are local-capacity errors and never poison or rotate a Cursor credential.
+- `CURSOR_COMPOSER_STATE_ROOT_MIN_FREE_BYTES` (default `67108864`, or 64 MiB) - minimum free durable-state capacity. Readiness degrades below this floor, and new fresh turns require additional room for their bounded recovery receipt; existing continuations still attempt to journal uncertainty evidence.
+- `CURSOR_COMPOSER_REPLAY_GLOBAL_MAX_BYTES` (default `268435456`, or 256 MiB) - process-wide admission budget reserved before SDK sends so ordered replay remains complete under concurrency.
+- `CURSOR_COMPOSER_UNRESOLVED_RECEIPT_MAX_BYTES` (default `1073741824`, or 1 GiB) - shared durable reservation ceiling for acceptance-unknown fresh-turn envelopes across overlapping bridge processes.
+- `CURSOR_COMPOSER_UNRESOLVED_RESERVATION_ORPHAN_MS` (default `3600000`) - retention window for a shared reservation whose receipt was never published. Published UNKNOWN/RUNNING/FAILED evidence is never age-evicted.
+- Receipt and ToolRound mutations use immutable revision claims and helper-completable filesystem CAS. There is no timestamp-based lock stealing; a replacement process can finish a claimed commit without allowing a paused stale writer to overwrite it.
+- `CURSOR_AGENT_DURABLE_MAINTENANCE_MS` (default `300000`, or 5 minutes) - periodic terminal-journal and completed-replay cleanup cadence. Acceptance-unknown fresh receipts are never age/count evicted.
+- `CURSOR_AGENT_SHUTDOWN_MAX_MS` (default `28000`) - one global bridge shutdown deadline for drain, concurrent cancellation, and store disposal. The default reserves time below Railway's 30-second drain window instead of relying on platform SIGKILL.
+- `CURSOR_AGENT_SHUTDOWN_CANCEL_CONCURRENCY` (default `16`) - bounded shutdown cancellation/disposal worker count, preventing one wedged session from serializing cleanup for all others.
+- `CURSOR_COMPOSER_SYSTEM_MAX_BYTES` (default `524288`, or 512 KiB) - aggregate cap for deduplicated, complete system/developer blocks. Unchanged blocks are not re-sent; append-only deltas remain deltas; replacement/removal/reorder rotates and re-seeds.
 - `CURSOR_DIRECT` (default unset) - set to `1` to skip the bridge and use the gated legacy direct Cursor path instead of the default ToS-safe Cursor Composer Client-Tools path.
 - `CURSOR_AGENT_BRIDGE_TOKEN` (default unset) - **multi-tenant opt-in.** Leave unset for the usual single-key setup (the bridge authenticates the forwarded key against `CURSOR_API_KEY`). When set, the bridge instead gates on this token (sent by CLIProxy as `X-Bridge-Auth`) and uses each request's forwarded per-user Cursor key under an **isolated** SDK platform + `STATE_ROOT/k_<hash>`, so multiple Cursor keys can safely share one bridge. Pair with the per-key `cursor-api-key[].composer-client-tools-bridge-token` YAML attribute. (Simpler alternative: run one bridge per Cursor key via per-key `composer-client-tools-bridge-url`.)
 - `CURSOR_AGENT_MAX_PLATFORMS` (default `64`) / `CURSOR_AGENT_PLATFORM_TTL_MS` (default `3600000`) - bound + idle-evict the per-key platform pool (multi-tenant only; the single-tenant platform is always resident).
@@ -106,6 +119,14 @@ Default merge safety rules:
   - `SECRET_DLP_DEFAULT_PROVIDER_POLICY=enabled|disabled` plus `SECRET_DLP_PROVIDER_OVERRIDES=provider=enabled,other=disabled` controls which providers get redaction. Managed-provider `secret-redaction` and auth-level `secret_redaction` can override this policy.
 
 **Node.js (Cursor sidecar + optional Electron):** the production Docker image bakes Node **22**, runs `npm ci`, applies the structural SDK patch, runs the bridge suite, and runs the SDK self-tests during image build. `railway_start.sh` refuses a missing/wrong Node major or missing patch descriptor; it never installs or patches the Cursor sidecar at runtime. `railpack.json` retains an equivalent build-time fallback when Railpack is selected explicitly.
+
+Cursor Composer streams commit model-visible text, reasoning, tool calls, and translated terminal frames only after the
+bridge emits a typed `turn_end`. Typed bridge pings still flow downstream as schema-neutral SSE comments while output is
+buffered, so Railway and the client connection stay alive without observing a partial assistant response.
+Clients that need restart-stable separation of byte-identical parallel calls should send a stable-per-retry,
+unique-per-invocation `Idempotency-Key`, `X-Client-Turn-ID`, `metadata.invocation_id`, or `metadata.turn_id`.
+This is a client-neutral protocol contract; the bridge does not inspect client names or prompt contents.
+
 - `STREAMING_KEEPALIVE_SECONDS` (default `0` / disabled) - how often the server emits SSE heartbeats (`: keep-alive\n\n`) during streaming responses.
   - What it is: a keep-alive mechanism to prevent Railway's proxy from closing idle connections.
   - What it does: sends a comment heartbeat every N seconds during SSE streaming to keep the connection alive.

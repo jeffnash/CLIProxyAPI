@@ -875,6 +875,8 @@ if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR
   fi
   CURSOR_AGENT_STATE_ROOT="${CURSOR_AGENT_STATE_ROOT:-${ROOT_DIR}/.cursor-agent-store}"
   if [[ -d "${CURSOR_BRIDGE_DIR}" ]]; then
+    # shellcheck source=scripts/lib/cursor-bridge-supervisor.sh
+    source "${ROOT_DIR}/scripts/lib/cursor-bridge-supervisor.sh"
     require_cmd node
     node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
     if [[ "${node_major}" != "22" ]]; then
@@ -885,38 +887,8 @@ if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR
       err "Cursor bridge dependencies/structural SDK patch are missing from the image; rebuild it (runtime npm install is intentionally disabled)"
       exit 1
     fi
-    info "Starting Cursor Composer Client-Tools agent bridge on port ${CURSOR_AGENT_BRIDGE_PORT} (Node $(node --version 2>/dev/null || echo unknown))"
-    (
-      cd "${CURSOR_BRIDGE_DIR}"
-      exec env CURSOR_API_KEY="${CURSOR_API_KEY:-}" \
-        CURSOR_AGENT_BRIDGE_TOKEN="${CURSOR_AGENT_BRIDGE_TOKEN:-}" \
-        CURSOR_AGENT_BRIDGE_PORT="${CURSOR_AGENT_BRIDGE_PORT}" \
-        CURSOR_AGENT_STATE_ROOT="${CURSOR_AGENT_STATE_ROOT}" \
-        CURSOR_COMPOSER_DEBUG="${CURSOR_COMPOSER_DEBUG:-}" \
-        node cursor-agent-bridge.mjs
-    ) &
-    CURSOR_BRIDGE_PID=$!
-    sidecar_ready=0
-    for _ in $(seq 1 60); do
-      if ! kill -0 "${CURSOR_BRIDGE_PID}" >/dev/null 2>&1; then
-        err "Cursor Composer Client-Tools bridge exited during startup"
-        wait "${CURSOR_BRIDGE_PID}" || true
-        exit 1
-      fi
-      if command -v curl >/dev/null 2>&1; then
-        if curl -fsS "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/ready" >/dev/null 2>&1; then
-          sidecar_ready=1
-          break
-        fi
-      elif command -v wget >/dev/null 2>&1; then
-        if wget -qO- "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/ready" >/dev/null 2>&1; then
-          sidecar_ready=1
-          break
-        fi
-      fi
-      sleep 1
-    done
-    if [[ "${sidecar_ready}" != "1" ]]; then
+    start_cursor_bridge_process
+    if ! wait_cursor_bridge_ready; then
       info "Cursor Composer Client-Tools bridge failed readiness; refusing to start the API"
       exit 1
     else
@@ -947,17 +919,21 @@ shutdown_children() {
 }
 trap shutdown_children TERM INT
 
-# Keep the API and bridge in one failure domain. The public /readyz endpoint
-# probes both while they are alive; if either child exits, terminate its sibling
-# and let Railway's restart policy rebuild a coherent pair.
+# The API is the supervisor for the optional Cursor sidecar. If the API exits,
+# stop the sidecar and let Railway restart the service. If only the bridge exits,
+# keep non-Composer providers available, leave /readyz degraded through
+# CURSOR_AGENT_BRIDGE_REQUIRED, and restart the bridge against the same durable
+# STATE_ROOT. A session-local SDK cleanup failure must not become an API-wide
+# outage.
+bridge_restart_delay=1
+bridge_stable_uptime=60
 while true; do
   if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
     set +e
     wait "${SERVER_PID}"
     server_status=$?
     set -e
-    kill -TERM "${CURSOR_BRIDGE_PID}" >/dev/null 2>&1 || true
-    wait "${CURSOR_BRIDGE_PID}" 2>/dev/null || true
+    stop_cursor_bridge_process
     exit "${server_status}"
   fi
   if ! kill -0 "${CURSOR_BRIDGE_PID}" >/dev/null 2>&1; then
@@ -965,10 +941,32 @@ while true; do
     wait "${CURSOR_BRIDGE_PID}"
     bridge_status=$?
     set -e
-    err "Cursor bridge exited after startup (status=${bridge_status}); stopping API for a coherent restart"
-    kill -TERM "${SERVER_PID}" >/dev/null 2>&1 || true
-    wait "${SERVER_PID}" 2>/dev/null || true
-    exit 1
+    bridge_uptime=$((SECONDS - CURSOR_BRIDGE_STARTED_AT))
+    update_cursor_bridge_restart_delay "${bridge_uptime}"
+    err "Cursor bridge exited after startup (status=${bridge_status}, uptime=${bridge_uptime}s); restarting isolated sidecar in ${bridge_restart_delay}s while API remains available"
+    while kill -0 "${SERVER_PID}" >/dev/null 2>&1; do
+      if ! wait_cursor_bridge_restart_delay "${bridge_restart_delay}"; then
+        break
+      fi
+      if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+        break
+      fi
+      start_cursor_bridge_process
+      set +e
+      wait_cursor_bridge_ready
+      bridge_ready_status=$?
+      set -e
+      if [[ "${bridge_ready_status}" == "0" ]]; then
+        info "Cursor Composer Client-Tools agent bridge recovered"
+        break
+      fi
+      if [[ "${bridge_ready_status}" == "2" ]] || ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+        stop_cursor_bridge_process readiness
+        break
+      fi
+      update_cursor_bridge_restart_delay 0
+      err "Cursor bridge restart failed readiness; retrying in ${bridge_restart_delay}s"
+    done
   fi
   sleep 1
 done

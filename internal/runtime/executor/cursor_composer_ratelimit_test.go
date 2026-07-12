@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 // TestComposerBridgeRateLimitStatusError pins the client-facing 429 message: a bridge rate-limit/backoff (or
@@ -83,6 +85,34 @@ func TestComposerBridgeRateLimitRetryAfter(t *testing.T) {
 	h := http.Header{"Retry-After": []string{"7"}}
 	if got := parseComposerRetryAfterHeader(h, time.Now()); got == nil || *got != 7*time.Second {
 		t.Fatalf("header RetryAfter = %v, want 7s", got)
+	}
+}
+
+func TestComposerBridgeRateLimitAttributionUsesStructuredCode(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		code          string
+		wantScope     cliproxyexecutor.RetryScope
+		wantAuthBlame bool
+	}{
+		{name: "local admission", code: "local_admission_capacity", wantScope: cliproxyexecutor.RetryScopeSelectedExecution},
+		{name: "local replay", code: "local_replay_capacity", wantScope: cliproxyexecutor.RetryScopeSelectedExecution},
+		{name: "durable state", code: "durable_state_capacity", wantScope: cliproxyexecutor.RetryScopeSelectedExecution},
+		{name: "session capacity", code: "session_capacity", wantScope: cliproxyexecutor.RetryScopeSelectedExecution},
+		{name: "platform capacity", code: "platform_capacity", wantScope: cliproxyexecutor.RetryScopeSelectedExecution},
+		{name: "session queue", code: "session_queue_capacity", wantScope: cliproxyexecutor.RetryScopeSelectedExecution},
+		{name: "upstream account", code: "upstream_account_rate_limit", wantScope: cliproxyexecutor.RetryScopeDefault, wantAuthBlame: true},
+		{name: "legacy untyped 429", code: "", wantScope: cliproxyexecutor.RetryScopeDefault, wantAuthBlame: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &composerBridgeStatusError{status: http.StatusTooManyRequests, bridgeCode: tc.code}
+			if got := err.RetryScope(); got != tc.wantScope {
+				t.Fatalf("RetryScope = %v, want %v", got, tc.wantScope)
+			}
+			if got := err.AuthAttributable(); got != tc.wantAuthBlame {
+				t.Fatalf("AuthAttributable = %v, want %v", got, tc.wantAuthBlame)
+			}
+		})
 	}
 }
 

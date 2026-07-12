@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,9 +14,14 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -229,6 +235,99 @@ func TestComposerInputClassification(t *testing.T) {
 	}
 }
 
+func TestComposerSystemDeduplicatesAndBoundsHiddenHooks(t *testing.T) {
+	const hook = "Stable project guidance\nUse the declared repository conventions."
+	messages := make([]map[string]any, 0, 53)
+	messages = append(messages, map[string]any{"role": "system", "content": "base system"})
+	for i := 0; i < 50; i++ {
+		messages = append(messages, map[string]any{"role": "developer", "content": "\r\n" + hook + "  "})
+	}
+	messages = append(messages,
+		map[string]any{"role": "developer", "content": "distinct update"},
+		map[string]any{"role": "user", "content": "ship the selected zip"},
+	)
+	body, err := json.Marshal(map[string]any{"messages": messages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := gjson.GetBytes(body, "messages").Array()
+	system := extractComposerSystem(parsed)
+	blocks := extractComposerSystemBlocks(parsed, "")
+	if count := strings.Count(system, "Stable project guidance"); count != 1 {
+		t.Fatalf("duplicate developer hooks must collapse to one copy, got %d in %q", count, system)
+	}
+	if !strings.Contains(system, "base system") || !strings.Contains(system, "distinct update") {
+		t.Fatalf("unique system/developer blocks must retain input order, got %q", system)
+	}
+	if len(blocks) != 3 || composerSystemBlocksText(blocks) != system {
+		t.Fatalf("structured blocks must exactly describe aggregate context: %#v / %q", blocks, system)
+	}
+	for _, block := range blocks {
+		if !strings.HasPrefix(block.ID, "csb1_") || block.Text == "" {
+			t.Fatalf("system block needs stable identity and non-empty text: %#v", block)
+		}
+	}
+
+	base := composerInput([]byte(`{"messages":[{"role":"developer","content":"same hook"},{"role":"user","content":"do it"}]}`))
+	duplicates := composerInput([]byte(`{"messages":[{"role":"developer","content":"same hook"},{"role":"developer","content":" same hook "},{"role":"user","content":"do it"}]}`))
+	if base["clientMessageId"] != duplicates["clientMessageId"] {
+		t.Fatalf("semantically duplicate hidden hooks must not change retry identity: %v vs %v", base["clientMessageId"], duplicates["clientMessageId"])
+	}
+	baseBlocks, ok := base["systemBlocks"].([]composerSystemBlock)
+	if !ok || len(baseBlocks) != 1 {
+		t.Fatalf("fresh input must carry one structured system block, got %#v", base["systemBlocks"])
+	}
+	duplicateBlocks, ok := duplicates["systemBlocks"].([]composerSystemBlock)
+	if !ok || !reflect.DeepEqual(baseBlocks, duplicateBlocks) {
+		t.Fatalf("duplicate hook replay changed delivered block identity: %#v vs %#v", baseBlocks, duplicates["systemBlocks"])
+	}
+
+	appended := composerInput([]byte(`{"messages":[{"role":"developer","content":"same hook"},{"role":"developer","content":"new suffix"},{"role":"user","content":"do it"}]}`))
+	appendedBlocks, ok := appended["systemBlocks"].([]composerSystemBlock)
+	if !ok || len(appendedBlocks) != 2 || appendedBlocks[0].ID != baseBlocks[0].ID {
+		t.Fatalf("ordinary context growth must preserve an exact block-ID prefix: %#v", appended["systemBlocks"])
+	}
+	replaced := composerInput([]byte(`{"messages":[{"role":"developer","content":"replacement"},{"role":"user","content":"do it"}]}`))
+	replacedBlocks, ok := replaced["systemBlocks"].([]composerSystemBlock)
+	if !ok || len(replacedBlocks) != 1 || replacedBlocks[0].ID == baseBlocks[0].ID {
+		t.Fatalf("replacement context must not masquerade as the original block: %#v", replaced["systemBlocks"])
+	}
+
+	saved := composerSystemMaxBytes
+	composerSystemMaxBytes = 4096
+	defer func() { composerSystemMaxBytes = saved }()
+	huge := strings.Repeat("界", 4000)
+	boundedBody, _ := json.Marshal(map[string]any{"messages": []map[string]any{
+		{"role": "system", "content": "HEAD " + huge},
+		{"role": "developer", "content": huge + " TAIL"},
+	}})
+	bounded := extractComposerSystem(gjson.GetBytes(boundedBody, "messages").Array())
+	boundedBlocks := extractComposerSystemBlocks(gjson.GetBytes(boundedBody, "messages").Array(), "")
+	if len(bounded) > composerSystemMaxBytes {
+		t.Fatalf("system/developer aggregate exceeded strict cap: %d > %d", len(bounded), composerSystemMaxBytes)
+	}
+	if !utf8.ValidString(bounded) || !strings.Contains(bounded, "content omitted inside this system/developer instruction block") {
+		t.Fatalf("bounded instructions must remain valid UTF-8 and mark omission, len=%d", len(bounded))
+	}
+	if composerSystemBlocksText(boundedBlocks) != bounded {
+		t.Fatalf("bounded structured blocks diverged from aggregate text: %#v", boundedBlocks)
+	}
+	for _, block := range boundedBlocks {
+		if !utf8.ValidString(block.Text) {
+			t.Fatalf("bounded block split UTF-8: %#v", block)
+		}
+	}
+
+	fullNoSystem := composerInput([]byte(`{"messages":[{"role":"user","content":"fresh stateless turn"}]}`))
+	if blocks, ok := fullNoSystem["systemBlocks"].([]composerSystemBlock); !ok || len(blocks) != 0 {
+		t.Fatalf("a full stateless snapshot must signal authoritative empty system context: %#v", fullNoSystem)
+	}
+	thinChained := composerInput([]byte(`{"previous_response_id":"resp_existing","messages":[{"role":"user","content":"thin chained turn"}]}`))
+	if _, exists := thinChained["systemBlocks"]; exists {
+		t.Fatalf("a thin server-chained turn must inherit omitted system context, got %#v", thinChained)
+	}
+}
+
 func TestComposerFreshUserTurnHasRetryStableMessageID(t *testing.T) {
 	request := []byte(`{"messages":[{"role":"system","content":"S"},{"role":"user","content":"do one thing"}]}`)
 	first := composerInput(request)
@@ -252,6 +351,31 @@ func TestComposerFreshUserTurnHasRetryStableMessageID(t *testing.T) {
 	]}`))
 	if repeatedLater["clientMessageId"] == id {
 		t.Fatalf("a later intentional repetition must not reuse the first turn id %q", id)
+	}
+}
+
+func TestComposerInvocationIDExtraction(t *testing.T) {
+	jsonUserID := `{"session_id":"session-1","turn_id":"inv1_turn-0001"}`
+	original, _ := json.Marshal(map[string]any{"metadata": map[string]any{"user_id": jsonUserID}})
+	if got := composerInvocationID(nil, cliproxyexecutor.Options{OriginalRequest: original}); got != "inv1_turn-0001" {
+		t.Fatalf("JSON metadata invocation id = %q", got)
+	}
+
+	opts := optsWithHeaders(map[string]string{
+		"Idempotency-Key": "inv1_standard-0002",
+	})
+	if got := composerInvocationID(nil, opts); got != "inv1_standard-0002" {
+		t.Fatalf("standard header invocation id = %q", got)
+	}
+
+	clientTurn := optsWithHeaders(map[string]string{"X-Client-Turn-ID": "inv1_client-0003"})
+	if got := composerInvocationID(nil, clientTurn); got != "inv1_client-0003" {
+		t.Fatalf("client turn header invocation id = %q", got)
+	}
+
+	invalid, _ := json.Marshal(map[string]any{"metadata": map[string]any{"turn_id": "contains spaces"}})
+	if got := composerInvocationID(invalid, cliproxyexecutor.Options{OriginalRequest: invalid}); got != "" {
+		t.Fatalf("invalid invocation id must be ignored, got %q", got)
 	}
 }
 
@@ -567,6 +691,163 @@ func TestComposerClientMessageIDIsRetryStableAndTurnDistinct(t *testing.T) {
 	}
 }
 
+func TestPrepareComposerInboundStockClientExactRetryReattachesLease(t *testing.T) {
+	e := NewCursorExecutor(&config.Config{})
+	auth := authWith("stock-lease-auth", "stock-lease-key")
+	opts := composerExecOpts("openai", "stock-lease-conversation")
+	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: toolTurn("same stock-client request")}
+
+	first, err := e.prepareComposerInbound(auth, "stock-lease-key", req, opts, true)
+	if err != nil {
+		t.Fatalf("first prepare: %v", err)
+	}
+	defer composerInflight.release(first.tenant, first.sessionID, first.leaseOwner)
+	second, err := e.prepareComposerInbound(auth, "stock-lease-key", req, opts, true)
+	if err != nil {
+		t.Fatalf("retry prepare: %v", err)
+	}
+	if first.sessionID != second.sessionID || first.leaseOwner != second.leaseOwner {
+		t.Fatalf("stock retry forked instead of reattaching: first=%s/%d second=%s/%d",
+			first.sessionID, first.leaseOwner, second.sessionID, second.leaseOwner)
+	}
+	clientMessageID, _ := first.input["clientMessageId"].(string)
+	if !strings.HasPrefix(clientMessageID, "ccm2_") {
+		t.Fatalf("stock compatibility identity = %q, want ccm2_", clientMessageID)
+	}
+	if _, explicit := first.input["invocationId"]; explicit {
+		t.Fatalf("stock request unexpectedly gained a client-supplied invocationId: %#v", first.input)
+	}
+}
+
+func TestExecuteComposerEstablishedStreamReconnectsStockClientWithoutDuplicateFrames(t *testing.T) {
+	t.Setenv("CURSOR_COMPOSER_STREAM_RECONNECT_MAX_ATTEMPTS", "1")
+	t.Setenv("CURSOR_COMPOSER_ADMISSION_MAX_ACTIVE_PER_KEY", "1")
+	t.Setenv("CURSOR_COMPOSER_ADMISSION_MIN_GAP_MS", "0")
+	var mu sync.Mutex
+	calls := 0
+	var bodies [][]byte
+	var authHeaders []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls++
+		call := calls
+		bodies = append(bodies, append([]byte(nil), raw...))
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		write := func(payload string) {
+			_, _ = io.WriteString(w, "data: "+payload+"\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		write(`{"type":"ping"}`)
+		write(`{"type":"reasoning","delta":"think"}`)
+		write(`{"type":"text","delta":"hel"}`)
+		if call == 1 {
+			return // accepted request, partial frames, then bridge EOF without terminal
+		}
+		write(`{"type":"text","delta":"lo"}`)
+		write(`{"type":"turn_end","stop_reason":"end_turn"}`)
+		write("[DONE]")
+	}))
+	defer srv.Close()
+
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "stock-stream-reattach", Attributes: map[string]string{
+		"api_key":                          "same-key",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: toolTurn("recover this stock request")}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := e.executeComposerStream(ctx, auth, "same-key", req, composerExecOpts("openai", "stock-stream-reattach"))
+	if err != nil {
+		t.Fatalf("stream setup: %v", err)
+	}
+	var wire strings.Builder
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("post-connect recovery surfaced an error: %v", chunk.Err)
+		}
+		wire.Write(chunk.Payload)
+	}
+	got := wire.String()
+	if !strings.Contains(got, ": keepalive") {
+		t.Fatalf("keepalive was not forwarded during atomic recovery: %q", got)
+	}
+	if strings.Count(got, `"reasoning_content":"think"`) != 1 ||
+		strings.Count(got, `"content":"hel"`) != 1 || strings.Count(got, `"content":"lo"`) != 1 {
+		t.Fatalf("replayed model frames were duplicated or lost: %s", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 || !bytes.Equal(bodies[0], bodies[1]) {
+		t.Fatalf("same-invocation reattach calls=%d bodiesEqual=%v", calls, len(bodies) == 2 && bytes.Equal(bodies[0], bodies[1]))
+	}
+	for i, header := range authHeaders {
+		if header != "Bearer same-key" {
+			t.Fatalf("attempt %d rotated credential: %q", i+1, header)
+		}
+	}
+	if !strings.HasPrefix(gjson.GetBytes(bodies[0], "input.clientMessageId").String(), "ccm2_") ||
+		gjson.GetBytes(bodies[0], "input.invocationId").Exists() {
+		t.Fatalf("test did not exercise stock ccm2 fallback: %s", bodies[0])
+	}
+}
+
+func TestExecuteComposerEstablishedResponseReconnectsWithoutDuplicateContent(t *testing.T) {
+	t.Setenv("CURSOR_COMPOSER_STREAM_RECONNECT_MAX_ATTEMPTS", "1")
+	var mu sync.Mutex
+	calls := 0
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls++
+		call := calls
+		bodies = append(bodies, append([]byte(nil), raw...))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"type\":\"reasoning\",\"delta\":\"think\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"text\",\"delta\":\"hel\"}\n\n")
+		if call == 1 {
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"type\":\"text\",\"delta\":\"lo\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "stock-response-reattach", Attributes: map[string]string{
+		"api_key":                          "same-key",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: toolTurn("recover this non-stream request")}
+	resp, err := e.executeComposer(context.Background(), auth, "same-key", req, composerExecOpts("openai", "stock-response-reattach"))
+	if err != nil {
+		t.Fatalf("non-stream post-connect recovery: %v", err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "hello" {
+		t.Fatalf("recovered content = %q, want hello: %s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.reasoning_content").String(); got != "think" {
+		t.Fatalf("recovered reasoning = %q, want think: %s", got, resp.Payload)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 || !bytes.Equal(bodies[0], bodies[1]) {
+		t.Fatalf("non-stream reattach calls=%d bodiesEqual=%v", calls, len(bodies) == 2 && bytes.Equal(bodies[0], bodies[1]))
+	}
+}
+
 // RC4: re-translating an already-OpenAI payload through the source(claude)->openai translator CORRUPTS it
 // (the gated CURSOR_DIRECT path's double-translation bug — here it drops the tool name). The fix reuses the
 // single-translation result instead of re-translating; this test pins the hazard.
@@ -620,11 +901,215 @@ func TestExecuteComposerStreamBridgeErrorSurfaces(t *testing.T) {
 	}
 }
 
-func TestExecuteComposerContainedConflictIsNormalRetryableTurn(t *testing.T) {
+func TestComposerRetryableCancellationTerminalMapsToTyped503(t *testing.T) {
+	retryable := gjson.Parse(`{"type":"turn_end","stop_reason":"error","retryable":true,"error":"bridge shutdown"}`)
+	err := composerBridgeTurnFailure("resp_retryable_cancel", retryable)
+	var statusErr cliproxyexecutor.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("retryable cancellation terminal must map to typed 503, got %T %v", err, err)
+	}
+	if strings.Contains(err.Error(), "bridge shutdown") {
+		t.Fatalf("client-facing retryable error must not expose internal cancellation detail: %v", err)
+	}
+
+	terminal := gjson.Parse(`{"type":"turn_end","stop_reason":"error","retryable":false,"error":"contract failed"}`)
+	err = composerBridgeTurnFailure("resp_terminal_cancel", terminal)
+	if errors.As(err, &statusErr) {
+		t.Fatalf("non-retryable bridge failure must retain ordinary terminal semantics, got typed status: %v", err)
+	}
+	if !strings.Contains(err.Error(), "contract failed") {
+		t.Fatalf("ordinary bridge terminal lost its error: %v", err)
+	}
+}
+
+func TestComposerAmbiguousTrailingUserSegmentsFailClosed(t *testing.T) {
+	messages := gjson.Parse(`[
+		{"role":"user","content":"transfer the newest bundle"},
+		{"role":"user","content":"standing repository discovery instructions"}
+	]`).Array()
+	if !composerAmbiguousTrailingUserSegments(messages) {
+		t.Fatal("adjacent non-empty user-role suffix must be treated as provenance-ambiguous")
+	}
+
+	unambiguous := gjson.Parse(`[
+		{"role":"user","content":"earlier turn"},
+		{"role":"assistant","content":"reply"},
+		{"role":"user","content":"current turn"}
+	]`).Array()
+	if composerAmbiguousTrailingUserSegments(unambiguous) {
+		t.Fatal("ordinary alternating conversation must remain accepted")
+	}
+}
+
+func TestAnthropicMessagesAdjacentUserSuffixFailsBeforeBridgeExecution(t *testing.T) {
+	var bridgeCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bridgeCalls.Add(1)
+		http.Error(w, "bridge must not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	payload := []byte(`{
+		"model":"composer-2.5",
+		"messages":[
+			{"role":"user","content":"transfer the selected bundle"},
+			{"role":"user","content":"standing repository discovery instructions"}
+		]
+	}`)
+	opts := composerExecOpts("claude", "ambiguous-anthropic-wire")
+	opts.OriginalRequest = append([]byte(nil), payload...)
+	opts.Metadata = map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/messages"}
+	auth := &cliproxyauth.Auth{ID: "ambiguous-anthropic", Attributes: map[string]string{
+		"api_key":                          "cursor-key",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	executor := NewCursorExecutor(&config.Config{})
+	_, err := executor.executeComposer(context.Background(), auth, "cursor-key", cliproxyexecutor.Request{
+		Model:   "composer-2.5",
+		Payload: payload,
+	}, opts)
+	if err == nil {
+		t.Fatal("adjacent user-role suffix must fail closed")
+	}
+	var statusErr cliproxyexecutor.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("ambiguous request error = %T %v, want typed 400", err, err)
+	}
+	if !strings.Contains(err.Error(), "ambiguous adjacent user-role segments") {
+		t.Fatalf("ambiguous request error lost recovery guidance: %v", err)
+	}
+	var disposition cliproxyexecutor.ErrorDisposition
+	if !errors.As(err, &disposition) || disposition.RetryScope() != cliproxyexecutor.RetryScopeSelectedExecution || disposition.AuthAttributable() {
+		t.Fatalf("ambiguous request disposition = %#v, want selected execution and non-auth-attributable", disposition)
+	}
+	if got := bridgeCalls.Load(); got != 0 {
+		t.Fatalf("bridge/model/tool execution calls = %d, want zero", got)
+	}
+}
+
+func TestManagerAdjacentUserSuffixDoesNotRotateOrPoisonCredentials(t *testing.T) {
+	var bridgeCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bridgeCalls.Add(1)
+		http.Error(w, "bridge must not be called", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	payload := []byte(`{
+		"model":"composer-2.5",
+		"messages":[
+			{"role":"user","content":"perform the requested operation"},
+			{"role":"user","content":"standing injected context"}
+		]
+	}`)
+	opts := composerExecOpts("claude", "ambiguous-manager-wire")
+	opts.OriginalRequest = append([]byte(nil), payload...)
+	opts.Metadata = map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/messages"}
+
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "nonstream", true: "stream"}[stream], func(t *testing.T) {
+			manager := cliproxyauth.NewManager(nil, &cliproxyauth.RoundRobinSelector{}, nil)
+			manager.RegisterExecutor(NewCursorExecutor(&config.Config{}))
+			for _, id := range []string{"ambiguous-a", "ambiguous-b"} {
+				_, err := manager.Register(context.Background(), &cliproxyauth.Auth{
+					ID:       id,
+					Provider: "cursor",
+					Attributes: map[string]string{
+						"api_key":                          "cursor-key",
+						"composer_client_tools_bridge_url": srv.URL,
+					},
+				})
+				if err != nil {
+					t.Fatalf("register %s: %v", id, err)
+				}
+				registry.GetGlobalRegistry().RegisterClient(id, "cursor", []*registry.ModelInfo{{ID: "composer-2.5"}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+			}
+
+			req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: payload}
+			var err error
+			if stream {
+				_, err = manager.ExecuteStream(context.Background(), []string{"cursor"}, req, opts)
+			} else {
+				_, err = manager.Execute(context.Background(), []string{"cursor"}, req, opts)
+			}
+			if err == nil {
+				t.Fatal("ambiguous adjacent user-role suffix must fail closed")
+			}
+			var statusErr cliproxyexecutor.StatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusBadRequest {
+				t.Fatalf("manager error = %T %v, want typed 400", err, err)
+			}
+			if got := bridgeCalls.Load(); got != 0 {
+				t.Fatalf("bridge/model/tool execution calls = %d, want zero", got)
+			}
+			for _, id := range []string{"ambiguous-a", "ambiguous-b"} {
+				auth, ok := manager.GetByID(id)
+				if !ok || auth.Unavailable || auth.LastError != nil {
+					t.Fatalf("credential %s was poisoned by request provenance rejection: %#v", id, auth)
+				}
+			}
+		})
+	}
+}
+
+func TestCursorDirectAdjacentUserSuffixFailsBeforeCredentialExchange(t *testing.T) {
+	var outboundCalls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		outboundCalls.Add(1)
+		http.Error(w, "credential exchange must not be called", http.StatusInternalServerError)
+	}))
+	defer proxy.Close()
+
+	payload := []byte(`{
+		"model":"composer-2.5",
+		"messages":[
+			{"role":"user","content":"perform the requested operation"},
+			{"role":"user","content":"standing injected context"}
+		]
+	}`)
+	auth := &cliproxyauth.Auth{ID: "direct-ambiguous", ProxyURL: proxy.URL}
+	opts := composerExecOpts("openai", "direct-ambiguous-wire")
+	executor := NewCursorExecutor(&config.Config{})
+	for _, stream := range []bool{false, true} {
+		req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: append([]byte(nil), payload...)}
+		_, err := executor.prepareCursorDirect(context.Background(), auth, "cursor-key", &req, opts, stream)
+		if err == nil {
+			t.Fatalf("stream=%t: adjacent user-role suffix must fail closed", stream)
+		}
+		var statusErr cliproxyexecutor.StatusError
+		if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusBadRequest {
+			t.Fatalf("stream=%t: error = %T %v, want typed 400", stream, err, err)
+		}
+	}
+	if got := outboundCalls.Load(); got != 0 {
+		t.Fatalf("credential/upstream calls = %d, want zero", got)
+	}
+}
+
+func TestExecuteComposerRetryableTerminalReattachesSameInvocation(t *testing.T) {
+	t.Setenv("CURSOR_COMPOSER_STREAM_RECONNECT_MAX_ATTEMPTS", "1")
+	var mu sync.Mutex
+	calls := 0
+	var bodies [][]byte
+	var authHeaders []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls++
+		call := calls
+		bodies = append(bodies, append([]byte(nil), raw...))
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: {\"type\":\"turn_end\",\"stop_reason\":\"error\",\"receipt\":\"multiple_live_tool_rounds_deferred\",\"retryable\":true,\"error\":\"each conversation must retry independently\"}\n\n"))
+		if call%2 == 1 {
+			_, _ = w.Write([]byte("data: {\"type\":\"turn_end\",\"stop_reason\":\"error\",\"receipt\":\"continuation_conflict_contained\",\"retryable\":true,\"retryMode\":\"identical\",\"errorCode\":\"journal_revision_conflict\",\"error\":\"retry the identical continuation\"}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"text\",\"delta\":\"recovered exactly once\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n"))
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer srv.Close()
@@ -641,48 +1126,61 @@ func TestExecuteComposerContainedConflictIsNormalRetryableTurn(t *testing.T) {
 
 	resp, err := e.executeComposer(context.Background(), auth, "k", req, composerExecOpts("openai", "contained-nonstream"))
 	if err != nil {
-		t.Fatalf("contained non-stream conflict must not be an API error: %v", err)
+		t.Fatalf("non-stream retryable terminal should recover internally: %v", err)
 	}
-	if got := gjson.GetBytes(resp.Payload, "choices.0.finish_reason").String(); got != "stop" {
-		t.Fatalf("contained non-stream finish_reason = %q, want stop: %s", got, resp.Payload)
-	}
-	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); !strings.Contains(got, "No tool results were consumed") {
-		t.Fatalf("contained non-stream explanation missing: %s", resp.Payload)
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "recovered exactly once" {
+		t.Fatalf("non-stream recovered content = %q: %s", got, resp.Payload)
 	}
 
 	stream, err := e.executeComposerStream(context.Background(), auth, "k", req, composerExecOpts("openai", "contained-stream"))
 	if err != nil {
-		t.Fatalf("contained stream setup must succeed: %v", err)
+		t.Fatalf("stream retryable terminal setup: %v", err)
 	}
 	var wire strings.Builder
 	for chunk := range stream.Chunks {
 		if chunk.Err != nil {
-			t.Fatalf("contained stream conflict must not emit an API error: %v", chunk.Err)
+			t.Fatalf("stream retryable terminal should recover internally: %v", chunk.Err)
 		}
 		wire.Write(chunk.Payload)
 	}
-	if got := wire.String(); !strings.Contains(got, "No tool results were consumed") || !strings.Contains(got, `"finish_reason":"stop"`) {
-		t.Fatalf("contained stream must emit explanatory text plus a normal stop: %s", got)
+	if got := wire.String(); !strings.Contains(got, "recovered exactly once") || strings.Contains(got, "retry the identical continuation") {
+		t.Fatalf("stream recovery leaked retry terminal or lost content: %s", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 4 {
+		t.Fatalf("requests = %d, want one initial + one same-invocation retry per mode", calls)
+	}
+	for _, pair := range [][2]int{{0, 1}, {2, 3}} {
+		if !bytes.Equal(bodies[pair[0]], bodies[pair[1]]) {
+			t.Fatalf("retry body changed between attempts %d and %d", pair[0]+1, pair[1]+1)
+		}
+	}
+	for i, header := range authHeaders {
+		if header != "Bearer k" {
+			t.Fatalf("attempt %d changed credential: %q", i+1, header)
+		}
 	}
 }
 
-func TestComposerContainedConflictMessageIsStrictlyAllowlisted(t *testing.T) {
+func TestComposerBridgeTerminalReplaySafeIsExplicitAndSplitAware(t *testing.T) {
 	for name, raw := range map[string]string{
-		"allowed":       `{"stop_reason":"error","receipt":"continuation_conflict_contained","retryable":true,"error":"retry"}`,
-		"not retryable": `{"stop_reason":"error","receipt":"continuation_conflict_contained","retryable":false,"error":"fatal"}`,
-		"unknown":       `{"stop_reason":"error","receipt":"some_future_error","retryable":true,"error":"fatal"}`,
-		"not error":     `{"stop_reason":"stop","receipt":"continuation_conflict_contained","retryable":true}`,
+		"explicit identical":       `{"stop_reason":"error","receipt":"future_receipt","retryable":true,"retryMode":"identical"}`,
+		"explicit split":           `{"stop_reason":"error","receipt":"continuation_conflict_contained","retryable":true,"retryMode":"split"}`,
+		"same invocation conflict": `{"stop_reason":"error","receipt":"continuation_conflict_contained","retryable":true,"errorCode":"journal_revision_conflict"}`,
+		"definitive conflict":      `{"stop_reason":"error","receipt":"continuation_conflict_contained","retryable":true,"errorCode":"result_conflict"}`,
+		"completion not durable":   `{"stop_reason":"error","receipt":"completion_not_durable","retryable":true}`,
+		"unknown retryable":        `{"stop_reason":"error","receipt":"some_future_error","retryable":true}`,
+		"not retryable":            `{"stop_reason":"error","receipt":"continuation_conflict_contained","retryable":false}`,
+		"not error":                `{"stop_reason":"stop","receipt":"continuation_conflict_contained","retryable":true}`,
+		"must split conversations": `{"stop_reason":"error","receipt":"multiple_live_tool_rounds_deferred","retryable":true}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			message, ok := composerContainedConflictMessage(gjson.Parse(raw))
-			if name == "allowed" {
-				if !ok || !strings.Contains(message, "retry") {
-					t.Fatalf("allowed receipt not recognized: ok=%v message=%q", ok, message)
-				}
-				return
-			}
-			if ok || message != "" {
-				t.Fatalf("non-allowlisted error was contained: ok=%v message=%q", ok, message)
+			got := composerBridgeTerminalReplaySafe(gjson.Parse(raw))
+			want := name == "explicit identical" || name == "same invocation conflict" || name == "completion not durable"
+			if got != want {
+				t.Fatalf("composerBridgeTerminalReplaySafe() = %v, want %v", got, want)
 			}
 		})
 	}
@@ -955,10 +1453,10 @@ func TestExecuteComposerNonStream(t *testing.T) {
 	}
 }
 
-// The bridge's typed {"type":"ping"} keepalive must reach the client as a real, schema-correct keepalive
-// frame (NOT the dropped ": keepalive" comment), so a long or QUEUED turn never trips a client idle-abort.
-// Rendering is keyed on the INBOUND schema, never client identity: Anthropic gets a typed ping AFTER
-// message_start; OpenAI gets benign empty-delta no-op chunks.
+// The bridge's typed {"type":"ping"} keepalive reaches the downstream as an
+// SSE comment while model-visible frames remain atomically buffered until a
+// durable terminal. Comments are schema-neutral and do not open an assistant
+// envelope that a retry would have to duplicate.
 func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -989,9 +1487,8 @@ func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 		return b.String()
 	}
 
-	// Anthropic client: the keepalive must reach the client as a real, typed `ping` event (the whole point —
-	// the bridge's ": keepalive" comment is dropped before the client). The message envelope must open before
-	// the typed ping (an empty delta lazily emits message_start), so the ping is never the first frame.
+	// Anthropic client: the comment may precede message_start because compliant
+	// SSE parsers ignore it; no model-visible response bytes are committed yet.
 	claudeReq := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"name":"Read","input_schema":{"type":"object"}}]}`)}
 	srA, err := e.executeComposerStream(context.Background(), auth, "k", claudeReq,
 		composerExecOpts("claude", "ping-a"))
@@ -999,12 +1496,11 @@ func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 		t.Fatalf("stream(claude): %v", err)
 	}
 	outA := collect(srA)
-	if !strings.Contains(outA, "event: ping") {
-		t.Fatalf("anthropic keepalive ping not rendered to the client (it would have been silently dropped): %q", outA)
+	if !strings.Contains(outA, ": keepalive") {
+		t.Fatalf("anthropic keepalive comment not rendered to the client: %q", outA)
 	}
-	// The message envelope (an Anthropic message frame) must precede the first typed ping.
-	if i, j := strings.Index(outA, `"type":"message"`), strings.Index(outA, "event: ping"); i < 0 || i > j {
-		t.Fatalf("typed ping must NOT precede the message envelope (msg@%d ping@%d): %q", i, j, outA)
+	if i, j := strings.Index(outA, `"type":"message"`), strings.Index(outA, ": keepalive"); i < 0 || j < 0 || j > i {
+		t.Fatalf("transport comment must precede the atomically committed envelope (msg@%d ping@%d): %q", i, j, outA)
 	}
 	// The stream MUST close with a terminal (message_stop) — the bridge's [DONE] is consumed by the executor,
 	// so it synthesizes one through the translator. Without it the Anthropic SDK hangs waiting to finalize.
@@ -1025,6 +1521,72 @@ func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 	}
 	if !strings.Contains(outO, "hi") {
 		t.Fatalf("openai content lost (ping handling must not drop real content): %q", outO)
+	}
+}
+
+func TestComposerAtomicCommitGlobalBudgetFailsWithoutCredentialAttribution(t *testing.T) {
+	savedBudget := composerStreamCommitGlobalBudget
+	composerStreamCommitGlobalBudget = &composerAtomicCommitBudget{max: 1}
+	defer func() { composerStreamCommitGlobalBudget = savedBudget }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"text\",\"delta\":\"buffered answer\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+	auth := &cliproxyauth.Auth{ID: "global-budget", Attributes: map[string]string{
+		"api_key":                          "cursor-key",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	executor := NewCursorExecutor(&config.Config{})
+	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: toolTurn("test aggregate admission")}
+	stream, err := executor.executeComposerStream(context.Background(), auth, "cursor-key", req, composerExecOpts("openai", "global-budget"))
+	if err != nil {
+		t.Fatalf("stream setup: %v", err)
+	}
+	var streamErr error
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	var capacityErr *composerCommitCapacityError
+	if !errors.As(streamErr, &capacityErr) {
+		t.Fatalf("stream error = %T %v, want local commit-capacity error", streamErr, streamErr)
+	}
+	if capacityErr.RetryScope() != cliproxyexecutor.RetryScopeSelectedExecution || capacityErr.AuthAttributable() {
+		t.Fatalf("capacity disposition = scope:%v auth:%v", capacityErr.RetryScope(), capacityErr.AuthAttributable())
+	}
+	if got := composerStreamCommitGlobalBudget.used; got != 0 {
+		t.Fatalf("global budget leaked %d bytes after failed stream", got)
+	}
+}
+
+func TestExecuteComposerNonStreamAggregateIsBounded(t *testing.T) {
+	savedMax := composerStreamCommitMaxBytes
+	composerStreamCommitMaxBytes = 64
+	defer func() { composerStreamCommitMaxBytes = savedMax }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"type\":\"text\",\"delta\":%q}\n\n", strings.Repeat("x", 65))
+		_, _ = w.Write([]byte("data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n"))
+	}))
+	defer srv.Close()
+	auth := &cliproxyauth.Auth{ID: "nonstream-bound", Attributes: map[string]string{
+		"api_key":                          "cursor-key",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	executor := NewCursorExecutor(&config.Config{})
+	_, err := executor.executeComposer(context.Background(), auth, "cursor-key", cliproxyexecutor.Request{
+		Model:   "composer-2.5",
+		Payload: toolTurn("test non-stream aggregate bound"),
+	}, composerExecOpts("openai", "nonstream-bound"))
+	var protocolErr *composerBridgeProtocolError
+	if !errors.As(err, &protocolErr) || !strings.Contains(err.Error(), "protocol violation") {
+		t.Fatalf("aggregate overflow error = %T %v, want bounded protocol failure", err, err)
 	}
 }
 
@@ -1375,11 +1937,9 @@ func TestCursorDirectEnabled(t *testing.T) {
 	}
 }
 
-// EX1/EX2 (C1): a mixed turn whose trailing block is a REAL user message frames it as the user's
-// instruction AND sets inp["userText"]; a trailing block that is purely an auto-injected
-// <system-reminder> uses neutral framing and does NOT set userText (a reminder is context, not an
-// instruction, so it must never drive a fresh send).
-func TestComposerMixedTurnSystemReminderFraming(t *testing.T) {
+// A mixed turn keeps role:user content actionable regardless of tag-like text;
+// the proxy never guesses provenance from content conventions.
+func TestComposerMixedTurnPreservesTagLikeUserContent(t *testing.T) {
 	// Real trailing user message.
 	real := composerInput([]byte(`{"messages":[
 		{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
@@ -1394,60 +1954,15 @@ func TestComposerMixedTurnSystemReminderFraming(t *testing.T) {
 		t.Fatalf("real trailing message must not mutate the result receipt: %q", c)
 	}
 
-	// M30: an AUTO-INJECTED reminder (the SAME block recurs verbatim earlier in the transcript as context)
-	// uses neutral framing and does NOT set userText. Here the reminder appears in an earlier user turn AND as
-	// the trailing block — that recurrence is the synthetic signal.
-	rem := composerInput([]byte(`{"messages":[
-		{"role":"user","content":"<system-reminder>The file changed on disk.</system-reminder> please read it"},
+	// User-role content remains user intent regardless of tag-like text. The
+	// proxy never infers provenance from content conventions.
+	literal := composerInput([]byte(`{"messages":[
 		{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
 		{"role":"tool","tool_call_id":"tc_1","content":"R"},
-		{"role":"user","content":"<system-reminder>The file changed on disk.</system-reminder>"}
+		{"role":"user","content":"<context-note>summarize what you just read</context-note>"}
 	]}`))
-	if _, ok := rem["userText"]; ok {
-		t.Fatalf("an auto-injected (recurring) system-reminder must NOT set userText, got %v", rem["userText"])
-	}
-	rres, _ := rem["results"].([]map[string]any)
-	if c, _ := rres[len(rres)-1]["content"].(string); c != "R" {
-		t.Fatalf("auto-injected reminder must not mutate the result receipt, got %q", c)
-	}
-	if system, _ := rem["system"].(string); !strings.Contains(system, "The file changed on disk") {
-		t.Fatalf("auto-injected reminder must travel through system context, got %q", system)
-	}
-
-	// M30: a FIRST-occurrence (user-authored) <system-reminder> as the trailing message is NOT auto-injected
-	// context — it is the user's literal message and MUST be answerable (userText set, instruction framing).
-	lit := composerInput([]byte(`{"messages":[
-		{"role":"assistant","content":"","tool_calls":[{"id":"tc_1","function":{"name":"Read"}}]},
-		{"role":"tool","tool_call_id":"tc_1","content":"R"},
-		{"role":"user","content":"<system-reminder>summarize what you just read</system-reminder>"}
-	]}`))
-	if lit["userText"] == nil || !strings.Contains(lit["userText"].(string), "summarize what you just read") {
-		t.Fatalf("a literal first-occurrence user <system-reminder> must set userText (M30), got %v", lit["userText"])
-	}
-	lres, _ := lit["results"].([]map[string]any)
-	if lc, _ := lres[len(lres)-1]["content"].(string); lc != "R" {
-		t.Fatalf("a literal user reminder must not mutate the result receipt (M30), got %q", lc)
-	}
-
-	// isAutoInjectedReminder unit checks: a single occurrence is user text (false); a recurrence is synthetic.
-	single := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":"<system-reminder>x</system-reminder>"}]}`), "messages").Array()
-	if isAutoInjectedReminder("<system-reminder>x</system-reminder>", single) {
-		t.Fatalf("a single-occurrence reminder must be treated as user text (M30)")
-	}
-	recurring := gjson.GetBytes([]byte(`{"messages":[{"role":"user","content":"<system-reminder>x</system-reminder> hi"},{"role":"user","content":"<system-reminder>x</system-reminder>"}]}`), "messages").Array()
-	if !isAutoInjectedReminder("<system-reminder>x</system-reminder>", recurring) {
-		t.Fatalf("a recurring reminder block must be classified auto-injected")
-	}
-
-	// isPureSystemReminder unit checks: a reminder plus a real sentence is NOT pure.
-	if !isPureSystemReminder("  <system-reminder>x</system-reminder> ") {
-		t.Fatalf("a lone reminder block must be classified pure")
-	}
-	if isPureSystemReminder("<system-reminder>x</system-reminder> now actually do this") {
-		t.Fatalf("a reminder followed by real text must NOT be pure")
-	}
-	if isPureSystemReminder("just a normal message") {
-		t.Fatalf("plain text must not be a system reminder")
+	if literal["userText"] == nil || !strings.Contains(literal["userText"].(string), "summarize what you just read") {
+		t.Fatalf("tag-like user content must remain answerable, got %v", literal["userText"])
 	}
 }
 
@@ -1685,16 +2200,23 @@ func TestDeriveComposerSessionID_ExtendedConvSignals(t *testing.T) {
 			t.Fatalf("body %s: same conv id + same opener must be stable (%s vs %s)", k, s1, s2)
 		}
 	}
-	// H16: previous_response_id is NOT a stable conv-id hash (it changes every turn). When UNMAPPED, the turn
-	// falls through past stableConversationID to CLIENT-AGNOSTIC content keying (the turn-stable opener), so two
-	// turns that share an opener but carry DIFFERENT previous_response_id values resolve to the SAME session —
-	// proving the (unstable) response id never entered the key.
-	p1, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"),
+	// H16: an unmapped previous_response_id may re-seed only when the request
+	// carries bounded prior history. The unstable response id never enters the
+	// content key, so two such faithful replays resolve identically.
+	historyTurn := []byte(`{"tools":[{"type":"function","function":{"name":"Read"}}],"messages":[
+		{"role":"user","content":"opener"},{"role":"assistant","content":"prior answer"},{"role":"user","content":"hi"}]}`)
+	p1, err1 := deriveComposerSessionID(auth, "cursorkey", historyTurn,
 		cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"unmapped-prev-1"}`)})
-	p2, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("hi"),
+	p2, err2 := deriveComposerSessionID(auth, "cursorkey", historyTurn,
 		cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"unmapped-prev-2"}`)})
-	if p1 != p2 {
+	if err1 != nil || err2 != nil || p1 != p2 {
 		t.Fatalf("H16: an unmapped previous_response_id must NOT enter the key — same opener must key the same regardless of response id: %s != %s", p1, p2)
+	}
+	if _, err := deriveComposerSessionID(auth, "cursorkey", toolTurn("thin follow-up"),
+		cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"unknown-legacy"}`)}); err == nil {
+		t.Fatal("an unmapped thin previous_response_id follow-up must return 410 instead of starting blank")
+	} else if statusErr, ok := err.(interface{ StatusCode() int }); !ok || statusErr.StatusCode() != http.StatusGone {
+		t.Fatalf("thin continuity error must be typed 410, got %T %v", err, err)
 	}
 	// Distinct conv ids (here via Session_id) must differ.
 	a, _ := deriveComposerSessionID(auth, "cursorkey", toolTurn("x"), optsWithHeaders(map[string]string{"Session_id": "A"}))
@@ -1946,7 +2468,7 @@ func TestComposerHistoryFingerprintRewriteSensitive(t *testing.T) {
 
 // H16 (C-RESPID): a Responses/Codex text-only follow-up carrying previous_response_id must resume the
 // DURABLE session recorded against that response id — NOT be diverted to an ephemeral one-shot, NOT be
-// hashed as a stable id. On a map MISS it degrades gracefully (mints/hashes), never errors.
+// hashed as a stable id. On a map miss, a thin request returns an honest 410.
 func TestDeriveComposerSessionID_PreviousResponseIDResumes(t *testing.T) {
 	auth := authWith("authA", "keyA")
 	tenant := composerTenant(auth, cliproxyexecutor.Options{})
@@ -1983,11 +2505,14 @@ func TestDeriveComposerSessionID_PreviousResponseIDResumes(t *testing.T) {
 	if errRouted != nil || gotRouted != prior {
 		t.Fatalf("self-routing previous_response_id must survive restart (id=%q err=%v), want %q", gotRouted, errRouted, prior)
 	}
-	// Unknown previous_response_id (bridge restart / eviction) must degrade gracefully (mint), not error.
+	// Unknown previous_response_id with no replay history must never start a blank agent.
 	miss := cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"chatcmpl-composer-UNKNOWN","input":"hi"}`)}
 	gotMiss, errMiss := deriveComposerSessionID(auth, "cursorkey", []byte(`{"messages":[{"role":"user","content":"hi"}]}`), miss)
-	if errMiss != nil || !strings.HasPrefix(gotMiss, "sess_") {
-		t.Fatalf("H16: unknown previous_response_id must mint gracefully (id=%q err=%v)", gotMiss, errMiss)
+	if errMiss == nil {
+		t.Fatalf("H16: unknown thin previous_response_id must return 410, got id=%q", gotMiss)
+	}
+	if statusErr, ok := errMiss.(interface{ StatusCode() int }); !ok || statusErr.StatusCode() != http.StatusGone {
+		t.Fatalf("H16: unknown continuity error must be typed 410, got %T %v", errMiss, errMiss)
 	}
 }
 
@@ -2174,8 +2699,7 @@ func TestExecuteComposerStreamRedactsBridgeErrorBody(t *testing.T) {
 
 // M24 (C-KEEPALIVE): for OpenAI-Responses and Gemini inbound, the bridge's {"type":"ping"} must render to a
 // REAL keepalive frame (a raw `: keepalive` SSE comment emitted directly by the executor) — not zero bytes —
-// so a long/queued turn does not trip a client idle-abort. The comment must appear AFTER the stream envelope
-// is open (after real content), never before it.
+// so a long/queued turn does not trip a client idle-abort while content waits for durable commit.
 func TestExecuteComposerStreamKeepaliveResponsesAndGemini(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -2218,10 +2742,9 @@ func TestExecuteComposerStreamKeepaliveResponsesAndGemini(t *testing.T) {
 	}
 }
 
-// M24: a ping that arrives BEFORE any content (queued-wait) must NOT emit a bare comment for
-// Responses/Gemini (it would precede response.created / the first candidate). It falls through to the
-// empty-delta path; the keepalive only fires once the envelope is open.
-func TestExecuteComposerStreamKeepaliveNotBeforeEnvelope(t *testing.T) {
+// A pre-content ping emits only an ignorable comment. It deliberately does not
+// open response.created/the first candidate before the durable commit point.
+func TestExecuteComposerStreamKeepaliveBeforeEnvelopeIsCommentOnly(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
@@ -2252,8 +2775,8 @@ func TestExecuteComposerStreamKeepaliveNotBeforeEnvelope(t *testing.T) {
 			first = append([]byte(nil), chunk.Payload...)
 		}
 	}
-	if strings.HasPrefix(string(first), ": keepalive") {
-		t.Fatalf("M24: a pre-envelope ping must NOT emit the keepalive comment first, got %q", string(first))
+	if !strings.HasPrefix(string(first), ": keepalive") || strings.Contains(string(first), "response.created") {
+		t.Fatalf("pre-envelope keepalive must be a comment-only frame, got %q", string(first))
 	}
 }
 

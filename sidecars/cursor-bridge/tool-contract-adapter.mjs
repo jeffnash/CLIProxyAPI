@@ -83,6 +83,12 @@ const GENERIC_WRAPPER_KEYS = ["value", "input", "content", "data", "payload"];
 const ARRAY_WRAPPER_KEYS = ["items", "list", "values", "array"];
 const OBJECT_WRAPPER_KEYS = ["object", "record", "map"];
 const STRING_WRAPPER_KEYS = ["text", "string"];
+// Cursor/model adapters sometimes preserve a scalar variant as a tagged
+// object. These keys are considered only when the advertised schema requires
+// a primitive and the extracted value is the one unique schema-valid choice.
+// A client-owned object field therefore never loses a legitimate `kind`,
+// `selected`, or `enumValue` property.
+const SCALAR_VARIANT_WRAPPER_KEYS = ["kind", "selected", "selection", "enum", "enumValue", "scalar", "scalarValue"];
 
 const ARGUMENT_ALIASES = Object.freeze({
   absolutepath: [["filePath", "path", "file", "filename"], 80],
@@ -415,6 +421,10 @@ function wrapperCandidates(value, propertyName, expectedKinds) {
   if (!expectedKinds || expectedKinds.has("array")) keys.push(...ARRAY_WRAPPER_KEYS);
   if (!expectedKinds || expectedKinds.has("object")) keys.push(...OBJECT_WRAPPER_KEYS);
   if (!expectedKinds || expectedKinds.has("string")) keys.push(...STRING_WRAPPER_KEYS);
+  if (expectedKinds && Object.keys(value).length === 1
+    && [...expectedKinds].some((kind) => ["string", "number", "integer", "boolean", "null"].includes(kind))) {
+    keys.push(...SCALAR_VARIANT_WRAPPER_KEYS);
+  }
   for (const key of [...new Set(keys.filter(Boolean))]) {
     if (Object.hasOwn(value, key)) add(value[key], `property:${key}`);
   }
@@ -464,7 +474,7 @@ function unwrapToSchema(value, schema, propertyName, path, transforms, depth = 0
       candidateValue = coerced;
       candidateKind = jsonKind(candidateValue);
     }
-    // A wrapper can contain another wrapper (OMP's todo list/items/task shape
+    // A wrapper can contain another wrapper (for example, a todo list/items/task shape
     // and protobuf-style JSON values both do this). Normalize the candidate in
     // isolation before deciding whether it is the unique schema-valid unwrap.
     // Rejected candidates never leak transforms into the real receipt.
@@ -646,12 +656,10 @@ function normalizeObjectKeys(value, schema, path, transforms, depth = 0) {
     const exact = normalized.find((entry) => entry.source === target);
     const selected = exact || normalized[0];
     const selectedJSON = stableJSON(selected.candidateValue);
-    // The harness descriptor is authoritative. If the model supplies the
-    // exact client field plus a native/SDK alias, execute the exact field and
-    // discard the redundant alias even when its guessed value differs. The
-    // old behavior called this ambiguous and killed functional OMP grep runs
-    // that contained exact `pattern` plus Cursor's extra `query` field.
-    if (!exact && normalized.some((entry) => stableJSON(entry.candidateValue) !== selectedJSON)) {
+    // Two source fields targeting one semantic argument are harmless only
+    // when their normalized values are identical. An exact spelling does not
+    // authorize silently discarding a conflicting alias.
+    if (normalized.some((entry) => stableJSON(entry.candidateValue) !== selectedJSON)) {
       throw new ToolContractNormalizationError(
         "ambiguous_alias",
         path ? `${path}.${target}` : target,
@@ -660,17 +668,6 @@ function normalizeObjectKeys(value, schema, path, transforms, depth = 0) {
     }
     normalized.sort((a, b) => b.priority - a.priority || a.source.localeCompare(b.source));
     const assignment = exact || normalized[0];
-    if (exact) {
-      for (const entry of normalized) {
-        if (entry === exact || stableJSON(entry.candidateValue) === selectedJSON) continue;
-        addTransform(transforms, {
-          kind: "discard-conflicting-alias",
-          path: path || "arguments",
-          source: entry.source,
-          target,
-        });
-      }
-    }
     assignments.set(target, assignment);
   }
 
@@ -725,27 +722,117 @@ function stripAdvisoryFields(value, schema, path, transforms) {
   return out;
 }
 
-const PRESENTATION_ONLY_FIELDS_BY_FAMILY = Object.freeze({
-  // OMP/Pi's Grep UI may add result-shaping controls that are not part of
-  // the executable grep schema. They do not change the search predicate or
-  // filesystem scope. Strip them only when the client schema explicitly
-  // rejects undeclared properties; a client that declares any of these keys
-  // keeps full ownership of it.
-  grep: new Set(["head_limit", "headLimit", "output_mode", "outputMode", "limit"]),
-});
+function replaceRootField(value, key, nextValue, transforms, transform) {
+  if (stableJSON(value[key]) === stableJSON(nextValue)) return value;
+  const out = Object.fromEntries(Object.entries(value));
+  Object.defineProperty(out, key, { value: nextValue, writable: true, enumerable: true, configurable: true });
+  addTransform(transforms, transform);
+  return out;
+}
 
-function stripKnownPresentationFields(name, value, schema, transforms) {
-  if (!isObject(value) || !isObject(schema) || schema.additionalProperties !== false) return value;
-  const family = clientToolFamily(name);
-  const known = family && PRESENTATION_ONLY_FIELDS_BY_FAMILY[family];
-  if (!known) return value;
-  const properties = schemaProperties(schema);
-  const removable = Object.keys(value).filter((key) => known.has(key) && !Object.hasOwn(properties, key));
-  if (!removable.length) return value;
-  const out = Object.fromEntries(Object.entries(value).filter(([key]) => !removable.includes(key)));
-  for (const key of removable) {
-    addTransform(transforms, { kind: "strip-presentation", path: key, family });
+function safeLineNumber(value) {
+  return Number.isSafeInteger(value) && value >= 1;
+}
+
+// Structured read selectors are inclusive, 1-indexed strings. Preserve the exact
+// range when a model emits the same value as a small structural record. No
+// offset/limit guessing is allowed because offsets are commonly 0-indexed.
+function structuredReadSelector(value) {
+  if (Array.isArray(value) && value.length === 2
+    && safeLineNumber(value[0]) && safeLineNumber(value[1]) && value[1] >= value[0]) {
+    return `${value[0]}-${value[1]}`;
   }
+  if (!isObject(value)) return undefined;
+  const entries = Object.entries(value);
+  const byName = new Map(entries.map(([key, item]) => [normalizeIdentifier(key), item]));
+  const rangePairs = [
+    ["start", "end"],
+    ["startline", "endline"],
+    ["linestart", "lineend"],
+    ["from", "to"],
+  ];
+  for (const [startKey, endKey] of rangePairs) {
+    if (entries.length !== 2 || !byName.has(startKey) || !byName.has(endKey)) continue;
+    const start = byName.get(startKey);
+    const end = byName.get(endKey);
+    if (safeLineNumber(start) && safeLineNumber(end) && end >= start) return `${start}-${end}`;
+  }
+  const countPairs = [["start", "count"], ["startline", "count"]];
+  for (const [startKey, countKey] of countPairs) {
+    if (entries.length !== 2 || !byName.has(startKey) || !byName.has(countKey)) continue;
+    const start = byName.get(startKey);
+    const count = byName.get(countKey);
+    if (safeLineNumber(start) && safeLineNumber(count)) return `${start}+${count}`;
+  }
+  return undefined;
+}
+
+function structuredReadSelectorCount(value) {
+  if (typeof value !== "string") return undefined;
+  let match = /^(\d+)-(\d+)$/.exec(value);
+  if (match) {
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    return Number.isSafeInteger(start) && Number.isSafeInteger(end) && end >= start
+      ? end - start + 1 : undefined;
+  }
+  match = /^(\d+)\+(\d+)$/.exec(value);
+  if (!match) return undefined;
+  const count = Number(match[2]);
+  return Number.isSafeInteger(count) && count >= 1 ? count : undefined;
+}
+
+function singletonJobIdList(value) {
+  if (typeof value === "string" && value.length > 0) return [value];
+  if (!isObject(value) || Object.keys(value).length !== 1) return undefined;
+  const [key, item] = Object.entries(value)[0];
+  if (!["id", "jobid", "poll"].includes(normalizeIdentifier(key))) return undefined;
+  return typeof item === "string" && item.length > 0 ? [item] : undefined;
+}
+
+function normalizeProductionToolCompatibility(name, value, schema, transforms) {
+  if (!isObject(value)) return value;
+  const family = clientToolFamily(name);
+  const properties = schemaProperties(schema);
+  let out = value;
+
+  if (family === "read" && Object.hasOwn(properties, "selector") && Object.hasOwn(out, "selector")) {
+    const selector = structuredReadSelector(out.selector);
+    if (selector !== undefined && schemaAcceptsValue(properties.selector, selector)) {
+      out = replaceRootField(out, "selector", selector, transforms, {
+        kind: "normalize-read-selector",
+        path: "selector",
+        fromType: jsonKind(value.selector),
+        toType: "string",
+      });
+    }
+    // An undeclared limit is redundant only when an exact, schema-valid
+    // selector already preserves the requested read scope. With path+limit
+    // alone, dropping limit would silently expand a bounded read to the whole
+    // file, so leave it visible to fail-closed schema validation.
+    if (schema.additionalProperties === false
+      && Object.hasOwn(out, "limit") && !Object.hasOwn(properties, "limit")
+      && schemaAcceptsValue(properties.selector, out.selector)
+      && Number.isSafeInteger(out.limit) && out.limit >= 1
+      && structuredReadSelectorCount(out.selector) === out.limit) {
+      out = Object.fromEntries(Object.entries(out).filter(([key]) => key !== "limit"));
+      addTransform(transforms, { kind: "strip-presentation", path: "limit", family });
+    }
+  }
+
+  if (normalizeIdentifier(name) === "job" && Object.hasOwn(properties, "poll") && Object.hasOwn(out, "poll")
+    && !schemaAcceptsValue(properties.poll, out.poll)) {
+    const poll = singletonJobIdList(out.poll);
+    if (poll !== undefined && schemaAcceptsValue(properties.poll, poll)) {
+      out = replaceRootField(out, "poll", poll, transforms, {
+        kind: "wrap-singleton-list",
+        path: "poll",
+        fromType: jsonKind(value.poll),
+        toType: "array",
+      });
+    }
+  }
+
   return out;
 }
 
@@ -849,54 +936,8 @@ function explicitDecoration(propertySchema) {
     || propertySchema["x-harness-decoration"] === true;
 }
 
-// OMP/Pi injects this exact presentation-only field into the model-facing
-// schema, then strips it before validating/executing the real tool. Recognize
-// the structural marker rather than an OMP provider/model name. A real tool
-// that owns an `i` parameter is untouched unless its descriptor is exactly the
-// injected shape, or the whole advertised inventory corroborates the
-// description-pruned form.
-function implicitIntentDecoration(name, propertySchema, allowPrunedIntent = false) {
-  if (name !== "i" || !isObject(propertySchema)) return false;
-  const keys = Object.keys(propertySchema);
-  const described = propertySchema.type === "string"
-    && propertySchema.description === "concise intent"
-    && keys.every((key) => key === "type" || key === "description");
-  const pruned = allowPrunedIntent
-    && propertySchema.type === "string"
-    && keys.length === 1
-    && keys[0] === "type";
-  return described || pruned;
-}
-
-function prunedIntentInventoryMarker(tool) {
-  const schema = tool && tool.inputSchema;
-  if (!isObject(schema) || !isObject(schema.properties)) return false;
-  if (typeof tool.description === "string" && tool.description.trim() !== "") return false;
-  if (!Object.hasOwn(schema.properties, "i")) return false;
-  const propertySchema = schema.properties.i;
-  if (!isObject(propertySchema)
-    || Object.keys(propertySchema).length !== 1
-    || propertySchema.type !== "string") return false;
-  return Array.isArray(schema.required)
-    && schema.required.includes("i");
-}
-
-function inventoryUsesPrunedIntent(tools) {
-  const eligible = tools.filter((tool) => {
-    const schema = tool && tool.inputSchema;
-    return isObject(schema)
-      && isObject(schema.properties)
-      && Object.keys(schema.properties).length > 0
-      && !(typeof tool.description === "string" && tool.description.trim() !== "");
-  });
-  const marked = eligible.filter(prunedIntentInventoryMarker);
-  // One genuine tool may legitimately require a short field named `i`.
-  // Requiring repeated, inventory-wide evidence avoids relaxing that schema.
-  return marked.length >= 2 && marked.length * 5 >= eligible.length * 4;
-}
-
-function deriveAcceptanceSchema(schema, allowPrunedIntent = false) {
-  if (Array.isArray(schema)) return schema.map((item) => deriveAcceptanceSchema(item, allowPrunedIntent));
+function deriveAcceptanceSchema(schema) {
+  if (Array.isArray(schema)) return schema.map((item) => deriveAcceptanceSchema(item));
   if (!isObject(schema)) return schema;
   const out = { ...schema };
   let changed = false;
@@ -906,9 +947,8 @@ function deriveAcceptanceSchema(schema, allowPrunedIntent = false) {
     const decorations = new Set();
     for (const [name, propertySchema] of Object.entries(schema.properties)) {
       const decoration = explicitDecoration(propertySchema)
-        || explicitAdvisoryIgnored(propertySchema)
-        || implicitIntentDecoration(name, propertySchema, allowPrunedIntent);
-      properties[name] = decoration ? true : deriveAcceptanceSchema(propertySchema, allowPrunedIntent);
+        || explicitAdvisoryIgnored(propertySchema);
+      properties[name] = decoration ? true : deriveAcceptanceSchema(propertySchema);
       if (decoration) decorations.add(name);
     }
     if (decorations.size && Array.isArray(schema.required)) {
@@ -925,14 +965,14 @@ function deriveAcceptanceSchema(schema, allowPrunedIntent = false) {
   }
   for (const key of ["anyOf", "oneOf", "allOf", "prefixItems"]) {
     if (!Array.isArray(schema[key])) continue;
-    const next = schema[key].map((item) => deriveAcceptanceSchema(item, allowPrunedIntent));
+    const next = schema[key].map((item) => deriveAcceptanceSchema(item));
     if (next.some((value, index) => value !== schema[key][index])) {
       out[key] = next;
       changed = true;
     }
   }
   if (isObject(schema.items)) {
-    const items = deriveAcceptanceSchema(schema.items, allowPrunedIntent);
+    const items = deriveAcceptanceSchema(schema.items);
     if (items !== schema.items) {
       out.items = items;
       changed = true;
@@ -941,7 +981,7 @@ function deriveAcceptanceSchema(schema, allowPrunedIntent = false) {
   for (const key of ["$defs", "definitions", "dependentSchemas", "patternProperties"]) {
     if (!isObject(schema[key])) continue;
     const next = Object.fromEntries(Object.entries(schema[key])
-      .map(([name, child]) => [name, deriveAcceptanceSchema(child, allowPrunedIntent)]));
+      .map(([name, child]) => [name, deriveAcceptanceSchema(child)]));
     if (Object.keys(next).some((name) => next[name] !== schema[key][name])) {
       out[key] = next;
       changed = true;
@@ -949,7 +989,7 @@ function deriveAcceptanceSchema(schema, allowPrunedIntent = false) {
   }
   for (const key of ["additionalProperties", "unevaluatedProperties", "contains", "not", "if", "then", "else", "propertyNames"]) {
     if (!isObject(schema[key])) continue;
-    const next = deriveAcceptanceSchema(schema[key], allowPrunedIntent);
+    const next = deriveAcceptanceSchema(schema[key]);
     if (next !== schema[key]) {
       out[key] = next;
       changed = true;
@@ -1042,12 +1082,12 @@ function compileSchema(name, schema) {
   }
 }
 
-function compiledContract(name, schema, allowPrunedIntent = false) {
-  const identity = schemaCacheIdentity(allowPrunedIntent ? "pruned-intent" : "strict", schema);
+function compiledContract(name, schema) {
+  const identity = schemaCacheIdentity("strict", schema);
   const cached = validatorCache.get(identity.key);
   if (cached) return cached;
   const wireValidator = compileSchema(name, schema);
-  const acceptanceSchema = deriveAcceptanceSchema(schema, allowPrunedIntent);
+  const acceptanceSchema = deriveAcceptanceSchema(schema);
   const acceptanceValidator = acceptanceSchema === schema ? wireValidator : compileSchema(name, acceptanceSchema);
   const normalizationSchema = materializeLocalRefs(schema);
   const contract = Object.freeze({ schema, normalizationSchema, acceptanceSchema, wireValidator, acceptanceValidator });
@@ -1117,9 +1157,8 @@ export class ToolContractRegistry {
       byName.set(name, normalized);
       next.push(normalized);
     }
-    const allowPrunedIntent = inventoryUsesPrunedIntent(next);
     for (const tool of next) {
-      contracts.set(tool.name, compiledContract(tool.name, tool.inputSchema, allowPrunedIntent));
+      contracts.set(tool.name, compiledContract(tool.name, tool.inputSchema));
     }
     this.byName = byName;
     this.contracts = contracts;
@@ -1134,7 +1173,7 @@ export class ToolContractRegistry {
     const transforms = [];
     const schema = contract ? contract.normalizationSchema : { type: "object" };
     let value = normalizeRootInput(input, schema, transforms);
-    value = stripKnownPresentationFields(name, value, schema, transforms);
+    value = normalizeProductionToolCompatibility(name, value, schema, transforms);
     const unsafePath = unsafeIntegerPath(value);
     if (unsafePath) {
       throw new ToolContractNormalizationError(
@@ -1312,6 +1351,6 @@ export function resolveClientToolName(want, tools, { onRejectedSingle } = {}) {
   return null;
 }
 
-export function acceptanceSchemaFor(schema, { allowPrunedIntent = false } = {}) {
-  return cloneJson(deriveAcceptanceSchema(schema, allowPrunedIntent));
+export function acceptanceSchemaFor(schema) {
+  return cloneJson(deriveAcceptanceSchema(schema));
 }

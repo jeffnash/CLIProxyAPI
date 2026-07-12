@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/url"
@@ -166,4 +167,44 @@ type StreamResult struct {
 type StatusError interface {
 	error
 	StatusCode() int
+}
+
+// RetryScope describes how far the auth conductor may move an execution after
+// an executor returns an error. The zero value preserves the existing policy.
+type RetryScope uint8
+
+const (
+	RetryScopeDefault RetryScope = iota
+	// RetryScopeSelectedExecution means the request may already have crossed an
+	// acceptance boundary. The conductor must not replay it with another model
+	// or credential; recovery is owned by the selected executor.
+	RetryScopeSelectedExecution
+)
+
+// ErrorDisposition lets an executor constrain generic retry and auth-health
+// behavior without coupling the conductor to a provider or client. Errors may
+// implement this in addition to StatusError.
+type ErrorDisposition interface {
+	error
+	RetryScope() RetryScope
+	AuthAttributable() bool
+}
+
+// IsSSECommentOnlyPayload reports whether payload contains only SSE comment
+// lines and blank separators. Comments are transport keepalives, not semantic
+// model output, so they do not establish a safe cross-execution retry boundary.
+func IsSSECommentOnlyPayload(payload []byte) bool {
+	if len(payload) == 0 {
+		return true
+	}
+	for _, line := range bytes.Split(payload, []byte{'\n'}) {
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		if len(line) == 0 {
+			continue
+		}
+		if line[0] != ':' {
+			return false
+		}
+	}
+	return true
 }

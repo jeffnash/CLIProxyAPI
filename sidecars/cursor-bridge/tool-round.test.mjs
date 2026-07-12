@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { canonicalRecordDigest } from "./durable-json-cas.mjs";
 import {
   CallState,
   DeferredInputState,
@@ -188,6 +189,28 @@ test("crash-left temporary snapshots never replace the last committed revision",
   assert.equal(journal.records().length, 1, "temporary files are never enumerated as journals");
 });
 
+test("RoundJournal reads recover a crash-published immutable revision claim", (t) => {
+  const dir = withTempDir(t);
+  const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 16) });
+  const round = new ToolRound({ sessionId: "sess", journal, codec });
+  const current = journal.read(round.route);
+  const next = { ...current, revision: current.revision + 1, state: RoundState.AWAITING_RESULTS };
+  const file = journal.file(round.route);
+  const candidate = `${path.basename(file)}.cas.r${next.revision}.crashed.candidate`;
+  writeFileSync(path.join(path.dirname(file), candidate), JSON.stringify(next) + "\n");
+  writeFileSync(journal.cas.claimPath(file, next.revision), JSON.stringify({
+    version: 1,
+    expectedRevision: current.revision,
+    expectedDigest: canonicalRecordDigest(current),
+    nextRevision: next.revision,
+    nextDigest: canonicalRecordDigest(next),
+    candidate,
+  }) + "\n");
+
+  assert.equal(journal.read(round.route).revision, next.revision);
+  assert.equal(journal.read(round.route).state, RoundState.AWAITING_RESULTS);
+});
+
 test("another bridge process can receipt a shared round and fences a stale writer", (t) => {
   const dir = withTempDir(t);
   const first = createRoundInfrastructure(dir);
@@ -209,20 +232,19 @@ test("another bridge process can receipt a shared round and fences a stale write
   assert.equal(second.journal.read(original.route).calls[0].receipt.result.content, "from another bridge");
 });
 
-test("journal rejects active locks and recovers demonstrably stale locks", (t) => {
+test("journal immutable revision claims fence concurrent writers without stealable locks", (t) => {
   const dir = withTempDir(t);
-  let now = 100_000;
-  const journal = new RoundJournal(dir, { now: () => now, staleLockMs: 1_000 });
-  const codec = new RoutingTokenCodec(Buffer.alloc(32, 3));
-  const route = codec.newRoute();
-  const lock = journal.lockDir(route);
-  mkdirSync(lock);
-  assert.throws(() => journal.acquire(route), (error) => error.code === "round_busy");
-  const old = new Date(0);
-  utimesSync(lock, old, old);
-  now = 200_000;
-  const release = journal.acquire(route);
-  release();
+  const first = createRoundInfrastructure(dir);
+  const second = createRoundInfrastructure(dir);
+  const round = new ToolRound({ sessionId: "sess", journal: first.journal, codec: first.codec });
+  const stale = first.journal.read(round.route);
+  const winner = second.journal.save({ ...stale, state: RoundState.AWAITING_RESULTS }, stale.revision);
+  assert.equal(winner.revision, stale.revision + 1);
+  assert.throws(
+    () => first.journal.save({ ...stale, state: RoundState.TERMINAL }, stale.revision),
+    (error) => error.code === "journal_revision_conflict",
+  );
+  assert.equal(first.journal.read(round.route).state, RoundState.AWAITING_RESULTS);
 });
 
 test("ToolRound persists registration before exposing a call", (t) => {

@@ -382,8 +382,34 @@ unless a startup self-test proves native local execution is unreachable, logging
 | `CURSOR_AGENT_BRIDGE_PORT` | `9798` | Port the bridge listens on. |
 | `CURSOR_AGENT_BRIDGE_URL` | `http://127.0.0.1:9798` | Base URL the Go executor POSTs `/agent/turn` to (also per-key via the `cursor-api-key[].composer-client-tools-bridge-url` YAML attribute). |
 | `CURSOR_AGENT_STATE_ROOT` | `./.cursor-agent-store` | Writable dir for durable SDK session/checkpoint state (mount a volume to persist across restarts). |
+| `CURSOR_COMPOSER_BRIDGE_RECONNECT_MAX_MS` | `90000` (90 seconds) | Maximum pre-response window for reconnecting replay-safe requests to the loopback bridge after a restart. Set to `0` to disable. This does not time out an established response stream. |
+| `CURSOR_COMPOSER_BRIDGE_RECONNECT_REMOTE` | unset | Set to a truthy value to allow the same replay-safe pre-response reconnect behavior for a non-loopback bridge URL. Remote reconnect is opt-in; requests without durable replay identity are never retried. |
+| `CURSOR_COMPOSER_STREAM_COMMIT_MAX_BYTES` | `67108864` (64 MiB) | Maximum translated model-visible stream data held for an atomic commit. Exceeding the limit fails the stream before any buffered assistant or tool output is exposed. |
+| `CURSOR_COMPOSER_STREAM_COMMIT_GLOBAL_MAX_BYTES` | `268435456` (256 MiB) | Process-wide cap across all atomic response buffers; local pressure fails the selected execution without marking credentials unhealthy. |
+| `CURSOR_COMPOSER_STATE_ROOT_MIN_FREE_BYTES` | `67108864` (64 MiB) | Free-space floor for bridge readiness and new recoverable fresh turns. Existing continuation receipts are retained rather than silently evicted. |
+| `CURSOR_COMPOSER_REPLAY_GLOBAL_MAX_BYTES` | `268435456` (256 MiB) | Process-wide capacity reserved before an SDK send so its ordered recovery log can never be partially retained. |
+| `CURSOR_COMPOSER_UNRESOLVED_RECEIPT_MAX_BYTES` | `1073741824` (1 GiB) | Shared-volume ceiling for durable acceptance-unknown fresh-turn envelopes. |
+| `CURSOR_COMPOSER_UNRESOLVED_RESERVATION_ORPHAN_MS` | `3600000` | Retention for a reservation that never produced a receipt; durable uncertainty evidence itself is not age-evicted. |
+| `CURSOR_AGENT_DURABLE_MAINTENANCE_MS` | `300000` (5 minutes) | Periodic terminal-state cleanup; unresolved acceptance evidence is retained. |
+| `CURSOR_AGENT_SHUTDOWN_MAX_MS` | `28000` | One global planned/fatal sidecar shutdown deadline, including drain, concurrent session cancellation, and store disposal. Keep below the platform drain window. |
+| `CURSOR_AGENT_SHUTDOWN_CANCEL_CONCURRENCY` | `16` | Bounded cancellation/disposal worker count during shutdown, so one wedged session cannot serialize cleanup for every other session. |
+| `CURSOR_COMPOSER_SYSTEM_MAX_BYTES` | `524288` (512 KiB) | Aggregate system/developer context cap. Complete, stable-ID blocks are deduplicated and bounded before reaching the bridge. |
 | `CURSOR_DIRECT` | unset | Set to `1` to **bypass** the bridge and use the gated legacy direct Cursor path instead. |
 | `CURSOR_AGENT_BRIDGE_TOKEN` | unset | **Multi-tenant opt-in.** Unset = usual single-key setup (bearer must equal `CURSOR_API_KEY`). Set = the bridge gates on this token (`X-Bridge-Auth`) and runs each forwarded per-user Cursor key under an isolated platform + `STATE_ROOT/k_<hash>`. Per-key via `cursor-api-key[].composer-client-tools-bridge-token`. |
+
+Streaming responses use an atomic commit boundary: translated text, reasoning, tool calls, and terminal schema frames
+remain buffered until the bridge supplies a typed `turn_end`. During that wait, bridge pings continue downstream as
+schema-neutral SSE comments, keeping the HTTP connection alive without exposing a partial assistant response. If the
+bridge disappears before the terminal, the client receives an error without a duplicated partial prefix or tool call.
+System/developer context is also client-neutral: stable blocks make unchanged context a no-op and append only a proven
+new suffix. Replacement, removal, or reordering rotates the durable agent and faithfully re-seeds bounded history;
+the bridge never recognizes client names or incident-specific prompt text.
+
+For the strongest retry/parallel-call distinction, any compatible client may provide one stable logical invocation ID
+through `Idempotency-Key`, `X-Client-Turn-ID`, `metadata.invocation_id`, or `metadata.turn_id` (including those fields
+inside a JSON `metadata.user_id`). Keep that ID unchanged across transport retries and unique across independently
+started calls. Without a client-supplied ID, the proxy's versioned semantic ID still supports ordinary replay, but no
+server can distinguish two byte-identical independent calls after all process-local ownership is lost.
 
 The CLIProxyAPI server uses this bridge by default; `scripts/railway_start.sh` launches it automatically
 when `CURSOR_API_KEY` is set (unless `CURSOR_DIRECT=1`). The previous `cursor-sdk-bridge.mjs` /

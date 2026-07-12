@@ -9,8 +9,6 @@ import {
   readFileSync,
   renameSync,
   rmSync,
-  statSync,
-  writeFileSync,
   writeSync,
 } from "node:fs";
 import {
@@ -21,6 +19,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import path from "node:path";
+import { DurableCASConflict, DurableJSONCAS } from "./durable-json-cas.mjs";
 
 export const ROUND_JOURNAL_VERSION = 1;
 export const ROUTING_TOKEN_VERSION = "cct1";
@@ -40,6 +39,7 @@ export const DeferredInputState = Object.freeze({
 export const MAX_DEFERRED_INPUT_RECORDS = 64;
 export const MAX_DEFERRED_INTENT_BYTES = 1 << 20;
 export const MAX_DEFERRED_CONTEXT_BYTES = 2 << 20;
+export const MAX_DEFERRED_IMAGE_BYTES = 64 << 20;
 export const MAX_DEFERRED_DELIVERY_BYTES = 32 << 20;
 
 function canonicalClientLeaseToken(value) {
@@ -376,8 +376,13 @@ function canonicalDeferredContext(input) {
   const value = input && typeof input === "object" ? input : {};
   return {
     system: typeof value.system === "string" ? value.system : "",
+    systemBlocks: Array.isArray(value.systemBlocks)
+      ? jsonValue(value.systemBlocks, "$.systemBlocks") : null,
     history: typeof value.history === "string" ? value.history : "",
     historyFingerprint: typeof value.historyFingerprint === "string" ? value.historyFingerprint : "",
+    currentUser: typeof value.currentUser === "string" ? value.currentUser : "",
+    toolInventoryEpoch: typeof value.toolInventoryEpoch === "string" ? value.toolInventoryEpoch : "",
+    images: Array.isArray(value.images) ? jsonValue(value.images, "$.images") : [],
   };
 }
 
@@ -394,7 +399,8 @@ function validateDeferredSizes(intent, context) {
       413,
     );
   }
-  const contextBytes = jsonBytes(context);
+  const images = Array.isArray(context?.images) ? context.images : [];
+  const contextBytes = jsonBytes({ ...context, images: [] });
   if (contextBytes > MAX_DEFERRED_CONTEXT_BYTES) {
     throw new ToolRoundError(
       "deferred_context_too_large",
@@ -402,7 +408,15 @@ function validateDeferredSizes(intent, context) {
       413,
     );
   }
-  return { intentBytes, contextBytes };
+  const imageBytes = jsonBytes(images);
+  if (imageBytes > MAX_DEFERRED_IMAGE_BYTES) {
+    throw new ToolRoundError(
+      "deferred_images_too_large",
+      `deferred recovery images exceed ${MAX_DEFERRED_IMAGE_BYTES} bytes`,
+      413,
+    );
+  }
+  return { intentBytes, contextBytes, imageBytes };
 }
 
 function compactDeferredState(record) {
@@ -579,26 +593,6 @@ function fsyncDirectory(dir) {
   finally { closeSync(fd); }
 }
 
-function atomicWrite(file, bytes, mode = 0o600) {
-  const dir = path.dirname(file);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
-  const fd = openSync(tmp, "wx", mode);
-  try {
-    writeSync(fd, bytes);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  try {
-    renameSync(tmp, file);
-    fsyncDirectory(dir);
-  } catch (error) {
-    try { rmSync(tmp, { force: true }); } catch {}
-    throw error;
-  }
-}
-
 export function loadOrCreateRoutingKey(stateRoot) {
   mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
   const keyPath = path.join(stateRoot, ".client-tool-routing.key");
@@ -640,6 +634,7 @@ export class RoundJournal {
     this.dir = path.join(this.stateRoot, "client-tool-rounds");
     this.now = now;
     this.staleLockMs = staleLockMs;
+    this.cas = new DurableJSONCAS();
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
   }
 
@@ -648,37 +643,16 @@ export class RoundJournal {
     return path.join(this.dir, `${route}.json`);
   }
 
-  lockDir(route) {
-    return path.join(this.dir, `${route}.lock`);
-  }
-
-  acquire(route) {
-    const lock = this.lockDir(route);
-    try {
-      mkdirSync(lock, { mode: 0o700 });
-      writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, createdAt: this.now() }), { mode: 0o600 });
-      return () => { try { rmSync(lock, { recursive: true, force: true }); } catch {} };
-    } catch (error) {
-      if (!error || error.code !== "EEXIST") throw error;
-      let age = 0;
-      try { age = this.now() - statSync(lock).mtimeMs; } catch {}
-      if (age > this.staleLockMs) {
-        try { rmSync(lock, { recursive: true, force: true }); }
-        catch (removeError) { throw new ToolRoundError("round_busy", `round ${route} has an unrecoverable stale lock: ${removeError.message}`, 503); }
-        return this.acquire(route);
-      }
-      throw new ToolRoundError("round_busy", `round ${route} is being updated`, 503);
-    }
-  }
-
   read(route) {
     const file = this.file(route);
     let parsed;
-    try { parsed = JSON.parse(readFileSync(file, "utf8")); }
+    try { parsed = this.cas.readRecover(file).record; }
     catch (error) {
       if (error && error.code === "ENOENT") return null;
       throw new ToolRoundError("journal_corrupt", `cannot read round journal ${route}: ${error.message}`, 500);
     }
+    if (!parsed) return null;
+    if (parsed && parsed.deleted === true) return null;
     this.validate(parsed, route);
     return parsed;
   }
@@ -694,10 +668,11 @@ export class RoundJournal {
   }
 
   save(next, expectedRevision = 0) {
-    const release = this.acquire(next.route);
     try {
-      const current = this.read(next.route);
-      const currentRevision = current ? current.revision : 0;
+      const currentState = this.cas.readRecover(this.file(next.route));
+      const current = currentState.record;
+      if (current) this.validate(current, next.route);
+      const currentRevision = currentState.revision;
       if (currentRevision !== expectedRevision) {
         throw new ToolRoundError(
           "journal_revision_conflict",
@@ -706,11 +681,21 @@ export class RoundJournal {
           { expectedRevision, currentRevision },
         );
       }
-      const saved = jsonValue({ ...next, version: ROUND_JOURNAL_VERSION, revision: currentRevision + 1, updatedAt: this.now() });
-      atomicWrite(this.file(next.route), `${JSON.stringify(saved)}\n`);
-      return saved;
-    } finally {
-      release();
+      const candidate = jsonValue({ ...next, version: ROUND_JOURNAL_VERSION, updatedAt: this.now() });
+      const committed = this.cas.commit(this.file(next.route), currentState, candidate).record;
+      this.cas.cleanupArtifacts(this.file(next.route), { keepRevision: committed.revision });
+      return this.validate(committed, next.route);
+    } catch (error) {
+      if (error instanceof DurableCASConflict) {
+        const current = this.read(next.route);
+        throw new ToolRoundError(
+          "journal_revision_conflict",
+          `round ${next.route} revision changed from ${expectedRevision} to ${current ? current.revision : 0}`,
+          409,
+          { expectedRevision, currentRevision: current ? current.revision : 0 },
+        );
+      }
+      throw error;
     }
   }
 
@@ -720,7 +705,8 @@ export class RoundJournal {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
       const route = entry.name.slice(0, -5);
       if (!validRoute(route)) continue;
-      records.push(this.read(route));
+      const record = this.read(route);
+      if (record) records.push(record);
     }
     return records;
   }
@@ -750,19 +736,26 @@ export class RoundJournal {
     for (const record of retainedAfterAge.slice(0, Math.max(0, retainedAfterAge.length - maxTerminal))) remove.add(record.route);
     let removed = 0;
     for (const route of remove) {
-      const release = this.acquire(route);
       try {
-        const current = this.read(route);
+        const state = this.cas.readRecover(this.file(route));
+        const current = state.record;
         const unresolvedDeferred = Array.isArray(current?.deferredInputs)
           && current.deferredInputs.some((item) => item && (
             item.state === DeferredInputState.QUEUED || item.state === DeferredInputState.DELIVERING
           ));
         if (current?.state !== RoundState.TERMINAL || unresolvedDeferred) continue;
-        rmSync(this.file(route), { force: true });
-        fsyncDirectory(this.dir);
+        const tombstone = this.cas.commit(this.file(route), state, {
+          version: ROUND_JOURNAL_VERSION,
+          route,
+          state: RoundState.TERMINAL,
+          calls: [],
+          deleted: true,
+          updatedAt: this.now(),
+        }).record;
+        this.cas.cleanupArtifacts(this.file(route), { keepRevision: tombstone.revision });
         removed++;
-      } finally {
-        release();
+      } catch (error) {
+        if (!(error instanceof DurableCASConflict)) throw error;
       }
     }
     return { removed, retained: terminal.length - removed };
@@ -865,6 +858,7 @@ export class ToolRound {
     clock = () => Date.now(),
     timers = { setTimeout, clearTimeout },
     terminalCallback = null,
+    recoveryContext = null,
     record = null,
   }) {
     this.clock = clock;
@@ -924,7 +918,8 @@ export class ToolRound {
     this.terminal = null;
     this.recovery = null;
     this.deferredInputs = [];
-    this.recoveryContext = canonicalDeferredContext(null);
+    this.recoveryContext = canonicalDeferredContext(recoveryContext);
+    validateDeferredSizes(canonicalDeferredInput(null), this.recoveryContext);
     this.calls = new Map();
     this.fifo = [];
     this.outbound = [];
@@ -942,7 +937,11 @@ export class ToolRound {
   get unreceiptedOwedCallCount() {
     let count = 0;
     for (const call of this.calls.values()) {
-      if (call.handedAt != null && !call.receipt && !call.callbackAppliedAt) count++;
+      // REGISTERED outbound siblings are already durable obligations even
+      // before their tool_call frame reaches the harness. Excluding them lets
+      // the first result of a parallel wave look complete and destructively
+      // redirect/cancel the run before the sibling can be handed.
+      if (!call.receipt && !call.callbackAppliedAt && call.state !== CallState.TERMINAL) count++;
     }
     return count;
   }
@@ -1341,6 +1340,11 @@ export class ToolRound {
       if (typeof meta.model === "string" && meta.model) saved.deliveryModel = meta.model;
       if (typeof meta.toolChoice === "string") saved.deliveryToolChoice = meta.toolChoice;
       if (typeof meta.seededSystem === "string") saved.deliverySeededSystem = meta.seededSystem;
+      if (Array.isArray(meta.systemBlockIds)
+          && meta.systemBlockIds.length <= 4096
+          && meta.systemBlockIds.every((id) => typeof id === "string" && id.length <= 128)) {
+        saved.deliverySystemBlockIds = [...meta.systemBlockIds];
+      }
     }
     if (state === DeferredInputState.DELIVERED) {
       saved.deliveredAt ||= at;

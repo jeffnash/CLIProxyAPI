@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -373,8 +374,8 @@ func TestLineage7_TenantScopeRouting(t *testing.T) {
 // ===========================================================================
 // #8 RESPONSES CARVE-OUT.
 // A previous_response_id follow-up -> H16 resume (branch 2), lineage SKIPPED; no fork, no lineage recorded.
-// Map miss (restart) -> stable-conv hash, never errors. (Subagent isolation under Responses is harness-
-// dependent and documented as a residual; not asserted here.)
+// A map miss without bounded history is an honest 410; silently hashing a
+// conversation id would start a blank agent under a plausible stable route.
 // ===========================================================================
 func TestLineage8_ResponsesCarveOut(t *testing.T) {
 	auth := authL("t8")
@@ -394,14 +395,12 @@ func TestLineage8_ResponsesCarveOut(t *testing.T) {
 		t.Fatalf("Responses branch must NOT record any lineage (carve-out)")
 	}
 
-	// Map miss -> falls through to the stable-conv hash; never errors, and is deterministic.
+	// Map miss plus only the current input has no faithful recovery source.
 	miss := cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"resp-UNKNOWN","conversation_id":"conv8"}`)}
-	m1, err := deriveComposerSessionID(auth, "ckey", []byte(`{"messages":[{"role":"user","content":"hi"}]}`), miss)
-	if err != nil {
-		t.Fatalf("map miss must not error: %v", err)
-	}
-	if !strings.HasPrefix(m1, "sess_") {
-		t.Fatalf("map miss must fall through to a stable-conv session, got %q", m1)
+	if _, err := deriveComposerSessionID(auth, "ckey", []byte(`{"messages":[{"role":"user","content":"hi"}]}`), miss); err == nil {
+		t.Fatal("map miss without replay history must return 410")
+	} else if statusErr, ok := err.(interface{ StatusCode() int }); !ok || statusErr.StatusCode() != http.StatusGone {
+		t.Fatalf("map miss continuity error must be typed 410, got %T %v", err, err)
 	}
 }
 
@@ -549,12 +548,16 @@ func TestConcurrencyForkDistinctSessions(t *testing.T) {
 	// Byte-identical subagent turns sharing the parent uuid — the vector that collapses under content routing.
 	turn := lineagePayload(true, lineageMsg{"system", "S"}, lineageMsg{"user", "identical subagent task"})
 
-	a, ownerA, err := deriveComposerSessionIDLive(auth, "ckey", turn, opts)
+	a, ownerA, err := deriveComposerSessionIDLive(auth, "ckey", turn, opts, "ccm2-subagent-a")
 	if err != nil {
 		t.Fatalf("A: %v", err)
 	}
+	retryA, retryOwnerA, err := deriveComposerSessionIDLive(auth, "ckey", turn, opts, "ccm2-subagent-a")
+	if err != nil || retryA != a || retryOwnerA != ownerA {
+		t.Fatalf("A retry must reattach its original session/owner: sid=%s owner=%d err=%v; want %s/%d", retryA, retryOwnerA, err, a, ownerA)
+	}
 	// B arrives while A's logical run is still in flight (A not released) -> must FORK to a distinct session.
-	b, ownerB, err := deriveComposerSessionIDLive(auth, "ckey", turn, opts)
+	b, ownerB, err := deriveComposerSessionIDLive(auth, "ckey", turn, opts, "ccm2-subagent-b")
 	if err != nil {
 		t.Fatalf("B: %v", err)
 	}
@@ -568,7 +571,7 @@ func TestConcurrencyForkDistinctSessions(t *testing.T) {
 		t.Fatalf("each forked claim must mint a distinct non-zero owner (a=%d b=%d)", ownerA, ownerB)
 	}
 	// A third concurrent sibling -> yet another distinct session.
-	c, ownerC, _ := deriveComposerSessionIDLive(auth, "ckey", turn, opts)
+	c, ownerC, _ := deriveComposerSessionIDLive(auth, "ckey", turn, opts, "ccm2-subagent-c")
 	if c == a || c == b {
 		t.Fatalf("a third concurrent sibling must also be distinct (a=%s b=%s c=%s)", a, b, c)
 	}
@@ -576,7 +579,7 @@ func TestConcurrencyForkDistinctSessions(t *testing.T) {
 	// Release A (its run reached a terminal end). A NEW same-content turn must REUSE A's freed session, not
 	// fork — concurrency forking splits only turns that are ACTUALLY concurrent.
 	composerInflight.release(tenant, a, ownerA)
-	d, ownerD, _ := deriveComposerSessionIDLive(auth, "ckey", turn, opts)
+	d, ownerD, _ := deriveComposerSessionIDLive(auth, "ckey", turn, opts, "ccm2-subagent-d")
 	if d != a {
 		t.Fatalf("after release, a same-content turn must REUSE the freed session, not fork (a=%s d=%s)", a, d)
 	}
@@ -630,6 +633,34 @@ func TestConcurrencyLeaseLifecycle(t *testing.T) {
 	// A different sid is independently claimable.
 	if _, ok := store.claim("t", "sB"); !ok {
 		t.Fatalf("a different sid must be independently claimable while sA is held")
+	}
+}
+
+func TestConcurrencyLeaseExactRetryReattachesOriginalSession(t *testing.T) {
+	store := newComposerInflightStore()
+	owner, ok := store.claimForRequest("tenant", "sess_original", "ccm2-same-turn")
+	if !ok || owner == 0 {
+		t.Fatalf("initial identified claim failed: owner=%d ok=%v", owner, ok)
+	}
+	retryOwner, ok := store.claimForRequest("tenant", "sess_original", "ccm2-same-turn")
+	if !ok || retryOwner != owner {
+		t.Fatalf("exact retry must reattach original owner: got owner=%d ok=%v want=%d", retryOwner, ok, owner)
+	}
+	if _, ok := store.claimForRequest("tenant", "sess_original", "ccm2-distinct-turn"); ok {
+		t.Fatal("a distinct request identity must not collapse onto the held session")
+	}
+}
+
+func TestComposerLeaseHeartbeatUsesElapsedTime(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	if composerLeaseHeartbeatDue(start, start.Add(composerInflightHeartbeatInterval-time.Nanosecond)) {
+		t.Fatal("lease heartbeat fired before the elapsed-time interval")
+	}
+	if !composerLeaseHeartbeatDue(start, start.Add(composerInflightHeartbeatInterval)) {
+		t.Fatal("lease heartbeat must fire at the elapsed-time interval")
+	}
+	if !composerLeaseHeartbeatDue(time.Time{}, start) {
+		t.Fatal("a missing heartbeat timestamp must refresh immediately")
 	}
 }
 
@@ -717,10 +748,9 @@ func TestLineageSecretStableFromEnv(t *testing.T) {
 	}
 }
 
-// P0-5: a previous_response_id resume must take part in the lease, not bypass it. Two CONCURRENT resumes of the
-// SAME response id must not both land on the pinned durable session (the bridge rejects a second concurrent turn
-// on a serial session -> 500). The first claims the pinned session; the second forks. A sequential resume (after
-// release) re-claims the pinned session so its durable context is preserved.
+// P0-5: a previous_response_id resume must take part in the lease, not bypass it. Two DISTINCT concurrent resumes
+// of the same response id must not both land on the pinned durable session. An exact retry with the same
+// clientMessageId reattaches there instead (covered above); a distinct request identity forks.
 func TestConcurrencyForkPreviousResponseIDResume(t *testing.T) {
 	auth := authL("tpr")
 	tenant := composerTenant(auth, cliproxyexecutor.Options{})
@@ -728,7 +758,7 @@ func TestConcurrencyForkPreviousResponseIDResume(t *testing.T) {
 	resume := cliproxyexecutor.Options{OriginalRequest: []byte(`{"previous_response_id":"resp-pin","input":"go on"}`)}
 	body := []byte(`{"messages":[{"role":"user","content":"go on"}]}`)
 
-	a, ownerA, err := deriveComposerSessionIDLive(auth, "ckey", body, resume)
+	a, ownerA, err := deriveComposerSessionIDLive(auth, "ckey", body, resume, "ccm2-resume-a")
 	if err != nil {
 		t.Fatalf("resume A must route: %v", err)
 	}
@@ -739,7 +769,7 @@ func TestConcurrencyForkPreviousResponseIDResume(t *testing.T) {
 		t.Fatalf("the first resume must now CLAIM the lease (owner must be non-zero) — it no longer bypasses it")
 	}
 	// A second concurrent resume of the SAME pid -> the pinned session is held -> must FORK to a distinct session.
-	b, ownerB, err := deriveComposerSessionIDLive(auth, "ckey", body, resume)
+	b, ownerB, err := deriveComposerSessionIDLive(auth, "ckey", body, resume, "ccm2-resume-b")
 	if err != nil {
 		t.Fatalf("resume B must route: %v", err)
 	}
@@ -748,7 +778,7 @@ func TestConcurrencyForkPreviousResponseIDResume(t *testing.T) {
 	}
 	// Release A; a sequential resume must RE-CLAIM the pinned session (durable context preserved), not fork.
 	composerInflight.release(tenant, a, ownerA)
-	c, ownerC, _ := deriveComposerSessionIDLive(auth, "ckey", body, resume)
+	c, ownerC, _ := deriveComposerSessionIDLive(auth, "ckey", body, resume, "ccm2-resume-c")
 	if c != a {
 		t.Fatalf("a sequential resume after release must re-claim the pinned session, not fork (got %s want %s)", c, a)
 	}
@@ -812,12 +842,12 @@ func TestContentKey_LiveForkOnConcurrentSameOpener(t *testing.T) {
 	noID := cliproxyexecutor.Options{}
 	tenant := composerTenant(auth, noID)
 	p := lineagePayload(true, lineageMsg{"user", "same opener concurrent run"})
-	s1, owner1, err := deriveComposerSessionIDLive(auth, "ckey", p, noID)
+	s1, owner1, err := deriveComposerSessionIDLive(auth, "ckey", p, noID, "ccm2-content-a")
 	if err != nil {
 		t.Fatalf("live derive 1: %v", err)
 	}
 	defer composerInflight.release(tenant, s1, owner1)
-	s2, owner2, err := deriveComposerSessionIDLive(auth, "ckey", p, noID)
+	s2, owner2, err := deriveComposerSessionIDLive(auth, "ckey", p, noID, "ccm2-content-b")
 	if err != nil {
 		t.Fatalf("live derive 2: %v", err)
 	}
