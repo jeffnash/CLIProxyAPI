@@ -373,6 +373,16 @@ func TestComposerInvocationIDExtraction(t *testing.T) {
 		t.Fatalf("client turn header invocation id = %q", got)
 	}
 
+	cliproxyHeader := optsWithHeaders(map[string]string{"X-CLIProxy-Invocation-ID": "inv1_cliproxy-0004"})
+	if got := composerInvocationID(nil, cliproxyHeader); got != "inv1_cliproxy-0004" {
+		t.Fatalf("cliproxy invocation header = %q", got)
+	}
+
+	fromMeta := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.InvocationIDMetadataKey: "inv1_meta-0005"}}
+	if got := composerInvocationID(nil, fromMeta); got != "inv1_meta-0005" {
+		t.Fatalf("metadata invocation id = %q", got)
+	}
+
 	invalid, _ := json.Marshal(map[string]any{"metadata": map[string]any{"turn_id": "contains spaces"}})
 	if got := composerInvocationID(invalid, cliproxyexecutor.Options{OriginalRequest: invalid}); got != "" {
 		t.Fatalf("invalid invocation id must be ignored, got %q", got)
@@ -1059,8 +1069,11 @@ func TestManagerAdjacentUserSuffixDoesNotRotateOrPoisonCredentials(t *testing.T)
 				t.Fatal("ambiguous adjacent user-role suffix must fail closed")
 			}
 			var statusErr cliproxyexecutor.StatusError
-			if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusBadRequest {
-				t.Fatalf("manager error = %T %v, want typed 400", err, err)
+			if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusUnprocessableEntity {
+				t.Fatalf("manager error = %T %v, want typed 422 clarification", err, err)
+			}
+			if !strings.Contains(err.Error(), "provenance_ambiguous") {
+				t.Fatalf("manager error missing provenance_ambiguous marker: %v", err)
 			}
 			if got := bridgeCalls.Load(); got != 0 {
 				t.Fatalf("bridge/model/tool execution calls = %d, want zero", got)
@@ -1100,8 +1113,11 @@ func TestCursorDirectAdjacentUserSuffixFailsBeforeCredentialExchange(t *testing.
 			t.Fatalf("stream=%t: adjacent user-role suffix must fail closed", stream)
 		}
 		var statusErr cliproxyexecutor.StatusError
-		if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusBadRequest {
-			t.Fatalf("stream=%t: error = %T %v, want typed 400", stream, err, err)
+		if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusUnprocessableEntity {
+			t.Fatalf("stream=%t: error = %T %v, want typed 422 clarification", stream, err, err)
+		}
+		if !strings.Contains(err.Error(), "provenance_ambiguous") {
+			t.Fatalf("stream=%t: error missing provenance_ambiguous marker: %v", stream, err)
 		}
 	}
 	if got := outboundCalls.Load(); got != 0 {
@@ -1543,6 +1559,136 @@ func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 	}
 	if !strings.Contains(outO, "hi") {
 		t.Fatalf("openai content lost (ping handling must not drop real content): %q", outO)
+	}
+}
+
+func TestExecuteComposerStreamResumeEmitsLiveBeforeTerminal(t *testing.T) {
+	releaseTerminal := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		write := func(s string) {
+			_, _ = w.Write([]byte("data: " + s + "\n\n"))
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		write(`{"type":"text","delta":"live-hi"}`)
+		<-releaseTerminal
+		write(`{"type":"turn_end","stop_reason":"end_turn"}`)
+		write("[DONE]")
+	}))
+	defer srv.Close()
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "authResume", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
+
+	opts := composerExecOpts("openai", "resume-live")
+	opts.Headers.Set(cliproxyexecutor.HeaderCLIProxyCapabilities, cliproxyexecutor.CapabilityStreamResumeV1)
+	req := cliproxyexecutor.Request{
+		Model:   "composer-2.5",
+		Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`),
+	}
+	sr, err := e.executeComposerStream(context.Background(), auth, "k", req, opts)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if got := sr.Headers.Get(cliproxyexecutor.HeaderCLIProxyCapabilities); !strings.Contains(got, cliproxyexecutor.CapabilityStreamResumeV1) {
+		t.Fatalf("expected stream-resume-v1 advertise, got %q", got)
+	}
+
+	sawLive := make(chan struct{})
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		for chunk := range sr.Chunks {
+			if chunk.Err != nil {
+				continue
+			}
+			b.Write(chunk.Payload)
+			if strings.Contains(b.String(), "live-hi") {
+				select {
+				case <-sawLive:
+				default:
+					close(sawLive)
+				}
+			}
+		}
+		done <- b.String()
+	}()
+
+	select {
+	case <-sawLive:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream-resume-v1 must expose journaled/live model bytes before the bridge terminal")
+	}
+	close(releaseTerminal)
+	out := <-done
+	if !strings.Contains(out, "live-hi") {
+		t.Fatalf("missing live content: %q", out)
+	}
+}
+
+func TestExecuteComposerStreamLegacyStaysAtomicUntilTerminal(t *testing.T) {
+	releaseTerminal := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		fl, _ := w.(http.Flusher)
+		write := func(s string) {
+			_, _ = w.Write([]byte("data: " + s + "\n\n"))
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		write(`{"type":"text","delta":"atomic-hi"}`)
+		<-releaseTerminal
+		write(`{"type":"turn_end","stop_reason":"end_turn"}`)
+		write("[DONE]")
+	}))
+	defer srv.Close()
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "authAtomic", Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
+
+	opts := composerExecOpts("openai", "atomic-legacy")
+	req := cliproxyexecutor.Request{
+		Model:   "composer-2.5",
+		Payload: []byte(`{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]}`),
+	}
+	sr, err := e.executeComposerStream(context.Background(), auth, "k", req, opts)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	sawEarly := make(chan struct{})
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		for chunk := range sr.Chunks {
+			if chunk.Err != nil {
+				continue
+			}
+			b.Write(chunk.Payload)
+			if strings.Contains(b.String(), "atomic-hi") {
+				select {
+				case <-sawEarly:
+				default:
+					close(sawEarly)
+				}
+			}
+		}
+		done <- b.String()
+	}()
+
+	select {
+	case <-sawEarly:
+		t.Fatal("legacy clients must not observe model bytes before the durable terminal flush")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(releaseTerminal)
+	out := <-done
+	if !strings.Contains(out, "atomic-hi") {
+		t.Fatalf("missing atomically flushed content: %q", out)
 	}
 }
 

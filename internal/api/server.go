@@ -29,6 +29,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/durablestate"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
@@ -528,18 +529,65 @@ func (s *Server) setupRoutes() {
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
 	readyzHandler := func(c *gin.Context) {
-		if err := checkComposerBridgeReadiness(c.Request.Context()); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready"})
+		component := strings.TrimSpace(c.Query("component"))
+		var err error
+		var composerReady *CursorComposerReadiness
+		if component == "cursor-composer" {
+			composerReady, err = probeCursorComposerComponent(c.Request.Context())
+		} else {
+			err = checkComposerBridgeReadiness(c.Request.Context())
+		}
+		if err != nil {
+			body := gin.H{"status": "not_ready", "error": err.Error()}
+			if component != "" {
+				body["component"] = component
+			}
+			retryAfter := "5"
+			c.Header("Retry-After", retryAfter)
+			c.JSON(http.StatusServiceUnavailable, body)
 			return
 		}
 		if c.Request.Method == http.MethodHead {
 			c.Status(http.StatusOK)
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ready"})
+		body := gin.H{"status": "ready"}
+		if component == "cursor-composer" || component == "" {
+			composer := gin.H{"status": "ready"}
+			if composerReady != nil {
+				if composerReady.Metrics != nil {
+					composer["metrics"] = composerReady.Metrics
+					body["durable_state_metrics"] = composerReady.Metrics
+				}
+				composer["flags"] = composerReady.Flags
+				if composerReady.Lease != nil {
+					composer["lease"] = composerReady.Lease
+				}
+				if composerReady.Migration != nil {
+					composer["migration"] = composerReady.Migration
+					body["migration"] = composerReady.Migration
+				}
+				if composerReady.StateEpoch > 0 {
+					composer["state_epoch"] = composerReady.StateEpoch
+				}
+			} else if component == "" {
+				// Default /ready also surfaces process metrics without full composer probe.
+				composer["metrics"] = durablestate.DefaultMetrics.Snapshot()
+				body["durable_state_metrics"] = composer["metrics"]
+			}
+			body["components"] = gin.H{
+				"cursor-composer": composer,
+			}
+		}
+		if component != "" {
+			body["component"] = component
+		}
+		c.JSON(http.StatusOK, body)
 	}
 	s.engine.GET("/readyz", readyzHandler)
+	s.engine.GET("/ready", readyzHandler)
 	s.engine.HEAD("/readyz", readyzHandler)
+	s.engine.HEAD("/ready", readyzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)

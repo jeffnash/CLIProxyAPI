@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	grokauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/grok"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/durablestate"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -71,6 +72,9 @@ type Service struct {
 
 	// server is the HTTP API server instance.
 	server *api.Server
+
+	// durableRuntime is the optional Go-owned durable-state coordinator.
+	durableRuntime *durablestate.Runtime
 
 	// pprofServer manages the optional pprof HTTP debug server.
 	pprofServer *pprofServer
@@ -1709,6 +1713,16 @@ func (s *Service) Run(ctx context.Context) error {
 		redisqueue.SetEnabled(true)
 	}
 
+	rtCfg := durablestate.LoadRuntimeConfigFromEnv()
+	if durablestate.ShouldStartRuntime(rtCfg) {
+		rt, errRT := durablestate.OpenRuntime(ctx, rtCfg)
+		if errRT != nil {
+			return fmt.Errorf("cliproxy: durable state runtime: %w", errRT)
+		}
+		s.durableRuntime = rt
+		log.Infof("durable-state coordinator listening on %s (backend=%s epoch=%d)", rt.Socket, runtimeBackendKind(rtCfg), rt.Epoch)
+	}
+
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
 	s.syncPluginRuntimeConfig(ctx)
@@ -1897,6 +1911,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 					shutdownErr = err
 				}
 			}
+		}
+
+		if s.durableRuntime != nil {
+			if err := s.durableRuntime.Close(ctx); err != nil {
+				log.Errorf("error stopping durable-state runtime: %v", err)
+				if shutdownErr == nil {
+					shutdownErr = err
+				}
+			}
+			s.durableRuntime = nil
 		}
 
 		if s.pluginHost != nil {
@@ -3198,4 +3222,11 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 		}
 	}
 	return out
+}
+
+func runtimeBackendKind(cfg durablestate.RuntimeConfig) string {
+	if strings.TrimSpace(cfg.PostgresDSN) != "" {
+		return "postgres"
+	}
+	return "sqlite"
 }

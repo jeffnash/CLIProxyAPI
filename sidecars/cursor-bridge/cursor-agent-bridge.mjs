@@ -64,6 +64,38 @@ import {
 import { SseWriter } from "./sse-writer.mjs";
 import { DurableCASConflict, DurableJSONCAS } from "./durable-json-cas.mjs";
 import {
+  TURN_RECEIPT_VERSION,
+  ACCEPTANCE_PHASE,
+  LEGACY_FRESH_ATTEMPT_STATE,
+  IllegalAcceptanceTransition,
+  EnvelopeMutationError,
+  resolveAcceptancePhase,
+  migrateLegacyAcceptancePhase,
+  applyAcceptanceTransition,
+  isAcceptancePhase,
+  isLegalAcceptanceTransition,
+  assertLegalAcceptanceTransition,
+  isUnresolvedAcceptanceRecord,
+  isUnresolvedAcceptancePhase,
+  sendBoundaryCrossed,
+  recoveryActionForPhase,
+  sameFrozenEnvelope,
+  hasPositiveAcceptanceEvidence,
+} from "./acceptance-receipt.mjs";
+import {
+  createStreamJournalFromEnv,
+  formatSseFrame,
+  hasStreamResumeCapability,
+} from "./stream-journal.mjs";
+import {
+  AdaptiveMemoryBudget,
+  DEFAULT_ADAPTIVE_MEMORY_INITIAL_BYTES,
+} from "./adaptive-reservation.mjs";
+
+
+
+
+import {
   ToolContractRegistry,
   ToolContractNormalizationError,
   normalizeToolArguments,
@@ -213,6 +245,12 @@ const replayMemoryBudget = {
   limit: envInt("CURSOR_COMPOSER_REPLAY_GLOBAL_MAX_BYTES", 256 * 1024 * 1024, { min: 1 }),
   used: 0,
 };
+const REPLAY_MEMORY_INITIAL_BYTES = envInt(
+  "CURSOR_COMPOSER_REPLAY_INITIAL_BYTES",
+  DEFAULT_ADAPTIVE_MEMORY_INITIAL_BYTES,
+  { min: 64 * 1024 },
+);
+
 // Shared with Go's bufio.Scanner. The extra MiB covers `data:` framing and
 // JSON envelope overhead above the largest accepted request body. If an
 // operator raises MAX_AGENT_TURN_BYTES, they must raise this shared contract
@@ -1378,17 +1416,13 @@ function keyFingerprint(k) { return createHash("sha256").update(String(k || ""))
 const AGENT_ALIAS_DIR = path.join(STATE_ROOT, ".cct-agent-alias");
 const COMPLETED_TURN_DIR = path.join(STATE_ROOT, ".cct-completed-turns");
 const completedTurnReceipts = new Map();
-const TURN_RECEIPT_VERSION = 5;
 const TURN_IDENTITY_POLICY = Object.freeze({
   INVOCATION_V1: "invocation-v1",
   LEGACY_CLIENT_MESSAGE_V1: "legacy-client-message-v1",
   NONE: "none",
 });
-const FRESH_ATTEMPT_STATE = Object.freeze({
-  UNKNOWN: "unknown",
-  RUNNING: "running",
-  FAILED: "failed",
-});
+// Dual-read alias for legacy v4/v5 status values. New writes use ACCEPTANCE_PHASE.
+const FRESH_ATTEMPT_STATE = LEGACY_FRESH_ATTEMPT_STATE;
 const INVOCATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 const SYSTEM_BLOCK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const MAX_SYSTEM_BLOCKS = 4096;
@@ -1878,8 +1912,13 @@ function mutateTurnReceipt(file, reducer) {
 }
 
 function validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId, requestHash = "") {
-  const common = !!record && typeof record === "object" && !Array.isArray(record)
-    && (record.version === 1 || record.version === 2 || record.version === 3 || record.version === 4 || record.version === TURN_RECEIPT_VERSION)
+  const versionOk = !!record && typeof record === "object" && !Array.isArray(record)
+    && (record.version === 1 || record.version === 2 || record.version === 3 || record.version === 4
+      || record.version === 5 || record.version === TURN_RECEIPT_VERSION);
+  const completedPhase = resolveAcceptancePhase(record) === ACCEPTANCE_PHASE.COMPLETED
+    || record?.status === "completed";
+  const common = versionOk
+    && completedPhase
     && record.keyFingerprint === keyFingerprint(cursorKey)
     && record.sessionId === String(sessionId || "")
     && record.clientMessageId === String(clientMessageId || "")
@@ -1889,7 +1928,6 @@ function validCompletedTurnReceipt(record, cursorKey, sessionId, clientMessageId
       ? !requestHash || (typeof record.requestHash === "string" && record.requestHash === requestHash)
       : /^[a-f0-9]{64}$/.test(record.requestHash) && (!requestHash || record.requestHash === requestHash))
     && (record.version < 3 || (Number.isSafeInteger(record.generation) && record.generation >= 1))
-    && record.status === "completed"
     && record.usage && typeof record.usage === "object" && !Array.isArray(record.usage);
   if (!common) return false;
   if (record.version < 4) {
@@ -1979,6 +2017,7 @@ function writeCompletedTurnReceipt(
     requestKind: requestKind === "fresh" ? "fresh" : "continuation",
     identityPolicy,
     clientLeaseToken: normalizeClientLeaseToken(clientLeaseToken),
+    acceptancePhase: ACCEPTANCE_PHASE.COMPLETED,
     status: "completed",
     events: replayEvents,
     usage: usage && typeof usage === "object" && !Array.isArray(usage)
@@ -2008,11 +2047,16 @@ function writeCompletedTurnReceipt(
 }
 
 function validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash = "") {
-  const legacy = record && record.version === 3 && record.status === "delivering";
-  const current = record && (record.version === 4 || record.version === TURN_RECEIPT_VERSION)
+  const legacyV3 = record && record.version === 3 && record.status === "delivering";
+  const legacyV45 = record && (record.version === 4 || record.version === 5)
     && Object.values(FRESH_ATTEMPT_STATE).includes(record.status);
+  const phase = record ? resolveAcceptancePhase(record) : ACCEPTANCE_PHASE.NOT_SENT;
+  const v6 = record && record.version === TURN_RECEIPT_VERSION
+    && isAcceptancePhase(record.acceptancePhase)
+    && record.acceptancePhase !== ACCEPTANCE_PHASE.COMPLETED
+    && record.acceptancePhase !== ACCEPTANCE_PHASE.NOT_SENT;
   return !!record && typeof record === "object" && !Array.isArray(record)
-    && (legacy || current)
+    && (legacyV3 || legacyV45 || v6)
     && record.requestKind === "fresh"
     && record.keyFingerprint === keyFingerprint(cursorKey)
     && record.sessionId === String(sessionId || "")
@@ -2029,17 +2073,13 @@ function validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId
       || record.identityPolicy === TURN_IDENTITY_POLICY.INVOCATION_V1
       || record.identityPolicy === TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1)
     && (record.status !== FRESH_ATTEMPT_STATE.FAILED
-      || (typeof record.failure === "string" && record.failure && Number.isFinite(record.failedAt)));
+      || (typeof record.failure === "string" && record.failure && Number.isFinite(record.failedAt)))
+    && (phase !== ACCEPTANCE_PHASE.REJECTED_BEFORE_SEND
+      || (typeof record.rejectionReason === "string" && record.rejectionReason && Number.isFinite(record.rejectedAt)));
 }
 
 function unresolvedFreshDeliveryReceipt(record) {
-  return !!record && (record.status === "delivering"
-    || record.status === FRESH_ATTEMPT_STATE.UNKNOWN
-    || record.status === FRESH_ATTEMPT_STATE.RUNNING
-    // Older bridge builds wrote FAILED after agent.send resolved. Treat those
-    // receipts as acceptance-unknown during rolling upgrades; only a future
-    // explicit pre-accept NOT_ACCEPTED state may authorize a new generation.
-    || record.status === FRESH_ATTEMPT_STATE.FAILED);
+  return isUnresolvedAcceptanceRecord(record);
 }
 
 function readFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash = "") {
@@ -2079,7 +2119,9 @@ function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, reques
   hasImages,
   identityPolicy = TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1,
 }) {
-  const record = {
+  // Persist the exact frozen envelope as PREPARED_DURABLE. The send boundary
+  // is crossed only after a later fsynced MAYBE_ACCEPTED transition.
+  const draft = {
     version: TURN_RECEIPT_VERSION,
     keyFingerprint: keyFingerprint(cursorKey),
     sessionId: String(sessionId || ""),
@@ -2088,10 +2130,6 @@ function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, reques
     generation: Number.isSafeInteger(generation) && generation >= 1 ? generation : 1,
     requestKind: "fresh",
     identityPolicy,
-    // The receipt is committed immediately before agent.send. A crash or
-    // rejection at that boundary cannot prove acceptance, so UNKNOWN is the
-    // only safe initial state and must retain the exact frozen envelope.
-    status: FRESH_ATTEMPT_STATE.UNKNOWN,
     agentId: String(agentId || ""),
     deliveryIdempotencyKey: String(idempotencyKey || ""),
     deliveryMessage: JSON.parse(canonicalJSONString(message)),
@@ -2104,6 +2142,7 @@ function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, reques
     deliveryHasImages: hasImages === true,
     startedAt: nowMs(),
   };
+  const record = applyAcceptanceTransition(draft, ACCEPTANCE_PHASE.PREPARED_DURABLE, { nowMs: nowMs() });
   if (!validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
     throw new Error("fresh delivery receipt violates the durable send contract");
   }
@@ -2133,6 +2172,59 @@ function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, reques
   return committed;
 }
 
+function transitionAcceptancePhase(
+  cursorKey,
+  sessionId,
+  clientMessageId,
+  requestHash,
+  nextPhase,
+  details = {},
+) {
+  if (!clientMessageId || !requestHash || !isAcceptancePhase(nextPhase)) return null;
+  const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
+  const committed = mutateTurnReceipt(file, (raw) => {
+    completedTurnReceipts.delete(file);
+    if (raw && validCompletedTurnReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash)) {
+      return { commit: false, record: raw };
+    }
+    const existing = raw && validFreshDeliveryReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash)
+      ? raw : null;
+    if (!existing) return { commit: false, record: raw };
+    const from = resolveAcceptancePhase(existing);
+    if (from === nextPhase && nextPhase === ACCEPTANCE_PHASE.ACCEPTED) {
+      const record = {
+        ...existing,
+        version: TURN_RECEIPT_VERSION,
+        acceptancePhase: ACCEPTANCE_PHASE.ACCEPTED,
+        identityPolicy: existing.identityPolicy || TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1,
+        acceptedAt: existing.acceptedAt || nowMs(),
+      };
+      if (details.evidence && !record.acceptanceEvidence) {
+        record.acceptanceEvidence = String(details.evidence);
+      }
+      delete record.status;
+      delete record.failedAt;
+      delete record.failure;
+      delete record.runningAt;
+      return { commit: true, record };
+    }
+    const record = applyAcceptanceTransition(existing, nextPhase, {
+      ...details,
+      nowMs: nowMs(),
+      envelope: existing,
+    });
+    record.identityPolicy = existing.identityPolicy || TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1;
+    if (nextPhase !== ACCEPTANCE_PHASE.COMPLETED
+        && !validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
+      throw new Error(`acceptance phase ${nextPhase} transition violates the durable receipt contract`);
+    }
+    return { commit: true, record };
+  });
+  if (committed) completedTurnReceipts.set(file, committed);
+  return committed;
+}
+
+/** Dual-read shim: legacy running maps to ACCEPTED; failed writes are refused. */
 function transitionFreshAttemptState(
   cursorKey,
   sessionId,
@@ -2141,34 +2233,25 @@ function transitionFreshAttemptState(
   state,
   details = {},
 ) {
-  if (!clientMessageId || !requestHash || !Object.values(FRESH_ATTEMPT_STATE).includes(state)) return null;
-  const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
-  const committed = mutateTurnReceipt(file, (raw) => {
-    completedTurnReceipts.delete(file);
-    const existing = raw && validFreshDeliveryReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash)
-      ? raw : null;
-    if (!existing) return { commit: false, record: raw };
-    const record = {
-      ...existing,
-      version: TURN_RECEIPT_VERSION,
-      identityPolicy: existing.identityPolicy || TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1,
-      status: state,
-    };
-    delete record.failedAt;
-    delete record.failure;
-    delete record.runningAt;
-    if (state === FRESH_ATTEMPT_STATE.RUNNING) record.runningAt = nowMs();
-    if (state === FRESH_ATTEMPT_STATE.FAILED) {
-      record.failedAt = nowMs();
-      record.failure = String(details.failure || "fresh Cursor run failed").replace(/\s+/g, " ").slice(0, 4096);
-    }
-    if (!validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId, requestHash)) {
-      throw new Error(`fresh attempt ${state} transition violates the durable receipt contract`);
-    }
-    return { commit: true, record };
-  });
-  if (committed) completedTurnReceipts.set(file, committed);
-  return committed;
+  if (state === FRESH_ATTEMPT_STATE.RUNNING || state === ACCEPTANCE_PHASE.ACCEPTED) {
+    return transitionAcceptancePhase(
+      cursorKey, sessionId, clientMessageId, requestHash,
+      ACCEPTANCE_PHASE.ACCEPTED, { ...details, evidence: details.evidence || "agent_send_resolved" },
+    );
+  }
+  if (state === ACCEPTANCE_PHASE.MAYBE_ACCEPTED
+      || state === ACCEPTANCE_PHASE.PREPARED_DURABLE
+      || state === ACCEPTANCE_PHASE.REJECTED_BEFORE_SEND
+      || state === ACCEPTANCE_PHASE.COMPLETED) {
+    return transitionAcceptancePhase(cursorKey, sessionId, clientMessageId, requestHash, state, details);
+  }
+  if (state === FRESH_ATTEMPT_STATE.FAILED) {
+    throw new IllegalAcceptanceTransition(
+      resolveAcceptancePhase(readFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash)),
+      ACCEPTANCE_PHASE.REJECTED_BEFORE_SEND,
+    );
+  }
+  return null;
 }
 
 function cleanupCompletedTurnReceipts({ ttlMs = TERMINAL_ROUND_TTL_MS, maxTerminal = TERMINAL_ROUND_MAX } = {}) {
@@ -2179,8 +2262,13 @@ function cleanupCompletedTurnReceipts({ ttlMs = TERMINAL_ROUND_TTL_MS, maxTermin
       .map((name) => {
         const file = path.join(COMPLETED_TURN_DIR, name);
         let status = "";
-        try { status = JSON.parse(readFileSync(file, "utf8")).status || ""; } catch {}
-        return { file, mtimeMs: statSync(file).mtimeMs, status };
+        let acceptancePhase = "";
+        try {
+          const raw = JSON.parse(readFileSync(file, "utf8"));
+          status = raw.status || "";
+          acceptancePhase = raw.acceptancePhase || "";
+        } catch {}
+        return { file, mtimeMs: statSync(file).mtimeMs, status, acceptancePhase };
       })
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
   } catch (error) {
@@ -2191,19 +2279,24 @@ function cleanupCompletedTurnReceipts({ ttlMs = TERMINAL_ROUND_TTL_MS, maxTermin
   const cutoff = ttlMs > 0 ? nowMs() - ttlMs : Number.NEGATIVE_INFINITY;
   let terminalIndex = 0;
   for (let i = 0; i < entries.length; i++) {
-    // UNKNOWN/RUNNING/FAILED (and legacy DELIVERING) are acceptance evidence, not a
-    // terminal cache. Age/count eviction would erase the only proof that an
-    // SDK send may already have crossed its side-effect boundary.
+    // Unresolved acceptance evidence (v6 phases + legacy statuses) must never
+    // be TTL-evicted: it is the only proof a send may have crossed its boundary.
     if (entries[i].status === "expired") continue;
-    if (entries[i].status === "delivering"
+    const phase = isAcceptancePhase(entries[i].acceptancePhase)
+      ? entries[i].acceptancePhase
+      : resolveAcceptancePhase({ status: entries[i].status, acceptancePhase: entries[i].acceptancePhase });
+    if (isUnresolvedAcceptancePhase(phase)
+        || entries[i].status === "delivering"
         || entries[i].status === FRESH_ATTEMPT_STATE.UNKNOWN
         || entries[i].status === FRESH_ATTEMPT_STATE.RUNNING
-        || entries[i].status === FRESH_ATTEMPT_STATE.FAILED) continue;
+        || entries[i].status === FRESH_ATTEMPT_STATE.FAILED
+        || phase === ACCEPTANCE_PHASE.REJECTED_BEFORE_SEND) continue;
     if ((ttlMs > 0 && entries[i].mtimeMs < cutoff)
         || (maxTerminal >= 0 && terminalIndex >= maxTerminal)) {
       try {
         const state = receiptCAS.readRecover(entries[i].file);
-        if (state.record?.status !== "completed") continue;
+        if (resolveAcceptancePhase(state.record) !== ACCEPTANCE_PHASE.COMPLETED
+            && state.record?.status !== "completed") continue;
         const tombstone = receiptCAS.commit(entries[i].file, state, {
           version: TURN_RECEIPT_VERSION,
           status: "expired",
@@ -2614,8 +2707,18 @@ class Session {
     this.replayEvents = [];
     this.replayEventBytes = 0;
     this.replayReservationBytes = 0;
+    this.replayMemory = null;
+
     this.replayEventOverflow = false;
     this.replaySegmentIdentity = "";
+    // stream-resume-v1: durable journal-before-expose. Legacy clients leave
+    // these unset and keep the existing immediate writePayload path.
+    this.streamResumeEnabled = false;
+    this.invocationId = "";
+    this.streamJournal = createStreamJournalFromEnv() || null;
+    this.streamJournalPhase = "accepted";
+    this._exposeChain = Promise.resolve();
+
     this.toolRegistry = new AdvertisedToolRegistry();
     this.toolInventoryEpoch = null;
     // Exact MCP server keys passed to the current SDK agent handle. The
@@ -2679,21 +2782,30 @@ class Session {
   beginReplaySegment(identity = "") {
     const nextIdentity = String(identity || "");
     const reuseReservation = nextIdentity && nextIdentity === this.replaySegmentIdentity
-      && this.replayReservationBytes === MAX_AGENT_TURN_BYTES;
-    if (!reuseReservation && this.replayReservationBytes > 0) {
-      replayMemoryBudget.used = Math.max(0, replayMemoryBudget.used - this.replayReservationBytes);
+      && this.replayMemory && this.replayMemory.reserved > 0;
+    if (!reuseReservation) {
+      if (this.replayMemory) this.replayMemory.release();
+      this.replayMemory = null;
       this.replayReservationBytes = 0;
     }
     if (nextIdentity && !reuseReservation) {
-      if (replayMemoryBudget.used + MAX_AGENT_TURN_BYTES > replayMemoryBudget.limit) {
+      this.replayMemory = new AdaptiveMemoryBudget({
+        limit: replayMemoryBudget.limit,
+        initial: Math.min(REPLAY_MEMORY_INITIAL_BYTES, MAX_AGENT_TURN_BYTES),
+        hardCap: MAX_AGENT_TURN_BYTES,
+        shared: replayMemoryBudget,
+      });
+      try {
+        this.replayMemory.ensure(1);
+      } catch (error) {
+        this.replayMemory = null;
         throw new ToolRoundError(
-          "local_replay_capacity",
-          "process-wide durable replay memory capacity is occupied; retry this turn shortly",
-          503,
+          error.code || "local_replay_capacity",
+          error.message || "process-wide durable replay memory capacity is occupied; retry this turn shortly",
+          error.status || 503,
         );
       }
-      replayMemoryBudget.used += MAX_AGENT_TURN_BYTES;
-      this.replayReservationBytes = MAX_AGENT_TURN_BYTES;
+      this.replayReservationBytes = this.replayMemory.reserved;
     }
     this.replayEvents = [];
     this.replayEventBytes = 0;
@@ -2705,7 +2817,16 @@ class Session {
       const canonical = canonicalReplayEvent(event);
       if (canonical.type === "turn_end") return false;
       const bytes = Buffer.byteLength(canonicalJSONString(canonical), "utf8") + 1;
-      if (this.replayEventBytes + bytes > MAX_AGENT_TURN_BYTES) {
+      const needed = this.replayEventBytes + bytes;
+      if (this.replayMemory) {
+        try {
+          this.replayMemory.ensure(needed);
+          this.replayReservationBytes = this.replayMemory.reserved;
+        } catch (error) {
+          this.replayEventOverflow = true;
+          return false;
+        }
+      } else if (needed > MAX_AGENT_TURN_BYTES) {
         this.replayEventOverflow = true;
         return false;
       }
@@ -2719,6 +2840,7 @@ class Session {
       return false;
     }
   }
+
   completedReplayEvents(terminal) {
     if (this.replayEventOverflow) throw new Error("completed replay event log overflowed its durable bound");
     return canonicalReplayEvents([...this.replayEvents, terminal]);
@@ -2851,12 +2973,68 @@ class Session {
         ? _clientLeaseTerminal : obj.stop_reason !== "tool_use";
       value = withClientLease(wire, this, terminal);
     }
+    const journalTypes = obj && (obj.type === "text" || obj.type === "reasoning"
+      || obj.type === "tool_call" || obj.type === "turn_end");
+    if (this.streamResumeEnabled && this.invocationId && this.streamJournal && journalTypes) {
+      return this.journaledSseReceipt(value, obj);
+    }
     const receipt = this.writePayload(formatSseData(value));
     if (receipt.ok && obj && (obj.type === "text" || obj.type === "reasoning" || obj.type === "tool_call")) {
       this.recordReplayEvent(obj);
     }
     if (obj && obj.type === "turn_end" && receipt.ok) this.lastTerminalTurnToken = this.turnToken;
     return receipt;
+  }
+  journaledSseReceipt(value, original) {
+    if (!this.responseWriter && this.activeRes) this.beginResponse(this.activeRes);
+    if (!this.responseWriter || this.writeFailed) {
+      const handedToNode = Promise.reject(new Error("stream dead"));
+      handedToNode.catch(() => {});
+      return { queued: false, handedToNode, ok: false };
+    }
+    const invocationId = this.invocationId;
+    const journal = this.streamJournal;
+    const phase = this.streamJournalPhase || "accepted";
+    let resolveHanded;
+    let rejectHanded;
+    const handedToNode = new Promise((res, rej) => { resolveHanded = res; rejectHanded = rej; });
+    handedToNode.catch(() => {});
+    this._exposeChain = this._exposeChain.catch(() => {}).then(async () => {
+      let committed;
+      try {
+        committed = await journal.appendBeforeExpose(invocationId, original.type, value, {
+          acceptancePhase: phase,
+        });
+      } catch (error) {
+        const wrapped = error instanceof Error ? error : new Error(String(error));
+        this.failWrite(`stream journal commit failed: ${wrapped.message}`);
+        rejectHanded(wrapped);
+        throw wrapped;
+      }
+      const frame = formatSseFrame(value, {
+        invocationId,
+        sequence: committed.sequence,
+      });
+      const receipt = this.writePayload(frame);
+      if (!receipt.ok) {
+        const err = new Error("stream dead after journal commit");
+        rejectHanded(err);
+        throw err;
+      }
+      if (original && (original.type === "text" || original.type === "reasoning" || original.type === "tool_call")) {
+        this.recordReplayEvent(original);
+      }
+      if (original && original.type === "turn_end") this.lastTerminalTurnToken = this.turnToken;
+      try {
+        await receipt.handedToNode;
+        resolveHanded();
+      } catch (error) {
+        rejectHanded(error);
+        throw error;
+      }
+      return receipt;
+    });
+    return { queued: true, handedToNode, ok: true };
   }
   writePayload(payload) {
     if (!this.responseWriter && this.activeRes) this.beginResponse(this.activeRes);
@@ -6962,6 +7140,27 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       return;
     }
     session.beginResponse(res); session.touch(); session.turnToken++;
+    {
+      const caps = input && (input.capabilities || input.clientCapabilities || "");
+      const wantsResume = input?.streamResume === true || hasStreamResumeCapability(caps);
+      session.streamResumeEnabled = wantsResume === true;
+      session.invocationId = (requestIdentity && requestIdentity.id) || clientMessageId || "";
+      if (session.streamResumeEnabled && !session.streamJournal) {
+        throw new ToolRoundError(
+          "stream_journal_unavailable",
+          "stream-resume-v1 requires a durable state store; set CLIPROXY_STATE_SOCKET",
+          503,
+        );
+      }
+      if (session.streamResumeEnabled && !session.invocationId) {
+        throw new ToolRoundError(
+          "stream_resume_invocation_required",
+          "stream-resume-v1 requires an invocation identity before live expose",
+          422,
+        );
+      }
+    }
+
     session.lastStallLogAt = 0;
     session.toolChoice = (constraints && constraints.toolChoice) || "";
     session.settleTurn = settleOnce;
@@ -7207,6 +7406,47 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         },
       );
     }
+    // Send boundary: durably commit MAYBE_ACCEPTED and await fsync before any
+    // agent.send. PREPARED_DURABLE recovery takes the same path. Already past
+    // the boundary (MAYBE_ACCEPTED/ACCEPTED) reattaches without regressing.
+    if (clientMessageKind === "fresh" && clientMessageId) {
+      const current = readFreshDeliveryReceipt(
+        session.cursorKey, session.id, clientMessageId, clientMessageHash,
+      );
+      const phase = resolveAcceptancePhase(current);
+      if (phase === ACCEPTANCE_PHASE.PREPARED_DURABLE || phase === ACCEPTANCE_PHASE.NOT_SENT) {
+        let maybeAccepted;
+        try {
+          maybeAccepted = transitionAcceptancePhase(
+            session.cursorKey,
+            session.id,
+            clientMessageId,
+            clientMessageHash,
+            ACCEPTANCE_PHASE.MAYBE_ACCEPTED,
+          );
+        } catch (error) {
+          throw new ToolRoundError(
+            "acceptance_boundary_commit_failed",
+            `cannot durable-commit MAYBE_ACCEPTED before agent.send: ${(error && error.message) || String(error)}`,
+            503,
+          );
+        }
+        if (!maybeAccepted
+            || resolveAcceptancePhase(maybeAccepted) !== ACCEPTANCE_PHASE.MAYBE_ACCEPTED) {
+          throw new ToolRoundError(
+            "acceptance_boundary_commit_failed",
+            "MAYBE_ACCEPTED was not fsynced; refusing to call agent.send",
+            503,
+          );
+        }
+      } else if (!sendBoundaryCrossed(phase)) {
+        throw new ToolRoundError(
+          "acceptance_boundary_unavailable",
+          `fresh receipt phase ${phase} cannot cross the send boundary`,
+          503,
+        );
+      }
+    }
     markDeferred(DeferredInputState.DELIVERING, {
       agentId: session.agentId,
       textHash: expectedUserTextHash,
@@ -7228,6 +7468,17 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         return;
       }
       markDeferred(DeferredInputState.DELIVERED, { evidence: "user_message_appended" });
+      if (clientMessageKind === "fresh" && clientMessageId) {
+        try {
+          transitionAcceptancePhase(
+            session.cursorKey, session.id, clientMessageId, clientMessageHash,
+            ACCEPTANCE_PHASE.ACCEPTED, { evidence: "user_message_appended" },
+          );
+        } catch (error) {
+          dbg("acceptance ACCEPTED (user_message_appended) unavailable; retaining prior phase",
+            "session=" + session.id, (error && error.message) || String(error));
+        }
+      }
     };
     const sendCallbacks = {
       ...streamCallbacks(session, ep, observeUserMessage),
@@ -7271,6 +7522,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         } else {
           // H11: the send failed — roll the seed flags back to their pre-send values so a retry on this same
           // in-memory session re-prepends the system + history prelude (the first send never actually landed).
+          // After MAYBE_ACCEPTED the durable phase stays MAYBE_ACCEPTED (not rejected / safely retryable).
           session.seeded = seededBefore;
           session.seededSystem = seededSystemBefore;
           session.seededSystemBlockIds = seededSystemBlockIdsBefore;
@@ -7282,17 +7534,18 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       }
       if (clientMessageKind === "fresh" && clientMessageId) {
         try {
-          transitionFreshAttemptState(
+          transitionAcceptancePhase(
             session.cursorKey,
             session.id,
             clientMessageId,
             clientMessageHash,
-            FRESH_ATTEMPT_STATE.RUNNING,
+            ACCEPTANCE_PHASE.ACCEPTED,
+            { evidence: "agent_send_resolved" },
           );
         } catch (error) {
-          // UNKNOWN is the safer fallback: it preserves the exact envelope
-          // and never grants permission to start a new attempt generation.
-          dbg("fresh attempt running transition unavailable; retaining UNKNOWN",
+          // MAYBE_ACCEPTED is the safer fallback after the send boundary:
+          // never grant a new generation or mark rejected/safely retryable.
+          dbg("acceptance ACCEPTED (agent_send_resolved) unavailable; retaining MAYBE_ACCEPTED",
             "session=" + session.id, (error && error.message) || String(error));
         }
       }
@@ -7317,7 +7570,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     } catch (error) {
       session.sendPending = false;
       // Once agent.send starts, a transport rejection cannot prove the remote
-      // durable agent did not accept the message. Keep DELIVERING with the
+      // durable agent did not accept the message. Keep MAYBE_ACCEPTED with the
       // exact envelope/agent/key persisted above; a later continuation retries
       // only that identical logical SDK request.
       throw error;
@@ -7730,6 +7983,12 @@ async function runBoundedShutdownTasks(tasks, deadline, concurrency = SHUTDOWN_C
     new Promise((resolve) => setTimeout(resolve, remaining)),
   ]);
 }
+async function flushProcessDiagnostics() {
+  const flush = (stream) => new Promise((resolve) => {
+    try { stream.write("", resolve); } catch { resolve(); }
+  });
+  await Promise.all([flush(process.stdout), flush(process.stderr)]);
+}
 async function shutdown(exitCode = 0, drain = true) {
   if (shuttingDown) return; shuttingDown = true;
   const startedAt = nowMs();
@@ -7780,6 +8039,7 @@ async function shutdown(exitCode = 0, drain = true) {
   await runBoundedShutdownTasks(disposeTasks, shutdownDeadline - 250, SHUTDOWN_CANCEL_CONCURRENCY);
   platforms.clear();
   clearTimeout(forcedExit);
+  await flushProcessDiagnostics();
   process.exit(exitCode);
 }
 process.on("SIGTERM", () => { void shutdown(0, true); });
@@ -8210,4 +8470,16 @@ if (RUN_AS_MAIN) {
 
 export { runDurableMaintenance };
 export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
+export {
+  TURN_RECEIPT_VERSION,
+  ACCEPTANCE_PHASE,
+  resolveAcceptancePhase,
+  migrateLegacyAcceptancePhase,
+  transitionAcceptancePhase,
+  IllegalAcceptanceTransition,
+  EnvelopeMutationError,
+  isLegalAcceptanceTransition,
+  assertLegalAcceptanceTransition,
+  recoveryActionForPhase,
+};
 function reconcileExport(advertise, want) { const s = new Session("x"); s.advertise = advertise; return s.reconcileToolName(want); }

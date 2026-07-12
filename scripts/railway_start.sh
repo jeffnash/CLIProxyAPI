@@ -851,6 +851,21 @@ fi
 
 ensure_server_binary
 
+# A single Railway replica already has an attached persistent volume. Keep the
+# durable coordinator co-located and use SQLite there by default instead of
+# requiring a separate Postgres service. Operators that explicitly configure a
+# Postgres DSN still opt into the horizontal backend.
+if [[ -n "${RAILWAY_VOLUME_MOUNT_PATH:-}" ]]; then
+  CLIPROXY_STATE_DIR="${CLIPROXY_STATE_DIR:-${RAILWAY_VOLUME_MOUNT_PATH}/.cliproxy-state}"
+  mkdir -p "${CLIPROXY_STATE_DIR}"
+  export CLIPROXY_STATE_SOCKET="${CLIPROXY_STATE_SOCKET:-${CLIPROXY_STATE_DIR}/state.sock}"
+  if [[ -z "${CLIPROXY_STATE_POSTGRES_DSN:-}" ]]; then
+    export CLIPROXY_STATE_SQLITE_PATH="${CLIPROXY_STATE_SQLITE_PATH:-${CLIPROXY_STATE_DIR}/durable-state.sqlite}"
+  fi
+  export CLIPROXY_STATE_REQUIRE_WRITER_LEASE="${CLIPROXY_STATE_REQUIRE_WRITER_LEASE:-true}"
+  export CLIPROXY_FLAG_STATE_COORDINATOR="${CLIPROXY_FLAG_STATE_COORDINATOR:-true}"
+fi
+
 # Cursor Composer Client-Tools is the default, ToS-safe Cursor path: the patched @cursor/sdk sidecar
 # (cursor-agent-bridge.mjs) owns all Cursor I/O and every tool executes on the
 # client. The Go executor defaults to POSTing /agent/turn on this bridge, so it
@@ -859,6 +874,7 @@ ensure_server_binary
 # Start the bridge for the default Cursor Composer Client-Tools path when EITHER a single-tenant Cursor key (CURSOR_API_KEY)
 # OR a multi-tenant bridge token (CURSOR_AGENT_BRIDGE_TOKEN) is configured. A deployment with neither
 # (e.g. only other providers) skips this block entirely so `set -u` never aborts on an unset CURSOR_API_KEY.
+START_CURSOR_BRIDGE=0
 if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR_AGENT_BRIDGE_TOKEN:-}" ) ]]; then
   CURSOR_BRIDGE_DIR="${ROOT_DIR}/sidecars/cursor-bridge"
   CURSOR_AGENT_BRIDGE_PORT="${CURSOR_AGENT_BRIDGE_PORT:-9798}"
@@ -887,13 +903,7 @@ if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR
       err "Cursor bridge dependencies/structural SDK patch are missing from the image; rebuild it (runtime npm install is intentionally disabled)"
       exit 1
     fi
-    start_cursor_bridge_process
-    if ! wait_cursor_bridge_ready; then
-      info "Cursor Composer Client-Tools bridge failed readiness; refusing to start the API"
-      exit 1
-    else
-      info "Cursor Composer Client-Tools agent bridge is ready"
-    fi
+    START_CURSOR_BRIDGE=1
     export CURSOR_AGENT_BRIDGE_REQUIRED=1
     export CURSOR_AGENT_BRIDGE_PORT
     export CURSOR_AGENT_BRIDGE_URL="${CURSOR_AGENT_BRIDGE_URL:-http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}}"
@@ -902,13 +912,48 @@ if [[ "${CURSOR_DIRECT:-0}" != "1" && ( -n "${CURSOR_API_KEY:-}" || -n "${CURSOR
   fi
 fi
 
-info "Starting server"
-if [[ -z "${CURSOR_BRIDGE_PID:-}" ]]; then
+if [[ "${START_CURSOR_BRIDGE}" != "1" ]]; then
+  info "Starting server"
   exec "${BIN_PATH}" --config "${OUT_CONFIG_PATH}"
 fi
 
+# The Go process owns the durable-state coordinator and its Unix socket. Start
+# it before the bridge so the bridge can durably journal before exposing frames
+# or crossing agent.send(). /readyz remains degraded until the required bridge
+# is ready, so Railway never routes Composer traffic through this bootstrap.
+info "Starting server and durable-state coordinator"
 "${BIN_PATH}" --config "${OUT_CONFIG_PATH}" &
 SERVER_PID=$!
+
+if [[ -n "${CLIPROXY_STATE_SOCKET:-}" ]]; then
+  state_socket_attempts="${CLIPROXY_STATE_SOCKET_READY_ATTEMPTS:-60}"
+  for ((attempt = 0; attempt < state_socket_attempts; attempt++)); do
+    if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+      wait "${SERVER_PID}" 2>/dev/null || true
+      err "API exited before the durable-state coordinator became ready"
+      exit 1
+    fi
+    if [[ -S "${CLIPROXY_STATE_SOCKET}" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ ! -S "${CLIPROXY_STATE_SOCKET}" ]]; then
+    err "Durable-state coordinator socket did not become ready: ${CLIPROXY_STATE_SOCKET}"
+    kill -TERM "${SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PID}" 2>/dev/null || true
+    exit 1
+  fi
+fi
+
+start_cursor_bridge_process
+if ! wait_cursor_bridge_ready; then
+  err "Cursor Composer Client-Tools bridge failed readiness; refusing deployment readiness"
+  kill -TERM "${SERVER_PID}" >/dev/null 2>&1 || true
+  wait "${SERVER_PID}" 2>/dev/null || true
+  exit 1
+fi
+info "Cursor Composer Client-Tools agent bridge is ready"
 
 shutdown_children() {
   trap - TERM INT

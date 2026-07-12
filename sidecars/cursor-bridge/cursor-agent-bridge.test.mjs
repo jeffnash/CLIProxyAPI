@@ -107,11 +107,12 @@ test("process-wide replay memory is reserved before a turn and rejects before SD
   const originalUsed = replayMemoryBudget.used;
   const first = new Session(`replay-budget-a-${Date.now()}`, "cursor-key-a");
   const second = new Session(`replay-budget-b-${Date.now()}`, "cursor-key-b");
+  const initialBytes = 2 * 1024 * 1024; // adaptive initial reservation
   try {
-    replayMemoryBudget.limit = MAX_AGENT_TURN_BYTES;
+    replayMemoryBudget.limit = initialBytes;
     replayMemoryBudget.used = 0;
     first.beginReplaySegment("turn-a");
-    assert.equal(replayMemoryBudget.used, MAX_AGENT_TURN_BYTES);
+    assert.equal(replayMemoryBudget.used, initialBytes);
     assert.throws(
       () => second.beginReplaySegment("turn-b"),
       (error) => error.code === "local_replay_capacity" && error.status === 503,
@@ -138,11 +139,11 @@ test("process-wide replay memory is reserved before a turn and rejects before SD
     assert.match(blocked.chunks.join(""), /"errorCode":"local_replay_capacity"/);
     assert.equal(sessions.has(blockedSessionId), false);
     first.beginReplaySegment("turn-a");
-    assert.equal(replayMemoryBudget.used, MAX_AGENT_TURN_BYTES, "same-turn reseed must reuse its reservation");
+    assert.equal(replayMemoryBudget.used, initialBytes, "same-turn reseed must reuse its reservation");
     first.beginReplaySegment();
     assert.equal(replayMemoryBudget.used, 0);
     second.beginReplaySegment("turn-b");
-    assert.equal(replayMemoryBudget.used, MAX_AGENT_TURN_BYTES);
+    assert.equal(replayMemoryBudget.used, initialBytes);
   } finally {
     first.beginReplaySegment();
     second.beginReplaySegment();
@@ -150,6 +151,7 @@ test("process-wide replay memory is reserved before a turn and rejects before SD
     replayMemoryBudget.used = originalUsed;
   }
 });
+
 
 class MockResponse extends EventEmitter {
   constructor(writeReturns = []) {
@@ -2999,7 +3001,8 @@ test("completed receipts replay ordered reasoning, text, tool frames, usage, and
 
   const file = exactTurnReceiptFile(cursorKey, sessionId, input.clientMessageId, input);
   const persisted = JSON.parse(readFileSync(file, "utf8"));
-  assert.equal(persisted.version, 5);
+  assert.equal(persisted.version, 6);
+  assert.equal(persisted.acceptancePhase, "COMPLETED");
   assert.deepEqual(persisted.events.map((event) => event.type), [
     "reasoning",
     "text",
@@ -3089,7 +3092,7 @@ test("a post-acceptance fresh run failure retains one frozen generation across r
   assert.match(first.text(), /post-acceptance upstream run failure/);
   const file = exactTurnReceiptFile(cursorKey, sessionId, invocationId, input);
   const unresolved = JSON.parse(readFileSync(file, "utf8"));
-  assert.equal(unresolved.status, "running");
+  assert.equal(unresolved.acceptancePhase, "ACCEPTED");
   assert.equal(unresolved.generation, 1);
 
   const retry = new MockResponse();
@@ -3178,15 +3181,30 @@ test("cross-process receipt races elect one fresh owner and completed state is a
   let receiptFiles = readdirSync(receiptDir).filter((name) => /^[a-f0-9]{64}\.json$/.test(name));
   assert.equal(receiptFiles.length, 1);
   let receipt = JSON.parse(readFileSync(path.join(receiptDir, receiptFiles[0]), "utf8"));
-  assert.equal(receipt.status, "unknown");
+  assert.equal(receipt.acceptancePhase, "PREPARED_DURABLE");
+
+  // Cross the send boundary before racing acceptance vs completion.
+  const maybeAt = Date.now() + 200;
+  const maybeChild = await runChild(`
+    const bridge = await import(${JSON.stringify(moduleUrl)});
+    ${waitUntil(maybeAt)}
+    bridge.transitionAcceptancePhase(
+      ${JSON.stringify(cursorKey)}, ${JSON.stringify(sessionId)},
+      ${JSON.stringify(clientMessageId)}, ${JSON.stringify(requestHash)}, "MAYBE_ACCEPTED",
+    );
+  `);
+  assert.deepEqual({ code: maybeChild.code, signal: maybeChild.signal }, { code: 0, signal: null }, maybeChild.stderr);
+  receipt = JSON.parse(readFileSync(path.join(receiptDir, receiptFiles[0]), "utf8"));
+  assert.equal(receipt.acceptancePhase, "MAYBE_ACCEPTED");
 
   const mutationAt = Date.now() + 1000;
   const transitionSource = `
     const bridge = await import(${JSON.stringify(moduleUrl)});
     ${waitUntil(mutationAt)}
-    bridge.transitionFreshAttemptState(
+    bridge.transitionAcceptancePhase(
       ${JSON.stringify(cursorKey)}, ${JSON.stringify(sessionId)},
-      ${JSON.stringify(clientMessageId)}, ${JSON.stringify(requestHash)}, "running",
+      ${JSON.stringify(clientMessageId)}, ${JSON.stringify(requestHash)}, "ACCEPTED",
+      { evidence: "agent_send_resolved" },
     );
   `;
   const completionSource = `
@@ -3233,7 +3251,7 @@ test("acceptance-unknown fresh receipts survive terminal TTL and count cleanup",
   await waitFor(() => response.ended, "ambiguous send terminal");
 
   const file = exactTurnReceiptFile(cursorKey, sessionId, invocationId, input);
-  assert.equal(readFreshDeliveryReceipt(cursorKey, sessionId, invocationId, completedTurnRequestHash(input)).status, "unknown");
+  assert.equal(readFreshDeliveryReceipt(cursorKey, sessionId, invocationId, completedTurnRequestHash(input)).acceptancePhase, "MAYBE_ACCEPTED");
   cleanupCompletedTurnReceipts({ ttlMs: 1, maxTerminal: 0 });
   assert.equal(existsSync(file), true, "cleanup must retain unresolved acceptance evidence");
 

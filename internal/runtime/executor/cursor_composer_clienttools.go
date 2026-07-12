@@ -899,11 +899,15 @@ func claudeSessionID(payload []byte) string {
 // Anthropic-compatible gateways without a non-standard top-level field;
 // generic headers/top-level metadata provide the same contract.
 func composerInvocationID(oai []byte, opts cliproxyexecutor.Options) string {
+	if id := cliproxyexecutor.InvocationIDFromMetadata(opts.Metadata); cliproxyexecutor.ValidInvocationID(id) {
+		return id
+	}
 	candidates := make([]string, 0, 8)
 	if opts.Headers != nil {
 		candidates = append(candidates,
-			opts.Headers.Get("Idempotency-Key"),
-			opts.Headers.Get("X-Client-Turn-ID"),
+			opts.Headers.Get(cliproxyexecutor.HeaderIdempotencyKey),
+			opts.Headers.Get(cliproxyexecutor.HeaderCLIProxyInvocationID),
+			opts.Headers.Get(cliproxyexecutor.HeaderClientTurnID),
 		)
 	}
 	for _, payload := range [][]byte{opts.OriginalRequest, oai} {
@@ -924,7 +928,7 @@ func composerInvocationID(oai []byte, opts cliproxyexecutor.Options) string {
 	}
 	for _, candidate := range candidates {
 		candidate = strings.TrimSpace(candidate)
-		if composerInvocationIDPattern.MatchString(candidate) {
+		if cliproxyexecutor.ValidInvocationID(candidate) {
 			return candidate
 		}
 	}
@@ -4047,7 +4051,6 @@ func composerTurnBody(sessionID, model string, input map[string]any, advertise [
 const composerRoutedResponseIDPrefix = "chatcmpl-composer-cr1_"
 
 var composerRoutedSessionIDPattern = regexp.MustCompile(`^sess_[A-Za-z0-9_-]{8,240}$`)
-var composerInvocationIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$`)
 
 func composerResponseRouteMAC(apiKey, tenant, sessionID, nonce string) []byte {
 	key := []byte(apiKey)
@@ -4355,8 +4358,11 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	turn.contHint = composerContinuationHintFor(turn.tenant, turn.oai)
 	messages := gjson.GetBytes(turn.oai, "messages").Array()
 	_, _, turn.continuation = composerToolResultsHinted(messages, turn.contHint)
-	if composerAmbiguousTrailingUserSegments(messages) {
-		return turn, &composerInvalidRequestError{msg: "cursor composer: ambiguous adjacent user-role segments at the current-turn suffix; preserve injected context as system/developer or merge intentional user fragments"}
+	if rewritten, cerr := resolveComposerProvenance(turn.tenant, turn.oai, opts, len(composerToolDefs(turn.oai)) > 0); cerr != nil {
+		return turn, cerr
+	} else if rewritten != nil {
+		turn.oai = rewritten
+		messages = gjson.GetBytes(turn.oai, "messages").Array()
 	}
 	if lastUserTurnImageOnlyInvalid(messages, turn.contHint) {
 		return turn, errComposerImageOnlyInvalid
@@ -4515,7 +4521,16 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 	// server-side-chained [..., tool, user] turn is sent as tool_results (with userText) — not a fresh user turn
 	// behind a paused run.
 	inp := turn.input
+	liveStream := cliproxyexecutor.HasCapability(opts.Headers, cliproxyexecutor.CapabilityStreamResumeV1)
+	if liveStream {
+		if inp == nil {
+			inp = map[string]any{}
+		}
+		inp["streamResume"] = true
+		inp["capabilities"] = cliproxyexecutor.CapabilityStreamResumeV1
+	}
 	body := composerTurnBody(sessionID, model, inp, advertise, toolChoice, turn.clientEnv, constraints, leaseOwner)
+
 	composerDebugf("[composer %s] STREAM sessionID=%s inputType=%v toolChoice=%q advertise=%d -> POST /agent/turn", responseID, sessionID, inp["type"], toolChoice, len(advertise))
 	composerDebugLogAdvertisedTools(responseID, advertise)
 
@@ -4570,9 +4585,11 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		// inject the prompt estimate into message_start or CC never auto-compacts a composer session, however full.
 		composerInputEstimate := composerEstimateTokens(promptChars)
 		// Hold all model-visible frames until the bridge has emitted a durable
-		// terminal. If the sidecar disappears mid-stream, the client has observed
-		// no assistant/tool bytes and can retry the invocation without duplicated
-		// prefixes or tool calls. SSE comments still flow as transport keepalives.
+		// terminal UNLESS the client advertised stream-resume-v1. Capable clients
+		// receive live frames that the bridge has already journal-committed;
+		// legacy clients keep the atomic full-response buffer. liveStream is
+		// computed before the goroutine from opts.Headers.
+
 		commitBuffer := make([][]byte, 0, 32)
 		commitBufferBytes := 0
 		commitBudgetBytes := 0
@@ -4587,6 +4604,14 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		emit := func(srcChunks [][]byte) bool {
 			for i := range srcChunks {
 				payload := composerSetMessageStartInputTokens(srcChunks[i], composerInputEstimate)
+				if liveStream {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: bytes.Clone(payload)}:
+					case <-ctx.Done():
+						return false
+					}
+					continue
+				}
 				if commitBufferBytes+len(payload) > composerStreamCommitMaxBytes {
 					if commitBufferErr == nil {
 						commitBufferErr = newComposerBridgeProtocolError(responseID, "translated stream exceeds the atomic commit buffer", "")
@@ -4626,6 +4651,9 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 			}
 		}
 		flushCommitted := func() bool {
+			if liveStream {
+				return commitBufferErr == nil
+			}
 			if commitBufferErr != nil {
 				return false
 			}
@@ -4863,13 +4891,20 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 			return
 		}
 		_ = flushCommitted()
+		observeComposerCompleted(tenant, oai, opts, leaseStop)
 	}()
 
 	// ADD-80 (RBT-035): do NOT forward the bridge's transport headers (text/event-stream, Cache-Control, any
 	// bridge/CDN/gateway headers) on the OUTBOUND stream. The per-schema STREAM handler already forces the
 	// correct streaming Content-Type (text/event-stream) and WriteUpstreamHeaders never overwrites it, so we
-	// return a minimal clean header set carrying no bridge transport headers rather than httpResp.Header.Clone().
-	return &cliproxyexecutor.StreamResult{Headers: composerStreamResponseHeaders(), Chunks: out}, nil
+	// return a minimal clean header set. stream-resume-v1 is advertised only for capable live clients.
+
+	headers := composerStreamResponseHeaders()
+	if liveStream {
+		headers.Set(cliproxyexecutor.HeaderCLIProxyCapabilities, cliproxyexecutor.CapabilityStreamResumeV1)
+	}
+	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}, nil
+
 }
 
 // executeComposer drives one /agent/turn and accumulates the bridge stream into a
@@ -5161,6 +5196,7 @@ bridgeResponse:
 	// ADD-80 (RBT-035): the body is the caller's JSON, not the bridge's SSE — never forward the bridge's
 	// text/event-stream/Cache-Control headers (a strict SDK would mis-parse JSON as SSE). Emit a clean
 	// schema-appropriate Content-Type instead of httpResp.Header.Clone().
+	observeComposerCompleted(tenant, turn.oai, opts, leaseStop)
 	return cliproxyexecutor.Response{Payload: []byte(out), Headers: composerJSONResponseHeaders(from)}, nil
 }
 

@@ -1780,7 +1780,34 @@ func errorDisposition(err error) (cliproxyexecutor.ErrorDisposition, bool) {
 	return errors.AsType[cliproxyexecutor.ErrorDisposition](err)
 }
 
+// errorAcceptancePhase returns a trustworthy acceptance phase when the error
+// carries explicit phase evidence. Unclassified legacy errors return ok=false
+// so credential failover keeps its existing provider behavior until executors
+// emit accurate phases.
+func errorAcceptancePhase(err error) (cliproxyexecutor.AcceptancePhase, bool) {
+	if err == nil {
+		return cliproxyexecutor.AcceptanceNotSent, true
+	}
+	if carrier, ok := errors.AsType[cliproxyexecutor.AcceptancePhaseCarrier](err); ok && carrier != nil {
+		phase := carrier.AcceptancePhase()
+		if cliproxyexecutor.IsValidAcceptancePhase(phase) {
+			return phase, true
+		}
+	}
+	return "", false
+}
+
 func errorRetryScope(err error) cliproxyexecutor.RetryScope {
+	if disposition, ok := errorDisposition(err); ok && disposition != nil {
+		if scope := disposition.RetryScope(); scope == cliproxyexecutor.RetryScopeSelectedExecution {
+			return scope
+		}
+	}
+	if phase, ok := errorAcceptancePhase(err); ok {
+		if scope := cliproxyexecutor.RetryScopeFromAcceptancePhase(phase); scope == cliproxyexecutor.RetryScopeSelectedExecution {
+			return scope
+		}
+	}
 	if disposition, ok := errorDisposition(err); ok && disposition != nil {
 		return disposition.RetryScope()
 	}
@@ -1792,6 +1819,16 @@ func errorAuthAttributable(err error) bool {
 		return disposition.AuthAttributable()
 	}
 	return true
+}
+
+// allowsCredentialFailover consults acceptance phase only when the error
+// carries trustworthy phase evidence. Unclassified errors preserve legacy
+// auth-attribution failover behavior.
+func allowsCredentialFailover(err error) bool {
+	if phase, ok := errorAcceptancePhase(err); ok {
+		return cliproxyexecutor.AllowsCredentialRotation(phase, errorAuthAttributable(err))
+	}
+	return errorAuthAttributable(err)
 }
 
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
@@ -1843,7 +1880,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				if errorAuthAttributable(chunk.Err) {
+				if allowsCredentialFailover(chunk.Err) {
 					m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
 				}
 			}
@@ -1933,7 +1970,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
-			if errorAuthAttributable(errStream) {
+			if allowsCredentialFailover(errStream) {
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
@@ -1953,7 +1990,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
-			if errorAuthAttributable(errStream) {
+			if allowsCredentialFailover(errStream) {
 				m.MarkResult(ctx, result)
 			}
 			if errorRetryScope(errStream) == cliproxyexecutor.RetryScopeSelectedExecution {
@@ -1972,7 +2009,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
 			}
-			if errorAuthAttributable(bootstrapErr) {
+			if allowsCredentialFailover(bootstrapErr) {
 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, bootstrapErr, didRefreshOnUnauthorized); okRefresh {
 					discardStreamChunks(streamResult.Chunks)
 					auth = refreshed
@@ -2003,7 +2040,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				if errorAuthAttributable(bootstrapErr) {
+				if allowsCredentialFailover(bootstrapErr) {
 					m.MarkResult(ctx, result)
 				}
 				discardStreamChunks(streamResult.Chunks)
@@ -2016,7 +2053,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				if errorAuthAttributable(bootstrapErr) {
+				if allowsCredentialFailover(bootstrapErr) {
 					m.MarkResult(ctx, result)
 				}
 				discardStreamChunks(streamResult.Chunks)
@@ -2029,7 +2066,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
-			if errorAuthAttributable(bootstrapErr) {
+			if allowsCredentialFailover(bootstrapErr) {
 				m.MarkResult(ctx, result)
 			}
 			discardStreamChunks(streamResult.Chunks)
@@ -2721,7 +2758,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				if errorAuthAttributable(errExec) {
+				if allowsCredentialFailover(errExec) {
 					if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 						auth = refreshed
 						didRefreshOnUnauthorized = true
@@ -2743,7 +2780,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				if errorAuthAttributable(errExec) {
+				if allowsCredentialFailover(errExec) {
 					m.MarkResult(execCtx, result)
 				}
 				if errorRetryScope(errExec) == cliproxyexecutor.RetryScopeSelectedExecution {

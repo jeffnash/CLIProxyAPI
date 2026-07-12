@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
@@ -12,12 +13,19 @@ import (
 type dispositionTestError struct {
 	scope        cliproxyexecutor.RetryScope
 	attributable bool
+	phase        cliproxyexecutor.AcceptancePhase
 }
 
 func (e *dispositionTestError) Error() string                           { return "classified execution failure" }
 func (e *dispositionTestError) StatusCode() int                         { return http.StatusTooManyRequests }
 func (e *dispositionTestError) RetryScope() cliproxyexecutor.RetryScope { return e.scope }
 func (e *dispositionTestError) AuthAttributable() bool                  { return e.attributable }
+func (e *dispositionTestError) AcceptancePhase() cliproxyexecutor.AcceptancePhase {
+	if e != nil && cliproxyexecutor.IsValidAcceptancePhase(e.phase) {
+		return e.phase
+	}
+	return ""
+}
 
 type dispositionTestExecutor struct {
 	mu       sync.Mutex
@@ -131,5 +139,70 @@ func TestManagerAuthAttributableFailureMayRotateCredentials(t *testing.T) {
 	}
 	if len(executor.calls) != 2 || executor.calls[0] == executor.calls[1] {
 		t.Fatalf("executor calls = %v, want two distinct credentials", executor.calls)
+	}
+}
+
+func TestErrorAcceptancePhaseHelpers(t *testing.T) {
+	unknown := errors.New("opaque upstream failure")
+	if _, ok := errorAcceptancePhase(unknown); ok {
+		t.Fatal("unclassified errors must not invent acceptance-phase evidence")
+	}
+	if !allowsCredentialFailover(unknown) {
+		t.Fatal("unclassified failures must preserve legacy credential failover")
+	}
+	if errorRetryScope(unknown) != cliproxyexecutor.RetryScopeDefault {
+		t.Fatalf("unknown retry scope = %v, want default", errorRetryScope(unknown))
+	}
+
+	clarification := &dispositionTestError{
+		scope:        cliproxyexecutor.RetryScopeSelectedExecution,
+		attributable: false,
+		phase:        cliproxyexecutor.AcceptanceNotSent,
+	}
+	if allowsCredentialFailover(clarification) {
+		t.Fatal("clarification must not allow credential failover")
+	}
+	if phase, ok := errorAcceptancePhase(clarification); !ok || phase != cliproxyexecutor.AcceptanceNotSent {
+		t.Fatalf("clarification phase = (%q,%v), want not_sent", phase, ok)
+	}
+	if errorRetryScope(clarification) != cliproxyexecutor.RetryScopeSelectedExecution {
+		t.Fatalf("clarification retry scope = %v, want selected execution", errorRetryScope(clarification))
+	}
+
+	preSendAuth := &dispositionTestError{
+		scope:        cliproxyexecutor.RetryScopeDefault,
+		attributable: true,
+		phase:        cliproxyexecutor.AcceptanceNotSent,
+	}
+	if !allowsCredentialFailover(preSendAuth) {
+		t.Fatal("auth-attributable pre-send failure must allow credential failover")
+	}
+}
+
+func TestManagerMaybeAcceptedFailureDoesNotRotateCredentials(t *testing.T) {
+	executor := &dispositionTestExecutor{
+		failures: 2,
+		err: &dispositionTestError{
+			scope:        cliproxyexecutor.RetryScopeDefault,
+			attributable: true,
+			phase:        cliproxyexecutor.AcceptanceMaybeAccepted,
+		},
+	}
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(executor)
+	registerDispositionTestAuths(t, manager)
+
+	_, err := manager.Execute(context.Background(), []string{"disposition-test"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("maybe_accepted failure must be returned")
+	}
+	if len(executor.calls) != 1 {
+		t.Fatalf("executor calls = %v, want no credential rotation after maybe_accepted", executor.calls)
+	}
+	for _, id := range []string{"disposition-a", "disposition-b"} {
+		auth, ok := manager.GetByID(id)
+		if !ok || auth.Unavailable || auth.LastError != nil {
+			t.Fatalf("credential %s was poisoned after maybe_accepted: %#v", id, auth)
+		}
 	}
 }

@@ -26,7 +26,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -76,8 +75,11 @@ func (e *CursorExecutor) prepareCursorDirect(ctx context.Context, auth *cliproxy
 	req.Payload = sdktranslator.TranslateRequest(from, to, req.Model, sourcePayload, stream)
 	log.Infof("cursor e2e (xlate): from=%s to=openai original=%d bytes msgs=%d translated=%d bytes msgs=%d",
 		from, originalBytes, originalMsgs, len(req.Payload), countJSONMessages(req.Payload))
-	if composerAmbiguousTrailingUserSegments(gjson.GetBytes(req.Payload, "messages").Array()) {
-		return nil, &composerInvalidRequestError{msg: "cursor: ambiguous adjacent user-role segments at the current-turn suffix; preserve injected context as system/developer or merge intentional user fragments"}
+	tenant := composerTenant(auth, opts)
+	if rewritten, cerr := resolveComposerProvenance(tenant, req.Payload, opts, false); cerr != nil {
+		return nil, cerr
+	} else if rewritten != nil {
+		req.Payload = rewritten
 	}
 
 	proxyClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
