@@ -941,49 +941,71 @@ func TestComposerAmbiguousTrailingUserSegmentsFailClosed(t *testing.T) {
 	}
 }
 
-func TestAnthropicMessagesAdjacentUserSuffixFailsBeforeBridgeExecution(t *testing.T) {
-	var bridgeCalls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		bridgeCalls.Add(1)
-		http.Error(w, "bridge must not be called", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
+func TestAnthropicMessagesAdjacentUserSuffixCombinesBeforeComposer(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages string
+		wantText []string
+	}{
+		{
+			name: "two user records",
+			messages: `[
+				{"role":"user","content":"goal context"},
+				{"role":"user","content":"visible request"}
+			]`,
+			wantText: []string{"goal context", "visible request"},
+		},
+		{
+			name: "four user continuation records",
+			messages: `[
+				{"role":"user","content":"goal context"},
+				{"role":"user","content":"visible request"},
+				{"role":"user","content":"refreshed goal context"},
+				{"role":"user","content":"continuation"}
+			]`,
+			wantText: []string{"goal context", "visible request", "refreshed goal context", "continuation"},
+		},
+	}
 
-	payload := []byte(`{
-		"model":"composer-2.5",
-		"messages":[
-			{"role":"user","content":"transfer the selected bundle"},
-			{"role":"user","content":"standing repository discovery instructions"}
-		]
-	}`)
-	opts := composerExecOpts("claude", "ambiguous-anthropic-wire")
-	opts.OriginalRequest = append([]byte(nil), payload...)
-	opts.Metadata = map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/messages"}
-	auth := &cliproxyauth.Auth{ID: "ambiguous-anthropic", Attributes: map[string]string{
-		"api_key":                          "cursor-key",
-		"composer_client_tools_bridge_url": srv.URL,
-	}}
-	executor := NewCursorExecutor(&config.Config{})
-	_, err := executor.executeComposer(context.Background(), auth, "cursor-key", cliproxyexecutor.Request{
-		Model:   "composer-2.5",
-		Payload: payload,
-	}, opts)
-	if err == nil {
-		t.Fatal("adjacent user-role suffix must fail closed")
-	}
-	var statusErr cliproxyexecutor.StatusError
-	if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusBadRequest {
-		t.Fatalf("ambiguous request error = %T %v, want typed 400", err, err)
-	}
-	if !strings.Contains(err.Error(), "ambiguous adjacent user-role segments") {
-		t.Fatalf("ambiguous request error lost recovery guidance: %v", err)
-	}
-	var disposition cliproxyexecutor.ErrorDisposition
-	if !errors.As(err, &disposition) || disposition.RetryScope() != cliproxyexecutor.RetryScopeSelectedExecution || disposition.AuthAttributable() {
-		t.Fatalf("ambiguous request disposition = %#v, want selected execution and non-auth-attributable", disposition)
-	}
-	if got := bridgeCalls.Load(); got != 0 {
-		t.Fatalf("bridge/model/tool execution calls = %d, want zero", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := []byte(`{"model":"composer-2.5","messages":` + tt.messages + `}`)
+			opts := composerExecOpts("claude", "anthropic-combined-wire-"+strings.ReplaceAll(tt.name, " ", "-"))
+			opts.OriginalRequest = append([]byte(nil), payload...)
+			opts.Metadata = map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/messages"}
+			auth := &cliproxyauth.Auth{ID: "anthropic-combined", Attributes: map[string]string{"api_key": "cursor-key"}}
+
+			turn, err := NewCursorExecutor(&config.Config{}).prepareComposerInbound(
+				auth,
+				"cursor-key",
+				cliproxyexecutor.Request{Model: "composer-2.5", Payload: payload},
+				opts,
+				false,
+			)
+			if err != nil {
+				t.Fatalf("prepareComposerInbound() error = %v", err)
+			}
+
+			var users []gjson.Result
+			for _, message := range gjson.GetBytes(turn.oai, "messages").Array() {
+				if message.Get("role").String() == "user" {
+					users = append(users, message)
+				}
+			}
+			if len(users) != 1 {
+				t.Fatalf("translated user messages = %s, want one combined turn", gjson.GetBytes(turn.oai, "messages").Raw)
+			}
+
+			var gotText []string
+			for _, part := range users[0].Get("content").Array() {
+				if part.Get("type").String() == "text" {
+					gotText = append(gotText, part.Get("text").String())
+				}
+			}
+			if !reflect.DeepEqual(gotText, tt.wantText) {
+				t.Fatalf("combined text blocks = %#v, want %#v", gotText, tt.wantText)
+			}
+		})
 	}
 }
 
@@ -1002,7 +1024,7 @@ func TestManagerAdjacentUserSuffixDoesNotRotateOrPoisonCredentials(t *testing.T)
 			{"role":"user","content":"standing injected context"}
 		]
 	}`)
-	opts := composerExecOpts("claude", "ambiguous-manager-wire")
+	opts := composerExecOpts("openai", "ambiguous-manager-wire")
 	opts.OriginalRequest = append([]byte(nil), payload...)
 	opts.Metadata = map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/messages"}
 

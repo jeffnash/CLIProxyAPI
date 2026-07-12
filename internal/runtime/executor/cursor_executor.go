@@ -69,7 +69,11 @@ func (e *CursorExecutor) prepareCursorDirect(ctx context.Context, auth *cliproxy
 	to := sdktranslator.FromString("openai")
 	originalBytes := len(req.Payload)
 	originalMsgs := countJSONMessages(req.Payload)
-	req.Payload = sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
+	sourcePayload := bytes.Clone(req.Payload)
+	if from == sdktranslator.FormatClaude {
+		sourcePayload = helps.NormalizeClaudeConsecutiveTurns(sourcePayload)
+	}
+	req.Payload = sdktranslator.TranslateRequest(from, to, req.Model, sourcePayload, stream)
 	log.Infof("cursor e2e (xlate): from=%s to=openai original=%d bytes msgs=%d translated=%d bytes msgs=%d",
 		from, originalBytes, originalMsgs, len(req.Payload), countJSONMessages(req.Payload))
 	if composerAmbiguousTrailingUserSegments(gjson.GetBytes(req.Payload, "messages").Array()) {

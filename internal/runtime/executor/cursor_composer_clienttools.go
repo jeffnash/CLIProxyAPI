@@ -4345,7 +4345,11 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	turn.model = resolveCursorModelName(resolveCursorModelAlias(auth, req.Model))
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
-	turn.oai = sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
+	sourcePayload := bytes.Clone(req.Payload)
+	if from == sdktranslator.FormatClaude {
+		sourcePayload = helps.NormalizeClaudeConsecutiveTurns(sourcePayload)
+	}
+	turn.oai = sdktranslator.TranslateRequest(from, to, req.Model, sourcePayload, stream)
 	turn.oai = composerForceStoreTrue(turn.oai)
 	turn.tenant = composerTenant(auth, opts)
 	turn.contHint = composerContinuationHintFor(turn.tenant, turn.oai)
