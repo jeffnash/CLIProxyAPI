@@ -41,13 +41,24 @@ type ResolutionRequest struct {
 	MergeGroups      [][]string `json:"merge_groups,omitempty"`
 }
 
-// TokenSecret returns CLIPROXY_TURN_PROVENANCE_SECRET bytes.
+// TokenSecret returns the explicit provenance secret or a purpose-separated
+// key derived from the stable Composer lineage secret.
 func TokenSecret() ([]byte, error) {
 	v := strings.TrimSpace(os.Getenv("CLIPROXY_TURN_PROVENANCE_SECRET"))
-	if v == "" {
-		return nil, errors.New("CLIPROXY_TURN_PROVENANCE_SECRET is not set")
+	if v != "" {
+		return []byte(v), nil
 	}
-	return []byte(v), nil
+
+	// Composer already requires a stable lineage secret for restart-safe routing.
+	// Derive a purpose-separated provenance key from it so signed clarification
+	// remains usable when deployments have not set a second secret explicitly.
+	lineage := strings.TrimSpace(os.Getenv("CURSOR_COMPOSER_LINEAGE_SECRET"))
+	if lineage == "" {
+		return nil, errors.New("CLIPROXY_TURN_PROVENANCE_SECRET or CURSOR_COMPOSER_LINEAGE_SECRET is not set")
+	}
+	mac := hmac.New(sha256.New, []byte(lineage))
+	_, _ = mac.Write([]byte("cliproxy-turn-provenance-v1"))
+	return mac.Sum(nil), nil
 }
 
 // IssueResolutionToken signs a clarification token for the candidate set.

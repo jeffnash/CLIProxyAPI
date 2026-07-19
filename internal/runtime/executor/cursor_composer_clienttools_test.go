@@ -1037,6 +1037,7 @@ func TestManagerAdjacentUserSuffixDoesNotRotateOrPoisonCredentials(t *testing.T)
 	opts := composerExecOpts("openai", "ambiguous-manager-wire")
 	opts.OriginalRequest = append([]byte(nil), payload...)
 	opts.Metadata = map[string]any{cliproxyexecutor.RequestPathMetadataKey: "/v1/messages"}
+	opts.Headers.Set(cliproxyexecutor.HeaderCLIProxyCapabilities, cliproxyexecutor.CapabilityProvenanceClarificationV1)
 
 	for _, stream := range []bool{false, true} {
 		t.Run(map[bool]string{false: "nonstream", true: "stream"}[stream], func(t *testing.T) {
@@ -1105,6 +1106,7 @@ func TestCursorDirectAdjacentUserSuffixFailsBeforeCredentialExchange(t *testing.
 	}`)
 	auth := &cliproxyauth.Auth{ID: "direct-ambiguous", ProxyURL: proxy.URL}
 	opts := composerExecOpts("openai", "direct-ambiguous-wire")
+	opts.Headers.Set(cliproxyexecutor.HeaderCLIProxyCapabilities, cliproxyexecutor.CapabilityProvenanceClarificationV1)
 	executor := NewCursorExecutor(&config.Config{})
 	for _, stream := range []bool{false, true} {
 		req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: append([]byte(nil), payload...)}

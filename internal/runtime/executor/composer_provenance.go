@@ -2,7 +2,6 @@ package executor
 
 import (
 	"encoding/json"
-	"os"
 	"strings"
 	"sync"
 
@@ -20,9 +19,9 @@ var (
 func composerProvenance() *turnprovenance.Resolver {
 	composerProvenanceOnce.Do(func() {
 		// Never fall back to a public/dev constant: forgeable resolution tokens
-		// are worse than unsigned clarification. When unset, Clarify still works
-		// but omits ResolutionToken until CLIPROXY_TURN_PROVENANCE_SECRET is set.
-		secret := []byte(strings.TrimSpace(os.Getenv("CLIPROXY_TURN_PROVENANCE_SECRET")))
+		// are worse than unsigned clarification. TokenSecret can safely derive a
+		// purpose-separated key from the stable Composer lineage secret.
+		secret, _ := turnprovenance.TokenSecret()
 		composerProvenanceResolver = &turnprovenance.Resolver{
 			Store:  turnprovenance.NewMemoryStore(secret, 3, 64),
 			Secret: secret,
@@ -102,6 +101,12 @@ func resolveComposerProvenance(tenantID string, oai []byte, opts cliproxyexecuto
 	}
 	decision := r.Resolve(in)
 	if decision.ClarificationRequired() {
+		// Clients that do not advertise the clarification protocol cannot act on
+		// a 422. Preserve their request losslessly and let the provider interpret
+		// the original ordering instead of guessing or returning a terminal error.
+		if !cliproxyexecutor.HasCapability(opts.Headers, cliproxyexecutor.CapabilityProvenanceClarificationV1) {
+			return oai, nil
+		}
 		return oai, r.Clarify(in, decision, digest)
 	}
 

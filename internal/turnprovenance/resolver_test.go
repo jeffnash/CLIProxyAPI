@@ -1,11 +1,28 @@
 package turnprovenance
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestTokenSecretFallsBackToPurposeSeparatedLineageSecret(t *testing.T) {
+	t.Setenv("CLIPROXY_TURN_PROVENANCE_SECRET", "")
+	t.Setenv("CURSOR_COMPOSER_LINEAGE_SECRET", "stable-lineage-secret")
+	got, err := TokenSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 || bytes.Equal(got, []byte("stable-lineage-secret")) {
+		t.Fatalf("TokenSecret() must return a non-empty purpose-separated key")
+	}
+	again, err := TokenSecret()
+	if err != nil || !bytes.Equal(got, again) {
+		t.Fatalf("derived key must be stable: equal=%t err=%v", bytes.Equal(got, again), err)
+	}
+}
 
 func TestResolveExplicitStandingAndCurrent(t *testing.T) {
 	raw := []byte(`{"messages":[

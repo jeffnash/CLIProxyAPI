@@ -1,7 +1,10 @@
 package executor
 
 import (
+	"bytes"
 	"encoding/json"
+	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,6 +12,59 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/tidwall/gjson"
 )
+
+func TestResolveComposerProvenanceLegacyClientPreservesAmbiguousColdStartForAllSDKModels(t *testing.T) {
+	for _, model := range []string{
+		"composer-2.5",
+		"composer-2.5-fast-high",
+		"grok-4.5",
+		"grok-4.5-fast-high",
+	} {
+		t.Run(model, func(t *testing.T) {
+			raw := []byte(`{"model":"` + model + `","messages":[
+				{"role":"user","content":"standing injected context that is long enough"},
+				{"role":"user","content":"do the work"}
+			]}`)
+			opts := cliproxyexecutor.Options{Headers: make(http.Header), OriginalRequest: raw}
+
+			got, clarification := resolveComposerProvenance("tenant-a", raw, opts, true)
+			if clarification != nil {
+				t.Fatalf("legacy client received unusable clarification: %v", clarification)
+			}
+			if !bytes.Equal(got, raw) {
+				t.Fatalf("legacy ambiguous request changed:\n got: %s\nwant: %s", got, raw)
+			}
+		})
+	}
+}
+
+func TestResolveComposerProvenanceCapableClientGetsSignedClarification(t *testing.T) {
+	t.Setenv("CLIPROXY_TURN_PROVENANCE_SECRET", "provenance-test-secret")
+	composerProvenanceOnce = sync.Once{}
+	composerProvenanceResolver = nil
+	t.Cleanup(func() {
+		composerProvenanceOnce = sync.Once{}
+		composerProvenanceResolver = nil
+	})
+	raw := []byte(`{"metadata":{"conversation_id":"conv-a"},"messages":[
+		{"role":"user","content":"standing injected context that is long enough"},
+		{"role":"user","content":"do the work"}
+	]}`)
+	headers := make(http.Header)
+	headers.Set(cliproxyexecutor.HeaderCLIProxyCapabilities, cliproxyexecutor.CapabilityProvenanceClarificationV1)
+	opts := cliproxyexecutor.Options{Headers: headers, OriginalRequest: raw}
+
+	got, clarification := resolveComposerProvenance("tenant-a", raw, opts, true)
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("clarification path changed request: %s", got)
+	}
+	if clarification == nil {
+		t.Fatal("capable client must receive clarification")
+	}
+	if clarification.ResolutionToken == "" {
+		t.Fatal("capable client clarification must include a signed resolution token")
+	}
+}
 
 func TestExtractAndApplySignedResolution(t *testing.T) {
 	secret := []byte("composer-provenance-test-secret")
