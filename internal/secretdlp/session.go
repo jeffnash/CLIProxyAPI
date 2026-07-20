@@ -369,15 +369,32 @@ func (s *Session) restoreJSONValueLocked(value any, path []string, resolver Plac
 		if !isSecretDLPRestorableJSONPath(path) {
 			return v, 0
 		}
-		return s.restoreJSONStringLocked(v, resolver)
+		return s.restoreJSONStringLocked(v, path, resolver)
 	default:
 		return value, 0
 	}
 }
 
-func (s *Session) restoreJSONStringLocked(value string, resolver PlaceholderResolver) (string, int) {
+func (s *Session) restoreJSONStringLocked(value string, path []string, resolver PlaceholderResolver) (string, int) {
 	if !strings.Contains(value, placeholderPrefix) {
 		return value, 0
+	}
+
+	// Tool-call arguments and similar fields commonly carry JSON encoded inside
+	// an outer JSON string. Restore the parsed nested values and re-marshal them
+	// so quotes, backslashes, and control characters in a secret retain both
+	// layers of escaping. Falling back to raw replacement preserves ordinary
+	// text fields and malformed provider fragments.
+	if json.Valid([]byte(value)) {
+		var nested any
+		if err := json.Unmarshal([]byte(value), &nested); err == nil {
+			next, count := s.restoreJSONValueLocked(nested, path, resolver)
+			if count > 0 {
+				if encoded, err := json.Marshal(next); err == nil {
+					return string(encoded), count
+				}
+			}
+		}
 	}
 
 	restored := 0
