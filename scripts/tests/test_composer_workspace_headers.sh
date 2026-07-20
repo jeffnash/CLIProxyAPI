@@ -31,7 +31,7 @@ unset CLIPROXY_WORKSPACE_PATH
 # Both sourceable launchers must locate their shared library correctly from
 # Bash, including when the caller is outside the repository.
 cd "${TMP_ROOT}"
-bash -c 'set -euo pipefail; cd "$1"; source "$2/scripts/claude-composer.sh" on; [[ "$CLIPROXY_CLIENT_CWD" == "$(pwd -P)" ]]; [[ "$ANTHROPIC_CUSTOM_HEADERS" == *"X-Cwd: "* ]]; source "$2/scripts/claude-composer.sh" off' _ "${TMP_ROOT}" "${REPO_ROOT}"
+bash -c 'set -euo pipefail; cd "$1"; source "$2/scripts/claude-composer.sh" on; [[ "$CLIPROXY_CLIENT_CWD" == "$(pwd -P)" ]]; [[ "$ANTHROPIC_CUSTOM_HEADERS" == *"X-Cwd: "* ]]; [[ "$CLAUDE_CODE_AUTO_MODE_MODEL" == "$ANTHROPIC_MODEL" ]]; [[ "$CLAUDE_CODE_BG_CLASSIFIER_MODEL" == "$ANTHROPIC_MODEL" ]]; source "$2/scripts/claude-composer.sh" off; [[ -z "${CLAUDE_CODE_AUTO_MODE_MODEL+x}" ]]; [[ -z "${CLAUDE_CODE_BG_CLASSIFIER_MODEL+x}" ]]' _ "${TMP_ROOT}" "${REPO_ROOT}"
 bash -c 'set -euo pipefail; cd "$1"; source "$2/scripts/codex-composer.sh" on; [[ "$CLIPROXY_CLIENT_CWD" == "$(pwd -P)" ]]; [[ -n "$OPENAI_BASE_URL" ]]; source "$2/scripts/codex-composer.sh" off' _ "${TMP_ROOT}" "${REPO_ROOT}"
 
 if command -v zsh >/dev/null 2>&1; then

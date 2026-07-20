@@ -1568,6 +1568,12 @@ function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
   }
 }
 
+function recoveryTargetAgentId(round) {
+  const source = String(round?.agentId || round?.sessionId || "");
+  const stableSource = source.replace(/_ctrecover_[A-Za-z0-9_-]+$/, "");
+  return `${stableSource}_ctrecover_${String(round?.route || "").slice(0, 10)}`;
+}
+
 // Invocation identity and semantic request equivalence are deliberately
 // separate contracts. invocationId is minted by the harness once per
 // independently initiated provider call and remains stable only across that
@@ -2660,6 +2666,12 @@ class Session {
                                   // requests a DIFFERENT model rotates the durable agent (the old agent is bound
                                   // to the old model) + forces a re-seed, instead of silently answering from it.
     this.agent = null; this.agentPromise = null; this.run = null;
+    this.utilityOneShot = false;
+    // A restart-recovery target is not the durable active alias until its
+    // first SDK send resolves. Keeping this intent process-local is safe: the
+    // ToolRound journal deterministically reconstructs the same target after
+    // a crash, while the prior alias continues to name a real seeded agent.
+    this.pendingRecoveryAlias = "";
     this.cancelPromise = null; this.cancelNotifyRequested = false;
     this.activeRes = null; this.responseWriter = null;
     this.sendPending = false;
@@ -2937,6 +2949,14 @@ class Session {
   }
   persistDurableAlias() {
     writeDurableAgentAlias(this.cursorKey, this.id, this.agentId, this);
+  }
+  promotePendingRecoveryAlias() {
+    if (!this.pendingRecoveryAlias) return;
+    if (this.pendingRecoveryAlias !== this.agentId) {
+      throw new Error("pending recovery alias no longer matches the active SDK agent");
+    }
+    this.persistDurableAlias();
+    this.pendingRecoveryAlias = "";
   }
   async finishRotationCancel() { await this.cancel(); this.done = false; }
   whenLogicalDone() { if (!this.run && !this.sendPending) return Promise.resolve(); return new Promise((r) => this._logicalDone.push(r)); }
@@ -4231,7 +4251,7 @@ function mapGrokEffort(level) {
   if (l === "minimal" || l === "none") return "low";
   return null;
 }
-function composerModelSelection(model) {
+function composerModelSelection(model, { utilityOneShot = false } = {}) {
   const raw = String(model || "");
   let id = raw;
   // Disambiguate from xAI grok-4.5: client-facing Cursor ids are cursor-grok-4.5*. Strip only that prefix.
@@ -4248,11 +4268,13 @@ function composerModelSelection(model) {
   }
   if (/-fast$/.test(id)) { fast = "true"; id = id.slice(0, id.length - "-fast".length); }
   if (id === "composer-2.5" || id === "composer-2") {
+    if (utilityOneShot) return { id, params: [{ id: "fast", value: "false" }, { id: "thinking", value: "low" }] };
     const params = [{ id: "fast", value: fast }];
     if (thinking) params.push({ id: "thinking", value: thinking });
     return { id, params };
   }
   if (id === "grok-4.5") {
+    if (utilityOneShot) return { id: "grok-4.5", params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }] };
     // Bare / missing level => effort=high (matches CLI's primary "Cursor Grok 4.5" = grok-4.5-xhigh).
     // Always set fast explicitly so we never silently inherit Cursor's costly fast=true default.
     // SDK id stays "grok-4.5" regardless of the client-facing cursor- prefix.
@@ -4267,7 +4289,7 @@ async function ensureAgent(session, model) {
   if (session.agentPromise) return session.agentPromise;          // guard TOCTOU
   session.agentPromise = (async () => {
     const platform = await getPlatform(session.cursorKey);
-    const modelSel = composerModelSelection(model);
+    const modelSel = composerModelSelection(model, { utilityOneShot: session.utilityOneShot });
     dbg("ensureAgent modelSelection", "session=" + session.id, "model=" + model, "selection=" + safeJson(modelSel));
     const opts = { model: modelSel, apiKey: session.cursorKey, local: { cwd: EMPTY_CWD } };
     // MCP shim registration (additive, never substitutive): attach the session's MCP server map so the SDK's
@@ -4287,8 +4309,13 @@ async function ensureAgent(session, model) {
     }
     // C05: resume/create against the DURABLE agentId (rotates on too-long), not the external session id.
     const agentId = session.agentId || session.id;
-    dbg("ensureAgent resumeAgent", "session=" + session.id, "agentId=" + agentId, "model=" + model, "mcpServers=" + (opts.mcpServers ? Object.keys(opts.mcpServers).length : 0));
     try {
+      if (session.utilityOneShot) {
+        dbg("ensureAgent createAgent (ephemeral utility)", "session=" + session.id, "agentId=" + agentId);
+        session.agent = await platform.createAgent({ agentId, ...opts });
+        return session.agent;
+      }
+      dbg("ensureAgent resumeAgent", "session=" + session.id, "agentId=" + agentId, "model=" + model, "mcpServers=" + (opts.mcpServers ? Object.keys(opts.mcpServers).length : 0));
       session.agent = await platform.resumeAgent(agentId, opts);          // cold / restart: resume by our durable agentId
       // BR-DS / H11 / H12 / ADD-73: a SUCCESSFUL resume means this durable agentId EXISTS in the SDK store —
       // which only happens after a prior createAgent + at least one send (the seed); the create-on-not-found
@@ -6250,9 +6277,9 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
           writeDurableAgentAlias(session.cursorKey, session.id, uncertainDeliveryAgentId, session);
           session.agentId = uncertainDeliveryAgentId;
         } else if (isRecovery) {
-          const targetAgentId = `${round.agentId || round.sessionId}_ctrecover_${round.route.slice(0, 10)}`;
-          writeDurableAgentAlias(session.cursorKey, session.id, targetAgentId, session);
+          const targetAgentId = recoveryTargetAgentId(round);
           session.agentId = targetAgentId;
+          session.pendingRecoveryAlias = targetAgentId;
           session.resetSeedState();
         } else if (round.agentId) {
           writeDurableAgentAlias(session.cursorKey, session.id, round.agentId, session);
@@ -6446,9 +6473,9 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       sessions.set(session.id, session);
     }
     session.clientLeaseToken = round.clientLeaseToken;
-    const recoveryAgentId = `${round.agentId || round.sessionId}_ctrecover_${round.route.slice(0, 10)}`;
-    writeDurableAgentAlias(session.cursorKey, session.id, recoveryAgentId, session);
+    const recoveryAgentId = recoveryTargetAgentId(round);
     session.agentId = recoveryAgentId;
+    session.pendingRecoveryAlias = recoveryAgentId;
     session.recoverySourceRound = round;
     session.resetSeedState();
     refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
@@ -7021,6 +7048,7 @@ function prepareAdvertisedToolRegistry(body) {
 }
 
 function refreshSessionFromBody(session, body, preparedToolRegistry = undefined, { ignoreToolInventory = false } = {}) {
+  session.utilityOneShot = body && body.utilityOneShot === true;
   const hasAuthoritativeSnapshot = body && body.contractVersion === CLIENT_TOOL_CONTRACT_VERSION
     && typeof body.toolInventoryJSON === "string";
   if (!ignoreToolInventory && (Array.isArray(body && body.tools) || hasAuthoritativeSnapshot)) {
@@ -7495,7 +7523,8 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       try {
         session.run = await agent.send(msg, sendCallbacks);
         session.sendPending = false;
-        if (!sameStringArray(seededSystemBlockIdsBefore, session.seededSystemBlockIds)) {
+        if (!session.pendingRecoveryAlias
+            && !sameStringArray(seededSystemBlockIdsBefore, session.seededSystemBlockIds)) {
           try {
             session.persistDurableAlias();
           } catch (aliasError) {
@@ -7505,6 +7534,15 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
             dbg("system block identity persistence unavailable; live run remains recoverable by exact receipt",
               "session=" + session.id, (aliasError && aliasError.message) || String(aliasError));
           }
+        }
+        try {
+          session.promotePendingRecoveryAlias();
+        } catch (aliasError) {
+          // The ToolRound journal retains the deterministic replacement id,
+          // so a restart retries this exact recovery target. Never publish a
+          // premature alias or invent a second nested recovery id.
+          dbg("recovery alias promotion unavailable after agent.send; retaining prior durable alias",
+            "session=" + session.id, (aliasError && aliasError.message) || String(aliasError));
         }
       } catch (sendErr) {
         // ADD-115: a RESUMED durable agent can be wedged on a PRIOR run that died abnormally (e.g. a
@@ -7518,6 +7556,12 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
             dbg("runTurn agent.send stuck on a prior run -> retry with local.force=true", "session=" + session.id, (sendErr && sendErr.message) || String(sendErr));
             session.run = await agent.send(msg, { ...sendCallbacks, local: { force: true } });
             session.sendPending = false;
+            try {
+              session.promotePendingRecoveryAlias();
+            } catch (aliasError) {
+              dbg("recovery alias promotion unavailable after forced agent.send; retaining prior durable alias",
+                "session=" + session.id, (aliasError && aliasError.message) || String(aliasError));
+            }
           } catch (forceErr) {
             session.seeded = seededBefore;
             session.seededSystem = seededSystemBefore;

@@ -4376,6 +4376,7 @@ type composerInboundTurn struct {
 	sessionID    string
 	leaseOwner   uint64
 	continuation bool
+	utility      bool
 	clientEnv    map[string]any
 	input        map[string]any
 }
@@ -4407,6 +4408,7 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 		return turn, errComposerImageOnlyInvalid
 	}
 	turn.defs = composerToolDefs(turn.oai)
+	turn.utility = isComposerUtilityOneShot(turn.oai, opts, turn.contHint)
 	turn.toolAliases = composerToolAliases(auth)
 	turn.input = composerInputHinted(turn.oai, turn.contHint)
 	invocationID := composerInvocationID(turn.oai, opts)
@@ -4556,6 +4558,9 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 	// phantom mapping that a later previous_response_id would then resume onto a session that never ran.
 	prep := prepareComposerAdvertise(oai, defs, toolAliases)
 	advertise, toolChoice, constraints := prep.advertise, prep.toolChoice, prep.constraints
+	if turn.utility {
+		constraints["utilityOneShot"] = true
+	}
 	// ADD-65: build input with the SAME tenant continuation hint deriveComposerSessionID used, so a Responses
 	// server-side-chained [..., tool, user] turn is sent as tool_results (with userText) — not a fresh user turn
 	// behind a paused run.
@@ -4995,6 +5000,9 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 	// valid SSE stream (below), not here — a failed dispatch must leave no phantom mapping (mirrors the stream path).
 	prep := prepareComposerAdvertise(oai, defs, toolAliases)
 	advertise, toolChoice, constraints := prep.advertise, prep.toolChoice, prep.constraints
+	if turn.utility {
+		constraints["utilityOneShot"] = true
+	}
 	// ADD-65: build input with the SAME tenant continuation hint deriveComposerSessionID used, so a Responses
 	// server-side-chained [..., tool, user] turn is sent as tool_results (with userText) — not a fresh user turn
 	// behind a paused run.

@@ -3791,6 +3791,9 @@ test("legacy recovery refuses missing replay and never downgrades a signed or mi
 test("cold restart delivers a journaled mixed user turn exactly once after faithful result recovery", async () => {
   const cursorKey = "cursor-key";
   const { session } = seedSession("mixed-cold-restart", cursorKey);
+  session.agentId = `${session.id}_ct5_ctrecover_priorroute`;
+  session.persistDurableAlias();
+  const priorAgentId = session.agentId;
   const opened = await openTool(session);
   opened.round.terminalize("shutdown", "bridge restarted");
   await assert.rejects(opened.promise, /shutdown/);
@@ -3798,9 +3801,15 @@ test("cold restart delivers a journaled mixed user turn exactly once after faith
   sessions.delete(session.id);
 
   const sent = [];
+  let noteSendStarted;
+  const sendStarted = new Promise((resolve) => { noteSendStarted = resolve; });
+  let releaseSend;
+  const sendGate = new Promise((resolve) => { releaseSend = resolve; });
   const agent = {
     async send(message) {
       sent.push(message);
+      noteSendStarted();
+      await sendGate;
       return {
         async wait() { return { status: "finished", result: "continued after restart" }; },
         async cancel() {},
@@ -3828,7 +3837,21 @@ test("cold restart delivers a journaled mixed user turn exactly once after faith
     interruptRequested: true,
   };
   const response = new MockResponse();
-  await handleContinue(request(), response, continuationBody([result], mixedInput), cursorKey);
+  const recovery = handleContinue(request(), response, continuationBody([result], mixedInput), cursorKey);
+  await recovery;
+  await sendStarted;
+  const pending = sessions.get(session.id);
+  assert.ok(pending);
+  assert.equal(pending.pendingRecoveryAlias, pending.agentId);
+  assert.equal(
+    pending.agentId,
+    `${session.id}_ct5_ctrecover_${opened.round.route.slice(0, 10)}`,
+    "retries must derive one recovery suffix from the stable pre-recovery id",
+  );
+  assert.equal(new Session(session.id, cursorKey).agentId, priorAgentId,
+    "the durable active alias must not move before the replacement send is accepted");
+  releaseSend();
+  await recovery;
   await waitFor(() => response.ended, "cold restart recovery terminal");
   await waitFor(
     () => journalRecord(opened.round.route).deferredInputs[0].state === "DELIVERED",
@@ -3836,6 +3859,8 @@ test("cold restart delivers a journaled mixed user turn exactly once after faith
   );
   assert.equal(response.status, 200);
   assert.equal(sent.length, 1);
+  assert.equal(new Session(session.id, cursorKey).agentId, pending.agentId,
+    "the accepted replacement becomes the durable active alias");
   assert.match(sent[0], /durable local result/);
   assert.match(sent[0], /continue this task after restart/);
   assert.match(sent[0], new RegExp(opened.call.wireId));
@@ -4466,6 +4491,17 @@ test("Grok 4.5 model aliases preserve slow default and map effort", () => {
   assert.deepEqual(composerModelSelection("cursor-grok-4.5"), { id: "grok-4.5", params: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }] });
   assert.deepEqual(composerModelSelection("cursor-grok-4.5-fast-low"), { id: "grok-4.5", params: [{ id: "fast", value: "true" }, { id: "effort", value: "low" }] });
   assert.deepEqual(composerModelSelection("cursor-grok-4.5-xhigh"), { id: "grok-4.5", params: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }] });
+});
+
+test("utility one-shots lower reasoning without enabling the costly fast tier", () => {
+  assert.deepEqual(composerModelSelection("composer-2.5", { utilityOneShot: true }), {
+    id: "composer-2.5",
+    params: [{ id: "fast", value: "false" }, { id: "thinking", value: "low" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.5", { utilityOneShot: true }), {
+    id: "grok-4.5",
+    params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }],
+  });
 });
 
 test("tool-choice gating does not widen the advertised set or fake native success", () => {

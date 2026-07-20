@@ -44,6 +44,9 @@ vars=(
   ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME
   ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION
   CLAUDE_CODE_SUBAGENT_MODEL
+	CLAUDE_CODE_AUTO_MODE_MODEL
+	CLAUDE_CODE_BG_CLASSIFIER_MODEL
+	ANTHROPIC_SMALL_FAST_MODEL
   CLAUDE_CODE_EFFORT_LEVEL
   DISABLE_TELEMETRY
   DISABLE_COST_WARNINGS
@@ -171,7 +174,7 @@ X-Os-Version: ${CLIPROXY_CLIENT_OS_VERSION}"
 }
 
 enable_overrides() {
-  local base_url model subagent_model key headers
+  local base_url model subagent_model utility_model key headers
   save_current_values
 
   base_url="${CLIPROXY_BASE_URL:-${default_base_url}}"
@@ -180,6 +183,7 @@ enable_overrides() {
 
   model="${COMPOSER_MODEL:-${CURSOR_MODEL:-${default_model}}}"
   subagent_model="${COMPOSER_SUBAGENT_MODEL:-${CURSOR_SUBAGENT_MODEL:-${model}}}"
+	utility_model="${COMPOSER_UTILITY_MODEL:-${CURSOR_UTILITY_MODEL:-${model}}}"
 
   # Capture outside command substitution so the exported advisory variables
   # remain in the caller's shell as well as in ANTHROPIC_CUSTOM_HEADERS.
@@ -200,6 +204,13 @@ enable_overrides() {
   unset ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME
   unset ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION
   export CLAUDE_CODE_SUBAGENT_MODEL="${subagent_model}"
+	# Claude Code 2.1.215+ uses dedicated background/auto-mode classifiers. Keep
+	# those short-lived calls on the selected Cursor model, while the bridge
+	# applies its low-reasoning utility profile instead of inheriting the main turn's
+	# expensive reasoning settings.
+	export CLAUDE_CODE_AUTO_MODE_MODEL="${utility_model}"
+	export CLAUDE_CODE_BG_CLASSIFIER_MODEL="${utility_model}"
+	export ANTHROPIC_SMALL_FAST_MODEL="${utility_model}"
   export CLAUDE_CODE_EFFORT_LEVEL="max"
   unset CLAUDE_CONFIG_DIR
   export DISABLE_TELEMETRY="true"

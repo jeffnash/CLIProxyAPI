@@ -973,6 +973,9 @@ export ANTHROPIC_MODEL="${model}"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="${model}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="${model}"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="${model}"
+export CLAUDE_CODE_AUTO_MODE_MODEL="${model}"
+export CLAUDE_CODE_BG_CLASSIFIER_MODEL="${model}"
+export ANTHROPIC_SMALL_FAST_MODEL="${model}"
 
 # Codex CLI overrides
 export OPENAI_BASE_URL="${base_v1}"
