@@ -4263,6 +4263,24 @@ func composerStreamResponseHeaders() http.Header {
 	return http.Header{}
 }
 
+const composerEffectiveSessionHeader = "X-CLIProxy-Composer-Session"
+
+// composerEffectiveContinuationSession returns the session selected by the
+// bridge from the signed ToolRound. The locally derived continuation session
+// is advisory because clients may reuse one parent conversation id across
+// concurrent subagents. Only the authenticated internal bridge response may
+// override it, and only with a valid routed session id.
+func composerEffectiveContinuationSession(resp *http.Response, advisory string, continuation bool) string {
+	if !continuation || resp == nil {
+		return advisory
+	}
+	effective := strings.TrimSpace(resp.Header.Get(composerEffectiveSessionHeader))
+	if !composerRoutedSessionIDPattern.MatchString(effective) {
+		return advisory
+	}
+	return effective
+}
+
 // composerContinuationLeaseStop validates the bridge's opaque fresh-lease
 // echo. A continuation is allowed to mutate only the exact owner token which
 // opened its signed ToolRound. Missing/malformed metadata is availability-safe:
@@ -4547,6 +4565,12 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		reporter.EnsurePublished(ctx)
 		composerInflight.release(tenant, sessionID, leaseOwner)
 		return nil, err
+	}
+	if effectiveSessionID := composerEffectiveContinuationSession(httpResp, sessionID, continuation); effectiveSessionID != sessionID {
+		composerDebugf("[composer %s] continuation effective session corrected advisory=%s routed=%s", responseID, sessionID, effectiveSessionID)
+		sessionID = effectiveSessionID
+		leaseSessionID = effectiveSessionID
+		responseID = composerResponseID(apiKey, tenant, effectiveSessionID)
 	}
 
 	// #21 (C-RESPID): the bridge has now accepted a valid SSE stream, so record outward-response-id -> sessionID
@@ -4977,6 +5001,12 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 		reporter.EnsurePublished(ctx)
 		composerInflight.release(tenant, sessionID, leaseOwner)
 		return cliproxyexecutor.Response{}, err
+	}
+	if effectiveSessionID := composerEffectiveContinuationSession(httpResp, sessionID, continuation); effectiveSessionID != sessionID {
+		composerDebugf("[composer %s] continuation effective session corrected advisory=%s routed=%s", responseID, sessionID, effectiveSessionID)
+		sessionID = effectiveSessionID
+		leaseSessionID = effectiveSessionID
+		responseID = composerResponseID(apiKey, tenant, effectiveSessionID)
 	}
 
 	// #21 (C-RESPID): the bridge accepted a valid SSE stream -> NOW record outward-response-id -> sessionID, so a

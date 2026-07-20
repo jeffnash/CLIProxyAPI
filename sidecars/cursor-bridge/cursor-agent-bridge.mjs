@@ -5864,6 +5864,12 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
     if (continuationTenantMismatch(round, cursorKey)) {
       throw new ToolRoundError("tenant_mismatch", "the signed tool round belongs to a different Cursor credential", 403);
     }
+    // The signed ToolRound is authoritative for continuation routing. The
+    // request body's sessionId is only advisory and may be the shared parent
+    // conversation id used by concurrent Claude subagents. Return the routed
+    // session over this authenticated bridge hop so Go can bind outward
+    // response ids and previous_response_id mappings to the actual child.
+    res.setHeader("X-CLIProxy-Composer-Session", round.sessionId);
     const liveRoundSession = sessions.get(round.sessionId);
     if (liveRoundSession) liveRoundSession.clientLeaseToken = round.clientLeaseToken;
 

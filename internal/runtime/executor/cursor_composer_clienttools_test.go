@@ -1493,6 +1493,65 @@ func TestExecuteComposerNonStream(t *testing.T) {
 	}
 }
 
+func TestComposerContinuationUsesBridgeRoutedSessionForResponseID(t *testing.T) {
+	const routedSession = "sess_0123456789abcdef0123456789abcdef"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set(composerEffectiveSessionHeader, routedSession)
+		_, _ = io.WriteString(w, "data: {\"type\":\"text\",\"delta\":\"continued\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"turn_end\",\"stop_reason\":\"stop\"}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "auth-routed", Attributes: map[string]string{
+		"api_key": "k", "composer_client_tools_bridge_url": srv.URL,
+	}}
+	req := cliproxyexecutor.Request{Model: "composer-2.5", Payload: []byte(`{
+		"model":"composer-2.5",
+		"messages":[
+			{"role":"user","content":"unique child assignment"},
+			{"role":"assistant","tool_calls":[{"id":"signed-call","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"signed-call","content":"ok"}
+		],
+		"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}]
+	}`)}
+	resp, err := e.executeComposer(context.Background(), auth, "k", req, composerExecOpts("openai", "shared-parent"))
+	if err != nil {
+		t.Fatalf("executeComposer: %v", err)
+	}
+	responseID := gjson.GetBytes(resp.Payload, "id").String()
+	if got := composerSessionFromResponseID(composerTenant(auth, composerExecOpts("openai", "shared-parent")), "k", responseID); got != routedSession {
+		t.Fatalf("response id routed session = %q, want %q (id=%q)", got, routedSession, responseID)
+	}
+}
+
+func TestComposerEffectiveContinuationSessionRejectsUntrustedValues(t *testing.T) {
+	const advisory = "sess_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, tc := range []struct {
+		name         string
+		continuation bool
+		header       string
+		want         string
+	}{
+		{name: "valid continuation", continuation: true, header: "sess_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", want: "sess_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		{name: "fresh turn cannot override", continuation: false, header: "sess_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", want: advisory},
+		{name: "malformed ignored", continuation: true, header: "../../another-session", want: advisory},
+		{name: "missing ignored", continuation: true, want: advisory},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{Header: http.Header{}}
+			if tc.header != "" {
+				resp.Header.Set(composerEffectiveSessionHeader, tc.header)
+			}
+			if got := composerEffectiveContinuationSession(resp, advisory, tc.continuation); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // The bridge's typed {"type":"ping"} keepalive reaches the downstream as an
 // SSE comment while model-visible frames remain atomically buffered until a
 // durable terminal. Comments are schema-neutral and do not open an assistant

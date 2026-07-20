@@ -2776,6 +2776,8 @@ test("a duplicate pure tool-result continuation hands off the resumed answer ins
   await Promise.all([firstHandling, retryHandling]);
 
   assert.equal((await opened.promise).content, "tool completed");
+  assert.equal(first.getHeader("x-cliproxy-composer-session"), session.id);
+  assert.equal(retry.getHeader("x-cliproxy-composer-session"), session.id);
   assert.match(retry.text(), /active_turn_handoff/);
   assert.match(retry.text(), /the resumed final answer/);
   assert.match(retry.text(), /"clientLease":\{"sessionId":"pure-continuation-handoff","token":"73","terminal":true\}/);
