@@ -3356,6 +3356,28 @@ func trailingContinuationUserIdx(messages []gjson.Result, start int) int {
 	return -1
 }
 
+func latestContiguousToolResults(messages []gjson.Result, start, end int) []map[string]any {
+	lastTool := -1
+	for i := end - 1; i >= start; i-- {
+		if messages[i].Get("role").String() == "tool" {
+			lastTool = i
+			break
+		}
+	}
+	if lastTool < 0 {
+		return nil
+	}
+	batchStart := lastTool
+	for batchStart > start && messages[batchStart-1].Get("role").String() == "tool" {
+		batchStart--
+	}
+	results := make([]map[string]any, 0, lastTool-batchStart+1)
+	for i := batchStart; i <= lastTool; i++ {
+		results = append(results, composerToolResultEntry(messages[i]))
+	}
+	return results
+}
+
 // composerToolResultsHinted classifies the incoming turn: a trailing tool message means the client returned
 // tool results (continuation); otherwise it is a new user turn. It extracts a tool_results continuation from
 // the (OpenAI-shape) messages and is the single source of continuation detection (composerInput,
@@ -3375,16 +3397,21 @@ func composerToolResultsHinted(messages []gjson.Result, hint composerContinuatio
 	// results + trailing user text) classify as a continuation instead of a fresh user turn (Comment 4).
 	lastTC := lastAssistantToolCallsIdx(messages)
 	if lastTC >= 0 {
-		res := make([]map[string]any, 0)
 		replied := false
 		for i := lastTC + 1; i < len(messages); i++ {
-			switch messages[i].Get("role").String() {
-			case "tool":
-				res = append(res, composerToolResultEntry(messages[i]))
-			case "assistant":
+			if messages[i].Get("role").String() == "assistant" {
 				replied = true
 			}
 		}
+		// Only the latest contiguous result batch belongs to this continuation.
+		// Older results separated by user input are replayed history from a prior
+		// signed round; combining them would make one invocation identity span
+		// multiple routes. Parallel results from the current round remain grouped.
+		end := len(messages)
+		if trailingIndex := trailingContinuationUserIdx(messages, lastTC+1); trailingIndex >= 0 {
+			end = trailingIndex
+		}
+		res := latestContiguousToolResults(messages, lastTC+1, end)
 		if len(res) > 0 && !replied {
 			trailing := ""
 			if index := trailingContinuationUserIdx(messages, lastTC+1); index >= 0 {
@@ -3427,7 +3454,6 @@ func composerToolResultsHinted(messages []gjson.Result, hint composerContinuatio
 				break
 			}
 		}
-		res := make([]map[string]any, 0)
 		signedIDSignal := false
 		// A server-side-chained request carries the current contiguous result
 		// batch immediately before its optional trailing user message. Older
@@ -3437,13 +3463,8 @@ func composerToolResultsHinted(messages []gjson.Result, hint composerContinuatio
 		if trailingIndex := trailingContinuationUserIdx(messages, lastAssistant+1); trailingIndex >= 0 {
 			end = trailingIndex
 		}
-		start := end
-		for start > lastAssistant+1 && messages[start-1].Get("role").String() == "tool" {
-			start--
-		}
-		for i := start; i < end; i++ {
-			tr := composerToolResultEntry(messages[i])
-			res = append(res, tr)
+		res := latestContiguousToolResults(messages, lastAssistant+1, end)
+		for _, tr := range res {
 			if hint.hasClientToolID != nil {
 				if id, _ := tr["toolCallId"].(string); strings.TrimSpace(id) != "" && hint.hasClientToolID(id) {
 					signedIDSignal = true

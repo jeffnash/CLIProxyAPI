@@ -89,6 +89,13 @@ const STRING_WRAPPER_KEYS = ["text", "string"];
 // A client-owned object field therefore never loses a legitimate `kind`,
 // `selected`, or `enumValue` property.
 const SCALAR_VARIANT_WRAPPER_KEYS = ["kind", "selected", "selection", "enum", "enumValue", "scalar", "scalarValue"];
+const PROTOBUF_JSON_VALUE_TYPES = new Set([
+  "google.protobuf.Value",
+  "google.protobuf.Struct",
+  "google.protobuf.ListValue",
+]);
+const PROTOCOL_DECODE_MAX_DEPTH = 32;
+const PROTOCOL_DECODE_MAX_NODES = 4096;
 
 const ARGUMENT_ALIASES = Object.freeze({
   absolutepath: [["filePath", "path", "file", "filename"], 80],
@@ -308,7 +315,17 @@ function schemaForValue(schema, value) {
     const branches = schema[unionKey];
     if (!Array.isArray(branches)) continue;
     const matching = branches.filter((branch) => schemaAcceptsValue(branch, value));
-    if (matching.length === 1) return matching[0];
+    if (matching.length === 1) {
+      // A union branch often carries only a discriminator or `required`
+      // refinement. Replacing the parent with that branch discards the
+      // parent's properties and prevents recursive field normalization. Keep
+      // the parent's structural contract while applying the selected branch
+      // as an additional refinement. Remove only the union being resolved so
+      // later calls cannot select it repeatedly.
+      const parent = { ...schema };
+      delete parent[unionKey];
+      return { allOf: [parent, matching[0]] };
+    }
   }
   return schema;
 }
@@ -387,6 +404,77 @@ function unwrapJsonLikeObject(value) {
   } catch {
     return undefined;
   }
+}
+
+function protobufJsonValueType(value) {
+  if (!isObject(value)) return "";
+  const constructor = Object.getPrototypeOf(value)?.constructor;
+  const typeName = constructor && typeof constructor.typeName === "string" ? constructor.typeName : "";
+  if (!PROTOBUF_JSON_VALUE_TYPES.has(typeName)) return "";
+  if (typeof value.toJson !== "function" || typeof value.toBinary !== "function") return "";
+  return typeName;
+}
+
+function plainJsonContainer(value) {
+  if (!isObject(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+// The patched Cursor seam receives MCP args before the SDK's native
+// map<string, google.protobuf.Value> -> JSON conversion. Decode only
+// positively identified protobuf JSON-value messages, then walk ordinary JSON
+// containers to find nested messages. Arbitrary client objects and their
+// toJson/toJSON methods are never invoked here.
+function decodeProtocolValues(value, path, transforms, state = null, depth = 0) {
+  const currentState = state || { nodes: 0, seen: new WeakSet() };
+  if (depth > PROTOCOL_DECODE_MAX_DEPTH || currentState.nodes >= PROTOCOL_DECODE_MAX_NODES) return value;
+  if (value === null || typeof value !== "object") return value;
+  if (currentState.seen.has(value)) return value;
+  currentState.seen.add(value);
+  currentState.nodes++;
+
+  const typeName = protobufJsonValueType(value);
+  if (typeName) {
+    try {
+      const decoded = value.toJson();
+      addTransform(transforms, {
+        kind: "decode-protocol-value",
+        path: path || "arguments",
+        source: typeName,
+        fromType: jsonKind(value),
+        toType: jsonKind(decoded),
+      });
+      return decodeProtocolValues(decoded, path, transforms, currentState, depth + 1);
+    } catch {
+      return value;
+    }
+  }
+
+  if (Array.isArray(value)) {
+    let out = value;
+    for (let index = 0; index < value.length; index++) {
+      const childPath = path ? `${path}.${index}` : String(index);
+      const child = decodeProtocolValues(value[index], childPath, transforms, currentState, depth + 1);
+      if (child !== value[index]) {
+        if (out === value) out = [...value];
+        out[index] = child;
+      }
+    }
+    return out;
+  }
+  if (!plainJsonContainer(value)) return value;
+
+  let out = value;
+  for (const key of Object.keys(value)) {
+    const childPath = path ? `${path}.${key}` : key;
+    const child = decodeProtocolValues(value[key], childPath, transforms, currentState, depth + 1);
+    if (child !== value[key]) {
+      if (out === value) out = { ...value };
+      Object.defineProperty(out, key, { value: child, writable: true, enumerable: true, configurable: true });
+    }
+  }
+  return out;
 }
 
 function wrapperCandidates(value, propertyName, expectedKinds) {
@@ -899,6 +987,7 @@ function normalizeValue(value, schema, propertyName, path, transforms, depth = 0
 function normalizeRootInput(input, schema, transforms) {
   if (input === undefined) return {};
   if (input === null) return null;
+  input = decodeProtocolValues(input, "", transforms);
   if (isObject(input)) {
     const serialized = unwrapJsonLikeObject(input);
     if (serialized !== undefined && jsonKind(serialized) !== "object") {

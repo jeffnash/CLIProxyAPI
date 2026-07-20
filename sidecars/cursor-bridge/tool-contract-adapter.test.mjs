@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Value } from "@bufbuild/protobuf";
 
 import {
   ToolContractRegistry,
@@ -764,6 +765,77 @@ test("protobuf Value and JSON-encoded scalar wrappers normalize structurally", (
   assert.deepEqual(normalizeToolArguments({ op: '"get"' }, {
     type: "object", properties: { op: { type: "string", enum: ["get"] } }, required: ["op"], additionalProperties: false,
   }).value, { op: "get" });
+});
+
+test("root required-alternative unions retain parent properties while normalizing real protobuf values", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      description: { type: "string" },
+      script: { type: "string" },
+      scriptPath: { type: "string" },
+    },
+    anyOf: [{ required: ["script"] }, { required: ["scriptPath"] }],
+    additionalProperties: false,
+  };
+  const cases = [
+    {
+      input: { description: Value.fromJson("probe"), script: Value.fromJson("return 'ok'") },
+      expected: { description: "probe", script: "return 'ok'" },
+    },
+    {
+      input: { description: Value.fromJson("probe"), scriptPath: Value.fromJson("/repo/workflow.js") },
+      expected: { description: "probe", scriptPath: "/repo/workflow.js" },
+    },
+  ];
+  for (const name of ["arbitrary", "another_tool_name"]) {
+    const registry = registryFor(name, schema);
+    for (const fixture of cases) {
+      const normalized = registry.normalize(name, fixture.input);
+      assert.deepEqual(normalized.value, fixture.expected);
+      assert.equal(registry.validate(name, normalized.value, normalized.transforms), null);
+      assert.ok(normalized.transforms.every((entry) => entry.kind === "decode-protocol-value"));
+    }
+  }
+});
+
+test("union traversal also normalizes non-protobuf wrappers without selecting a tool-specific path", () => {
+  const schema = {
+    type: "object",
+    properties: { description: { type: "string" }, inline: { type: "string" }, path: { type: "string" } },
+    oneOf: [{ required: ["inline"] }, { required: ["path"] }],
+    additionalProperties: false,
+  };
+  const normalized = normalizeToolArguments({ description: { text: "d" }, inline: { value: "body" } }, schema);
+  assert.deepEqual(normalized.value, { description: "d", inline: "body" });
+  assert.equal(normalized.transforms.length, 2);
+});
+
+test("protocol decoding preserves strict disagreement handling after decoding a protobuf Struct", () => {
+  const schema = {
+    type: "object",
+    properties: { description: { type: "string" } },
+    required: ["description"],
+    additionalProperties: false,
+  };
+  const registry = registryFor("generic", schema);
+  const normalized = registry.normalize("generic", {
+    description: Value.fromJson({ text: "first", value: "second" }),
+  });
+  assert.deepEqual(normalized.value, { description: { text: "first", value: "second" } });
+  assert.ok(normalized.transforms.some((entry) => entry.kind === "decode-protocol-value"));
+  assert.equal(registry.validate("generic", normalized.value, normalized.transforms).structuredContent.errors[0].path,
+    "description");
+});
+
+test("large multiline protobuf strings decode losslessly under union schemas", () => {
+  const script = `export const meta = { name: "large" };\n${"const x = 'payload';\n".repeat(6000)}return x;`;
+  const schema = {
+    type: "object",
+    properties: { script: { type: "string" }, scriptPath: { type: "string" } },
+    anyOf: [{ required: ["script"] }, { required: ["scriptPath"] }],
+  };
+  assert.equal(normalizeToolArguments({ script: Value.fromJson(script) }, schema).value.script, script);
 });
 
 test("numeric coercion accepts JSON numbers but rejects JavaScript-only spellings", () => {

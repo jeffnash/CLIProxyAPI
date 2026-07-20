@@ -1869,6 +1869,32 @@ func TestComposerToolResultsExtractionCount(t *testing.T) {
 	}
 }
 
+func TestComposerToolResultsIgnorePriorSignedRoundAcrossUserInterruption(t *testing.T) {
+	inp := composerInput([]byte(`{"messages":[
+		{"role":"user","content":"start"},
+		{"role":"assistant","content":"","tool_calls":[
+			{"id":"cct1_old_route_0_signature","function":{"name":"AskUserQuestion"}}
+		]},
+		{"role":"tool","tool_call_id":"cct1_old_route_0_signature","content":"old answer"},
+		{"role":"user","content":"retry with the required field"},
+		{"role":"tool","tool_call_id":"cct1_current_route_0_signature","content":"current answer A"},
+		{"role":"tool","tool_call_id":"cct1_current_route_1_signature","content":"current answer B"},
+		{"role":"user","content":"continue"}
+	]}`))
+	if inp["type"] != "tool_results" {
+		t.Fatalf("interrupted continuation must remain tool_results, got %v", inp["type"])
+	}
+	results, _ := inp["results"].([]map[string]any)
+	if len(results) != 2 ||
+		results[0]["toolCallId"] != "cct1_current_route_0_signature" ||
+		results[1]["toolCallId"] != "cct1_current_route_1_signature" {
+		t.Fatalf("only the latest contiguous signed-round batch may be forwarded, got %#v", results)
+	}
+	if inp["userText"] != "continue" || inp["interruptRequested"] != true {
+		t.Fatalf("latest user interruption must be preserved independently, got %#v", inp)
+	}
+}
+
 // L1: callerCredential must cover all inbound credential forms (headers + query params) so distinct
 // callers sharing one Cursor key are isolated regardless of how they authenticate.
 func TestCallerCredentialForms(t *testing.T) {

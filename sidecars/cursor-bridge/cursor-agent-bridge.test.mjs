@@ -1554,6 +1554,34 @@ test("schema preflight runs after safe wrapper normalization and valid calls sti
   await assert.rejects(opened.promise, /test_cleanup/);
 });
 
+test("required-alternative union schemas normalize parent fields before opening exactly one ToolRound", async () => {
+  const schema = {
+    type: "object",
+    properties: {
+      description: { type: "string" },
+      inline: { type: "string" },
+      path: { type: "string" },
+    },
+    anyOf: [{ required: ["inline"] }, { required: ["path"] }],
+    additionalProperties: false,
+  };
+  const { session } = seedSession("union-normalized-valid-mcp", "key", [{
+    name: "ArbitraryTool",
+    description: "generic required alternative",
+    inputSchema: schema,
+  }]);
+  const boxed = (value) => ({ toJSON: () => value });
+  const opened = await openTool(session, {
+    name: "ArbitraryTool",
+    input: { description: boxed("probe"), inline: boxed("return 'ok'") },
+  });
+  assert.deepEqual(opened.call.input, { description: "probe", inline: "return 'ok'" });
+  assert.equal(session.currentRound.calls.size, 1);
+  assert.equal(session.invalidToolCalls, 0);
+  await session.cancel({ terminalReason: "test_cleanup", detail: "union normalization test complete" });
+  await assert.rejects(opened.promise, /test_cleanup/);
+});
+
 test("native read, write, and shell dispatch use the canonical client tool contracts", async () => {
   const cases = [
     {
