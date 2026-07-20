@@ -103,6 +103,24 @@ test("an old marker reclaims a local checkpoint after Cursor no longer lists the
   assert.equal(existsSync(localDirectory), false);
 });
 
+test("a stale listed agent that vanishes at deletion still reclaims its checkpoint", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "sdk-agent-gc-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const now = { value: 20_000 };
+  const platform = mockPlatform([{ agentId: "stale-listing", lastModified: 1_000, archived: false }]);
+  const opts = options(platform, root, now);
+  await collectSdkAgents(opts);
+  const localDirectory = localAgentStateDir(opts.localStateRoot, "stale-listing");
+  mkdirSync(localDirectory, { recursive: true });
+  platform.getAgent = async () => { throw new Error("not found"); };
+  now.value += 10_000;
+
+  const stats = await collectSdkAgents(opts);
+  assert.equal(stats.localDeleted, 1);
+  assert.equal(stats.markersCleared, 1);
+  assert.equal(existsSync(localDirectory), false);
+});
+
 test("a durable root prevents marker-driven local checkpoint deletion", async (t) => {
   const root = mkdtempSync(path.join(tmpdir(), "sdk-agent-gc-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));

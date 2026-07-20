@@ -260,8 +260,18 @@ export async function collectSdkAgents({
       stats.deleted++;
       mutations++;
     } catch (error) {
-      if (isNotFound(error)) rmSync(file, { force: true });
-      else stats.skipped++;
+      if (!isNotFound(error)) {
+        stats.skipped++;
+        continue;
+      }
+      roots = await refreshProtectedAgentIds();
+      if (roots.has(agentId)) { stats.protected++; continue; }
+      try {
+        if (await removeLocalAgentState(localStateRoot, agentId)) stats.localDeleted++;
+        rmSync(file, { force: true });
+        stats.markersCleared++;
+        mutations++;
+      } catch { stats.skipped++; }
     }
   }
   return stats;
