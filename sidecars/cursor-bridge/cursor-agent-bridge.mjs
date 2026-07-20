@@ -20,7 +20,7 @@
 //      CURSOR_AGENT_PENDING_TIMEOUT_MS (default 600000 in-process abandonment watchdog; NOT an upstream deadline),
 //      CURSOR_AGENT_SESSION_TTL_MS (default 1800000 idle session eviction),
 //      CURSOR_AGENT_CANCEL_CLEANUP_MS (default 5000; bounds already-requested SDK teardown, never live data),
-//      CURSOR_COMPOSER_AGENT_GC (default ON; archive -> quarantine -> delete stale unreferenced SDK agents),
+//      CURSOR_COMPOSER_AGENT_GC (default OFF; maintenance-only archive -> quarantine -> delete of stale agents),
 //      CURSOR_COMPOSER_MCP_SHIM (default ON; "0"/"false" disables registering the client's tools via the SDK's
 //        official mcpServers path — the in-bridge /mcp streamable-http server),
 //      CURSOR_COMPOSER_MCP_GROUPING (one|natural|per-tool, default natural — how advertised tools are
@@ -31,6 +31,7 @@ import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { Worker } from "node:worker_threads";
 import {
   accessSync,
   closeSync,
@@ -63,7 +64,7 @@ import {
   probeStateRoot,
 } from "./tool-round.mjs";
 import { SseWriter } from "./sse-writer.mjs";
-import { collectSdkAgents } from "./sdk-agent-gc.mjs";
+import { collectSdkAgents, sdkAgentGCEnabled } from "./sdk-agent-gc.mjs";
 import { DurableCASConflict, DurableJSONCAS } from "./durable-json-cas.mjs";
 import {
   TURN_RECEIPT_VERSION,
@@ -299,9 +300,9 @@ const UNRESOLVED_RESERVATION_ORPHAN_MS = envInt(
   60 * 60 * 1000,
   { min: 60_000 },
 );
-const SDK_AGENT_GC_ENABLED = !["0", "false", "off"].includes(
-  String(process.env.CURSOR_COMPOSER_AGENT_GC || "1").trim().toLowerCase(),
-);
+// This performs a remote full-agent census and repeatedly scans durable state.
+// It must be an explicit maintenance-window opt-in, never a data-plane default.
+const SDK_AGENT_GC_ENABLED = sdkAgentGCEnabled(process.env.CURSOR_COMPOSER_AGENT_GC);
 const SDK_AGENT_GC_MIN_IDLE_MS = envInt(
   "CURSOR_COMPOSER_AGENT_GC_MIN_IDLE_MS", 7 * 24 * 60 * 60 * 1000, { min: 60_000 },
 );
@@ -2393,13 +2394,67 @@ function sdkAgentLiveRoots(durableRoots) {
 }
 
 let sdkAgentGCRunning = false;
+function createSdkAgentRootScanner() {
+  const worker = new Worker(new URL("./sdk-agent-root-scanner.mjs", import.meta.url));
+  const pending = new Map();
+  let nextId = 0;
+  let closed = false;
+  let scans = 0;
+  let elapsedMs = 0;
+  const fail = (error) => {
+    if (closed) return;
+    closed = true;
+    for (const { reject } of pending.values()) reject(error);
+    pending.clear();
+  };
+  worker.on("message", (message) => {
+    const waiter = pending.get(message?.id);
+    if (!waiter) return;
+    pending.delete(message.id);
+    if (message.error) {
+      waiter.reject(new Error(message.error));
+      return;
+    }
+    scans++;
+    elapsedMs += Number(message.elapsedMs) || 0;
+    waiter.resolve(new Set(Array.isArray(message.roots) ? message.roots : []));
+  });
+  worker.on("error", fail);
+  worker.on("exit", (code) => {
+    if (!closed && code !== 0) fail(new Error(`SDK agent root scanner exited with code ${code}`));
+  });
+  return {
+    scan() {
+      if (closed) return Promise.reject(new Error("SDK agent root scanner is closed"));
+      const id = ++nextId;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        worker.postMessage({ id });
+      });
+    },
+    metrics() { return { rootScans: scans, rootScanMs: elapsedMs }; },
+    async close() {
+      if (closed) return;
+      closed = true;
+      for (const { reject } of pending.values()) reject(new Error("SDK agent root scanner closed"));
+      pending.clear();
+      await worker.terminate();
+    },
+  };
+}
+
 async function runSdkAgentMaintenance() {
   if (!SDK_AGENT_GC_ENABLED || sdkAgentGCRunning) return;
   sdkAgentGCRunning = true;
+  let rootScanner = null;
   try {
+    // Durable root discovery touches thousands of JSON receipts in mature
+    // deployments. Keep that synchronous filesystem work off the HTTP/SSE
+    // event loop; only the small resulting Set crosses the worker boundary.
+    rootScanner = createSdkAgentRootScanner();
     for (const [scope, entry] of platforms.entries()) {
       const platform = await entry.promise;
-      const durableRoots = sdkAgentGCRoots();
+      const durableRoots = sdkAgentLiveRoots(await rootScanner.scan());
       const stats = await collectSdkAgents({
         platform,
         scope,
@@ -2408,20 +2463,25 @@ async function runSdkAgentMaintenance() {
         // Re-read shared durable roots before every mutation. Multiple bridge
         // processes may overlap during deploys, so the initial census is not
         // deletion authority.
-        refreshProtectedAgentIds: () => sdkAgentLiveRoots(sdkAgentGCRoots()),
+        refreshProtectedAgentIds: async () => sdkAgentLiveRoots(await rootScanner.scan()),
         minIdleMs: SDK_AGENT_GC_MIN_IDLE_MS,
         quarantineMs: SDK_AGENT_GC_QUARANTINE_MS,
         maxScan: SDK_AGENT_GC_MAX_SCAN,
         maxMutations: SDK_AGENT_GC_MAX_MUTATIONS,
       });
       if (stats.quarantined || stats.deleted || stats.restored || stats.skipped) {
-        console.log("[cursor-agent-bridge] SDK agent GC", JSON.stringify({ scope, ...stats }));
+        console.log("[cursor-agent-bridge] SDK agent GC", JSON.stringify({
+          scope,
+          ...stats,
+          ...rootScanner.metrics(),
+        }));
       }
     }
   } catch (error) {
     console.error("[cursor-agent-bridge] SDK agent GC failed closed; preserving state:",
       (error && error.message) || String(error));
   } finally {
+    if (rootScanner) await rootScanner.close().catch(() => {});
     sdkAgentGCRunning = false;
   }
 }

@@ -13,6 +13,10 @@ import path from "node:path";
 
 const RECORD_VERSION = 1;
 
+export function sdkAgentGCEnabled(raw) {
+  return ["1", "true", "on"].includes(String(raw || "").trim().toLowerCase());
+}
+
 function markerPath(root, scope, agentId) {
   const key = createHash("sha256").update(String(scope)).update("\0").update(String(agentId)).digest("hex");
   return path.join(root, `${key}.json`);
@@ -115,7 +119,7 @@ export async function collectSdkAgents({
     if (!marker) {
       const modifiedAt = agentModifiedAt(agent);
       if (!modifiedAt || now() - modifiedAt < minIdleMs || mutations >= maxMutations) continue;
-      roots = refreshProtectedAgentIds();
+      roots = await refreshProtectedAgentIds();
       if (roots.has(agentId)) { stats.protected++; continue; }
       try {
         await platform.archiveAgent(agentId);
@@ -137,7 +141,7 @@ export async function collectSdkAgents({
       continue;
     }
     if (now() - marker.quarantinedAt < quarantineMs || mutations >= maxMutations) continue;
-    roots = refreshProtectedAgentIds();
+    roots = await refreshProtectedAgentIds();
     if (roots.has(agentId)) { stats.protected++; continue; }
     try {
       const current = await platform.getAgent(agentId);
@@ -146,7 +150,7 @@ export async function collectSdkAgents({
         stats.restored++;
         continue;
       }
-      roots = refreshProtectedAgentIds();
+      roots = await refreshProtectedAgentIds();
       if (roots.has(agentId)) { stats.protected++; continue; }
       await platform.deleteAgent(agentId);
       rmSync(file, { force: true });

@@ -1,9 +1,47 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { collectSdkAgents } from "./sdk-agent-gc.mjs";
+import { Worker } from "node:worker_threads";
+import { collectSdkAgents, sdkAgentGCEnabled } from "./sdk-agent-gc.mjs";
+
+test("SDK agent GC is maintenance-only and requires an explicit opt-in", () => {
+  assert.equal(sdkAgentGCEnabled(undefined), false);
+  assert.equal(sdkAgentGCEnabled(""), false);
+  assert.equal(sdkAgentGCEnabled("0"), false);
+  assert.equal(sdkAgentGCEnabled("false"), false);
+  assert.equal(sdkAgentGCEnabled("1"), true);
+  assert.equal(sdkAgentGCEnabled("TRUE"), true);
+  assert.equal(sdkAgentGCEnabled(" on "), true);
+});
+
+test("durable-root discovery runs successfully in an isolated worker", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "sdk-agent-root-scanner-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const aliases = path.join(root, ".cct-agent-alias");
+  mkdirSync(aliases, { recursive: true });
+  for (let index = 0; index < 1_000; index++) {
+    writeFileSync(path.join(aliases, `${index}.json`), JSON.stringify({ agentId: `agent-${index}` }));
+  }
+  const worker = new Worker(new URL("./sdk-agent-root-scanner.mjs", import.meta.url), {
+    env: { ...process.env, CURSOR_AGENT_STATE_ROOT: root },
+  });
+  t.after(() => worker.terminate());
+  let heartbeats = 0;
+  const heartbeat = setInterval(() => { heartbeats++; }, 1);
+  t.after(() => clearInterval(heartbeat));
+  const response = await new Promise((resolve, reject) => {
+    worker.once("message", resolve);
+    worker.once("error", reject);
+    worker.postMessage({ id: 1 });
+  });
+  clearInterval(heartbeat);
+  assert.equal(response.id, 1);
+  assert.equal(response.roots.length, 1_000);
+  assert.equal(Number.isSafeInteger(response.elapsedMs), true);
+  assert.ok(heartbeats > 0, "the main event loop remained responsive during the durable scan");
+});
 
 function mockPlatform(agents) {
   const values = new Map(agents.map((agent) => [agent.agentId, { ...agent }]));
@@ -88,6 +126,18 @@ test("a root appearing during the pre-mutation recheck fences archival", async (
   let checks = 0;
   const opts = options(platform, root, now);
   opts.refreshProtectedAgentIds = () => (++checks >= 1 ? new Set(["racing"]) : new Set());
+  const stats = await collectSdkAgents(opts);
+  assert.equal(stats.quarantined, 0);
+  assert.deepEqual(platform.calls, []);
+});
+
+test("an asynchronous durable-root refresh fences archival", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "sdk-agent-gc-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const now = { value: 20_000 };
+  const platform = mockPlatform([{ agentId: "async-root", lastModified: 1_000, archived: false }]);
+  const opts = options(platform, root, now);
+  opts.refreshProtectedAgentIds = async () => new Set(["async-root"]);
   const stats = await collectSdkAgents(opts);
   assert.equal(stats.quarantined, 0);
   assert.deepEqual(platform.calls, []);
