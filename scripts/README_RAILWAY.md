@@ -98,6 +98,10 @@ Default merge safety rules:
 - `CURSOR_COMPOSER_REPLAY_GLOBAL_MAX_BYTES` (default `268435456`, or 256 MiB) - process-wide admission budget reserved before SDK sends so ordered replay remains complete under concurrency.
 - `CURSOR_COMPOSER_UNRESOLVED_RECEIPT_MAX_BYTES` (default `1073741824`, or 1 GiB) - shared durable reservation ceiling for acceptance-unknown fresh-turn envelopes across overlapping bridge processes.
 - `CURSOR_COMPOSER_UNRESOLVED_RESERVATION_ORPHAN_MS` (default `3600000`) - retention window for a shared reservation whose receipt was never published. Published UNKNOWN/RUNNING/FAILED evidence is never age-evicted.
+- `CURSOR_COMPOSER_AGENT_GC` (default `1`) - enables conservative SDK-agent collection. Referenced agents are never mutated; stale unreferenced agents are archived, quarantined, and rechecked before deletion. Set to `0` to disable.
+- `CURSOR_COMPOSER_AGENT_GC_MIN_IDLE_MS` (default `604800000`, or 7 days) - minimum SDK agent idle age before quarantine.
+- `CURSOR_COMPOSER_AGENT_GC_QUARANTINE_MS` (default `86400000`, or 24 hours) - reversible archive period before physical deletion.
+- `CURSOR_COMPOSER_AGENT_GC_MAX_SCAN` (default `10000`) / `CURSOR_COMPOSER_AGENT_GC_MAX_MUTATIONS` (default `50`) - per-maintenance scan and mutation bounds.
 - Receipt and ToolRound mutations use immutable revision claims and helper-completable filesystem CAS. There is no timestamp-based lock stealing; a replacement process can finish a claimed commit without allowing a paused stale writer to overwrite it.
 - `CURSOR_AGENT_DURABLE_MAINTENANCE_MS` (default `300000`, or 5 minutes) - periodic terminal-journal and completed-replay cleanup cadence. Acceptance-unknown fresh receipts are never age/count evicted.
 - `CURSOR_AGENT_SHUTDOWN_MAX_MS` (default `28000`) - one global bridge shutdown deadline for drain, concurrent cancellation, and store disposal. The default reserves time below Railway's 30-second drain window instead of relying on platform SIGKILL.

@@ -20,6 +20,7 @@
 //      CURSOR_AGENT_PENDING_TIMEOUT_MS (default 600000 in-process abandonment watchdog; NOT an upstream deadline),
 //      CURSOR_AGENT_SESSION_TTL_MS (default 1800000 idle session eviction),
 //      CURSOR_AGENT_CANCEL_CLEANUP_MS (default 5000; bounds already-requested SDK teardown, never live data),
+//      CURSOR_COMPOSER_AGENT_GC (default ON; archive -> quarantine -> delete stale unreferenced SDK agents),
 //      CURSOR_COMPOSER_MCP_SHIM (default ON; "0"/"false" disables registering the client's tools via the SDK's
 //        official mcpServers path — the in-bridge /mcp streamable-http server),
 //      CURSOR_COMPOSER_MCP_GROUPING (one|natural|per-tool, default natural — how advertised tools are
@@ -62,6 +63,7 @@ import {
   probeStateRoot,
 } from "./tool-round.mjs";
 import { SseWriter } from "./sse-writer.mjs";
+import { collectSdkAgents } from "./sdk-agent-gc.mjs";
 import { DurableCASConflict, DurableJSONCAS } from "./durable-json-cas.mjs";
 import {
   TURN_RECEIPT_VERSION,
@@ -297,6 +299,18 @@ const UNRESOLVED_RESERVATION_ORPHAN_MS = envInt(
   60 * 60 * 1000,
   { min: 60_000 },
 );
+const SDK_AGENT_GC_ENABLED = !["0", "false", "off"].includes(
+  String(process.env.CURSOR_COMPOSER_AGENT_GC || "1").trim().toLowerCase(),
+);
+const SDK_AGENT_GC_MIN_IDLE_MS = envInt(
+  "CURSOR_COMPOSER_AGENT_GC_MIN_IDLE_MS", 7 * 24 * 60 * 60 * 1000, { min: 60_000 },
+);
+const SDK_AGENT_GC_QUARANTINE_MS = envInt(
+  "CURSOR_COMPOSER_AGENT_GC_QUARANTINE_MS", 24 * 60 * 60 * 1000, { min: 60_000 },
+);
+const SDK_AGENT_GC_MAX_SCAN = envInt("CURSOR_COMPOSER_AGENT_GC_MAX_SCAN", 10_000, { min: 1 });
+const SDK_AGENT_GC_MAX_MUTATIONS = envInt("CURSOR_COMPOSER_AGENT_GC_MAX_MUTATIONS", 50, { min: 1 });
+const SDK_AGENT_GC_DIR = path.join(STATE_ROOT, ".cct-agent-gc");
 
 function stateRootDiskStatus(requiredBytes = 0, statfs = statfsSync) {
   try {
@@ -2320,6 +2334,98 @@ function cleanupCompletedTurnReceipts({ ttlMs = TERMINAL_ROUND_TTL_MS, maxTermin
   }
 }
 
+function sdkAgentGCRoots() {
+  const roots = new Set();
+  for (const session of sessions.values()) {
+    if (session?.agentId) roots.add(session.agentId);
+    if (session?.pendingRecoveryAlias) roots.add(session.pendingRecoveryAlias);
+  }
+  try {
+    for (const name of readdirSync(AGENT_ALIAS_DIR)) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const record = JSON.parse(readFileSync(path.join(AGENT_ALIAS_DIR, name), "utf8"));
+        if (typeof record?.agentId === "string" && record.agentId) roots.add(record.agentId);
+      } catch {}
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const { journal } = getRoundInfrastructure();
+  for (const record of journal.records()) {
+    const unresolvedDeferred = Array.isArray(record?.deferredInputs)
+      && record.deferredInputs.some((item) => item && (
+        item.state === DeferredInputState.QUEUED || item.state === DeferredInputState.DELIVERING
+      ));
+    if (record?.state !== RoundState.TERMINAL || unresolvedDeferred) {
+      if (typeof record?.agentId === "string" && record.agentId) roots.add(record.agentId);
+      if (typeof record?.recovery?.replacementAgentId === "string") roots.add(record.recovery.replacementAgentId);
+      for (const item of record?.deferredInputs || []) {
+        if (typeof item?.deliveryAgentId === "string" && item.deliveryAgentId) roots.add(item.deliveryAgentId);
+      }
+    }
+  }
+  try {
+    for (const name of readdirSync(COMPLETED_TURN_DIR)) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+      try {
+        const record = receiptCAS.readRecover(path.join(COMPLETED_TURN_DIR, name)).record;
+        if (isUnresolvedAcceptanceRecord(record)
+            && typeof record?.agentId === "string" && record.agentId) roots.add(record.agentId);
+      } catch {}
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return roots;
+}
+
+function sdkAgentLiveRoots(durableRoots) {
+  const roots = new Set(durableRoots);
+  for (const session of sessions.values()) {
+    if (session?.agentId) roots.add(session.agentId);
+    if (session?.pendingRecoveryAlias) roots.add(session.pendingRecoveryAlias);
+  }
+  for (const round of liveToolRounds.values()) {
+    if (round?.agentId) roots.add(round.agentId);
+  }
+  return roots;
+}
+
+let sdkAgentGCRunning = false;
+async function runSdkAgentMaintenance() {
+  if (!SDK_AGENT_GC_ENABLED || sdkAgentGCRunning) return;
+  sdkAgentGCRunning = true;
+  try {
+    for (const [scope, entry] of platforms.entries()) {
+      const platform = await entry.promise;
+      const durableRoots = sdkAgentGCRoots();
+      const stats = await collectSdkAgents({
+        platform,
+        scope,
+        quarantineRoot: SDK_AGENT_GC_DIR,
+        protectedAgentIds: durableRoots,
+        // Re-read shared durable roots before every mutation. Multiple bridge
+        // processes may overlap during deploys, so the initial census is not
+        // deletion authority.
+        refreshProtectedAgentIds: () => sdkAgentLiveRoots(sdkAgentGCRoots()),
+        minIdleMs: SDK_AGENT_GC_MIN_IDLE_MS,
+        quarantineMs: SDK_AGENT_GC_QUARANTINE_MS,
+        maxScan: SDK_AGENT_GC_MAX_SCAN,
+        maxMutations: SDK_AGENT_GC_MAX_MUTATIONS,
+      });
+      if (stats.quarantined || stats.deleted || stats.restored || stats.skipped) {
+        console.log("[cursor-agent-bridge] SDK agent GC", JSON.stringify({ scope, ...stats }));
+      }
+    }
+  } catch (error) {
+    console.error("[cursor-agent-bridge] SDK agent GC failed closed; preserving state:",
+      (error && error.message) || String(error));
+  } finally {
+    sdkAgentGCRunning = false;
+  }
+}
+
 function runDurableMaintenance() {
   const { journal } = getRoundInfrastructure();
   journal.cas.sweepDirectory(journal.dir, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
@@ -2327,6 +2433,7 @@ function runDurableMaintenance() {
   journal.cleanupTerminal({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
   cleanupCompletedTurnReceipts({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
   reconcileUnresolvedReservations();
+  void runSdkAgentMaintenance();
 }
 
 function sdkUserTextHash(message) {
@@ -7523,7 +7630,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       try {
         session.run = await agent.send(msg, sendCallbacks);
         session.sendPending = false;
-        if (!session.pendingRecoveryAlias
+        if (!session.utilityOneShot && !session.pendingRecoveryAlias
             && !sameStringArray(seededSystemBlockIdsBefore, session.seededSystemBlockIds)) {
           try {
             session.persistDurableAlias();
@@ -7829,7 +7936,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     // fingerprint (a future /compact) is detected. Always update on a successful seed/continue. H12: ALSO
     // persist it durably keyed by agentId so a COLD restart can detect a compact that happened while the
     // bridge was down (the in-memory fp is lost on restart; the durable one survives).
-    if (inboundFp) {
+    if (inboundFp && !session.utilityOneShot) {
       session.historyFingerprint = inboundFp;
       writeDurableFingerprint(session.cursorKey, session.agentId || session.id, inboundFp);
     }
@@ -8518,7 +8625,7 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { runDurableMaintenance };
+export { runDurableMaintenance, runSdkAgentMaintenance, sdkAgentGCRoots };
 export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
 export {
   TURN_RECEIPT_VERSION,
