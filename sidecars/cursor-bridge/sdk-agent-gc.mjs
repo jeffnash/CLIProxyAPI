@@ -9,6 +9,7 @@ import {
   rmSync,
   writeSync,
 } from "node:fs";
+import { lstat, readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 
 const RECORD_VERSION = 1;
@@ -22,6 +23,16 @@ function markerPath(root, scope, agentId) {
   return path.join(root, `${key}.json`);
 }
 
+export function localAgentStateDir(localStateRoot, agentId) {
+  const agentsRoot = path.resolve(localStateRoot, "agents");
+  const digest = createHash("sha256").update(String(agentId)).digest("hex");
+  const directory = path.resolve(agentsRoot, `agent-${digest}`);
+  if (path.dirname(directory) !== agentsRoot || !/^agent-[a-f0-9]{64}$/.test(path.basename(directory))) {
+    throw new Error("refusing unsafe SDK agent state path");
+  }
+  return directory;
+}
+
 function readMarker(file) {
   try {
     const value = JSON.parse(readFileSync(file, "utf8"));
@@ -32,6 +43,48 @@ function readMarker(file) {
     if (error?.code === "ENOENT") return null;
     return null;
   }
+}
+
+async function readMarkerAsync(file) {
+  try {
+    const value = JSON.parse(await readFile(file, "utf8"));
+    if (value?.version !== RECORD_VERSION || typeof value.agentId !== "string"
+        || typeof value.scope !== "string" || !Number.isSafeInteger(value.quarantinedAt)) return null;
+    return value;
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    return null;
+  }
+}
+
+async function listMarkers(root) {
+  try {
+    const entries = await readdir(root, { withFileTypes: true });
+    const records = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !/^[a-f0-9]{64}\.json$/.test(entry.name)) continue;
+      const file = path.join(root, entry.name);
+      const marker = await readMarkerAsync(file);
+      if (marker) records.push({ file, marker });
+    }
+    return records;
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function removeLocalAgentState(localStateRoot, agentId) {
+  if (!localStateRoot) return false;
+  const directory = localAgentStateDir(localStateRoot, agentId);
+  try {
+    await lstat(directory);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  await rm(directory, { recursive: true, force: true });
+  return true;
 }
 
 function writeMarker(file, record) {
@@ -86,6 +139,7 @@ export async function collectSdkAgents({
   platform,
   scope,
   quarantineRoot,
+  localStateRoot,
   protectedAgentIds,
   refreshProtectedAgentIds = () => protectedAgentIds,
   now = () => Date.now(),
@@ -94,10 +148,58 @@ export async function collectSdkAgents({
   maxScan,
   maxMutations,
 }) {
-  const stats = { scanned: 0, protected: 0, quarantined: 0, deleted: 0, restored: 0, skipped: 0 };
+  const stats = {
+    scanned: 0,
+    protected: 0,
+    quarantined: 0,
+    deleted: 0,
+    localDeleted: 0,
+    markersCleared: 0,
+    restored: 0,
+    skipped: 0,
+  };
   const agents = await listAgentsBounded(platform, maxScan);
   stats.scanned = agents.length;
   let mutations = 0;
+
+  // Cursor may stop listing an archived/deleted agent before its SDK checkpoint
+  // directory is removed. The durable marker is the only safe authority for
+  // locating those orphans, so sweep eligible markers before creating new ones.
+  const listedAgentIds = new Set(agents.map((agent) => String(agent?.agentId || "")).filter(Boolean));
+  for (const { file, marker } of await listMarkers(quarantineRoot)) {
+    if (mutations >= maxMutations) break;
+    if (marker.scope !== String(scope) || listedAgentIds.has(marker.agentId)
+        || now() - marker.quarantinedAt < quarantineMs) continue;
+    let roots = await refreshProtectedAgentIds();
+    if (roots.has(marker.agentId)) { stats.protected++; continue; }
+    let current = null;
+    try {
+      current = await platform.getAgent(marker.agentId);
+    } catch (error) {
+      if (!isNotFound(error)) { stats.skipped++; continue; }
+    }
+    if (current && !agentIsArchived(current)) {
+      rmSync(file, { force: true });
+      stats.restored++;
+      mutations++;
+      continue;
+    }
+    roots = await refreshProtectedAgentIds();
+    if (roots.has(marker.agentId)) { stats.protected++; continue; }
+    try {
+      if (current) {
+        await platform.deleteAgent(marker.agentId);
+        stats.deleted++;
+      }
+      if (await removeLocalAgentState(localStateRoot, marker.agentId)) stats.localDeleted++;
+      rmSync(file, { force: true });
+      stats.markersCleared++;
+      mutations++;
+    } catch (error) {
+      stats.skipped++;
+    }
+  }
+
   for (const agent of agents) {
     const agentId = String(agent?.agentId || "");
     if (!agentId) { stats.skipped++; continue; }
@@ -153,6 +255,7 @@ export async function collectSdkAgents({
       roots = await refreshProtectedAgentIds();
       if (roots.has(agentId)) { stats.protected++; continue; }
       await platform.deleteAgent(agentId);
+      if (await removeLocalAgentState(localStateRoot, agentId)) stats.localDeleted++;
       rmSync(file, { force: true });
       stats.deleted++;
       mutations++;

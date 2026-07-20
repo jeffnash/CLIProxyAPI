@@ -2395,7 +2395,11 @@ function sdkAgentLiveRoots(durableRoots) {
 
 let sdkAgentGCRunning = false;
 function createSdkAgentRootScanner() {
-  const worker = new Worker(new URL("./sdk-agent-root-scanner.mjs", import.meta.url));
+  const worker = new Worker(new URL("./sdk-agent-root-scanner.mjs", import.meta.url), {
+    // `node --input-type=module -e ...` is useful for Railway maintenance
+    // canaries, but that flag is invalid for a file-backed worker.
+    execArgv: process.execArgv.filter((arg) => !arg.startsWith("--input-type")),
+  });
   const pending = new Map();
   let nextId = 0;
   let closed = false;
@@ -2459,6 +2463,7 @@ async function runSdkAgentMaintenance() {
         platform,
         scope,
         quarantineRoot: SDK_AGENT_GC_DIR,
+        localStateRoot: entry.stateRoot,
         protectedAgentIds: durableRoots,
         // Re-read shared durable roots before every mutation. Multiple bridge
         // processes may overlap during deploys, so the initial census is not
@@ -2469,7 +2474,8 @@ async function runSdkAgentMaintenance() {
         maxScan: SDK_AGENT_GC_MAX_SCAN,
         maxMutations: SDK_AGENT_GC_MAX_MUTATIONS,
       });
-      if (stats.quarantined || stats.deleted || stats.restored || stats.skipped) {
+      if (stats.quarantined || stats.deleted || stats.localDeleted
+          || stats.markersCleared || stats.restored || stats.skipped) {
         console.log("[cursor-agent-bridge] SDK agent GC", JSON.stringify({
           scope,
           ...stats,

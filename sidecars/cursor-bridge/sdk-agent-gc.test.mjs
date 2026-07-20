@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
-import { collectSdkAgents, sdkAgentGCEnabled } from "./sdk-agent-gc.mjs";
+import { collectSdkAgents, localAgentStateDir, sdkAgentGCEnabled } from "./sdk-agent-gc.mjs";
 
 test("SDK agent GC is maintenance-only and requires an explicit opt-in", () => {
   assert.equal(sdkAgentGCEnabled(undefined), false);
@@ -70,6 +70,7 @@ function options(platform, root, now, protectedAgentIds = new Set()) {
     platform,
     scope: "tenant-a",
     quarantineRoot: root,
+    localStateRoot: path.join(root, "state"),
     protectedAgentIds,
     refreshProtectedAgentIds: () => protectedAgentIds,
     now: () => now.value,
@@ -79,6 +80,67 @@ function options(platform, root, now, protectedAgentIds = new Set()) {
     maxMutations: 100,
   };
 }
+
+test("an old marker reclaims a local checkpoint after Cursor no longer lists the agent", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "sdk-agent-gc-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const now = { value: 20_000 };
+  const platform = mockPlatform([{ agentId: "remote-gone", lastModified: 1_000, archived: false }]);
+  const opts = options(platform, root, now);
+  await collectSdkAgents(opts);
+
+  platform.values.delete("remote-gone");
+  const localDirectory = localAgentStateDir(opts.localStateRoot, "remote-gone");
+  mkdirSync(localDirectory, { recursive: true });
+  writeFileSync(path.join(localDirectory, "store.db"), "checkpoint");
+  now.value += 10_000;
+
+  const stats = await collectSdkAgents(opts);
+  assert.equal(stats.localDeleted, 1);
+  assert.equal(stats.markersCleared, 1);
+  assert.equal(stats.deleted, 0);
+  assert.equal(platform.values.has("remote-gone"), false);
+  assert.equal(existsSync(localDirectory), false);
+});
+
+test("a durable root prevents marker-driven local checkpoint deletion", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "sdk-agent-gc-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const now = { value: 20_000 };
+  const platform = mockPlatform([{ agentId: "still-rooted", lastModified: 1_000, archived: false }]);
+  const opts = options(platform, root, now);
+  await collectSdkAgents(opts);
+  platform.values.delete("still-rooted");
+  const localDirectory = localAgentStateDir(opts.localStateRoot, "still-rooted");
+  mkdirSync(localDirectory, { recursive: true });
+  now.value += 10_000;
+  opts.refreshProtectedAgentIds = async () => new Set(["still-rooted"]);
+
+  const stats = await collectSdkAgents(opts);
+  assert.equal(stats.localDeleted, 0);
+  assert.equal(stats.protected, 1);
+  assert.equal(existsSync(localDirectory), true);
+});
+
+test("an unlisted but remotely active agent cancels marker-driven deletion", async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "sdk-agent-gc-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const now = { value: 20_000 };
+  const platform = mockPlatform([{ agentId: "active-again", lastModified: 1_000, archived: false }]);
+  const opts = options(platform, root, now);
+  await collectSdkAgents(opts);
+  platform.values.get("active-again").archived = false;
+  platform.listAgents = async () => ({ items: [] });
+  const localDirectory = localAgentStateDir(opts.localStateRoot, "active-again");
+  mkdirSync(localDirectory, { recursive: true });
+  now.value += 10_000;
+
+  const stats = await collectSdkAgents(opts);
+  assert.equal(stats.localDeleted, 0);
+  assert.equal(stats.restored, 1);
+  assert.equal(existsSync(localDirectory), true);
+  assert.equal(platform.values.has("active-again"), true);
+});
 
 test("SDK agent GC archives, quarantines, then deletes only after a second TTL", async (t) => {
   const root = mkdtempSync(path.join(tmpdir(), "sdk-agent-gc-"));

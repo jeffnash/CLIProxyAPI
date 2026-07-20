@@ -390,7 +390,7 @@ unless a startup self-test proves native local execution is unreachable, logging
 | `CURSOR_COMPOSER_REPLAY_GLOBAL_MAX_BYTES` | `268435456` (256 MiB) | Process-wide capacity reserved before an SDK send so its ordered recovery log can never be partially retained. |
 | `CURSOR_COMPOSER_UNRESOLVED_RECEIPT_MAX_BYTES` | `1073741824` (1 GiB) | Shared-volume ceiling for durable acceptance-unknown fresh-turn envelopes. |
 | `CURSOR_COMPOSER_UNRESOLVED_RESERVATION_ORPHAN_MS` | `3600000` | Retention for a reservation that never produced a receipt; durable uncertainty evidence itself is not age-evicted. |
-| `CURSOR_COMPOSER_AGENT_GC` | `0` | Maintenance-only two-phase SDK-agent GC. Durable-root scans run in an isolated worker; enable only after a quiescent canary confirms the account's remote census does not affect live sends. |
+| `CURSOR_COMPOSER_AGENT_GC` | `0` | Maintenance-only two-phase SDK-agent GC. Durable-root scans run in an isolated worker; enable only after a quiescent canary confirms the account's remote census does not affect live sends. Eligible same-scope markers also reclaim orphaned deterministic local SDK checkpoints. |
 | `CURSOR_COMPOSER_AGENT_GC_MIN_IDLE_MS` | `604800000` | Minimum idle age before an unreferenced SDK agent is quarantined. |
 | `CURSOR_COMPOSER_AGENT_GC_QUARANTINE_MS` | `86400000` | Reversible archive interval before deletion. |
 | `CURSOR_COMPOSER_AGENT_GC_MAX_SCAN` / `CURSOR_COMPOSER_AGENT_GC_MAX_MUTATIONS` | `10000` / `50` | Work bounds per maintenance pass. |
