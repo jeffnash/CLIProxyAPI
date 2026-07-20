@@ -838,7 +838,7 @@ function toolManifest(advertised) {
     + "Call the matching tool by its exact advertised name and declared schema; do not invent wrapper or transport tool names. "
     + "Invalid calls are not executed. Wait for each returned result, and treat an error result as a real failure rather than success. "
     + "Consume returned content directly; do not create scratch files merely to relay tool output unless the user explicitly requested a file. "
-    + "When a task requires delegation and a delegation capability is advertised, call it rather than only narrating delegation. "
+    + "ROUTING — choose the shape of the work before acting. A broad or multi-part ask (several independent areas, files, or hypotheses), or a long detailed brief, is a FAN-OUT: decompose it into independent seams and delegate them in parallel with the advertised workflow/delegation capability — do NOT inline-execute a long brief yourself. A single specific bounded target: do it yourself now. Explicitly named parallel items ('spawn subagents for X and Y'): use the named delegation/subagent capability for exactly those. After launching delegated work, WAIT for its result and build on it; do not redo the same work yourself in parallel. "
     + "Always return to the current user instruction after consulting this inventory.";
 }
 
@@ -4937,6 +4937,11 @@ function normalizeToolArgsToSchema(_name, input, schema) {
 // argument contract appended to each tool's MCP description below. Disable only to shrink the tools/list payload;
 // the per-tool EXTRAS (critical conflation fixes) still apply when disabled.
 const TOOL_ARG_CONTRACT_ENABLED = !["0", "false", "off", "no"].includes(String(process.env.CURSOR_COMPOSER_TOOL_ARG_CONTRACT || "").toLowerCase());
+// CURSOR_COMPOSER_WORKFLOW_BASE_DESC_MAX (default 3000; 0 = drop the verbatim CC base entirely) caps the verbose
+// Claude Code Workflow description that rides the advertised tool. The consolidated WORKFLOW block prepended by
+// augmentToolDescription is the authoritative script contract, so the CC base is belt-and-suspenders API-surface
+// context — cap it to keep the per-turn payload small. Workflow-only; description is never validated.
+const WORKFLOW_BASE_DESC_MAX = envInt("CURSOR_COMPOSER_WORKFLOW_BASE_DESC_MAX", 3000, { min: 0 });
 // argContract reinforces a tool's exact arg KEYS/types, which only matters for the few tools composer CONFLATES
 // (it borrows the Agent tool's object shape onto the workflow agent() function, invents Agent args, etc.). Every
 // other tool (chrome-devtools, Read, Bash, Write, …) already conveys its shape via the schema, so the contract
@@ -4951,49 +4956,6 @@ function toolNeedsArgContract(name) {
 // source (composer borrows the `Agent` TOOL's object shape for the workflow `agent()` function -> "[object Object]"
 // agents). Keyed by exact tool name; a tool not listed gets only the generic schema-derived contract.
 const TOOL_USAGE_EXTRAS = {
-  // Prescriptive against CC's ACTUAL workflow runtime (verified in the 2.1.158 binary): the script is AST-parsed —
-  // `export const meta` (statement #1, a pure literal) is taken, then scriptBody = everything AFTER it is wrapped in
-  // an async function with agent()/parallel()/pipeline()/phase() injected. Each rule below maps to a real failure
-  // mode we've observed (export-in-body -> "Unexpected keyword export"; object-shape agent() -> "[object Object]";
-  // bad agentType -> "agent type not found"; promises in parallel -> "expects an array of functions").
-  Workflow:
-    "DECOMPOSE BY REASONING ABOUT THIS TASK — derive the structure from the problem in front of you; do NOT copy a fixed recipe. Work it out in four moves:\n" +
-    "  (1) SEAMS → THE PROBE PHASE, the HEART of the workflow (it holds the MOST agents). Name the INDEPENDENT pieces of THIS task that can run AT THE SAME TIME, then fan out ONE agent PER seam with `parallel([...])`. STRICT: the probe MUST have ≥ as many lanes as the seams you list AND ≥ any count the user named — '8-fold audit' / 'use 8 subagents' ⇒ EXACTLY 8 probe lanes. The wide probe IS the work; verify/synthesize are small add-ons AFTER it. If you can't name 4+ seams, cut finer (per-file / per-hypothesis / per-case). NEVER collapse the probe into one 'auditor'/'reviewer'/'skeptic' agent — the most common failure. Use SEAM PATTERNS (below) to find the split.\n" +
-    "  SEAM PATTERNS — match your task to one, list the items, fan out ONE probe lane per item:\n" +
-    "    • audit / review code → one lane per (file or module) × (lens: correctness, concurrency, security, error-handling), + 1–2 lanes attacking the core assumption  [e.g. 6 files × 4 lenses, or 8 invariants ⇒ 8 lanes]\n" +
-    "    • hunt bugs across a repo → one lane per subsystem, OR per bug-class hypothesis (races, leaks, injection, off-by-one, auth-bypass)\n" +
-    "    • build a feature / UI → one lane per component / screen / layer, then a final integration lane\n" +
-    "    • design / architecture decision → one lane per COMPETING APPROACH, + one lane per stress-lens (scale, failure, security) attacking the front-runner\n" +
-    "    • migrate / refactor → one lane per call-site or per file touched\n" +
-    "    • research a question → one lane per sub-question or per source/doc\n" +
-    "    • review a diff / PR → one lane per changed file × dimension (bugs, tests, perf)\n" +
-    "    • fix failing tests → one lane per failing test\n" +
-    "    • make a cleanup / refactor PLAN → one lane per category (dead code, duplication, complexity hotspots, config, test gaps)\n" +
-    "  (2) PER-LANE CONTRACT + DEEP PROMPTS — each subagent is ISOLATED: it ONLY sees its `agent('…')` string, not your chat. Write `const CTX = 'TASK:… SCOPE:… GOAL:… METHOD:… OUTPUT: schema only BAR:…'` once, then a `function lanePrompt(unit) { return CTX + '\\nLANE: ' + unit + '\\n' + /* slice: paths/hypothesis, numbered steps, cite file:line, return schema */ }` and call `agent(lanePrompt(u), { schema, label })` in probe `parallel`. Probe prompts should be ~150–400+ chars; one-liners ('Audit auth') starve subagents. Every probe lane needs a `schema` (e.g. { findings: [{ where, issue, severity }] }). Verify/synth prompts can stay shorter — they receive structured JSON from prior phases.\n" +
-    "  (3) VERIFY — a SEPARATE phase that runs AFTER the probe, ON the probe's FINDINGS. It is an ADD-ON that scrutinizes the probe's output; it does NOT replace or shrink the wide probe. Fan out one skeptic PER finding, schema'd ({ isReal, reasoning }), told to DEFAULT to refuted and confirm only with evidence; then `.filter(v => v.isReal)`. The skeptics are DOWNSTREAM and one-per-finding — do NOT turn the whole task into a single 'skeptic' or 'adversarial' agent; that discards the probe and is wrong.\n" +
-    "  (4) SHAPE & THREAD — the result is: WIDE PROBE (one lane per seam / per the user's count) → VERIFY (one skeptic per finding) → synthesize (a lone agent reading the CONFIRMED set). Thread each phase's STRUCTURED output into the next. THESE ARE ALL WRONG: a workflow with ≤2 total agents; a probe phase with FEWER lanes than your seams or the user's number; collapsing the work into a single 'auditor'/'skeptic' agent; a bare verify+synthesize with no wide probe. Sketch the seam LIST first — the probe gets ONE lane per item on it; verify and synthesize are appended AFTER and never shrink it.\n" +
-    "SELF-CHECK before emit: probe `parallel` lane count === UNITS.length === user N if given ('8-fold' ⇒ 8; if 1–2 lanes, you collapsed). `const CTX` is a full brief (not a stub); probe uses `lanePrompt(u)` or CTX+'\\nLANE:'+u with ~150+ chars per lane (not one-liners). Every probe has `schema`; separate verify phase after probe.\n" +
-    "DELEGATE — when you launch this workflow to do work, the WORKFLOW'S AGENTS do it, not you. The tool returns IMMEDIATELY while they run in the BACKGROUND; that is NOT a cue to start editing or building yourself. Launch it, WAIT for it to finish, then synthesize its output. Doing the same work in the main agent in parallel wastes tokens and creates conflicting edits to the same files; if the user asked you to fan out, fanning out is the WHOLE job — do not also hand-apply the changes. Do NOT do the work yourself 'to be safe' or 'to make sure it completes end-to-end' — that exact reasoning IS the mistake; trust the workflow and WAIT for it.\n" +
-    "WORKFLOW `script` RULES — the runtime PARSES your script; breaking any one fails the launch:\n" +
-    "1. The FIRST statement MUST be `export const meta = { name, description, phases }`, a PURE LITERAL (no variables, function calls, spreads, or template strings inside meta; name + description are non-empty strings; phases is an array, e.g. [{ title: 'Scan' }]).\n" +
-    "2. Use `export` EXACTLY ONCE — only for meta. Everything AFTER meta is the BODY; the runtime wraps it in an async function and runs it for you. So NEVER write `export` again (no `export function`, no `export default`, no exported helpers) and do NOT wrap the body in `async function` or an IIFE yourself — a second `export` or a self-wrap throws 'Unexpected keyword export' and the workflow never launches. Use `await` directly in the body.\n" +
-    "3. `phase('title')` takes ONLY a string title and runs NO callback. NEVER `phase('name', () => {...})` or `phase('name', async () => {...})` — the callback is never called, so NO agents spawn (a 0-agent empty workflow). Call `phase('name')` on its own to label a section, then write the `agent()`/`parallel()` calls DIRECTLY in the body.\n" +
-    "4. `agent()` is POSITIONAL: `agent(promptString, { label, schema, model, agentType })` — the prompt STRING is the FIRST arg. NEVER `agent({ description, prompt, subagent_type })` (that single-object shape is the `Agent` TOOL's, not this function's — it makes the agent's prompt `[object Object]`). If you set `agentType`, copy an EXACT registered agent name verbatim, case-sensitive (e.g. 'general-purpose', 'Explore', 'Plan'); 'explore' or 'generalPurpose' are rejected as 'agent type not found'.\n" +
-    "5. `parallel()`/`pipeline()` take ONE array of THUNKS: `parallel([() => agent(...), () => agent(...)])`, or from a list `parallel(UNITS.map((u) => () => agent(...)))` — the INNER `() =>` is REQUIRED. NEVER bare `agent(...)` (a promise), NEVER `.map((u) => agent(...))` (returns promises — add the `() =>`), NEVER separate args (pass one array). On a `parallel`/`pipeline` error, FIX the thunks and RE-INVOKE Workflow — do not fall back to doing the task yourself.\n" +
-    "6. No markdown fences. COPY THIS SHAPE EXACTLY (swap in YOUR derived seams + schema fields) — it does the four moves above: derives the SEAMS (UNITS), gives each lane a STRUCTURED-OUTPUT `schema`, adversarially VERIFIES every finding (default-refuted) and keeps only survivors, and threads the confirmed set into the synthesis. It also avoids every pitfall (one `export`; each `phase('x')` is a bare label; `parallel` gets `() =>` thunks; every `agent` is positional):\n" +
-    "export const meta = { name: 'audit', description: 'Probe seams, adversarially verify, synthesize', phases: [{ title: 'probe' }, { title: 'verify' }, { title: 'synthesize' }] }\n" +
-    "const CTX = 'TASK: audit THIS subsystem. SCOPE: <dirs in/out>. GOAL: bugs, races, security. METHOD: read, grep, targeted tests. OUTPUT: schema only. BAR: file:line + trigger + severity per finding.'\n" +
-    "const UNITS = ['auth', 'session', 'routing', 'storage', 'streaming', 'usage']  // seams FIRST (8-fold ⇒ 8 items); one probe lane each\n" +
-    "function lanePrompt(u) { return CTX + '\\nLANE: ' + u + '\\nSlice: only this seam. Steps: (1) map entrypoints (2) hunt races/leaks/auth (3) record findings file:line+trigger+severity. Return FIND schema; empty OK.' }\n" +
-    "const FIND = { type: 'object', additionalProperties: false, required: ['findings'], properties: { findings: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['where', 'issue', 'severity'], properties: { where: { type: 'string' }, issue: { type: 'string' }, severity: { type: 'string', enum: ['high', 'medium', 'low'] } } } } } }\n" +
-    "const VERDICT = { type: 'object', additionalProperties: false, required: ['isReal', 'reasoning'], properties: { isReal: { type: 'boolean' }, reasoning: { type: 'string' } } }\n" +
-    "const REFUTE = 'Try to REFUTE this finding. DEFAULT isReal=false; confirm only with concrete evidence: '\n" +
-    "phase('probe')\n" +
-    "const found = (await parallel(UNITS.map((u) => () => agent(lanePrompt(u), { label: 'probe:' + u, schema: FIND, agentType: 'general-purpose' })))).filter(Boolean).flatMap((r) => r.findings)\n" +
-    "phase('verify')\n" +
-    "const confirmed = (await parallel(found.map((f) => () => agent(REFUTE + JSON.stringify(f), { label: 'verify', schema: VERDICT, agentType: 'general-purpose' }).then((v) => ({ finding: f, ok: v && v.isReal }))))).filter((x) => x && x.ok).map((x) => x.finding)\n" +
-    "phase('synthesize')\n" +
-    "return await agent(CTX + '\\nFINAL: Rank these CONFIRMED findings into one report: ' + JSON.stringify(confirmed), { label: 'synth', agentType: 'general-purpose' })",
   Agent:
     "IMPORTANT — `Agent` (capitalized, THIS tool) and the workflow `agent()` function are DIFFERENT. `Agent` is invoked as a tool call with the object arguments above; `subagent_type` must be an EXACT registered agent name copied verbatim, case-sensitive (e.g. 'general-purpose', 'Explore', 'Plan') — NEVER 'explore' or 'generalPurpose'. The lowercase `agent()` is a SEPARATE positional function (`agent(promptString, {opts})`, e.g. inside a Workflow `script`); never give it this tool's object shape. DELEGATE: when you spawn an `Agent` to DO work, let IT do that work — do NOT also make the same edits or run the same commands yourself in the main agent while it runs; wait for its result and build on it.",
   Bash:
@@ -5046,7 +5008,7 @@ function augmentWorkflowResultOnFailure(content, isError) {
     } else {
       return content; // not a recognized failure -> leave the real result untouched
     }
-    return text + "\n\n[BRIDGE] Your Workflow call FAILED — " + reason + ".\nYou MUST FIX the `script` and RE-INVOKE the `Workflow` tool NOW. Do NOT abandon the workflow to do the task yourself / inline / with the Task tool — this is a SMALL mechanical script correction, not a reason to give up on the workflow. Keep your phases, lanes, and schema; just apply the one fix and re-run `Workflow` with the corrected `script`, following these rules EXACTLY:\n\n" + TOOL_USAGE_EXTRAS.Workflow;
+    return text + "\n\n[BRIDGE] Your Workflow call FAILED — " + reason + ".\nYou MUST FIX the `script` and RE-INVOKE the `Workflow` tool NOW. Do NOT abandon the workflow to do the task yourself / inline / with the Task tool — this is a SMALL mechanical script correction, not a reason to give up on the workflow. Keep your phases, lanes, and schema; just apply the one fix and re-run `Workflow` with the corrected `script`, following these rules EXACTLY:\n\n" + TOOL_USAGE_PROMINENT.Workflow;
   } catch {
     return content;
   }
@@ -5119,47 +5081,65 @@ function argContractFor(name, schema) {
 // object-shape agent() and bare-call parallel — as explicit ✅RIGHT / ❌WRONG contrasts so there is zero ambiguity.
 const TOOL_USAGE_PROMINENT = {
   Workflow:
-    "━━━━━━━━━━ WORKFLOW SCRIPT — READ THIS FIRST ━━━━━━━━━━\n" +
-    "MENTAL MODEL (the root mistake): the script is a PLAIN imperative async body — NOT a declarative/phased framework. Pass data between steps with NORMAL `const` variables + top-level `await`. `phase('title')` and `meta.phases` are PROGRESS LABELS ONLY — they run NO callback, inject NO data (`{ prev }` is NEVER passed to a 'next phase'), and define NO execution graph. Write `const found = await parallel([...]); const out = await agent('Synthesize: ' + JSON.stringify(found))` — NEVER `phase('x', () => …)` (the callback never runs), NEVER `phase('y', ({ found }) => …)` (no injection), NEVER infer an execution order from `meta.phases` (it's UI metadata).\n" +
-    "PROBE WIDE — list seams in UNITS[], then `parallel` one agent PER item (probe holds MOST agents; user '8-fold' ⇒ 8 lanes). NEVER one auditor/skeptic replacing the probe. DEEP PROMPTS — subagents ONLY see `agent('…')`; write `const CTX` + `function lanePrompt(u){ return CTX+'\\nLANE:'+u+'\\n…' }` (~150+ chars per lane); one-liners starve them. RIGOR — `schema` on every probe; separate verify (one skeptic per finding, default-refuted, `.filter`). 3+ phases typical. Details below.\n" +
-    "DELEGATE, DON'T DOUBLE — the Workflow tool RETURNS IMMEDIATELY and runs in the BACKGROUND. That does NOT mean it finished, and it does NOT mean you should do the work yourself. Its agents ARE doing the work; WAIT for the completion notification, then use their results. NEVER make the same edits or run the same commands in the main agent while a workflow (or a subagent you spawned) is still running — it duplicates the work and produces conflicting changes. If the user asked you to fan out, fanning out IS the job: do not also hand-apply the changes. Do NOT do it yourself 'to be safe' or 'to make sure it completes' — that exact reasoning is the mistake.\n" +
-    "Then two mistakes that BREAK every workflow:\n" +
-    "(1) `agent()` is a POSITIONAL function — the prompt STRING is the FIRST argument:\n" +
+    "━━━━━━━━━━ WORKFLOW — READ THIS FIRST ━━━━━━━━━━\n" +
+    "WHEN TO USE — reach for Workflow for a BROAD or MULTI-SEAM ask, or a LONG DETAILED BRIEF: split it into independent seams and fan out one agent per seam. A single specific bounded target: just do it yourself. Explicitly-named parallel items: use the named subagent/Task capability. A long detailed brief is the SEED for fan-out — decompose it into seams; do NOT inline-execute the whole thing yourself.\n" +
+    "MENTAL MODEL (the root mistake) — the script is a PLAIN imperative async body, NOT a declarative/phased framework. `phase('title')` and `meta.phases` are PROGRESS LABELS ONLY: no callback, no `{prev}` injection, no execution graph. Pass data between steps with normal `const` + top-level `await`: `const found = await parallel([...]); const out = await agent('Synthesize: ' + JSON.stringify(found))`. NEVER `phase('x', () => …)` (the callback never runs) and never infer execution order from `meta.phases`.\n" +
+    "DELEGATE & WAIT — the tool RETURNS IMMEDIATELY and runs in the BACKGROUND; that is not 'finished' and not a cue to do the work yourself. Its agents ARE doing it — WAIT for the completion notification, then use their results. Do NOT make the same edits or run the same commands in the main agent while it runs (duplicates work, conflicting edits), and do NOT busy-poll with sleep/stat/tail loops (you are AUTO-NOTIFIED; `/workflows` shows progress). If the user messages while it runs, STOP polling and reply.\n" +
+    "BREAKING MECHANICS — these break EVERY workflow:\n" +
+    "(1) `agent()` is POSITIONAL — the prompt STRING is the FIRST argument:\n" +
     "      ✅ RIGHT:  agent('Audit the auth code for bugs', { agentType: 'general-purpose' })\n" +
-    "      ❌ WRONG:  agent({ description: '…', prompt: '…', subagent_type: '…' })\n" +
-    "                 An OBJECT first arg makes the prompt literally '[object Object]' and the agent does nothing.\n" +
-    "(2) `parallel()` / `pipeline()` take ONE ARRAY of THUNKS — wrap each call as `() => agent(...)`:\n" +
-    "      ✅ RIGHT:  await parallel([ () => agent('a', { agentType: 'general-purpose' }), () => agent('b', { agentType: 'general-purpose' }) ])\n" +
-    "      ✅ RIGHT:  await parallel(UNITS.map((u) => () => agent(lanePrompt(u), { schema: FIND })))   // from a list: note the INNER () =>\n" +
-    "      ❌ WRONG:  await parallel([ agent('a', {…}), agent('b', {…}) ])                            // promises, not functions\n" +
-    "      ❌ WRONG:  await parallel(UNITS.map((u) => agent(lanePrompt(u), {…})))                     // .map returns promises — add the () =>\n" +
-    "      ❌ WRONG:  await parallel(() => agent('a'), () => agent('b'))                              // pass ONE array, not separate args\n" +
-    "                 A thunk is a ZERO-ARG function `() => agent(...)`; bare `agent(...)` is a promise and errors immediately.\n" +
-    "(3) Subagents do NOT see your chat — put the brief IN the script:\n" +
-    "      ✅ RIGHT:  const CTX='TASK:…'; function lanePrompt(u){ return CTX+'\\nLANE:'+u+'\\nSteps:…' }; agent(lanePrompt('auth'), { schema:FIND })\n" +
-    "      ❌ WRONG:  agent('Audit auth')   // blind one-liner — subagent has no context\n" +
-    "(4) Each STEP needs its OWN `phase('title')` placed BEFORE that step's agents — every agent attaches to the MOST RECENT `phase()`:\n" +
-    "      ✅ RIGHT:  phase('probe'); await parallel([...]); phase('synthesize'); await agent('Synthesize the findings…', { agentType: 'general-purpose' })\n" +
-    "      ❌ WRONG:  phase('probe'); await parallel([...]); await agent('Synthesize…')   // the synth agent lands inside 'probe' — call phase('synthesize') FIRST\n" +
-    "                 So a 2nd/3rd step's agents do NOT pile into the 1st step. List EVERY step in meta.phases:[{title:'probe'},{title:'synthesize'}] with titles matching your phase() calls.\n" +
-    "IF A WORKFLOW CALL ERRORS: it is a SMALL mechanical fix (one of the above) — CORRECT the `script` and RE-INVOKE `Workflow`. NEVER abandon the workflow to do the task inline / yourself / with the Task tool just because the script errored.\n" +
-    "WHILE A WORKFLOW RUNS: do NOT busy-poll it with `sleep`/`stat`/`tail` loops — you are AUTO-NOTIFIED the moment it completes (use `/workflows` for live progress). Burning turns on poll loops makes you UNRESPONSIVE: a new user message must be answered RIGHT AWAY, not after the loop. If the user asks something while a workflow runs, STOP polling and reply.\n" +
-    "SKELETON — the WHOLE shape, copy and adapt (every line matters; this is the imperative model above):\n" +
-    "  export const meta = { name: 'task', description: 'what it does', phases: [{ title: 'probe' }, { title: 'synthesize' }] }\n" +
-    "  const CTX = 'TASK: <the goal>.  SCOPE: <in/out>.  OUTPUT: <what each lane returns>.'\n" +
-    "  const UNITS = ['partA', 'partB', 'partC']            // the INDEPENDENT pieces to fan out — one lane each (>= any N the user named)\n" +
+    "      ❌ WRONG:  agent({ description: '…', prompt: '…', subagent_type: '…' })   // object first arg makes the prompt literally '[object Object]'\n" +
+    "(2) `parallel()`/`pipeline()` take ONE ARRAY of THUNKS — wrap each call as `() => agent(...)` (the INNER `() =>` is required):\n" +
+    "      ✅ RIGHT:  await parallel([ () => agent('a', {…}), () => agent('b', {…}) ])\n" +
+    "      ✅ RIGHT:  await parallel(UNITS.map((u) => () => agent(lanePrompt(u), { schema: FIND })))   // from a list: note the inner () =>\n" +
+    "      ❌ WRONG:  await parallel([ agent('a'), agent('b') ])          // promises, not functions\n" +
+    "      ❌ WRONG:  await parallel(UNITS.map((u) => agent(lanePrompt(u), {…})))   // .map returns promises — add the () =>\n" +
+    "      ❌ WRONG:  await parallel(() => agent('a'), () => agent('b'))  // pass ONE array, not separate args\n" +
+    "(3) Subagents ONLY see their `agent('…')` string, NOT your chat — put the brief IN the script: write `const CTX='TASK:… SCOPE:… GOAL:… OUTPUT:…'` once, then `function lanePrompt(u){ return CTX+'\\nLANE: '+u+'\\nSteps:…' }` and call `agent(lanePrompt(u), { schema })` (~150+ chars per lane). `agent('Audit auth')` is a blind one-liner that starves the subagent.\n" +
+    "(4) Each step needs its OWN `phase('title')` placed BEFORE that step's agents — every agent attaches to the most-recent `phase()`: `phase('probe'); await parallel([...]); phase('synthesize'); await agent('Merge the findings…')`. List every step in `meta.phases` with titles matching your `phase()` calls, so a later step's agents do not pile into an earlier step.\n" +
+    "FAN-OUT SHAPE — list the INDEPENDENT seams in `UNITS[]`, then `parallel` ONE probe lane per seam (the wide probe IS the work; use ≥ any count the user named — '8-fold' ⇒ exactly 8 lanes; if you can't name 4+ seams, cut finer: per-file / per-hypothesis / per-case). Then a SEPARATE verify phase AFTER the probe: one skeptic PER finding, told to DEFAULT to refuted and confirm only with evidence, `.filter(v => v.isReal)`. Then one synth agent on the confirmed set. NEVER collapse the work into a single 'auditor'/'skeptic' agent. SEAM PATTERNS (one lane per item): audit/review code → per (file or module) × lens (correctness, concurrency, security, error-handling); hunt bugs → per subsystem or per bug-class hypothesis (races, leaks, injection, auth-bypass); build a feature/UI → per component/screen/layer + an integration lane; a design/architecture decision → per competing approach + a stress-lens; migrate/refactor/PR/failing-tests → per call-site / file / failing test.\n" +
+    "SCRIPT RULES — the runtime PARSES the script; breaking any rule fails the launch: (a) the FIRST statement MUST be `export const meta = { name, description, phases: [{ title }] }`, a PURE LITERAL (no variables, calls, spreads, or template strings inside meta); (b) use `export` EXACTLY ONCE (only for meta) — everything after it is the body, wrapped in an async function for you, so NEVER `export` again and NEVER self-wrap the body in `async function`/an IIFE (a second `export` or a self-wrap throws 'Unexpected keyword export'); use `await` directly; (c) no markdown fences; (d) `agentType`/`subagent_type` must be an EXACT registered agent name copied verbatim, case-sensitive (e.g. 'general-purpose', 'Explore', 'Plan') — 'explore'/'generalPurpose' are rejected as 'agent type not found'.\n" +
+    "SKELETON — copy and adapt (every line matters; one agent per seam, schema'd, adversarially verified, synthesized):\n" +
+    "  export const meta = { name: 'audit', description: 'Probe seams, verify, synthesize', phases: [{ title: 'probe' }, { title: 'verify' }, { title: 'synthesize' }] }\n" +
+    "  const CTX = 'TASK: audit THIS subsystem. SCOPE: <dirs in/out>. GOAL: bugs/races/security. OUTPUT: schema only. BAR: file:line + trigger + severity per finding.'\n" +
+    "  const UNITS = ['auth', 'session', 'routing', 'storage', 'streaming', 'usage']   // seams FIRST (8-fold ⇒ 8 items); one probe lane each\n" +
+    "  function lanePrompt(u) { return CTX + '\\nLANE: ' + u + '\\nSlice: only this seam. Steps: (1) map entrypoints (2) hunt races/leaks/auth (3) record findings file:line+trigger+severity. Return FIND schema; empty OK.' }\n" +
+    "  const FIND = { type: 'object', additionalProperties: false, required: ['findings'], properties: { findings: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['where', 'issue', 'severity'], properties: { where: { type: 'string' }, issue: { type: 'string' }, severity: { type: 'string', enum: ['high', 'medium', 'low'] } } } } } }\n" +
+    "  const VERDICT = { type: 'object', additionalProperties: false, required: ['isReal', 'reasoning'], properties: { isReal: { type: 'boolean' }, reasoning: { type: 'string' } } }\n" +
     "  phase('probe')\n" +
-    "  const results = await parallel(UNITS.map((u) => () => agent(CTX + '\\nLANE: ' + u + '\\nDo the work for THIS piece and report.', { agentType: 'general-purpose' })))\n" +
+    "  const found = (await parallel(UNITS.map((u) => () => agent(lanePrompt(u), { label: 'probe:' + u, schema: FIND, agentType: 'general-purpose' })))).filter(Boolean).flatMap((r) => r.findings)\n" +
+    "  phase('verify')\n" +
+    "  const confirmed = (await parallel(found.map((f) => () => agent('Try to REFUTE this finding. DEFAULT isReal=false; confirm only with concrete evidence: ' + JSON.stringify(f), { label: 'verify', schema: VERDICT, agentType: 'general-purpose' }).then((v) => ({ finding: f, ok: v && v.isReal }))))).filter((x) => x && x.ok).map((x) => x.finding)\n" +
     "  phase('synthesize')\n" +
-    "  return await agent(CTX + '\\nMerge these lane results into the final answer: ' + JSON.stringify(results), { agentType: 'general-purpose' })\n" +
-    "(Add a `schema` per lane + a verify phase for audits — see the full example below.)\n" +
-    "Copy the ✅ RIGHT forms exactly. Full rules and a complete runnable example follow below.\n" +
+    "  return await agent(CTX + '\\nFINAL: rank these CONFIRMED findings into one report: ' + JSON.stringify(confirmed), { label: 'synth', agentType: 'general-purpose' })\n" +
+    "ON ERROR — a failed Workflow call is a SMALL mechanical fix (one of the above): CORRECT the `script` and RE-INVOKE `Workflow`. NEVER abandon the workflow to do the task inline / yourself / with the Task tool just because the script errored.\n" +
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
 };
 
+// capAtBoundary slices text to at most max chars, then backs off to the last line break (unless that would discard
+// more than half) so a capped description never ends mid-word or mid-code. Returns "" when max <= 0.
+function capAtBoundary(text, max) {
+  if (typeof text !== "string" || !text || max <= 0) return "";
+  if (text.length <= max) return text;
+  let cut = text.slice(0, max);
+  const nl = cut.lastIndexOf("\n");
+  if (nl > max * 0.5) cut = cut.slice(0, nl);
+  return cut.replace(/[\s.]+$/, "");
+}
+
 function augmentToolDescription(name, description, schema) {
   try {
-    const base = typeof description === "string" ? description : "";
+    let base = typeof description === "string" ? description : "";
+    // The Workflow tool ships an ~19KB verbatim CC description. The consolidated WORKFLOW block (prepended below)
+    // is the authoritative script contract, so cap the CC base to keep the per-turn tools/list payload small (the
+    // whole inventory is re-shipped every turn). 0 drops the base entirely. Description is never validated, so
+    // capping cannot break the tool contract; session.advertise (execution truth) is untouched either way.
+    if (name === "Workflow" && base.length > WORKFLOW_BASE_DESC_MAX) {
+      base = WORKFLOW_BASE_DESC_MAX === 0
+        ? ""
+        : capAtBoundary(base, WORKFLOW_BASE_DESC_MAX)
+          + "\n…[CC docs abbreviated — the WORKFLOW block above is the authoritative script contract]";
+    }
     const prominent = (TOOL_USAGE_PROMINENT && TOOL_USAGE_PROMINENT[name]) || ""; // PREPENDED: read first, before CC's own docs
     const extra = (TOOL_USAGE_EXTRAS && TOOL_USAGE_EXTRAS[name]) || "";
     const contract = (TOOL_ARG_CONTRACT_ENABLED && toolNeedsArgContract(name)) ? argContractFor(name, schema) : "";
