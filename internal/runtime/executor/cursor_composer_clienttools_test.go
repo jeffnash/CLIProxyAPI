@@ -139,8 +139,8 @@ func TestDeriveComposerSessionID_UtilityOneShotIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("continuation must route, not error: %v", err)
 	}
-	if c1 != r1 {
-		t.Fatalf("continuation must route to the stable session (got %s want %s)", c1, r1)
+	if !strings.HasPrefix(c1, "sess_") || c1 == o1 || c1 == o2 || c1 == o3 {
+		t.Fatalf("continuation must route to durable advisory context, not an ephemeral utility session (got %s)", c1)
 	}
 }
 
@@ -922,6 +922,25 @@ func TestComposerRetryableCancellationTerminalMapsToTyped503(t *testing.T) {
 		t.Fatalf("client-facing retryable error must not expose internal cancellation detail: %v", err)
 	}
 
+	busy := gjson.Parse(`{"type":"turn_end","stop_reason":"error","retryable":true,"retryMode":"identical","errorCode":"agent_lifecycle_busy","retryAfterMs":1000,"error":"internal lease detail"}`)
+	err = composerBridgeTurnFailure("resp_agent_busy", busy)
+	var bridgeErr *composerBridgeStatusError
+	if !errors.As(err, &bridgeErr) || bridgeErr.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("typed lifecycle contention must remain a 503 status error, got %T %v", err, err)
+	}
+	if bridgeErr.bridgeCode != "agent_lifecycle_busy" {
+		t.Fatalf("typed lifecycle code was lost: %#v", bridgeErr)
+	}
+	if bridgeErr.RetryAfter() == nil || *bridgeErr.RetryAfter() != time.Second {
+		t.Fatalf("typed lifecycle retry hint was lost: %#v", bridgeErr.RetryAfter())
+	}
+	if body := string(bridgeErr.APIErrorBody()); !strings.Contains(body, `"code":"agent_lifecycle_busy"`) {
+		t.Fatalf("client API body lost lifecycle code: %s", body)
+	}
+	if strings.Contains(err.Error(), "internal lease detail") {
+		t.Fatalf("client-facing lifecycle error leaked internal detail: %v", err)
+	}
+
 	terminal := gjson.Parse(`{"type":"turn_end","stop_reason":"error","retryable":false,"error":"contract failed"}`)
 	err = composerBridgeTurnFailure("resp_terminal_cancel", terminal)
 	if errors.As(err, &statusErr) {
@@ -1121,6 +1140,31 @@ func TestCursorDirectAdjacentUserSuffixFailsBeforeCredentialExchange(t *testing.
 		if !strings.Contains(err.Error(), "provenance_ambiguous") {
 			t.Fatalf("stream=%t: error missing provenance_ambiguous marker: %v", stream, err)
 		}
+	}
+	if got := outboundCalls.Load(); got != 0 {
+		t.Fatalf("credential/upstream calls = %d, want zero", got)
+	}
+}
+
+func TestCursorDirectRejectsConversationAliasConflictBeforeCredentialExchange(t *testing.T) {
+	var outboundCalls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		outboundCalls.Add(1)
+		http.Error(w, "credential exchange must not be called", http.StatusInternalServerError)
+	}))
+	defer proxy.Close()
+
+	payload := []byte(`{"model":"cursor","messages":[{"role":"user","content":"do the work"}]}`)
+	auth := &cliproxyauth.Auth{ID: "direct-conflict", ProxyURL: proxy.URL}
+	opts := composerExecOpts("openai", "header-conversation")
+	opts.OriginalRequest = []byte(`{"metadata":{"conversation_id":"body-conversation"}}`)
+	executor := NewCursorExecutor(&config.Config{})
+	req := cliproxyexecutor.Request{Model: "cursor", Payload: payload}
+
+	_, err := executor.prepareCursorDirect(context.Background(), auth, "cursor-key", &req, opts, false)
+	var conflict *composerConversationIdentityConflictError
+	if !errors.As(err, &conflict) || conflict.StatusCode() != http.StatusConflict {
+		t.Fatalf("direct identity conflict = %T %v, want typed 409", err, err)
 	}
 	if got := outboundCalls.Load(); got != 0 {
 		t.Fatalf("credential/upstream calls = %d, want zero", got)
@@ -1495,9 +1539,11 @@ func TestExecuteComposerNonStream(t *testing.T) {
 
 func TestComposerContinuationUsesBridgeRoutedSessionForResponseID(t *testing.T) {
 	const routedSession = "sess_0123456789abcdef0123456789abcdef"
+	const routedBinding = "b8d71aac994558419432c141915c98540d36b09c4dc34d5aa5ff49bd5fbf63fc"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set(composerEffectiveSessionHeader, routedSession)
+		w.Header().Set(composerEffectiveConversationBindingHeader, routedBinding)
 		_, _ = io.WriteString(w, "data: {\"type\":\"text\",\"delta\":\"continued\"}\n\n")
 		_, _ = io.WriteString(w, "data: {\"type\":\"turn_end\",\"stop_reason\":\"stop\"}\n\n")
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
@@ -1525,6 +1571,12 @@ func TestComposerContinuationUsesBridgeRoutedSessionForResponseID(t *testing.T) 
 	if got := composerSessionFromResponseID(composerTenant(auth, composerExecOpts("openai", "shared-parent")), "k", responseID); got != routedSession {
 		t.Fatalf("response id routed session = %q, want %q (id=%q)", got, routedSession, responseID)
 	}
+	route := lookupComposerResponseRoute(
+		composerTenant(auth, composerExecOpts("openai", "shared-parent")), "k", responseID,
+	)
+	if route.conversationBinding != routedBinding {
+		t.Fatalf("response id binding = %q, want signed-round binding %q", route.conversationBinding, routedBinding)
+	}
 }
 
 func TestComposerEffectiveContinuationSessionRejectsUntrustedValues(t *testing.T) {
@@ -1549,6 +1601,33 @@ func TestComposerEffectiveContinuationSessionRejectsUntrustedValues(t *testing.T
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestComposerEffectiveContinuationBindingUsesOnlySignedRoundAuthority(t *testing.T) {
+	const advisory = "a8d71aac994558419432c141915c98540d36b09c4dc34d5aa5ff49bd5fbf63fc"
+	const routed = "b8d71aac994558419432c141915c98540d36b09c4dc34d5aa5ff49bd5fbf63fc"
+	resp := &http.Response{Header: http.Header{}}
+
+	// No effective-session header means the bridge executed a genuinely fresh split; retain its request epoch.
+	if got, err := composerEffectiveContinuationBinding(resp, advisory, true); err != nil || got != advisory {
+		t.Fatalf("fresh split binding = %q/%v, want advisory", got, err)
+	}
+
+	resp.Header.Set(composerEffectiveSessionHeader, "sess_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	resp.Header.Set(composerEffectiveConversationBindingHeader, routed)
+	if got, err := composerEffectiveContinuationBinding(resp, advisory, true); err != nil || got != routed {
+		t.Fatalf("signed round binding = %q/%v, want %q", got, err, routed)
+	}
+
+	resp.Header.Del(composerEffectiveConversationBindingHeader)
+	if got, err := composerEffectiveContinuationBinding(resp, advisory, true); err != nil || got != "" {
+		t.Fatalf("legacy signed round must remain unbound, got %q/%v", got, err)
+	}
+
+	resp.Header.Set(composerEffectiveConversationBindingHeader, strings.ToUpper(routed))
+	if _, err := composerEffectiveContinuationBinding(resp, advisory, true); err == nil {
+		t.Fatal("malformed authoritative binding must fail the internal bridge protocol")
 	}
 }
 
@@ -2771,6 +2850,116 @@ func TestDeriveComposerSessionID_PreviousResponseIDResumes(t *testing.T) {
 	}
 }
 
+func TestComposerConversationIdentityClaudePrecedenceAndConflict(t *testing.T) {
+	const uuid = "57ada5e2-13a3-438a-898c-098e87c5a3ee"
+	opts := optsWithHeaders(map[string]string{"X-Session-Id": uuid})
+	opts.OriginalRequest = []byte(`{"metadata":{"user_id":"user_account__session_` + uuid + `"}}`)
+	identity, err := resolveComposerConversationIdentity(opts)
+	if err != nil {
+		t.Fatalf("equivalent Claude/header identities must resolve: %v", err)
+	}
+	if identity.ID != "claude:"+uuid || identity.Source != "metadata.user_id" {
+		t.Fatalf("Claude metadata.user_id must be authoritative, got %#v", identity)
+	}
+
+	conflict := optsWithHeaders(map[string]string{"X-Session-Id": "stale-old-session"})
+	conflict.OriginalRequest = opts.OriginalRequest
+	if _, err := resolveComposerConversationIdentity(conflict); err == nil {
+		t.Fatal("a stale header conflicting with Claude /new must fail closed")
+	} else if statusErr, ok := err.(interface{ StatusCode() int }); !ok || statusErr.StatusCode() != http.StatusConflict {
+		t.Fatalf("identity conflict must be typed 409, got %T %v", err, err)
+	}
+}
+
+func TestComposerConversationIdentityCanonicalMetadataAliasesConflict(t *testing.T) {
+	payload := []byte(`{"metadata":{"cliproxy":{"conversation_id":"conv-a"},"session_id":"conv-a","conversationId":"conv-a"}}`)
+	identity, err := resolveComposerConversationIdentity(cliproxyexecutor.Options{OriginalRequest: payload})
+	if err != nil {
+		t.Fatalf("equivalent metadata aliases conflicted: %v", err)
+	}
+	if identity.ID != "conv-a" {
+		t.Fatalf("identity = %q, want conv-a", identity.ID)
+	}
+
+	conflictPayload := []byte(`{"metadata":{"conversation_id":"conv-a","session_id":"conv-b"}}`)
+	_, err = resolveComposerConversationIdentity(cliproxyexecutor.Options{OriginalRequest: conflictPayload})
+	var conflict *composerConversationIdentityConflictError
+	if !errors.As(err, &conflict) || conflict.StatusCode() != http.StatusConflict {
+		t.Fatalf("metadata alias conflict = %T %v, want typed 409", err, err)
+	}
+
+	jsonUserID := []byte(`{"metadata":{"user_id":"{\"thread_id\":\"thread-a\"}"}}`)
+	identity, err = resolveComposerConversationIdentity(cliproxyexecutor.Options{OriginalRequest: jsonUserID})
+	if err != nil || identity.ID != "thread-a" {
+		t.Fatalf("JSON user_id thread identity = %#v, %v", identity, err)
+	}
+	if got := composerConversationIDForProvenance(nil, cliproxyexecutor.Options{OriginalRequest: jsonUserID}); got != identity.ID {
+		t.Fatalf("provenance identity = %q, routing identity = %q", got, identity.ID)
+	}
+}
+
+func TestPreviousResponseIDCannotCrossConversationBinding(t *testing.T) {
+	auth := authWith("auth-binding", "key-binding")
+	tenant := composerTenant(auth, cliproxyexecutor.Options{})
+	apiKey := "cursor-key"
+	oldID := "claude:old-conversation"
+	oldBinding := composerConversationBinding(tenant, apiKey, oldID)
+	priorSession := "sess_1234567890abcdef1234567890abcdef"
+	responseID := composerResponseIDBound(apiKey, tenant, priorSession, oldBinding)
+
+	same := cliproxyexecutor.Options{OriginalRequest: []byte(fmt.Sprintf(`{"metadata":{"user_id":"user_account__session_old-conversation"},"previous_response_id":%q}`, responseID))}
+	got, err := deriveComposerSessionID(auth, apiKey, []byte(`{"messages":[{"role":"user","content":"continue"}]}`), same)
+	if err != nil || got != priorSession {
+		t.Fatalf("same-conversation response resume failed: sid=%q err=%v", got, err)
+	}
+
+	changed := cliproxyexecutor.Options{OriginalRequest: []byte(fmt.Sprintf(`{"metadata":{"user_id":"user_account__session_new-conversation"},"previous_response_id":%q}`, responseID))}
+	if got, err = deriveComposerSessionID(auth, apiKey, []byte(`{"messages":[{"role":"user","content":"after /new"}]}`), changed); err == nil {
+		t.Fatalf("old previous_response_id must not override a new conversation, got %q", got)
+	} else if statusErr, ok := err.(interface{ StatusCode() int }); !ok || statusErr.StatusCode() != http.StatusConflict {
+		t.Fatalf("cross-conversation response route must be typed 409, got %T %v", err, err)
+	}
+
+	legacy := composerResponseID(apiKey, tenant, priorSession)
+	changed.OriginalRequest = []byte(fmt.Sprintf(`{"metadata":{"user_id":"user_account__session_new-conversation"},"previous_response_id":%q}`, legacy))
+	if _, err = deriveComposerSessionID(auth, apiKey, []byte(`{"messages":[{"role":"user","content":"after /new"}]}`), changed); err == nil {
+		t.Fatal("an unbound legacy route plus explicit conversation identity must fail closed")
+	}
+}
+
+func TestPreviousResponseIDCannotCrossContentDerivedConversation(t *testing.T) {
+	auth := authWith("auth-content-binding", "key-content-binding")
+	tenant := composerTenant(auth, cliproxyexecutor.Options{})
+	apiKey := "cursor-key"
+	oldMessages := gjson.Get(`{"messages":[{"role":"user","content":"old task"}]}`, "messages").Array()
+	oldBinding := composerConversationBinding(tenant, apiKey, composerContentConvKey(oldMessages))
+	responseID := composerResponseIDBound(apiKey, tenant, "sess_1234567890abcdef1234567890abcdef", oldBinding)
+	opts := cliproxyexecutor.Options{OriginalRequest: []byte(fmt.Sprintf(`{"previous_response_id":%q}`, responseID))}
+	newTurn := []byte(`{"messages":[{"role":"user","content":"brand new task"}]}`)
+	if _, err := deriveComposerSessionID(auth, apiKey, newTurn, opts); err == nil {
+		t.Fatal("content-derived conversation must reject a response route bound to another opener")
+	} else if statusErr, ok := err.(interface{ StatusCode() int }); !ok || statusErr.StatusCode() != http.StatusConflict {
+		t.Fatalf("cross-content route must be typed 409, got %T %v", err, err)
+	}
+
+	toolResultTurn := []byte(`{"messages":[{"role":"user","content":"brand new task"},{"role":"tool","tool_call_id":"call_other","content":"done"}]}`)
+	if _, err := deriveComposerSessionID(auth, apiKey, toolResultTurn, opts); err == nil {
+		t.Fatal("tool-result continuation must also reject a response route bound to another content-derived conversation")
+	} else if statusErr, ok := err.(interface{ StatusCode() int }); !ok || statusErr.StatusCode() != http.StatusConflict {
+		t.Fatalf("cross-content tool-result route must be typed 409, got %T %v", err, err)
+	}
+}
+
+func TestComposerConversationBindingShape(t *testing.T) {
+	binding := composerConversationBinding("tenant", "key", "claude:conversation")
+	if len(binding) != 64 || strings.Trim(binding, "0123456789abcdef") != "" {
+		t.Fatalf("conversation binding must be opaque lowercase sha256 hex, got %q", binding)
+	}
+	if binding == composerConversationBinding("tenant", "key", "claude:new-conversation") {
+		t.Fatal("conversation binding must change on /new")
+	}
+}
+
 // H16/L35: a tool-less follow-up that carries an EXPLICIT body durable reference (previous_response_id or
 // conversation_id) must NOT be classified as a utility one-shot. A bare history-only tool-less turn under a
 // HEADER conv id STAYS a one-shot (concurrent-collision guard — see isComposerUtilityOneShot doc).
@@ -2802,17 +2991,18 @@ func TestDeriveComposerSessionID_ToollessBodyConvFollowup(t *testing.T) {
 	auth := authWith("authA", "keyA")
 	agentic := []byte(`{"conversation_id":"conv-l35-body","tools":[{"type":"function","function":{"name":"Read"}}],"messages":[{"role":"user","content":"describe the repo"}]}`)
 	bodyOpts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"conversation_id":"conv-l35-body"}`)}
-	stable, _ := deriveComposerSessionID(auth, "cursorkey", agentic, bodyOpts)
+	initial, _ := deriveComposerSessionID(auth, "cursorkey", agentic, bodyOpts)
 	// A realistic tool-less follow-up REPLAYS the same opener (the durable conversation grows at the tail).
-	// identity-finalplan: the opener bridge re-keys the same lineage as the head grows, so the follow-up
-	// resolves to the SAME stable session (the L35/H16 durable-resume contract).
+	// Once an assistant reply exists, the authoritative retained head changes. The follow-up may faithfully
+	// re-seed instead of guessing that a same-opener divergent branch owns the initial agent.
 	toolless := []byte(`{"conversation_id":"conv-l35-body","messages":[{"role":"user","content":"describe the repo"},{"role":"assistant","content":"it is a proxy"},{"role":"user","content":"summarize"}]}`)
 	got, err := deriveComposerSessionID(auth, "cursorkey", toolless, bodyOpts)
 	if err != nil {
 		t.Fatalf("L35 follow-up must not error: %v", err)
 	}
-	if got != stable {
-		t.Fatalf("L35/H16: a tool-less follow-up with a body conversation_id must route to the stable session %s, got %s", stable, got)
+	gotAgain, errAgain := deriveComposerSessionID(auth, "cursorkey", toolless, bodyOpts)
+	if errAgain != nil || gotAgain != got || got == initial {
+		t.Fatalf("L35/H16: the complete retained head must route deterministically without reusing the ambiguous initial lineage (initial=%s got=%s again=%s err=%v)", initial, got, gotAgain, errAgain)
 	}
 }
 

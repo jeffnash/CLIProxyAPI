@@ -30,6 +30,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/turnprovenance"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
@@ -235,6 +236,11 @@ func waitComposerBridgeReconnect(ctx context.Context, delay time.Duration) error
 // with that meaning (ADD-59 / C-ADD59-TYPED-STATUS), never as an opaque 500 and never as a success.
 const composerBridgeStatusGone = 410
 
+// composerBridgeStatusInsufficientStorage is the HTTP status the bridge returns when shared durable
+// capacity is occupied (durable_state_capacity / admission shed). It is retryable with backoff and
+// must reach the client as a 507 with its typed metadata, never downgraded to an opaque 500 (P1.3).
+const composerBridgeStatusInsufficientStorage = 507
+
 // composerBridgeProtocolError is a typed executor error for a bridge SSE CONTRACT violation that is NOT a
 // bridge HTTP non-2xx (ADD-88/96, Comment 1): a 2xx response whose Content-Type is not text/event-stream, an
 // SSE payload that is not valid JSON, an unknown/non-benign event type (RBT-013), or a clean stream EOF with
@@ -353,16 +359,22 @@ func composerBridgeTerminalReplaySafe(ev gjson.Result) bool {
 // message tells the client the tool-call continuation is gone and the turn must be re-seeded/restarted —
 // distinguishable from "retry later". This mirrors the Codex precedent (classifyCodexStatusError).
 type composerBridgeStatusError struct {
-	status      int
-	correlation string
-	retryAfter  *time.Duration
-	bridgeCode  string
+	status         int
+	correlation    string
+	retryAfter     *time.Duration
+	bridgeCode     string
+	requestedBytes *int64
+	availableBytes *int64
+	priority       *int
 }
 
 func (e *composerBridgeStatusError) Error() string {
 	if e.status == composerBridgeStatusGone {
-		return fmt.Sprintf("cursor composer: round_lost — the tool-call this result answers is no longer active on the bridge "+
-			"(session lost to restart/eviction); submitted results were not applied and the round must be re-driven by the harness (correlation %s)", e.correlation)
+		code := e.bridgeCode
+		if code == "" {
+			code = "state_gone"
+		}
+		return fmt.Sprintf("cursor composer: bridge state is unavailable (%s); the request was not applied and must be re-seeded or re-driven by the harness (correlation %s)", code, e.correlation)
 	}
 	if e.status == http.StatusTooManyRequests {
 		// 429: upstream rate-limit (Cursor HTTP/2 ENHANCE_YOUR_CALM, recycled connection + backoff) or proxy
@@ -371,6 +383,20 @@ func (e *composerBridgeStatusError) Error() string {
 			"back off and retry in a few seconds — rapid retries make it worse (correlation %s)", e.correlation)
 	}
 	if e.bridgeCode != "" {
+		if e.requestedBytes != nil || e.availableBytes != nil || e.priority != nil {
+			fields := make([]string, 0, 3)
+			if e.requestedBytes != nil {
+				fields = append(fields, fmt.Sprintf("requested_bytes=%d", *e.requestedBytes))
+			}
+			if e.availableBytes != nil {
+				fields = append(fields, fmt.Sprintf("available_bytes=%d", *e.availableBytes))
+			}
+			if e.priority != nil {
+				fields = append(fields, fmt.Sprintf("priority=%d", *e.priority))
+			}
+			return fmt.Sprintf("cursor composer: bridge request failed with status %d (%s; %s; correlation %s)",
+				e.status, e.bridgeCode, strings.Join(fields, " "), e.correlation)
+		}
 		return fmt.Sprintf("cursor composer: bridge request failed with status %d (%s; correlation %s)", e.status, e.bridgeCode, e.correlation)
 	}
 	return fmt.Sprintf("cursor composer: bridge request failed with status %d (correlation %s)", e.status, e.correlation)
@@ -414,6 +440,61 @@ func (e *composerBridgeStatusError) AuthAttributable() bool {
 	}
 }
 
+// APIErrorBody implements the API handlers' structured-error contract (P1.3): a REDACTED,
+// OpenAI-compatible JSON error payload that preserves the bridge's symbolic code and the
+// bounded capacity/retry fields all the way to the client, so a shed turn can be retried
+// intelligently (which code, how much capacity was requested/available, when to retry)
+// instead of arriving as a generic internal_server_error with no actionable metadata.
+// The message text stays the same sanitized string as Error(); the raw bridge body is
+// never forwarded (M25). Returns nil on any marshal failure so callers fall back to the
+// generic body.
+func (e *composerBridgeStatusError) APIErrorBody() []byte {
+	errType := "server_error"
+	code := e.bridgeCode
+	switch {
+	case e.status == http.StatusTooManyRequests:
+		errType = "rate_limit_error"
+		if code == "" {
+			code = "rate_limit_exceeded"
+		}
+	case e.status == composerBridgeStatusInsufficientStorage:
+		errType = "capacity_error"
+		if code == "" {
+			code = "durable_state_capacity"
+		}
+	case e.status == http.StatusGone, e.status == http.StatusBadRequest:
+		errType = "invalid_request_error"
+	case e.status >= http.StatusInternalServerError:
+		if code == "" {
+			code = "internal_server_error"
+		}
+	}
+	detail := map[string]any{
+		"message": e.Error(),
+		"type":    errType,
+	}
+	if code != "" {
+		detail["code"] = code
+	}
+	if e.retryAfter != nil && *e.retryAfter > 0 {
+		detail["retry_after_ms"] = int64(*e.retryAfter / time.Millisecond)
+	}
+	if e.requestedBytes != nil {
+		detail["requested_bytes"] = *e.requestedBytes
+	}
+	if e.availableBytes != nil {
+		detail["available_bytes"] = *e.availableBytes
+	}
+	if e.priority != nil {
+		detail["priority"] = *e.priority
+	}
+	body, err := json.Marshal(map[string]any{"error": detail})
+	if err != nil {
+		return nil
+	}
+	return body
+}
+
 var composerRetryInPattern = regexp.MustCompile(`(?i)retry\s+in\s+~?\s*(\d+)\s*s`)
 var composerBridgeErrorCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
@@ -427,6 +508,29 @@ func parseComposerBridgeErrorCode(body []byte) string {
 		return ""
 	}
 	return code
+}
+
+func parseComposerCapacityMetadata(body []byte) (requestedBytes, availableBytes *int64, priority *int) {
+	const maxReportedBytes = int64(1 << 50)
+	boundedBytes := func(path string) *int64 {
+		v := gjson.GetBytes(body, path)
+		if !v.Exists() || v.Type != gjson.Number {
+			return nil
+		}
+		n := v.Int()
+		if n < 0 || n > maxReportedBytes {
+			return nil
+		}
+		return &n
+	}
+	requestedBytes = boundedBytes("error.requestedBytes")
+	availableBytes = boundedBytes("error.availableBytes")
+	p := gjson.GetBytes(body, "error.priority")
+	if p.Exists() && p.Type == gjson.Number && p.Int() >= 0 && p.Int() <= 100 {
+		value := int(p.Int())
+		priority = &value
+	}
+	return
 }
 
 func parseComposerRetryAfterHeader(h http.Header, now time.Time) *time.Duration {
@@ -507,6 +611,22 @@ func composerBridgeTurnFailure(responseID string, ev gjson.Result) error {
 		emsg = "upstream Cursor run failed"
 	}
 	if ev.Get("retryable").Bool() {
+		code := ev.Get("errorCode").String()
+		if composerBridgeErrorCodePattern.MatchString(code) {
+			corr := composerCorrelationID()
+			log.Errorf("[composer %s] bridge RETRYABLE TERMINAL corr=%s code=%s (-> 503)", responseID, corr, code)
+			var retryAfter *time.Duration
+			if millis := ev.Get("retryAfterMs").Int(); millis > 0 {
+				duration := time.Duration(millis) * time.Millisecond
+				retryAfter = &duration
+			}
+			return &composerBridgeStatusError{
+				status:      http.StatusServiceUnavailable,
+				correlation: corr,
+				retryAfter:  retryAfter,
+				bridgeCode:  code,
+			}
+		}
 		return newComposerBridgeUnavailableError(responseID, errors.New(emsg))
 	}
 	return &composerSelectedExecutionError{cause: fmt.Errorf("cursor composer: bridge turn failed: %s", emsg)}
@@ -745,19 +865,28 @@ func recordComposerResponseSession(tenant, outwardResponseID, sessionID string) 
 // lookupComposerResponseSession verifies a restart-safe route embedded in a
 // new response ID, then falls back to the legacy process-local map.
 func lookupComposerResponseSession(tenant, apiKey, outwardResponseID string) string {
+	return lookupComposerResponseRoute(tenant, apiKey, outwardResponseID).sessionID
+}
+
+type composerResponseRoute struct {
+	sessionID           string
+	conversationBinding string
+}
+
+func lookupComposerResponseRoute(tenant, apiKey, outwardResponseID string) composerResponseRoute {
 	if outwardResponseID == "" {
-		return ""
+		return composerResponseRoute{}
 	}
 	// New composer response ids carry an authenticated opaque session route.
 	// This is the restart/multi-replica authority; the bounded process-local
 	// map below remains only as backward compatibility for response ids emitted
 	// before the routed-id contract existed.
-	if sid := composerSessionFromResponseID(tenant, apiKey, outwardResponseID); sid != "" {
-		return sid
+	if route := composerRouteFromResponseID(tenant, apiKey, outwardResponseID); route.sessionID != "" {
+		return route
 	}
 	composerResponseSessionMu.Lock()
 	defer composerResponseSessionMu.Unlock()
-	return composerResponseSessions[tenant+"\x00resp:"+outwardResponseID]
+	return composerResponseRoute{sessionID: composerResponseSessions[tenant+"\x00resp:"+outwardResponseID]}
 }
 
 // composerDebugEnabled gates the verbose per-turn [composer] diagnostic logs (session routing, dispatch).
@@ -798,16 +927,80 @@ var composerLiveUsageEnabled = func() bool {
 // overhead stays negligible.
 const composerLiveUsageStepChars = 200
 
-// stableConversationID returns a stable caller/session identifier from the request headers, the inbound
-// request's session metadata, or CLIProxy execution metadata — or "" when the caller provides none. It
-// is NEVER derived from message text.
-//
-// The highest-value source is the inbound payload's metadata.user_id: Claude Code sends a per-conversation
-// session id there (format user_<acct>_account__session_<uuid>, or a JSON object with session_id). That
-// uuid is globally unique and stable across a conversation's turns, so keying on it both fixes
-// content-collisions AND separates distinct users/conversations that happen to share one upstream Cursor
-// key. The conversation/session headers are honored first for clients that do set them.
-func stableConversationID(opts cliproxyexecutor.Options) string {
+type composerConversationIdentity struct {
+	ID     string
+	Source string
+}
+
+type composerConversationIdentityCandidate struct {
+	id     string
+	source string
+}
+
+type composerConversationIdentityConflictError struct {
+	primarySource     string
+	conflictingSource string
+}
+
+func (e *composerConversationIdentityConflictError) Error() string {
+	return fmt.Sprintf("cursor composer: conflicting explicit conversation identities (%s versus %s); start the request with one canonical conversation id", e.primarySource, e.conflictingSource)
+}
+
+func (e *composerConversationIdentityConflictError) StatusCode() int { return http.StatusConflict }
+
+func composerConversationIDsEqual(a, b string) bool {
+	normalize := func(v string) string {
+		v = strings.TrimSpace(v)
+		return strings.TrimPrefix(v, "claude:")
+	}
+	return normalize(a) == normalize(b)
+}
+
+// composerConversationIdentityCandidates is the single parser for explicit
+// body identities used by both durable routing and turn provenance. Every
+// accepted alias participates in conflict detection; no secondary subsystem may
+// discover an identity that routing did not validate.
+func composerConversationIdentityCandidates(payload []byte) []composerConversationIdentityCandidate {
+	if len(payload) == 0 {
+		return nil
+	}
+	candidates := make([]composerConversationIdentityCandidate, 0, 10)
+	if id := claudeSessionID(payload); id != "" {
+		candidates = append(candidates, composerConversationIdentityCandidate{id: id, source: "metadata.user_id"})
+	}
+	for _, item := range []struct {
+		path   string
+		source string
+	}{
+		{path: "metadata.cliproxy.conversation_id", source: "body.metadata.cliproxy.conversation_id"},
+		{path: "metadata.conversation_id", source: "body.metadata.conversation_id"},
+		{path: "metadata.conversationId", source: "body.metadata.conversationId"},
+		{path: "metadata.session_id", source: "body.metadata.session_id"},
+		{path: "metadata.sessionId", source: "body.metadata.sessionId"},
+		{path: "conversation_id", source: "body.conversation_id"},
+	} {
+		if value := strings.TrimSpace(gjson.GetBytes(payload, item.path).String()); value != "" {
+			candidates = append(candidates, composerConversationIdentityCandidate{id: value, source: item.source})
+		}
+	}
+	userID := strings.TrimSpace(gjson.GetBytes(payload, "metadata.user_id").String())
+	if strings.HasPrefix(userID, "{") {
+		for _, key := range []string{"session_id", "conversation_id", "thread_id"} {
+			if value := strings.TrimSpace(gjson.Get(userID, key).String()); value != "" {
+				candidates = append(candidates, composerConversationIdentityCandidate{
+					id: value, source: "metadata.user_id." + key,
+				})
+			}
+		}
+	}
+	return candidates
+}
+
+// resolveComposerConversationIdentity resolves every explicit conversation signal once. Claude Code's
+// per-conversation metadata.user_id is authoritative, matching the auth selector. Any contradictory explicit
+// signal is rejected instead of silently attaching a /new request to a stale header or response lineage.
+func resolveComposerConversationIdentity(opts cliproxyexecutor.Options) (composerConversationIdentity, error) {
+	candidates := composerConversationIdentityCandidates(opts.OriginalRequest)
 	if opts.Headers != nil {
 		// Existing conversation/session headers first, then the additional real conv-id signals that
 		// extractSessionIDs / copilot_headers honor (Codex Session_id, Amp thread id, a bare Conversation_id)
@@ -825,12 +1018,9 @@ func stableConversationID(opts cliproxyexecutor.Options) string {
 			"Session_id", "Conversation_id", "X-Amp-Thread-Id",
 		} {
 			if v := strings.TrimSpace(opts.Headers.Get(h)); v != "" {
-				return v
+				candidates = append(candidates, composerConversationIdentityCandidate{id: v, source: "header." + h})
 			}
 		}
-	}
-	if id := claudeSessionID(opts.OriginalRequest); id != "" {
-		return id
 	}
 	// Body signals that mirror extractSessionIDs steps 7+: a conversation_id is stable across a conversation's
 	// turns and never derived from message content. Never derive from message text. H16: previous_response_id
@@ -844,13 +1034,6 @@ func stableConversationID(opts cliproxyexecutor.Options) string {
 	// prompt / repo context. Hashing it as the stable session preimage merged independent conversations onto
 	// one durable Cursor agent (prior tool state / seeded system bleeds across unrelated
 	// requests). A turn whose ONLY id is prompt_cache_key now degrades to mint + history re-seed instead.
-	if len(opts.OriginalRequest) > 0 {
-		for _, k := range []string{"conversation_id"} {
-			if v := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, k).String()); v != "" {
-				return v
-			}
-		}
-	}
 	if opts.Metadata != nil {
 		// ADD-48: request_id/requestId are REMOVED here for the same reason as the header above — a CLIProxy
 		// execution-metadata request id is per-call, not per-conversation; keying on it churned a fresh session
@@ -858,12 +1041,33 @@ func stableConversationID(opts cliproxyexecutor.Options) string {
 		for _, k := range []string{"conversation_id", "conversationId", "session_id", "sessionId"} {
 			if v, ok := opts.Metadata[k]; ok {
 				if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
-					return s
+					candidates = append(candidates, composerConversationIdentityCandidate{id: s, source: "execution_metadata." + k})
 				}
 			}
 		}
 	}
-	return ""
+	if len(candidates) == 0 {
+		return composerConversationIdentity{}, nil
+	}
+	primary := candidates[0]
+	for _, c := range candidates[1:] {
+		if !composerConversationIDsEqual(primary.id, c.id) {
+			return composerConversationIdentity{}, &composerConversationIdentityConflictError{
+				primarySource: primary.source, conflictingSource: c.source,
+			}
+		}
+	}
+	return composerConversationIdentity{ID: primary.id, Source: primary.source}, nil
+}
+
+// stableConversationID is retained for narrow helpers/tests that only need the resolved value. Request routing
+// must call resolveComposerConversationIdentity and propagate its typed conflict error.
+func stableConversationID(opts cliproxyexecutor.Options) string {
+	identity, err := resolveComposerConversationIdentity(opts)
+	if err != nil {
+		return ""
+	}
+	return identity.ID
 }
 
 // claudeSessionID extracts a stable per-conversation id from the inbound payload's metadata.user_id
@@ -968,26 +1172,11 @@ const (
 	composerLineageEntryTTL = 30 * time.Minute
 )
 
-// serverSecret keys the lineage head digest (HMAC) so a stored digest is a fixed-width, non-reversible value
-// that never carries raw conversation text. It is NEVER logged.
-//
-// CONTINUITY across restart/replica (review Comment 2): when CURSOR_COMPOSER_LINEAGE_SECRET is set, the key is
-// STABLE — the same (tenant, conversation, content) re-derives the same head digest and the same content-fork
-// id after a process restart or on another replica, WITHOUT any shared/persisted routing state. When unset, the
-// key is per-process crypto/rand: head digests + content-fork ids are deterministic only WITHIN one process
-// (single-process sticky routing — the documented single-instance contract; multi-replica / cross-restart
-// determinism REQUIRES setting the env secret). Either way the tenant boundary (composerTenant) is unchanged.
-var serverSecret = func() []byte {
-	secret := loadComposerLineageSecret(os.Getenv)
-	if strings.TrimSpace(os.Getenv("CURSOR_COMPOSER_LINEAGE_SECRET")) == "" {
-		// P1-4: a per-process random lineage key means forked subagent conversations re-derive a DIFFERENT id
-		// after a restart / on another replica and are reseeded (context-light) instead of re-attaching to their
-		// durable agent. Warn at startup so cross-restart/replica continuity is a conscious operator choice
-		// (parity with the bind-host warnings); set CURSOR_COMPOSER_LINEAGE_SECRET to a stable value to fix it.
-		log.Warnf("[composer] CURSOR_COMPOSER_LINEAGE_SECRET is unset: conversation-fork routing uses a per-process random key — forked subagent conversations lose durable continuity across restarts/replicas (they reseed). Set a stable secret for cross-restart determinism.")
-	}
-	return secret
-}()
+// serverSecret authenticates the response-route fallback used by tests and malformed internal calls that have
+// no resolved Cursor API key. Production response routes use that request's API key. Lineage digests deliberately
+// do not use this secret: their preimage is already tenant-scoped and must remain deterministic across restarts
+// even when CURSOR_COMPOSER_LINEAGE_SECRET is unset.
+var serverSecret = loadComposerLineageSecret(os.Getenv)
 
 // loadComposerLineageSecret derives the 32-byte lineage HMAC key from the environment (testable via the getenv
 // param). A configured CURSOR_COMPOSER_LINEAGE_SECRET (hex or raw text) yields a STABLE, deterministic key; an
@@ -1018,9 +1207,8 @@ func loadComposerLineageSecret(getenv func(string) string) []byte {
 // the bookkeeping for re-resolution, retry tolerance, and the recorded identical-clone collision slot.
 type lineageEntry struct {
 	sid        string    // baseSid for the base lineage, forkSid for a fork
-	headDigest string    // growth-stable HMAC of the first 2 non-system messages
-	priorHead  string    // one-behind headDigest, for retry/duplicate tolerance across a re-key
-	openerFP   string    // fingerprint of the first non-system message (role + prefix) for the compaction signal
+	headDigest string    // growth-stable SHA-256 of the retained non-system head
+	openerFP   string    // diagnostic fingerprint; never authoritative over a divergent retained head
 	slot       int       // recorded identical-head collision slot (0 = first claimant, omitted from the id)
 	lastUsed   time.Time // LRU + TTL
 }
@@ -1078,21 +1266,58 @@ func composerStableBaseSessionID(tenant, apiKey, convID string) string {
 	return "sess_" + hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, convID)))[:32]
 }
 
-// lineageHeadDigest is the growth-stable HMAC head used as a lineage key component (§1.2). It reuses the
-// SAME head window as composerHistoryFingerprint (the first composerHistoryFingerprintHeadMessages non-system
-// messages, role + a 256-rune text prefix each) so a fork's head is identical across its own turns. fp16 is
-// the existing composerHistoryFingerprint (the compaction signal) folded into the keying so two conversations
-// with the same opener but divergent bodies do not share a head; tenant is folded so the digest is
-// tenant-scoped. crypto/hmac keyed by serverSecret keeps the stored digest a fixed-width, non-reversible value
-// (the raw conversation text is never retained in the registry).
-func lineageHeadDigest(tenant, fp16 string, messages []gjson.Result) string {
-	mac := hmac.New(sha256.New, serverSecret)
-	mac.Write([]byte(tenant))
-	mac.Write([]byte{0})
-	mac.Write([]byte(fp16))
-	mac.Write([]byte{0})
-	composerWriteFingerprintHead(mac, composerNonSystemHeadMessages(messages))
-	return hex.EncodeToString(mac.Sum(nil))[:32]
+// composerConversationBinding is the opaque, authenticated conversation epoch shared with the bridge. It is
+// deliberately the full digest (rather than the truncated external session id) so ToolRounds can reject a
+// signed old-conversation route carrying fresh post-/new user intent without learning the client identity.
+func composerConversationBinding(tenant, apiKey, convID string) string {
+	if tenant == "" || convID == "" {
+		return ""
+	}
+	return hex.EncodeToString(sha256Sum(composerStableSessionPreimage(tenant, apiKey, convID)))
+}
+
+func composerConversationKey(opts cliproxyexecutor.Options, messages []gjson.Result) (string, error) {
+	identity, err := resolveComposerConversationIdentity(opts)
+	if err != nil {
+		return "", err
+	}
+	if identity.ID != "" {
+		return identity.ID, nil
+	}
+	return composerContentConvKey(messages), nil
+}
+
+// lineageHeadDigest is the growth-stable head used as a lineage key component (§1.2). It hashes the full text
+// and tool-routing structure in the retained non-system head window, avoiding the old 256-rune-prefix alias.
+// The bounded head window keeps the key stable as a transcript grows. Tenant scoping prevents cross-tenant
+// aliases, and plain SHA-256 makes the same lineage deterministic across restarts even when no optional secret
+// is configured. The registry retains only the digest, never raw conversation text.
+func lineageHeadDigest(tenant, _ string, messages []gjson.Result) string {
+	digest := sha256.New()
+	_, _ = digest.Write([]byte(tenant))
+	_, _ = digest.Write([]byte{0})
+	head := composerNonSystemHeadMessages(messages)
+	limit := len(head)
+	if limit > composerHistoryFingerprintHeadMessages {
+		limit = composerHistoryFingerprintHeadMessages
+	}
+	for i := 0; i < limit; i++ {
+		m := head[i]
+		_, _ = io.WriteString(digest, strings.ToLower(strings.TrimSpace(m.Get("role").String())))
+		_, _ = digest.Write([]byte{0x1f})
+		// Lineage isolation hashes full text and structural tool routing fields. The history fingerprint remains
+		// prefix-bounded for cheap reseed detection, but two tasks sharing a 256-rune preamble must not collapse.
+		_, _ = io.WriteString(digest, cursorMessageText(m))
+		for _, tc := range m.Get("tool_calls").Array() {
+			_, _ = digest.Write([]byte{0x1e})
+			_, _ = io.WriteString(digest, tc.Get("id").String())
+			_, _ = digest.Write([]byte{0x1f})
+			_, _ = io.WriteString(digest, tc.Get("function.name").String())
+		}
+		_, _ = io.WriteString(digest, m.Get("tool_call_id").String())
+		_, _ = digest.Write([]byte{0})
+	}
+	return hex.EncodeToString(digest.Sum(nil))[:32]
 }
 
 // lineageHeadDigestFromMessages folds composerHistoryFingerprint + lineageHeadDigest for a message array.
@@ -1104,6 +1329,43 @@ func lineageHeadDigestFromMessages(tenant string, messages []gjson.Result) strin
 func lineageForkKeys(tenant string, messages []gjson.Result) (headDigest, openerFP string) {
 	headDigest = lineageHeadDigestFromMessages(tenant, messages)
 	openerFP = lineageOpenerFingerprint(messages)
+	return
+}
+
+// composerExplicitLineageID is an optional client contract for branches that can be byte-identical. Without
+// such an identity no server can later prove whether a fresh identical request owns collision slot 0 or 1.
+func composerExplicitLineageID(opts cliproxyexecutor.Options) string {
+	if opts.Headers != nil {
+		if v := strings.TrimSpace(opts.Headers.Get("X-CLIProxy-Lineage-ID")); v != "" {
+			return v
+		}
+	}
+	for _, path := range []string{"metadata.cliproxy.lineage_id", "metadata.lineage_id", "metadata.branch_id"} {
+		if v := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, path).String()); v != "" {
+			return v
+		}
+	}
+	if opts.Metadata != nil {
+		for _, key := range []string{"lineage_id", "lineageId", "branch_id", "branchId"} {
+			if v, ok := opts.Metadata[key]; ok {
+				if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func lineageForkKeysForRequest(tenant string, messages []gjson.Result, opts cliproxyexecutor.Options) (headDigest, openerFP string) {
+	headDigest, openerFP = lineageForkKeys(tenant, messages)
+	if lineageID := composerExplicitLineageID(opts); lineageID != "" {
+		// A client lineage id is authoritative branch identity, not merely extra entropy for one content head.
+		// Do not mix the growing transcript into it: doing so would move the same branch to a new durable agent
+		// when turn two adds the first assistant message or when compaction rewrites retained history.
+		sum := sha256.Sum256([]byte(tenant + "\x00lineage-id:" + lineageID))
+		headDigest = hex.EncodeToString(sum[:])[:32]
+	}
 	return
 }
 
@@ -1119,8 +1381,16 @@ func forkSessionID(baseSid, headDigest string, slot int) string {
 	return "sess_" + hex.EncodeToString(sum[:])[:32]
 }
 
+// stableLineageSessionID removes process arrival order from durable routing. The bounded two-message head is
+// growth-stable while distinguishing branches/subagents that share the same opener. A compact that rewrites
+// that head may re-seed onto a new deterministic agent after process-state loss; isolation is safer than
+// guessing that a same-opener divergent head belongs to the parent.
+func stableLineageSessionID(baseSid, headDigest, _ string) string {
+	return forkSessionID(baseSid, "lineage:"+headDigest, 0)
+}
+
 // expireLocked drops lineages older than entryTTL for a tenant. Caller holds to.mu.
-func (s *composerLineageStore) expireLocked(to *tenantLineage) {
+func (s *composerLineageStore) expireLocked(tenant string, to *tenantLineage) {
 	if s.entryTTL <= 0 {
 		return
 	}
@@ -1131,13 +1401,34 @@ func (s *composerLineageStore) expireLocked(to *tenantLineage) {
 		if !ok {
 			continue
 		}
-		if e.lastUsed.Before(cutoff) {
+		if e.lastUsed.Before(cutoff) && !composerSessionIsLive(tenant, e.sid) {
 			delete(to.byBaseHead, key)
 			continue
 		}
 		kept = append(kept, key)
 	}
 	to.order = kept
+}
+
+// enforceTenantCapLocked evicts the oldest non-live lineage. The cap is soft when every entry is live: reusing
+// a live collision slot would route two logical runs onto one serial bridge session.
+func (to *tenantLineage) enforceTenantCapLocked(tenant string, cap int) {
+	for len(to.order) > cap {
+		evicted := false
+		for i, key := range to.order {
+			e := to.byBaseHead[key]
+			if e != nil && composerSessionIsLive(tenant, e.sid) {
+				continue
+			}
+			delete(to.byBaseHead, key)
+			to.order = append(to.order[:i], to.order[i+1:]...)
+			evicted = true
+			break
+		}
+		if !evicted {
+			return
+		}
+	}
 }
 
 // moveToTail moves an existing LRU key to the tail (most-recently-used). Caller holds to.mu.
@@ -1217,9 +1508,8 @@ func (s *composerLineageStore) deleteTenantIfEmptyLocked(tenant string, to *tena
 // putForkSlotted records a FIRST-CLASS fork under (baseSid, headDigest), resolving the identical-clone
 // collision slot (§1.3c). The first claimant of a head gets slot 0 (id omits the slot, back-compat). A
 // SECOND concurrent claimant of the SAME head within the live window — signalled by collide=true — gets the
-// next slot with a RECORDED crypto/rand tie value folded only to disambiguate two byte-identical openings;
-// the slot is recorded, not re-minted, so each clone stays head-stable across its own later turns. Returns
-// the fork's stable sess_ id.
+// next recorded integer slot, disambiguating byte-identical openings without collision risk. A client-provided
+// stable lineage id is still required to prove which identical slot owns a later turn. Returns the fork's sid.
 func (s *composerLineageStore) putForkSlotted(tenant, baseSid, headDigest string, collide bool) string {
 	if tenant == "" {
 		// Empty tenant never reaches here (deriveComposerSessionID mints first); return a deterministic id.
@@ -1228,7 +1518,7 @@ func (s *composerLineageStore) putForkSlotted(tenant, baseSid, headDigest string
 	to := s.tenantLineageFor(tenant)
 	to.mu.Lock()
 	defer to.mu.Unlock()
-	s.expireLocked(to)
+	s.expireLocked(tenant, to)
 	now := s.nowFn()
 	key := lineageKey(baseSid, headDigest)
 	if e, ok := to.byBaseHead[key]; ok {
@@ -1243,9 +1533,8 @@ func (s *composerLineageStore) putForkSlotted(tenant, baseSid, headDigest string
 		// independently addressable. #10 (review): allocate the SMALLEST UNUSED slot (>=1) under (baseSid,
 		// headDigest) DETERMINISTICALLY, under the tenant lock — never a random 16-bit slot, which could
 		// birthday-collide at the per-base cap (64) and OVERWRITE a live sibling's lineage. A monotonic slot also
-		// makes concurrency forks reproducible across restart/replica (with a shared lineage secret), and reuses
-		// slots freed by eviction. The fork id still requires the server secret (folded into baseSid), so a
-		// predictable slot does not make a fork id guessable.
+		// makes slot selection reproducible while the registry is present and reuses slots freed by eviction.
+		// The external session id remains an opaque SHA-256-derived value.
 		slot := 1
 		slotKey := key + "\x00slot:" + fmt.Sprint(slot)
 		for {
@@ -1260,11 +1549,7 @@ func (s *composerLineageStore) putForkSlotted(tenant, baseSid, headDigest string
 		ne := &lineageEntry{sid: forkSid, headDigest: headDigest, slot: slot, lastUsed: now}
 		to.byBaseHead[slotKey] = ne
 		to.order = append(to.order, slotKey)
-		for len(to.order) > s.perCap {
-			oldest := to.order[0]
-			to.order = to.order[1:]
-			delete(to.byBaseHead, oldest)
-		}
+		to.enforceTenantCapLocked(tenant, s.perCap)
 		return forkSid
 	}
 	// First claimant of this head: slot 0, id omits the slot for back-compat.
@@ -1273,11 +1558,7 @@ func (s *composerLineageStore) putForkSlotted(tenant, baseSid, headDigest string
 	e := &lineageEntry{sid: forkSid, headDigest: headDigest, lastUsed: now}
 	to.byBaseHead[key] = e
 	to.order = append(to.order, key)
-	for len(to.order) > s.perCap {
-		oldest := to.order[0]
-		to.order = to.order[1:]
-		delete(to.byBaseHead, oldest)
-	}
+	to.enforceTenantCapLocked(tenant, s.perCap)
 	return forkSid
 }
 
@@ -1301,98 +1582,59 @@ func (s *composerLineageStore) putForkSlotted(tenant, baseSid, headDigest string
 //	    Otherwise it is a FIRST-CLASS fork (subagent / branch / parallel fan-out) recorded under
 //	    (baseSid, headDigest) so its later new-user turns re-resolve via (a)/(b).
 func (s *composerLineageStore) resolveStableSession(tenant, baseSid, headDigest, openerFP string) string {
+	return s.resolveStableSessionForTurn(tenant, baseSid, headDigest, openerFP, "")
+}
+
+func (s *composerLineageStore) resolveStableSessionForTurn(tenant, baseSid, headDigest, openerFP, turnDiscriminator string) string {
 	if tenant == "" {
 		return baseSid
 	}
 	to := s.tenantLineageFor(tenant)
 	to.mu.Lock()
 	defer to.mu.Unlock()
-	s.expireLocked(to)
+	s.expireLocked(tenant, to)
 	now := s.nowFn()
-	prefix := baseSid + "\x00"
-
-	// (a) exact head match (current or one-behind), co-resident under this baseSid.
+	// (a) exact retained-head match, co-resident under this baseSid.
 	key := lineageKey(baseSid, headDigest)
 	if e, ok := to.byBaseHead[key]; ok {
+		if turnDiscriminator != "" {
+			prefix := key + "\x00slot:"
+			for siblingKey := range to.byBaseHead {
+				if strings.HasPrefix(siblingKey, prefix) {
+					// The client supplied no stable branch identity and multiple identical-head owners exist.
+					// Never guess slot 0: isolate this exact retry deterministically and rely on bounded replay.
+					return forkSessionID(baseSid, headDigest+"\x00ambiguous-turn:"+turnDiscriminator, 0)
+				}
+			}
+		}
 		e.lastUsed = now
 		to.moveToTail(key)
 		return e.sid
 	}
-	for _, k := range to.order {
-		e := to.byBaseHead[k]
-		if e != nil && e.priorHead == headDigest && strings.HasPrefix(k, prefix) {
-			e.lastUsed = now
-			to.moveToTail(k)
-			return e.sid
-		}
-	}
+	// A matching opener with a different retained head is not authoritative. It can mean compaction, but it can
+	// equally mean a divergent branch/subagent. Treating it as continuation collapses those lineages and can
+	// attach a child to its parent. Route by the deterministic retained head and let bounded history faithfully
+	// re-seed compaction; never trade isolation for an unprovable same-opener guess.
 
-	// (b) opener bridge: find a co-resident lineage whose opener matches but whose head moved
-	// (compactionSignal) — the same conversation/fork with a rewritten (compact) or grown (turn-1→turn-3) body.
-	// #11 (review): a SINGLE such match is unambiguous and is re-keyed. But when MORE THAN ONE co-resident
-	// lineage shares the opener (a base AND its concurrency-fork, or several forks), the opener alone cannot say
-	// which one this turn continues — the old "prefer base" tie-break would re-key the BASE onto a fork's new
-	// head (corrupting the parent) or pull a fork back to base. Treat >1 as AMBIGUOUS and do NOT bridge: fall
-	// through to (c) and isolate this turn, rather than collapse/corrupt a lineage on a guess.
-	var matches []*lineageEntry
-	var matchKeys []string
-	if openerFP != "" {
-		for _, k := range to.order {
-			e := to.byBaseHead[k]
-			if e == nil || !strings.HasPrefix(k, prefix) || !compactionSignal(e.headDigest, headDigest, e.openerFP, openerFP) {
-				continue
-			}
-			matches = append(matches, e)
-			matchKeys = append(matchKeys, k)
-		}
-	}
-	var match *lineageEntry
-	var matchKey string
-	if len(matches) == 1 {
-		match, matchKey = matches[0], matchKeys[0]
-	}
-	if match != nil {
-		// Re-key the matched lineage from its old head to the new head, preserving its recorded sid.
-		oldKey := matchKey
-		newKey := lineageKey(baseSid, headDigest)
-		for i, k := range to.order {
-			if k == oldKey {
-				to.order = append(to.order[:i], to.order[i+1:]...)
-				break
-			}
-		}
-		delete(to.byBaseHead, oldKey)
-		match.priorHead = match.headDigest
-		match.headDigest = headDigest
-		match.lastUsed = now
-		to.byBaseHead[newKey] = match
-		to.order = append(to.order, newKey)
-		return match.sid
-	}
-
-	// (c) genuinely new divergent context for this baseSid.
-	baseExists := false
-	for _, k := range to.order {
-		e := to.byBaseHead[k]
-		if e != nil && e.sid == baseSid && strings.HasPrefix(k, prefix) {
-			baseExists = true
-			break
-		}
-	}
+	// (c) genuinely new divergent context for this baseSid. Every lineage, including the parent, uses a
+	// content-pure id. The former "first claimant gets baseSid" rule was process-order-dependent: after a
+	// restart/TTL expiry, a subagent arriving first could resume the parent's durable agent.
 	to.enforcePerBaseCapLocked(tenant, baseSid, s.perBase) // #19: evict only NON-live forks (else exceed softly)
-	sid := baseSid
-	if baseExists {
-		sid = forkSessionID(baseSid, headDigest, 0) // first claimant of this head: slot 0 omitted, back-compat
-	}
+	sid := stableLineageSessionID(baseSid, headDigest, openerFP)
 	e := &lineageEntry{sid: sid, headDigest: headDigest, openerFP: openerFP, lastUsed: now}
 	to.byBaseHead[key] = e
 	to.order = append(to.order, key)
-	for len(to.order) > s.perCap {
-		oldest := to.order[0]
-		to.order = to.order[1:]
-		delete(to.byBaseHead, oldest)
-	}
+	to.enforceTenantCapLocked(tenant, s.perCap)
 	return sid
+}
+
+func lineageTurnDiscriminator(messages []gjson.Result) string {
+	h := sha256.New()
+	for _, m := range messages {
+		_, _ = io.WriteString(h, m.Raw)
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
 // forget drops every lineage routing to sid for a tenant (terminal-stop release). Best-effort cleanup; the
@@ -1628,13 +1870,8 @@ func composerAcquireOrFork(tenant, sid, baseSid, headDigest, requestID string) (
 	return sid, 0
 }
 
-// compactionSignal reports whether a recorded BASE head change is a COMPACTION (same conversation, rewritten
-// body) rather than a genuine divergence (a fork). It mirrors composerHistoryFingerprint's design: a /compact
-// preserves the opener (the first non-system message) verbatim and rewrites the body, so when the recorded
-// base head moved (oldHead != newHead) BUT the first non-system message's role+prefix is unchanged
-// (recordedOpenerFP == currentOpenerFP), we classify it as a compaction and CONTINUE the base (re-key + let
-// inp["historyFingerprint"] drive the bridge warm-reseed at the existing seam). An OPENER edit (first message
-// changed) is NOT a compaction — it falls through to a fork (documented residual context loss).
+// compactionSignal is a diagnostic/test signal only. Same opener plus changed head is compatible with both
+// compaction and a divergent branch, so it is deliberately not routing authority.
 func compactionSignal(oldHead, newHead, recordedOpenerFP, currentOpenerFP string) bool {
 	if oldHead == newHead {
 		return false // the recorded base head did not change at all
@@ -1645,10 +1882,8 @@ func compactionSignal(oldHead, newHead, recordedOpenerFP, currentOpenerFP string
 	return recordedOpenerFP == currentOpenerFP
 }
 
-// lineageOpenerFingerprint returns a 16-hex fingerprint of the FIRST non-system message (role + 256-rune
-// prefix) — the growth-stable opener anchor. It never changes as the conversation/fork appends tail turns, so
-// the opener bridge can recognise a body rewrite (opener kept, head moved) and distinguish it from an opener
-// edit (opener changed → a genuine fork). Empty when there is no non-system message.
+// lineageOpenerFingerprint returns a 32-hex diagnostic fingerprint of the first non-system message. It helps
+// observe compaction-like rewrites but is never sufficient to merge lineages. Empty when no such message exists.
 func lineageOpenerFingerprint(messages []gjson.Result) string {
 	head := composerNonSystemHeadMessages(messages)
 	if len(head) == 0 {
@@ -1656,7 +1891,7 @@ func lineageOpenerFingerprint(messages []gjson.Result) string {
 	}
 	m := head[0]
 	sum := sha256.Sum256([]byte(m.Get("role").String() + "\x1f" + composerHeadMessageText(m)))
-	return hex.EncodeToString(sum[:])[:16]
+	return hex.EncodeToString(sum[:])[:32]
 }
 
 // composerContentConvKey derives a CLIENT-AGNOSTIC, turn-stable conversation key for a turn that carries no
@@ -1785,6 +2020,12 @@ func composerHasReplayableHistory(oai []byte) bool {
 // continuation carries history+system (composerInput) so the rotated durable agent re-seeds bounded context.
 func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte, opts cliproxyexecutor.Options) (string, error) {
 	tenant := composerTenant(auth, opts)
+	identity, identityErr := resolveComposerConversationIdentity(opts)
+	if identityErr != nil {
+		return "", identityErr
+	}
+	explicitConversationID := identity.ID
+	explicitBinding := composerConversationBinding(tenant, apiKey, explicitConversationID)
 	// Empty-tenant fail-closed guard (identity-finalplan §1.4): with no auth.ID/api_key AND no caller
 	// credential there is no isolation boundary, so a stable id from one anonymous caller could be replayed
 	// by another. NEVER share a "" bucket and NEVER consult the lineage registry — mint a fresh session
@@ -1825,14 +2066,40 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 
 	// Tool-result routing is bridge-owned. The session id in this body is advisory recovery context only;
 	// `/agent/continue` resolves the actual paused round from the opaque signed tool-call ids.
-	if _, _, isCont := composerToolResultsHinted(gjson.GetBytes(oai, "messages").Array(), contHint); isCont {
+	messages := gjson.GetBytes(oai, "messages").Array()
+	currentConversationBinding := explicitBinding
+	if currentConversationBinding == "" {
+		if convKey := composerContentConvKey(messages); convKey != "" {
+			currentConversationBinding = composerConversationBinding(tenant, apiKey, convKey)
+		}
+	}
+	if _, _, isCont := composerToolResultsHinted(messages, contHint); isCont {
 		if pid := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, "previous_response_id").String()); pid != "" {
-			if mapped := lookupComposerResponseSession(tenant, apiKey, pid); mapped != "" {
-				return mapped, nil
+			if route := lookupComposerResponseRoute(tenant, apiKey, pid); route.sessionID != "" {
+				if currentConversationBinding != "" && route.conversationBinding != currentConversationBinding {
+					if route.conversationBinding != "" {
+						return "", &composerConversationRouteConflictError{}
+					}
+					if explicitBinding != "" {
+						// A legacy response route cannot prove an explicit conversation scope. Fall through
+						// to the signed tool result or bounded-history recovery instead of guessing.
+					} else {
+						return route.sessionID, nil // legacy no-explicit-id compatibility
+					}
+				} else {
+					return route.sessionID, nil
+				}
 			}
 		}
-		if id := stableConversationID(opts); id != "" {
-			return composerStableBaseSessionID(tenant, apiKey, id), nil
+		if explicitConversationID != "" {
+			baseSid := composerStableBaseSessionID(tenant, apiKey, explicitConversationID)
+			headDigest, openerFP := lineageForkKeysForRequest(tenant, messages, opts)
+			return composerLineage.resolveStableSessionForTurn(tenant, baseSid, headDigest, openerFP, lineageTurnDiscriminator(messages)), nil
+		}
+		if convKey := composerContentConvKey(messages); convKey != "" {
+			baseSid := composerStableBaseSessionID(tenant, apiKey, convKey)
+			headDigest, openerFP := lineageForkKeysForRequest(tenant, messages, opts)
+			return composerLineage.resolveStableSessionForTurn(tenant, baseSid, headDigest, openerFP, lineageTurnDiscriminator(messages)), nil
 		}
 		return mintComposerSessionID(), nil
 	}
@@ -1843,9 +2110,21 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 	// list (it is not stable — it changes every turn). On an unknown legacy ID we fall
 	// through to the stable-conv hash and finally to a fresh mint, so a routine follow-up never errors.
 	if pid := strings.TrimSpace(gjson.GetBytes(opts.OriginalRequest, "previous_response_id").String()); pid != "" {
-		if sid := lookupComposerResponseSession(tenant, apiKey, pid); sid != "" {
-			composerDebugf("[composer] deriveSessionID BRANCH=previous_response_id(durable resume) -> sessionID=%s", sid)
-			return sid, nil
+		if route := lookupComposerResponseRoute(tenant, apiKey, pid); route.sessionID != "" {
+			if currentConversationBinding != "" && route.conversationBinding != currentConversationBinding {
+				if route.conversationBinding != "" {
+					return "", &composerConversationRouteConflictError{}
+				}
+				if explicitBinding != "" {
+					// A pre-binding response id cannot prove an explicit scope. Never resume it directly; bounded
+					// history can faithfully re-seed, while a thin request gets the normal 410 below.
+				} else {
+					return route.sessionID, nil // legacy no-explicit-id compatibility; no scope exists to compare
+				}
+			} else {
+				composerDebugf("[composer] deriveSessionID BRANCH=previous_response_id(durable resume) -> sessionID=%s", route.sessionID)
+				return route.sessionID, nil
+			}
 		}
 		if !composerHasReplayableHistory(oai) {
 			composerDebugf("[composer] deriveSessionID previous_response_id present but unmapped and replay history absent -> 410")
@@ -1853,7 +2132,7 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 		}
 		composerDebugf("[composer] deriveSessionID previous_response_id present but unmapped; bounded replay history is present -> faithful re-seed")
 	}
-	if id := stableConversationID(opts); id != "" {
+	if id := explicitConversationID; id != "" {
 		// ADD-62 invariant (C-ADD62-MODEL-ROTATE): the BASE session id is derived from tenant + conversation
 		// (+ the ADD-79 Cursor-key fingerprint), NEVER the model. A model change on the same conversation MUST
 		// keep the same external session id so the BRIDGE can detect the change (session.model != requested)
@@ -1864,14 +2143,10 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 		// lineage registry only splits distinct divergent contexts that share this id (subagents reusing the
 		// parent metadata.user_id, parallel fan-out, branches) into per-lineage sessions and re-resolves each
 		// to ONE stable sess_ across all of its own turns. The head reuses the growth-stable
-		// composerHistoryFingerprint window + an opener bridge, so a fork's recorded sid is computed once and
-		// re-resolved turn-to-turn (multi-turn fork stability). The UNCHANGED inp["historyFingerprint"] field
-		// still drives the bridge warm-reseed on the re-key (compaction) path.
-		messages := gjson.GetBytes(oai, "messages").Array()
-		fp16 := composerHistoryFingerprint(messages)
-		headDigest := lineageHeadDigest(tenant, fp16, messages)
-		openerFP := lineageOpenerFingerprint(messages)
-		sid := composerLineage.resolveStableSession(tenant, baseSid, headDigest, openerFP)
+		// composerHistoryFingerprint window, so a fork's recorded sid is computed once and re-resolved
+		// turn-to-turn. A changed retained head isolates and faithfully re-seeds instead of guessing from opener.
+		headDigest, openerFP := lineageForkKeysForRequest(tenant, messages, opts)
+		sid := composerLineage.resolveStableSessionForTurn(tenant, baseSid, headDigest, openerFP, lineageTurnDiscriminator(messages))
 		composerDebugf("[composer] deriveSessionID BRANCH=stable convID=%q -> sessionID=%s (baseSid=%s)", id, sid, baseSid)
 		return sid, nil
 	}
@@ -1884,13 +2159,10 @@ func deriveComposerSessionID(auth *cliproxyauth.Auth, apiKey string, oai []byte,
 	// that happen to share an opener). composerContentConvKey returns "" only when there is no opener at all,
 	// where a fresh mint remains the floor — and a continuation still re-seeds from its own replayed history, so a
 	// routine turn never errors.
-	messages := gjson.GetBytes(oai, "messages").Array()
 	if convKey := composerContentConvKey(messages); convKey != "" {
 		baseSid := composerStableBaseSessionID(tenant, apiKey, convKey)
-		fp16 := composerHistoryFingerprint(messages)
-		headDigest := lineageHeadDigest(tenant, fp16, messages)
-		openerFP := lineageOpenerFingerprint(messages)
-		sid := composerLineage.resolveStableSession(tenant, baseSid, headDigest, openerFP)
+		headDigest, openerFP := lineageForkKeysForRequest(tenant, messages, opts)
+		sid := composerLineage.resolveStableSessionForTurn(tenant, baseSid, headDigest, openerFP, lineageTurnDiscriminator(messages))
 		composerDebugf("[composer] deriveSessionID BRANCH=content-key(client-agnostic opener) -> sessionID=%s (baseSid=%s)", sid, baseSid)
 		return sid, nil
 	}
@@ -1937,7 +2209,7 @@ func deriveComposerSessionIDLive(auth *cliproxyauth.Auth, apiKey string, oai []b
 			// case — sequential resumes — always re-claims the pinned session and preserves its durable context;
 			// only the rare concurrent-resume race degrades to a fresh (context-light) fork instead of a 500.
 			messages := gjson.GetBytes(oai, "messages").Array()
-			headDigest := lineageHeadDigestFromMessages(tenant, messages)
+			headDigest, _ := lineageForkKeysForRequest(tenant, messages, opts)
 			finalSid, owner := composerAcquireOrFork(tenant, sid, sid, headDigest, requestID)
 			return finalSid, owner, nil
 		}
@@ -1957,7 +2229,7 @@ func deriveComposerSessionIDLive(auth *cliproxyauth.Auth, apiKey string, oai []b
 	if baseSid == "" {
 		return sid, 0, nil // stateless mint with no opener: unique by construction, cannot collide
 	}
-	headDigest := lineageHeadDigestFromMessages(tenant, messages)
+	headDigest, _ := lineageForkKeysForRequest(tenant, messages, opts)
 	finalSid, owner := composerAcquireOrFork(tenant, sid, baseSid, headDigest, requestID)
 	if finalSid != sid {
 		composerDebugf("[composer] deriveSessionID concurrency-fork convID=%q content-sid=%s busy -> sessionID=%s", id, sid, finalSid)
@@ -2034,24 +2306,13 @@ func composerJSONKeys(raw []byte) string {
 
 // cursorMessageText extracts the text content of an OpenAI-shape message whose
 // content may be a string or an array of content parts.
+// cursorMessageText delegates to the canonical turnprovenance.MessageText (P2.6) so routing,
+// history rendering, and provenance fingerprinting all see identical text for the same
+// message. The canonical parser joins multiple text parts with a newline (M29: adjacent
+// blocks are distinct segments — bare concat corrupts code/JSON boundaries) and whitelists
+// genuine text part types, so non-standard parts cannot diverge the two subsystems.
 func cursorMessageText(m gjson.Result) string {
-	c := m.Get("content")
-	if c.Type == gjson.String {
-		return c.String()
-	}
-	if c.IsArray() {
-		// M29: join multiple text parts with a newline, not a bare concat. Adjacent blocks are distinct
-		// segments (e.g. stdout then stderr, or user text split across client blocks); concatenating them
-		// with no separator corrupts code/command-output/JSON boundaries ("foo"+"bar" -> "foobar").
-		var parts []string
-		for _, part := range c.Array() {
-			if t := part.Get("text"); t.Exists() {
-				parts = append(parts, t.String())
-			}
-		}
-		return strings.Join(parts, "\n")
-	}
-	return c.String()
+	return turnprovenance.MessageText(m)
 }
 
 var composerSystemMaxBytes = func() int {
@@ -2672,6 +2933,14 @@ func (e *composerContinuityGoneError) Error() string {
 	return "cursor composer: prior response continuity is unavailable; resend bounded conversation history or start a new conversation"
 }
 func (e *composerContinuityGoneError) StatusCode() int { return http.StatusGone }
+
+type composerConversationRouteConflictError struct{}
+
+func (e *composerConversationRouteConflictError) Error() string {
+	return "cursor composer: previous response belongs to a different or unverifiable conversation; do not reuse it after starting a new conversation"
+}
+
+func (e *composerConversationRouteConflictError) StatusCode() int { return http.StatusConflict }
 
 // composerForceStoreTrue coerces the (translated) request's `store` field to true. Cursor Composer is an
 // inherently DURABLE agent — it persists/resumes state via resumeAgent on a stable session id, so there is no
@@ -4074,6 +4343,10 @@ const composerRoutedResponseIDPrefix = "chatcmpl-composer-cr1_"
 var composerRoutedSessionIDPattern = regexp.MustCompile(`^sess_[A-Za-z0-9_-]{8,240}$`)
 
 func composerResponseRouteMAC(apiKey, tenant, sessionID, nonce string) []byte {
+	return composerResponseRouteMACBound(apiKey, tenant, sessionID, "", nonce)
+}
+
+func composerResponseRouteMACBound(apiKey, tenant, sessionID, binding, nonce string) []byte {
 	key := []byte(apiKey)
 	if len(key) == 0 {
 		// A resolved Cursor key is present on every production composer request.
@@ -4082,11 +4355,19 @@ func composerResponseRouteMAC(apiKey, tenant, sessionID, nonce string) []byte {
 		key = serverSecret[:]
 	}
 	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte("cursor-composer-response-route-v1\x00"))
+	domain := "cursor-composer-response-route-v1\x00"
+	if binding != "" {
+		domain = "cursor-composer-response-route-v2\x00"
+	}
+	_, _ = mac.Write([]byte(domain))
 	_, _ = mac.Write([]byte(tenant))
 	_, _ = mac.Write([]byte{'\x00'})
 	_, _ = mac.Write([]byte(sessionID))
 	_, _ = mac.Write([]byte{'\x00'})
+	if binding != "" {
+		_, _ = mac.Write([]byte(binding))
+		_, _ = mac.Write([]byte{'\x00'})
+	}
 	_, _ = mac.Write([]byte(nonce))
 	return mac.Sum(nil)[:16]
 }
@@ -4095,42 +4376,68 @@ func composerResponseRouteMAC(apiKey, tenant, sessionID, nonce string) []byte {
 // the durable bridge session route. A Responses client may return only this id
 // after a Go restart; no process-local map or replayed history is required.
 func composerResponseID(apiKey, tenant, sessionID string) string {
+	return composerResponseIDBound(apiKey, tenant, sessionID, "")
+}
+
+func composerResponseIDBound(apiKey, tenant, sessionID, binding string) string {
 	nonce := composerRandHex(8)
 	sid := base64.RawURLEncoding.EncodeToString([]byte(sessionID))
-	sig := base64.RawURLEncoding.EncodeToString(composerResponseRouteMAC(apiKey, tenant, sessionID, nonce))
+	sig := base64.RawURLEncoding.EncodeToString(composerResponseRouteMACBound(apiKey, tenant, sessionID, binding, nonce))
 	// Dot is outside the base64url and hexadecimal alphabets, so parsing never
 	// depends on whether an opaque encoded component happens to contain '_'.
+	if binding != "" {
+		return composerRoutedResponseIDPrefix + sid + "." + binding + "." + nonce + "." + sig
+	}
 	return composerRoutedResponseIDPrefix + sid + "." + nonce + "." + sig
 }
 
 func composerSessionFromResponseID(tenant, apiKey, responseID string) string {
+	return composerRouteFromResponseID(tenant, apiKey, responseID).sessionID
+}
+
+func composerRouteFromResponseID(tenant, apiKey, responseID string) composerResponseRoute {
 	if !strings.HasPrefix(responseID, composerRoutedResponseIDPrefix) {
-		return ""
+		return composerResponseRoute{}
 	}
 	parts := strings.Split(strings.TrimPrefix(responseID, composerRoutedResponseIDPrefix), ".")
-	if len(parts) != 3 || len(parts[1]) != 16 || len(parts[2]) != 22 {
-		return ""
+	if len(parts) != 3 && len(parts) != 4 {
+		return composerResponseRoute{}
 	}
-	if _, err := hex.DecodeString(parts[1]); err != nil {
-		return ""
+	binding := ""
+	nonceIndex, signatureIndex := 1, 2
+	if len(parts) == 4 {
+		binding = parts[1]
+		nonceIndex, signatureIndex = 2, 3
+		if len(binding) != 64 {
+			return composerResponseRoute{}
+		}
+		if _, err := hex.DecodeString(binding); err != nil {
+			return composerResponseRoute{}
+		}
+	}
+	if len(parts[nonceIndex]) != 16 || len(parts[signatureIndex]) != 22 {
+		return composerResponseRoute{}
+	}
+	if _, err := hex.DecodeString(parts[nonceIndex]); err != nil {
+		return composerResponseRoute{}
 	}
 	rawSession, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil || !utf8.Valid(rawSession) || base64.RawURLEncoding.EncodeToString(rawSession) != parts[0] {
-		return ""
+		return composerResponseRoute{}
 	}
 	sessionID := string(rawSession)
 	if !composerRoutedSessionIDPattern.MatchString(sessionID) {
-		return ""
+		return composerResponseRoute{}
 	}
-	supplied, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil || len(supplied) != 16 || base64.RawURLEncoding.EncodeToString(supplied) != parts[2] {
-		return ""
+	supplied, err := base64.RawURLEncoding.DecodeString(parts[signatureIndex])
+	if err != nil || len(supplied) != 16 || base64.RawURLEncoding.EncodeToString(supplied) != parts[signatureIndex] {
+		return composerResponseRoute{}
 	}
-	expected := composerResponseRouteMAC(apiKey, tenant, sessionID, parts[1])
+	expected := composerResponseRouteMACBound(apiKey, tenant, sessionID, binding, parts[nonceIndex])
 	if !hmac.Equal(supplied, expected) {
-		return ""
+		return composerResponseRoute{}
 	}
-	return sessionID
+	return composerResponseRoute{sessionID: sessionID, conversationBinding: binding}
 }
 
 // oaiChunk wraps an OpenAI chat.completion.chunk choice delta as an SSE "data:" line.
@@ -4284,7 +4591,12 @@ func composerStreamResponseHeaders() http.Header {
 	return http.Header{}
 }
 
-const composerEffectiveSessionHeader = "X-CLIProxy-Composer-Session"
+const (
+	composerEffectiveSessionHeader             = "X-CLIProxy-Composer-Session"
+	composerEffectiveConversationBindingHeader = "X-CLIProxy-Composer-Conversation-Binding"
+)
+
+var composerConversationBindingPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // composerEffectiveContinuationSession returns the session selected by the
 // bridge from the signed ToolRound. The locally derived continuation session
@@ -4300,6 +4612,29 @@ func composerEffectiveContinuationSession(resp *http.Response, advisory string, 
 		return advisory
 	}
 	return effective
+}
+
+// composerEffectiveContinuationBinding returns the conversation epoch owned by the signed ToolRound. The
+// bridge emits the effective-session header only after it has loaded and authenticated a signed round; its
+// companion binding therefore outranks the advisory request binding. When the signed round predates bindings,
+// return empty rather than falsely promoting old state into a current /new epoch. A continuation split into a
+// genuinely fresh turn emits neither authoritative header and retains the advisory fresh binding.
+func composerEffectiveContinuationBinding(resp *http.Response, advisory string, continuation bool) (string, error) {
+	if !continuation || resp == nil {
+		return advisory, nil
+	}
+	effectiveSession := strings.TrimSpace(resp.Header.Get(composerEffectiveSessionHeader))
+	if !composerRoutedSessionIDPattern.MatchString(effectiveSession) {
+		return advisory, nil
+	}
+	binding := strings.TrimSpace(resp.Header.Get(composerEffectiveConversationBindingHeader))
+	if binding == "" {
+		return "", nil
+	}
+	if !composerConversationBindingPattern.MatchString(binding) {
+		return "", fmt.Errorf("malformed authoritative conversation binding header")
+	}
+	return binding, nil
 }
 
 // composerContinuationLeaseStop validates the bridge's opaque fresh-lease
@@ -4366,19 +4701,20 @@ func composerDebugLogAdvertisedTools(responseID string, advertise []map[string]a
 
 // composerInboundTurn holds validated per-turn state shared by executeComposer and executeComposerStream.
 type composerInboundTurn struct {
-	model        string
-	responseID   string
-	tenant       string
-	contHint     composerContinuationHint
-	oai          []byte
-	defs         []cursorToolDefinition
-	toolAliases  map[string]string
-	sessionID    string
-	leaseOwner   uint64
-	continuation bool
-	utility      bool
-	clientEnv    map[string]any
-	input        map[string]any
+	model               string
+	responseID          string
+	tenant              string
+	contHint            composerContinuationHint
+	oai                 []byte
+	defs                []cursorToolDefinition
+	toolAliases         map[string]string
+	sessionID           string
+	leaseOwner          uint64
+	continuation        bool
+	utility             bool
+	clientEnv           map[string]any
+	input               map[string]any
+	conversationBinding string
 }
 
 func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (composerInboundTurn, error) {
@@ -4395,6 +4731,11 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	turn.oai = sdktranslator.TranslateRequest(from, to, req.Model, sourcePayload, stream)
 	turn.oai = composerForceStoreTrue(turn.oai)
 	turn.tenant = composerTenant(auth, opts)
+	// Identity conflicts outrank provenance clarification. Otherwise an ambiguous request with stale /new
+	// headers can receive a signed 422 token under the wrong conversation before reaching the typed 409.
+	if _, identityErr := resolveComposerConversationIdentity(opts); identityErr != nil {
+		return turn, identityErr
+	}
 	turn.contHint = composerContinuationHintFor(turn.tenant, turn.oai)
 	messages := gjson.GetBytes(turn.oai, "messages").Array()
 	_, _, turn.continuation = composerToolResultsHinted(messages, turn.contHint)
@@ -4403,6 +4744,10 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	} else if rewritten != nil {
 		turn.oai = rewritten
 		messages = gjson.GetBytes(turn.oai, "messages").Array()
+		// Provenance normalization can drop or rewrite untrusted tool-result shapes. Classification must use the
+		// payload actually dispatched; retaining the pre-rewrite value can send a fresh user turn to /continue.
+		turn.contHint = composerContinuationHintFor(turn.tenant, turn.oai)
+		_, _, turn.continuation = composerToolResultsHinted(messages, turn.contHint)
 	}
 	if lastUserTurnImageOnlyInvalid(messages, turn.contHint) {
 		return turn, errComposerImageOnlyInvalid
@@ -4411,6 +4756,14 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	turn.utility = isComposerUtilityOneShot(turn.oai, opts, turn.contHint)
 	turn.toolAliases = composerToolAliases(auth)
 	turn.input = composerInputHinted(turn.oai, turn.contHint)
+	conversationKey, identityErr := composerConversationKey(opts, messages)
+	if identityErr != nil {
+		return turn, identityErr
+	}
+	turn.conversationBinding = composerConversationBinding(turn.tenant, apiKey, conversationKey)
+	if turn.conversationBinding != "" {
+		turn.input["conversationBinding"] = turn.conversationBinding
+	}
 	invocationID := composerInvocationID(turn.oai, opts)
 	if invocationID != "" {
 		turn.input["invocationId"] = invocationID
@@ -4431,7 +4784,7 @@ func (e *CursorExecutor) prepareComposerInbound(auth *cliproxyauth.Auth, apiKey 
 	if err != nil {
 		return turn, err
 	}
-	turn.responseID = composerResponseID(apiKey, turn.tenant, turn.sessionID)
+	turn.responseID = composerResponseIDBound(apiKey, turn.tenant, turn.sessionID, turn.conversationBinding)
 	return turn, nil
 }
 
@@ -4505,11 +4858,15 @@ func composerValidateAgentTurnPreStream(resp *http.Response, responseID string, 
 		} else {
 			log.Errorf("[composer %s] bridge NON-2xx corr=%s status=%d body=%s", responseID, corr, resp.StatusCode, sanitizeBridgeBody(errBody))
 		}
+		requestedBytes, availableBytes, priority := parseComposerCapacityMetadata(errBody)
 		return &composerBridgeStatusError{
-			status:      resp.StatusCode,
-			correlation: corr,
-			retryAfter:  retryAfter,
-			bridgeCode:  parseComposerBridgeErrorCode(errBody),
+			status:         resp.StatusCode,
+			correlation:    corr,
+			retryAfter:     retryAfter,
+			bridgeCode:     parseComposerBridgeErrorCode(errBody),
+			requestedBytes: requestedBytes,
+			availableBytes: availableBytes,
+			priority:       priority,
 		}
 	}
 	if !composerResponseIsSSE(resp) {
@@ -4592,11 +4949,25 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		composerInflight.release(tenant, sessionID, leaseOwner)
 		return nil, err
 	}
+	effectiveBinding, bindingErr := composerEffectiveContinuationBinding(
+		httpResp, turn.conversationBinding, continuation,
+	)
+	if bindingErr != nil {
+		_ = httpResp.Body.Close()
+		protocolErr := newComposerBridgeProtocolError(responseID,
+			"invalid effective conversation binding", bindingErr.Error())
+		reporter.PublishFailure(ctx, protocolErr)
+		reporter.EnsurePublished(ctx)
+		composerInflight.release(tenant, sessionID, leaseOwner)
+		return nil, protocolErr
+	}
 	if effectiveSessionID := composerEffectiveContinuationSession(httpResp, sessionID, continuation); effectiveSessionID != sessionID {
 		composerDebugf("[composer %s] continuation effective session corrected advisory=%s routed=%s", responseID, sessionID, effectiveSessionID)
 		sessionID = effectiveSessionID
 		leaseSessionID = effectiveSessionID
-		responseID = composerResponseID(apiKey, tenant, effectiveSessionID)
+	}
+	if effectiveBinding != turn.conversationBinding || sessionID != turn.sessionID {
+		responseID = composerResponseIDBound(apiKey, tenant, sessionID, effectiveBinding)
 	}
 
 	// #21 (C-RESPID): the bridge has now accepted a valid SSE stream, so record outward-response-id -> sessionID
@@ -5031,11 +5402,24 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 		composerInflight.release(tenant, sessionID, leaseOwner)
 		return cliproxyexecutor.Response{}, err
 	}
+	effectiveBinding, bindingErr := composerEffectiveContinuationBinding(
+		httpResp, turn.conversationBinding, continuation,
+	)
+	if bindingErr != nil {
+		protocolErr := newComposerBridgeProtocolError(responseID,
+			"invalid effective conversation binding", bindingErr.Error())
+		reporter.PublishFailure(ctx, protocolErr)
+		reporter.EnsurePublished(ctx)
+		composerInflight.release(tenant, sessionID, leaseOwner)
+		return cliproxyexecutor.Response{}, protocolErr
+	}
 	if effectiveSessionID := composerEffectiveContinuationSession(httpResp, sessionID, continuation); effectiveSessionID != sessionID {
 		composerDebugf("[composer %s] continuation effective session corrected advisory=%s routed=%s", responseID, sessionID, effectiveSessionID)
 		sessionID = effectiveSessionID
 		leaseSessionID = effectiveSessionID
-		responseID = composerResponseID(apiKey, tenant, effectiveSessionID)
+	}
+	if effectiveBinding != turn.conversationBinding || sessionID != turn.sessionID {
+		responseID = composerResponseIDBound(apiKey, tenant, sessionID, effectiveBinding)
 	}
 
 	// #21 (C-RESPID): the bridge accepted a valid SSE stream -> NOW record outward-response-id -> sessionID, so a
@@ -5365,6 +5749,17 @@ func composerAdmissionConfig() (maxActive int, maxQueue int, minGap time.Duratio
 }
 
 func composerAdmissionApplies(body []byte) bool {
+	// The bridge owns the authoritative global, priority-aware admission queue.
+	// Keeping a second default-on polling gate here can reorder recovery behind
+	// fresh work and multiplies the queue bound per credential. Retain the old
+	// per-key limiter only as an explicit operator compatibility switch.
+	//
+	// DEPRECATED (P5.6): two unreconciled admission authorities are a landmine.
+	// This gate stays default-off; after one canary cycle of the bridge priority
+	// queue it should be deleted outright rather than re-enabled.
+	if strings.TrimSpace(os.Getenv("CURSOR_COMPOSER_GO_ADMISSION")) != "1" {
+		return false
+	}
 	return gjson.GetBytes(body, "input.type").String() != "tool_results"
 }
 

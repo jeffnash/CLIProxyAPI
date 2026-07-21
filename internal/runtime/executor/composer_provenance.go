@@ -30,27 +30,17 @@ func composerProvenance() *turnprovenance.Resolver {
 	return composerProvenanceResolver
 }
 
-func composerConversationIDFromPayload(payload []byte) string {
-	for _, path := range []string{
-		"metadata.cliproxy.conversation_id",
-		"metadata.conversation_id",
-		"metadata.conversationId",
-		"metadata.session_id",
-		"metadata.sessionId",
-		"conversation_id",
-	} {
-		if v := strings.TrimSpace(gjson.GetBytes(payload, path).String()); v != "" {
-			return v
-		}
+func composerConversationIDForProvenance(_ []byte, opts cliproxyexecutor.Options) string {
+	// The same resolver covers body aliases, authenticated conversation headers,
+	// and execution metadata. A conflict is rejected by normal request identity
+	// validation; this helper remains side-effect free while that typed 409 is
+	// propagated by the caller.
+	if identity, err := resolveComposerConversationIdentity(opts); err == nil && identity.ID != "" {
+		return identity.ID
 	}
-	userID := strings.TrimSpace(gjson.GetBytes(payload, "metadata.user_id").String())
-	if strings.HasPrefix(userID, "{") {
-		for _, k := range []string{"session_id", "conversation_id", "thread_id"} {
-			if v := strings.TrimSpace(gjson.Get(userID, k).String()); v != "" {
-				return v
-			}
-		}
-	}
+	// Do not independently discover aliases from translated payloads here. Durable
+	// routing and provenance must either use the same canonical explicit identity or
+	// both fall back; otherwise one request can acquire two conversation keys.
 	return ""
 }
 
@@ -74,10 +64,7 @@ func resolveComposerProvenance(tenantID string, oai []byte, opts cliproxyexecuto
 	// Keep the legacy structural detector as an input signal, not final policy.
 	_ = composerAmbiguousTrailingUserSegments(gjson.Parse(messagesRaw).Array())
 
-	conversationID := composerConversationIDFromPayload(opts.OriginalRequest)
-	if conversationID == "" {
-		conversationID = composerConversationIDFromPayload(oai)
-	}
+	conversationID := composerConversationIDForProvenance(oai, opts)
 	invocationID := composerInvocationID(oai, opts)
 	in := turnprovenance.Input{
 		TenantID:       tenantID,
@@ -143,10 +130,7 @@ func observeComposerCompleted(tenantID string, oai []byte, opts cliproxyexecutor
 	if len(segments) == 0 {
 		return
 	}
-	conversationID := composerConversationIDFromPayload(opts.OriginalRequest)
-	if conversationID == "" {
-		conversationID = composerConversationIDFromPayload(oai)
-	}
+	conversationID := composerConversationIDForProvenance(oai, opts)
 	composerProvenance().ObserveCompletedTurn(turnprovenance.Input{
 		TenantID:       tenantID,
 		ConversationID: conversationID,

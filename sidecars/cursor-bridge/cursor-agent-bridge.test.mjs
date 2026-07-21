@@ -45,6 +45,8 @@ async function spawnNodeCaptured(args, options = {}) {
 
 const bridge = await import("./cursor-agent-bridge.mjs");
 const { createRoundInfrastructure, ToolRound, ToolRoundError, TerminalReason } = await import("./tool-round.mjs");
+const { ADMISSION_PRIORITY } = await import("./adaptive-reservation.mjs");
+const { markerPath, readMarker } = await import("./sdk-agent-gc.mjs");
 const {
   AdvertisedToolRegistry,
   appendRulesReminder,
@@ -70,15 +72,19 @@ const {
   completedTurnRequestHash,
   cleanupCompletedTurnReceipts,
   readFreshDeliveryReceipt,
+  readAuthoritativeSdkAgentRoots,
   runBoundedShutdownTasks,
   runDurableMaintenance,
   turnInvocationIdentity,
+  turnFailureMetadata,
   validCompletedTurnReceipt,
   continuationTenantMismatch,
+  continuationAdmissionPriority,
   constraintInstructions,
   dispatchMcpBatch,
   effectiveAdvertise,
   envInt,
+  ensureAgent,
   handleContinue,
   handleHttpRequestSafely,
   handleTurn,
@@ -109,6 +115,9 @@ const {
   refreshSessionFromBody,
   sessions,
   sdkAdvertisedTools,
+  sdkAgentGCCensus,
+  sdkAgentGCRoots,
+  sdkAgentRootGeneration,
   sdkSendIdempotencyKey,
   stateRootDiskStatus,
   systemContextPlan,
@@ -131,6 +140,601 @@ const {
   validateBindHost,
   wrapToolInput,
 } = bridge;
+
+// P3.4: a corrupt alias no longer wedges all root discovery (fail-closed-throw) nor silently
+// unprotects the agent (fail-open-skip): the file is quarantined aside and any extractable
+// agentId stays a protected root.
+test("GC root discovery quarantines structurally malformed v2 aliases and protects the extractable agent (P3.4)", (t) => {
+  const aliasDir = path.join(TEST_STATE_ROOT, ".cct-agent-alias");
+  const badDir = path.join(TEST_STATE_ROOT, ".cct-quarantine-bad");
+  mkdirSync(aliasDir, { recursive: true });
+  const base = `malformed-root-${Date.now()}.json`;
+  const file = path.join(aliasDir, base);
+  t.after(() => {
+    rmSync(file, { force: true });
+    try {
+      for (const name of readdirSync(badDir)) {
+        if (name.startsWith(base)) rmSync(path.join(badDir, name), { force: true });
+      }
+    } catch {}
+  });
+  writeFileSync(file, JSON.stringify({
+    version: 2,
+    keyFingerprint: "fingerprint",
+    sessionId: "malformed-root",
+    agentId: "malformed-root_agent",
+    createdAt: Date.now(),
+    lastUsedAt: "not-an-integer",
+    generation: 1,
+    conversationBinding: "",
+  }));
+  const roots = sdkAgentGCRoots();
+  assert.equal(existsSync(file), false, "malformed alias must be renamed aside, not left to wedge discovery");
+  assert.ok(roots.has("malformed-root_agent"), "an extractable agentId stays protected after quarantine");
+  assert.ok(sdkAgentGCRoots().has("malformed-root_agent"),
+    "the quarantined evidence must remain a hard root on every later census");
+});
+
+test("anonymous unreadable quarantined evidence blocks GC root discovery fail closed", (t) => {
+  const badDir = path.join(TEST_STATE_ROOT, ".cct-quarantine-bad");
+  mkdirSync(badDir, { recursive: true });
+  const file = path.join(badDir, `anonymous-${Date.now()}.json.bad`);
+  writeFileSync(file, "{not-json");
+  t.after(() => rmSync(file, { force: true }));
+  assert.throws(() => sdkAgentGCRoots(), /unresolved corrupt durable evidence blocks SDK agent GC/);
+});
+
+test("durable alias publication advances the cheap GC root generation", async () => {
+  const before = sdkAgentRootGeneration();
+  const session = new Session(`generation-${Date.now()}`, "generation-key", "d".repeat(64));
+  await session.persistDurableAlias();
+  const after = sdkAgentRootGeneration();
+  assert.notEqual(after, before);
+  assert.match(after, /^[a-f0-9]{64}$/);
+  assert.equal(await session.touchDurableAlias(), false, "hot turns do not churn the global root generation");
+  assert.equal(sdkAgentRootGeneration(), after);
+});
+
+test("an alias published after its census slot is retried into the authoritative root snapshot", async (t) => {
+  const aliasDir = path.join(TEST_STATE_ROOT, ".cct-agent-alias");
+  mkdirSync(aliasDir, { recursive: true });
+  const file = path.join(aliasDir, `alias-race-${Date.now()}.json`);
+  const sessionId = `alias-race-session-${Date.now()}`;
+  const agentId = `${sessionId}_agent`;
+  const priorNodeEnv = process.env.NODE_ENV;
+  process.env.NODE_ENV = "test";
+  let injected = false;
+  globalThis.__CCT_TEST_AFTER_ALIAS_ROOTS = async () => {
+    if (injected) return;
+    injected = true;
+    writeFileSync(file, JSON.stringify({
+      version: 1,
+      keyFingerprint: "a".repeat(64),
+      sessionId,
+      agentId,
+    }));
+  };
+  t.after(() => {
+    delete globalThis.__CCT_TEST_AFTER_ALIAS_ROOTS;
+    if (priorNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = priorNodeEnv;
+    rmSync(file, { force: true });
+  });
+  const snapshot = await readAuthoritativeSdkAgentRoots({
+    async scan() { return { roots: new Set() }; },
+  });
+  assert.equal(existsSync(file), true, "the injected alias remains readable");
+  assert.ok(sdkAgentGCRoots().has(agentId), "a direct post-publication scan sees the alias");
+  assert.equal(snapshot.complete, true);
+  assert.ok(snapshot.roots.has(agentId), "the retry must include the concurrently published alias");
+});
+
+test("a missing aliased agent requires bounded reseed and never blank-creates", async (t) => {
+  const cursorKey = `missing-alias-key-${Date.now()}`;
+  const session = new Session(`missing-alias-${Date.now()}`, cursorKey, "e".repeat(64));
+  await session.persistDurableAlias();
+  let creates = 0;
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { creates++; return {}; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  t.after(() => platforms.delete(keyHash(cursorKey)));
+
+  await assert.rejects(ensureAgent(session, "composer-2.5"),
+    (error) => error instanceof ToolRoundError
+      && error.code === "collected_agent_history_required" && error.status === 410);
+  assert.equal(creates, 0);
+
+  session.reseedAllowed = true;
+  await ensureAgent(session, "composer-2.5");
+  assert.equal(creates, 1);
+  assert.equal(session.reseeding, true);
+});
+
+// P1.1 / audit R1: the not-found branch is an EVIDENCE TABLE, never a silent blank create.
+// Evidence ∈ {none, alias, tombstone(deleted), quarantined marker, corrupt marker};
+// history ∈ {absent, present}. Blank createAgent is reachable ONLY for provable first use
+// (no alias ever written, no marker, no tombstone). Every other combination is either a
+// faithful bounded reseed (history present) or a typed 410 (history absent). This runs with
+// GC disabled (the current production state), so the tombstone/alias consultation on the
+// not-found path must stand on its own.
+test("ensureAgent not-found evidence table: reseed-or-410, blank-create only on provable first use (P1.1)", async (t) => {
+  const gcDir = path.join(TEST_STATE_ROOT, ".cct-agent-gc");
+  mkdirSync(gcDir, { recursive: true });
+  const makeCase = async (name, { evidence, history }) => {
+    const cursorKey = `nf-${name}-${Date.now()}`;
+    const session = new Session(`nf-${name}-${Date.now()}`, cursorKey, "f".repeat(64));
+    const agentId = session.agentId || session.id;
+    const scope = keyHash(cursorKey);
+    let creates = 0;
+    platforms.set(scope, {
+      promise: Promise.resolve({
+        async resumeAgent() { throw new Error("agent not found"); },
+        async createAgent() { creates++; return {}; },
+      }),
+      stateRoot: TEST_STATE_ROOT,
+      lastUsed: Date.now(),
+      fp: keyFingerprint(cursorKey),
+    });
+    const files = [];
+    if (evidence === "alias") await session.persistDurableAlias();
+    if (evidence === "tombstone" || evidence === "quarantined" || evidence === "corrupt") {
+      const file = markerPath(gcDir, scope, agentId);
+      const record = evidence === "tombstone"
+        ? { version: 1, scope, agentId, quarantinedAt: Date.now() - 1000, status: "deleted", deletedAt: Date.now() }
+        : evidence === "quarantined"
+          ? { version: 1, scope, agentId, quarantinedAt: Date.now() - 1000, status: "quarantined" }
+          : { version: 999, scope, agentId }; // malformed: readMarker must throw -> fail closed
+      writeFileSync(file, JSON.stringify(record));
+      files.push(file);
+    }
+    if (history) session.reseedAllowed = true;
+    t.after(() => { platforms.delete(scope); for (const f of files) rmSync(f, { force: true }); });
+    return { session, agentId, creates: () => creates };
+  };
+
+  // Provable first use (no alias ever, no marker): minting is correct, no reseed flag.
+  {
+    const c = await makeCase("firstuse", { evidence: null, history: false });
+    await ensureAgent(c.session, "composer-2.5");
+    assert.equal(c.creates(), 1, "first use mints the agent");
+    assert.notEqual(c.session.reseeding, true, "first use is not a reseed");
+  }
+  // No evidence but history present: loud reseed (not_found_bare), never a silent blank.
+  {
+    const c = await makeCase("bare-history", { evidence: null, history: true });
+    await ensureAgent(c.session, "composer-2.5");
+    assert.equal(c.creates(), 1);
+    assert.equal(c.session.reseeding, true, "bare missing agent with history reseeds faithfully");
+  }
+  // Alias proves prior life.
+  {
+    const c = await makeCase("alias-nohistory", { evidence: "alias", history: false });
+    await assert.rejects(ensureAgent(c.session, "composer-2.5"),
+      (e) => e instanceof ToolRoundError && e.code === "collected_agent_history_required" && e.status === 410);
+    assert.equal(c.creates(), 0, "aliased missing agent without history must 410, never blank-create");
+  }
+  {
+    const c = await makeCase("alias-history", { evidence: "alias", history: true });
+    await ensureAgent(c.session, "composer-2.5");
+    assert.equal(c.creates(), 1);
+    assert.equal(c.session.reseeding, true);
+  }
+  // Tombstone proves prior deletion.
+  {
+    const c = await makeCase("tombstone-nohistory", { evidence: "tombstone", history: false });
+    await assert.rejects(ensureAgent(c.session, "composer-2.5"),
+      (e) => e instanceof ToolRoundError && e.code === "collected_agent_history_required" && e.status === 410);
+    assert.equal(c.creates(), 0);
+  }
+  {
+    const c = await makeCase("tombstone-history", { evidence: "tombstone", history: true });
+    await ensureAgent(c.session, "composer-2.5");
+    assert.equal(c.creates(), 1);
+    assert.equal(c.session.reseeding, true);
+  }
+  // A quarantined marker for a now-missing agent is prior-life evidence too.
+  {
+    const c = await makeCase("quarantined-nohistory", { evidence: "quarantined", history: false });
+    await assert.rejects(ensureAgent(c.session, "composer-2.5"),
+      (e) => e instanceof ToolRoundError && e.status === 410);
+    assert.equal(c.creates(), 0);
+  }
+  {
+    const c = await makeCase("quarantined-history", { evidence: "quarantined", history: true });
+    await ensureAgent(c.session, "composer-2.5");
+    assert.equal(c.creates(), 1);
+    assert.equal(c.session.reseeding, true);
+  }
+  // Corrupt marker fails CLOSED toward protection: never permission to blank-create.
+  {
+    const c = await makeCase("corrupt-nohistory", { evidence: "corrupt", history: false });
+    await assert.rejects(ensureAgent(c.session, "composer-2.5"),
+      (e) => e instanceof ToolRoundError && e.code === "agent_missing_history_required" && e.status === 410);
+    assert.equal(c.creates(), 0, "unreadable evidence is still evidence");
+  }
+});
+
+// P1.2: the one-shot backfill heals pre-tombstone deletions — every alias whose agent 404s
+// gains a status:"deleted" tombstone (so resumes resolve through the evidence table), live
+// agents are untouched, dry-run writes nothing, and the done marker makes it run once.
+test("P9: alias roots honor the 24h TTL (stale aliases stop protecting; fresh ones protect)", (t) => {
+  const aliasDir = path.join(TEST_STATE_ROOT, ".cct-agent-alias");
+  mkdirSync(aliasDir, { recursive: true });
+  const now = Date.now();
+  const freshFile = path.join(aliasDir, `ttl-fresh-${now}.json`);
+  const staleFile = path.join(aliasDir, `ttl-stale-${now}.json`);
+  t.after(() => { rmSync(freshFile, { force: true }); rmSync(staleFile, { force: true }); });
+  writeFileSync(freshFile, JSON.stringify({
+    version: 2, keyFingerprint: "fp", sessionId: "ttl-fresh-s", agentId: "ttl-fresh-s_agent",
+    createdAt: now, lastUsedAt: now, generation: 1, conversationBinding: "",
+  }));
+  const staleAt = now - 49 * 60 * 60 * 1000;
+  writeFileSync(staleFile, JSON.stringify({
+    version: 2, keyFingerprint: "fp", sessionId: "ttl-stale-s", agentId: "ttl-stale-s_agent",
+    createdAt: staleAt, lastUsedAt: staleAt, generation: 1, conversationBinding: "",
+  }));
+  const roots = sdkAgentGCRoots();
+  assert.ok(roots.has("ttl-fresh-s_agent"), "a touched alias protects its agent");
+  assert.equal(roots.has("ttl-stale-s_agent"), false, "an alias idle past the 24h TTL stops protecting");
+});
+
+test("partial local checkpoints never authorize a history-less collected-agent reseed", async (t) => {
+  const cursorKey = `checkpoint-reseed-key-${Date.now()}`;
+  const sessionId = `checkpoint-reseed-${Date.now()}`;
+  const session = new Session(sessionId, cursorKey, "a".repeat(64));
+  await session.persistDurableAlias();
+  const checkpointDir = path.join(TEST_STATE_ROOT, ".cct-checkpoints");
+  mkdirSync(checkpointDir, { recursive: true });
+  const checkpointFile = path.join(checkpointDir, `${createHash("sha256")
+    .update("composer-checkpoint\x00" + sessionId).digest("hex")}.json`);
+  writeFileSync(checkpointFile, JSON.stringify({
+    version: 1,
+    segments: [{ seq: 1, userText: "partial prior context", assistantText: "partial answer" }],
+    toolResults: {},
+    tokenEstimate: 8,
+  }));
+  t.after(() => rmSync(checkpointFile, { force: true }));
+  let creates = 0;
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() {
+        creates++;
+        return { async close() {} };
+      },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  t.after(() => platforms.delete(keyHash(cursorKey)));
+
+  session.reseedAllowed = false;
+  await assert.rejects(
+    () => ensureAgent(session, "cursor-grok-4.5"),
+    (error) => error instanceof ToolRoundError
+      && error.code === "collected_agent_history_required" && error.status === 410,
+  );
+  if (session.agentUseLease) {
+    await session.agentUseLease.release();
+    session.agentUseLease = null;
+  }
+  assert.equal(creates, 0, "partial checkpoint evidence never permits blank recreation");
+});
+
+test("P6.1: expired receipt tombstones unlink after grace; in-grace and unresolved receipts survive", async (t) => {
+  const dir = path.join(TEST_STATE_ROOT, ".cct-completed-turns");
+  mkdirSync(dir, { recursive: true });
+  const oldExpired = "a1".repeat(32);
+  const freshExpired = "b2".repeat(32);
+  const unresolved = "c3".repeat(32);
+  const write = (hex, record) => writeFileSync(path.join(dir, `${hex}.json`), JSON.stringify(record));
+  write(oldExpired, { version: 1, status: "expired", expiredAt: Date.now() - 2 * 60 * 60 * 1000 });
+  write(freshExpired, { version: 1, status: "expired", expiredAt: Date.now() });
+  write(unresolved, { version: 1, status: "delivering", agentId: "unresolved-agent-p6" });
+  t.after(() => {
+    for (const hex of [oldExpired, freshExpired, unresolved]) rmSync(path.join(dir, `${hex}.json`), { force: true });
+  });
+  bridge.reclaimTombstonedDurableFiles();
+  assert.equal(existsSync(path.join(dir, `${oldExpired}.json`)), false, "grace-expired tombstone is physically reclaimed");
+  assert.equal(existsSync(path.join(dir, `${freshExpired}.json`)), true, "tombstone inside the grace window survives");
+  assert.equal(existsSync(path.join(dir, `${unresolved}.json`)), true, "unresolved acceptance evidence is NEVER reclaimed");
+});
+
+test("P5: reservations shard by key nibble; concurrent reserves all land and release cleans exactly its entry", async (t) => {
+  const ledgerDir = path.join(TEST_STATE_ROOT, ".cct-completed-turns", ".unresolved-reservations");
+  const readShard = (nibble) => {
+    try { return JSON.parse(readFileSync(path.join(ledgerDir, `${nibble}.json`), "utf8")).entries || {}; }
+    catch { return {}; }
+  };
+  const allEntries = () => {
+    const entries = {};
+    for (const nibble of "0123456789abcdef") Object.assign(entries, readShard(nibble));
+    return entries;
+  };
+  const before = new Set(Object.keys(allEntries()));
+  // 64 concurrent reserves with sha-shaped keys spread across all 16 nibbles.
+  const keys = [];
+  await Promise.all(Array.from({ length: 64 }, (_, i) => {
+    const key = createHash("sha256").update(`p5-shard-${Date.now()}-${i}`).digest("hex");
+    keys.push(key);
+    return Promise.resolve().then(() => bridge.reserveUnresolvedReceipt(`/receipts/${key}.json`, 2 * 1024 * 1024));
+  }));
+  const added = Object.keys(allEntries()).filter((key) => !before.has(key));
+  assert.equal(added.length, 64, "every concurrent reserve landed (CAS retries, no 507)");
+  const usedShards = new Set(keys.map((key) => key[0]));
+  assert.ok(usedShards.size >= 8, `keys must distribute across shards (got ${usedShards.size})`);
+  for (const key of keys) {
+    const ledgerKey = `${key}.json`; // reservation keys are receipt basenames
+    assert.ok(readShard(ledgerKey[0])[ledgerKey], "entry lives in the shard for its key nibble");
+  }
+  // Release removes exactly the released entries.
+  for (const key of keys) bridge.releaseUnresolvedReceipt(`/receipts/${key}.json`);
+  const after = Object.keys(allEntries()).filter((key) => !before.has(key));
+  assert.deepEqual(after, [], "all test reservations released");
+});
+
+test("P5: aggregate-lock contention waits without blocking the Node event loop", async () => {
+  const ledgerDir = path.join(TEST_STATE_ROOT, ".cct-completed-turns", ".unresolved-reservations");
+  const lockDir = path.join(ledgerDir, ".aggregate-lock");
+  mkdirSync(lockDir, { recursive: true });
+  writeFileSync(path.join(lockDir, "owner"), "external-owner\n");
+  let timerRan = false;
+  const releaseTimer = setTimeout(() => {
+    timerRan = true;
+    rmSync(lockDir, { recursive: true, force: true });
+  }, 50);
+  const key = createHash("sha256").update(`nonblocking-lock-${Date.now()}`).digest("hex");
+  try {
+    await bridge.reserveUnresolvedReceipt(`/receipts/${key}.json`, 1024);
+    assert.equal(timerRan, true, "the timer must run while admission is waiting on another process");
+  } finally {
+    clearTimeout(releaseTimer);
+    bridge.releaseUnresolvedReceipt(`/receipts/${key}.json`);
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+});
+
+test("P5: resize is shrink-only and cannot bypass aggregate admission", async () => {
+  const key = createHash("sha256").update(`resize-monotonic-${Date.now()}`).digest("hex");
+  await bridge.reserveUnresolvedReceipt(`/receipts/${key}.json`, 1024);
+  try {
+    assert.throws(
+      () => bridge.resizeUnresolvedReceipt(`/receipts/${key}.json`, 1025),
+      /reservation growth must use reserveExactBytes/,
+    );
+  } finally {
+    bridge.releaseUnresolvedReceipt(`/receipts/${key}.json`);
+  }
+});
+
+test("P5: cross-process cross-shard reservations cannot overcommit the aggregate byte ceiling", async (t) => {
+  const raceRoot = mkdtempSync(path.join(tmpdir(), "cursor-reservation-race-"));
+  t.after(() => rmSync(raceRoot, { recursive: true, force: true }));
+  const moduleUrl = new URL("./cursor-agent-bridge.mjs", import.meta.url).href;
+  const startAt = Date.now() + 1200;
+  const children = [];
+  for (let index = 0; index < 8; index++) {
+    const key = `${index.toString(16)}${createHash("sha256").update(`aggregate-race-${index}`).digest("hex").slice(1)}.json`;
+    const source = `
+      const bridge = await import(${JSON.stringify(moduleUrl)});
+      const view = new Int32Array(new SharedArrayBuffer(4));
+      while (Date.now() < ${startAt}) Atomics.wait(view, 0, 0, Math.min(20, ${startAt} - Date.now()));
+      try {
+        await bridge.reserveUnresolvedReceipt(${JSON.stringify(`/receipts/${key}`)}, 262144);
+        process.stdout.write("WIN\\n");
+      } catch (error) {
+        process.stdout.write("LOSS:" + (error.code || error.message) + "\\n");
+      }
+    `;
+    children.push(spawnNodeCaptured(["--input-type=module", "--eval", source], {
+      cwd: path.dirname(new URL(import.meta.url).pathname),
+      env: {
+        ...process.env,
+        CURSOR_AGENT_STATE_ROOT: raceRoot,
+        CURSOR_COMPOSER_UNRESOLVED_RECEIPT_MAX_BYTES: String(1024 * 1024),
+      },
+    }));
+  }
+  const results = await Promise.all(children);
+  for (const child of results) assert.equal(child.code, 0, child.stderr);
+  const wins = results.filter((child) => child.stdout.trim() === "WIN");
+  const losses = results.filter((child) => child.stdout.trim() === "LOSS:durable_state_capacity");
+  assert.equal(wins.length, 4, "exactly four 256KiB claims fit the shared 1MiB ceiling");
+  assert.equal(losses.length, 4, "every excess cross-shard writer fails closed");
+
+  const ledgerDir = path.join(raceRoot, ".cct-completed-turns", ".unresolved-reservations");
+  let reserved = 0;
+  for (const nibble of "0123456789abcdef") {
+    try {
+      const shard = JSON.parse(readFileSync(path.join(ledgerDir, `${nibble}.json`), "utf8"));
+      for (const entry of Object.values(shard.entries || {})) reserved += Number(entry.bytes) || 0;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  assert.equal(reserved, 1024 * 1024, "durable aggregate equals, and never exceeds, its ceiling");
+});
+
+test("P5: an unreadable reservation shard fails admission closed", async (t) => {
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "cursor-reservation-corrupt-"));
+  t.after(() => rmSync(stateRoot, { recursive: true, force: true }));
+  const moduleUrl = new URL("./cursor-agent-bridge.mjs", import.meta.url).href;
+  const source = `
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const path = await import("node:path");
+    const ledger = path.join(process.env.CURSOR_AGENT_STATE_ROOT, ".cct-completed-turns", ".unresolved-reservations");
+    mkdirSync(ledger, { recursive: true });
+    writeFileSync(path.join(ledger, "a.json"), "{corrupt");
+    const bridge = await import(${JSON.stringify(moduleUrl)});
+    try {
+      await bridge.reserveUnresolvedReceipt("/receipts/b" + "1".repeat(63) + ".json", 65536);
+      process.stdout.write("FAIL_OPEN\\n");
+    } catch (error) {
+      process.stdout.write("FAIL_CLOSED:" + error.name + "\\n");
+    }
+  `;
+  const child = await spawnNodeCaptured(["--input-type=module", "--eval", source], {
+    cwd: path.dirname(new URL(import.meta.url).pathname),
+    env: { ...process.env, CURSOR_AGENT_STATE_ROOT: stateRoot },
+  });
+  assert.equal(child.code, 0, child.stderr);
+  assert.match(child.stdout, /^FAIL_CLOSED:/, "corrupt capacity evidence is never counted as zero");
+});
+
+test("P5: global entry capacity has no 256-entry hash-shard cliff", async (t) => {
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "cursor-reservation-skew-"));
+  t.after(() => rmSync(stateRoot, { recursive: true, force: true }));
+  const moduleUrl = new URL("./cursor-agent-bridge.mjs", import.meta.url).href;
+  const source = `
+    const bridge = await import(${JSON.stringify(moduleUrl)});
+    let admitted = 0;
+    for (let index = 0; index < 300; index++) {
+      const suffix = index.toString(16).padStart(63, "0");
+      await bridge.reserveUnresolvedReceipt("/receipts/a" + suffix + ".json", 1);
+      admitted++;
+    }
+    let overflow = "accepted";
+    try { await bridge.reserveUnresolvedReceipt("/receipts/a" + "f".repeat(63) + ".json", 1); }
+    catch (error) { overflow = error.code || error.message; }
+    process.stdout.write(JSON.stringify({ admitted, overflow }) + "\\n");
+  `;
+  const child = await spawnNodeCaptured(["--input-type=module", "--eval", source], {
+    cwd: path.dirname(new URL(import.meta.url).pathname),
+    env: {
+      ...process.env,
+      CURSOR_AGENT_STATE_ROOT: stateRoot,
+      CURSOR_COMPOSER_UNRESOLVED_RESERVATION_MAX_ENTRIES: "300",
+    },
+  });
+  assert.equal(child.code, 0, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), { admitted: 300, overflow: "durable_state_capacity" });
+});
+
+test("P5: partial legacy migration preserves the legacy ledger for retry", async (t) => {
+  const stateRoot = mkdtempSync(path.join(tmpdir(), "cursor-reservation-migration-"));
+  t.after(() => rmSync(stateRoot, { recursive: true, force: true }));
+  const moduleUrl = new URL("./cursor-agent-bridge.mjs", import.meta.url).href;
+  const source = `
+    const { existsSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const path = await import("node:path");
+    const completed = path.join(process.env.CURSOR_AGENT_STATE_ROOT, ".cct-completed-turns");
+    const shards = path.join(completed, ".unresolved-reservations");
+    mkdirSync(shards, { recursive: true });
+    const entry = { bytes: 65536, materializedBytes: 0, createdAt: Date.now() };
+    const legacy = path.join(completed, ".unresolved-reservations.json");
+    writeFileSync(legacy, JSON.stringify({ version: 1, entries: { ["a" + "1".repeat(63) + ".json"]: entry, ["b" + "2".repeat(63) + ".json"]: entry } }));
+    writeFileSync(path.join(shards, "b.json"), "{corrupt");
+    const bridge = await import(${JSON.stringify(moduleUrl)});
+    try { await bridge.reserveUnresolvedReceipt("/receipts/c" + "3".repeat(63) + ".json", 65536); } catch {}
+    process.stdout.write(existsSync(legacy) ? "LEGACY_PRESERVED\\n" : "LEGACY_LOST\\n");
+  `;
+  const child = await spawnNodeCaptured(["--input-type=module", "--eval", source], {
+    cwd: path.dirname(new URL(import.meta.url).pathname),
+    env: { ...process.env, CURSOR_AGENT_STATE_ROOT: stateRoot },
+  });
+  assert.equal(child.code, 0, child.stderr);
+  assert.equal(child.stdout.trim(), "LEGACY_PRESERVED");
+});
+
+test("round open/terminal transitions are visible to the authoritative GC census (P4)", async (t) => {
+  const cursorKey = `roots-index-round-key-${Date.now()}`;
+  const session = new Session(`roots-index-round-${Date.now()}`, cursorKey, "");
+  session.clientEnv = { workspaceUnknown: true };
+  session.advertise = advertised();
+  session.beginResponse(new MockResponse());
+  sessions.set(session.id, session);
+  t.after(() => sessions.delete(session.id));
+  const round = session.ensureToolRound();
+  const agentId = round.agentId;
+  // Drop the in-memory session so only durable journal evidence can protect the agent.
+  sessions.delete(session.id);
+  assert.ok(sdkAgentGCCensus().has(agentId), "an open round protects its agent via the journal census");
+  const generationBefore = sdkAgentRootGeneration();
+  round.terminalize(TerminalReason.COMPLETED);
+  assert.equal(sdkAgentGCCensus().has(agentId), false, "a terminal round stops protecting its agent");
+  assert.notEqual(sdkAgentRootGeneration(), generationBefore, "the cheap generation token reflects the transition");
+});
+
+test("tombstone backfill heals ghost aliases once, skips live agents, and honors dry-run (P1.2)", async (t) => {
+  const gcDir = path.join(TEST_STATE_ROOT, ".cct-agent-gc");
+  const aliasDir = path.join(TEST_STATE_ROOT, ".cct-agent-alias");
+  const doneFile = path.join(gcDir, "backfill-tombstones.done");
+  rmSync(doneFile, { force: true });
+  const cursorKey = `backfill-key-${Date.now()}`;
+  const scope = keyHash(cursorKey);
+  const session = new Session(`backfill-live-${Date.now()}`, cursorKey, "b".repeat(64));
+  await session.persistDurableAlias(); // the LIVE agent's alias
+  const liveAgentId = session.agentId || session.id;
+  const ghostAgentId = `${liveAgentId}_ghost`;
+  const ghostAliasFile = path.join(aliasDir, `ghost-${Date.now()}.json`);
+  writeFileSync(ghostAliasFile, JSON.stringify({
+    version: 2,
+    keyFingerprint: keyFingerprint(cursorKey),
+    sessionId: `${session.id}-ghost`,
+    agentId: ghostAgentId,
+    createdAt: Date.now(),
+    lastUsedAt: Date.now(),
+    generation: 1,
+    conversationBinding: "",
+  }));
+  const probes = [];
+  platforms.set(scope, {
+    promise: Promise.resolve({
+      async getAgent(id) {
+        probes.push(id);
+        if (id === ghostAgentId) throw new Error("agent not found");
+        return { agentId: id };
+      },
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return {}; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  t.after(() => {
+    delete process.env.CURSOR_COMPOSER_BACKFILL_TOMBSTONES;
+    platforms.delete(scope);
+    rmSync(ghostAliasFile, { force: true });
+    rmSync(doneFile, { force: true });
+    rmSync(markerPath(gcDir, scope, ghostAgentId), { force: true });
+  });
+
+  // dry-run: probes but writes no tombstone and no done marker.
+  process.env.CURSOR_COMPOSER_BACKFILL_TOMBSTONES = "dry-run";
+  await bridge.backfillTombstonesTick();
+  assert.ok(probes.includes(ghostAgentId), "dry-run still probes");
+  assert.equal(readMarker(markerPath(gcDir, scope, ghostAgentId)), null, "dry-run writes no tombstone");
+  assert.equal(existsSync(doneFile), false, "dry-run writes no done marker");
+
+  // apply: ghost gains a tombstone; the live agent does not.
+  process.env.CURSOR_COMPOSER_BACKFILL_TOMBSTONES = "apply";
+  await bridge.backfillTombstonesTick();
+  const ghostMarker = readMarker(markerPath(gcDir, scope, ghostAgentId));
+  assert.ok(ghostMarker, "ghost alias gained a tombstone");
+  assert.equal(ghostMarker.status, "deleted");
+  assert.equal(readMarker(markerPath(gcDir, scope, liveAgentId)), null, "live agent must not be tombstoned");
+  assert.equal(existsSync(doneFile), true, "apply writes the done marker after a full uncapped pass");
+
+  // done marker makes the backfill a no-op even when a NEW ghost appears.
+  const lateGhost = `${liveAgentId}_late`;
+  const lateAlias = path.join(aliasDir, `ghost-late-${Date.now()}.json`);
+  writeFileSync(lateAlias, JSON.stringify({
+    version: 2, keyFingerprint: keyFingerprint(cursorKey), sessionId: `${session.id}-late`,
+    agentId: lateGhost, createdAt: Date.now(), lastUsedAt: Date.now(), generation: 1, conversationBinding: "",
+  }));
+  t.after(() => rmSync(lateAlias, { force: true }));
+  await bridge.backfillTombstonesTick();
+  assert.equal(readMarker(markerPath(gcDir, scope, lateGhost)), null, "done marker stops further backfill");
+});
 
 test("process-wide replay memory is reserved before a turn and rejects before SDK send", async () => {
   const originalLimit = replayMemoryBudget.limit;
@@ -180,6 +784,27 @@ test("process-wide replay memory is reserved before a turn and rejects before SD
     replayMemoryBudget.limit = originalLimit;
     replayMemoryBudget.used = originalUsed;
   }
+});
+
+test("retryable lifecycle contention survives the SSE terminal boundary with exact-replay metadata", () => {
+  assert.deepEqual(turnFailureMetadata({
+    code: "agent_lifecycle_busy",
+    status: 503,
+    retryable: true,
+    message: "agent lifecycle lease is busy",
+  }), {
+    errorCode: "agent_lifecycle_busy",
+    retryable: true,
+    retryMode: "identical",
+    retryAfterMs: 1000,
+  });
+  assert.deepEqual(turnFailureMetadata({
+    code: "unsafe code with spaces",
+    retryable: true,
+  }), {
+    retryable: true,
+    retryMode: "none",
+  }, "untrusted symbolic codes are never reflected to the client");
 });
 
 
@@ -237,6 +862,61 @@ function authoritativeRawToolsBody(toolInventoryJSON, extra = {}) {
 function authoritativeToolsBody(tools, extra = {}) {
   return authoritativeRawToolsBody(JSON.stringify(tools), extra);
 }
+
+test("cold signed continuations receive recovery admission priority", () => {
+  const { codec } = createRoundInfrastructure(TEST_STATE_ROOT);
+  const route = codec.newRoute();
+  const toolCallId = codec.issue(route, 0);
+  const body = { input: { type: "tool_results", results: [{ toolCallId, content: "done" }] } };
+  assert.equal(continuationAdmissionPriority(body), ADMISSION_PRIORITY.RECOVERY);
+  liveToolRounds.set(route, {});
+  try {
+    assert.equal(continuationAdmissionPriority(body), ADMISSION_PRIORITY.TOOL_CONTINUATION);
+  } finally {
+    liveToolRounds.delete(route);
+  }
+  assert.equal(continuationAdmissionPriority({
+    input: { type: "tool_results", results: [{ toolCallId: "forged", content: "x" }] },
+  }), ADMISSION_PRIORITY.TOOL_CONTINUATION);
+});
+
+test("disconnecting a queued fresh turn releases its durable pre-reservation", async (t) => {
+  const sessionId = `queued-disconnect-${Date.now()}`;
+  const session = new Session(sessionId, "cursor-key");
+  let unblock;
+  session.tail = new Promise((resolve) => { unblock = resolve; });
+  sessions.set(sessionId, session);
+  t.after(() => {
+    unblock();
+    sessions.delete(sessionId);
+  });
+  // P5: the reservation ledger is sharded by key nibble under .unresolved-reservations/.
+  const ledgerDir = path.join(TEST_STATE_ROOT, ".cct-completed-turns", ".unresolved-reservations");
+  const ledgerEntries = () => {
+    const entries = {};
+    try {
+      for (const name of readdirSync(ledgerDir)) {
+        if (!/^[a-f0-9]\.json$/.test(name)) continue;
+        try { Object.assign(entries, JSON.parse(readFileSync(path.join(ledgerDir, name), "utf8")).entries || {}); } catch {}
+      }
+    } catch {}
+    return entries;
+  };
+  const before = new Set(Object.keys(ledgerEntries()));
+  const response = new MockResponse();
+  await handleTurn(request(), response, neutralBody({
+    sessionId,
+    input: {
+      type: "user",
+      text: "queued then disconnected",
+      clientMessageId: `ccm2_queued_disconnect_${Date.now()}`,
+    },
+  }), "cursor-key");
+  const reserved = Object.keys(ledgerEntries()).filter((key) => !before.has(key));
+  assert.equal(reserved.length, 1);
+  response.emit("close");
+  assert.deepEqual(Object.keys(ledgerEntries()).filter((key) => !before.has(key)), []);
+});
 
 function advertised(name = "Lookup") {
   return [{ name, toolName: name, description: `${name} tool`, inputSchema: { type: "object", properties: { q: { type: "string" } } } }];
@@ -310,9 +990,10 @@ function seedSession(id, key = "cursor-key", tools = advertised()) {
 }
 
 async function waitFor(predicate, message = "condition") {
-  for (let i = 0; i < 100; i++) {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
     if (predicate()) return;
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 1));
   }
   assert.fail(`timed out waiting for ${message}`);
 }
@@ -3000,6 +3681,284 @@ test("signed continuation authority ignores advisory session ids and binds befor
   );
 });
 
+test("pure signed results return the round conversation binding after slash-new", async () => {
+  const cursorKey = "pure-result-binding-key";
+  const oldBinding = "c".repeat(64);
+  const newBinding = "d".repeat(64);
+  const oldSession = new Session("pure-result-old-session", cursorKey, oldBinding);
+  oldSession.clientEnv = { workspaceUnknown: true };
+  oldSession.advertise = advertised();
+  oldSession.beginResponse(new MockResponse());
+  sessions.set(oldSession.id, oldSession);
+  const opened = await openTool(oldSession);
+  const result = { toolCallId: opened.call.wireId, content: "old result", isError: false };
+
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody([result], {
+    conversationBinding: newBinding,
+  }, { sessionId: "pure-result-new-session" }), cursorKey);
+  await waitFor(() => response.ended, "pure old-result completion");
+
+  assert.equal(response.getHeader("X-CLIProxy-Composer-Session"), oldSession.id);
+  assert.equal(
+    response.getHeader("X-CLIProxy-Composer-Conversation-Binding"),
+    oldBinding,
+    "the signed journal binding overrides the advisory post-/new request binding",
+  );
+  assert.equal(opened.round.calls.get(opened.call.wireId).receipt.result.content, "old result");
+});
+
+test("cross-conversation mixed continuation receipts old results but sends fresh intent only on the new session", async () => {
+  const cursorKey = "cross-conversation-split-key";
+  const oldBinding = "a".repeat(64);
+  const newBinding = "b".repeat(64);
+  const oldSession = new Session("cross-conversation-old", cursorKey, oldBinding);
+  oldSession.clientEnv = { workspaceUnknown: true };
+  oldSession.advertise = advertised();
+  oldSession.beginResponse(new MockResponse());
+  sessions.set(oldSession.id, oldSession);
+  const opened = await openTool(oldSession);
+  let sends = 0;
+  let sentMessage = null;
+  const agent = {
+    async send(message) {
+      sends++;
+      sentMessage = message;
+      return {
+        async wait() { return { status: "finished", result: "new conversation answer" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  const result = { toolCallId: opened.call.wireId, content: "old result", isError: false };
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody([result], {
+    userText: "fresh text after slash-new",
+    history: "bounded new-conversation history",
+    clientMessageId: "ccm2_cross_conversation_split",
+    invocationId: "invocation-cross-conversation-split-0001",
+    conversationBinding: newBinding,
+  }, { sessionId: "cross-conversation-new" }), cursorKey);
+  await waitFor(() => response.ended, "cross-conversation fresh completion");
+
+  assert.equal(sends, 1);
+  assert.match(typeof sentMessage === "string" ? sentMessage : sentMessage.text, /fresh text after slash-new/);
+  assert.equal(opened.round.calls.get(opened.call.wireId).receipt.result.content, "old result");
+  assert.equal(opened.round.terminal.reason, TerminalReason.CLIENT_CANCELLED);
+  assert.equal(opened.round.deferredInputs.length, 0, "fresh intent must never be journaled on the old round");
+  assert.equal(sessions.get("cross-conversation-new").conversationBinding, newBinding);
+  assert.match(response.text(), /new conversation answer/);
+});
+
+// P2.1/P2.2: a LEGACY binding-less round is compared via the shared-digest prefix relation
+// (binding = full SHA-256; sessionId = "sess_" + its first 32 hex chars). A matching request
+// binding self-heals the round (stamp) and routes fresh intent on the SAME conversation; a
+// mismatching binding is PROVEN epoch change and splits; a non-derivable session id also
+// splits by default, with only an explicit warn-mode migration escape hatch.
+function legacyBindingFixtures(cursorKey, sessionDigestHex, bindingHex) {
+  const sessionId = `sess_${sessionDigestHex}`;
+  const session = new Session(sessionId, cursorKey, ""); // legacy: no binding stamped
+  session.clientEnv = { workspaceUnknown: true };
+  session.advertise = advertised();
+  session.beginResponse(new MockResponse());
+  sessions.set(session.id, session);
+  let sends = 0;
+  let sentMessage = null;
+  const agent = {
+    async send(message) {
+      sends++;
+      sentMessage = message;
+      return {
+        async wait() { return { status: "finished", result: "legacy answer" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  return { session, sends: () => sends, sentMessage: () => sentMessage };
+}
+
+test("a matching request binding self-heals a legacy binding-less round and keeps fresh intent on the same conversation (P2.2)", async (t) => {
+  const cursorKey = "legacy-bind-match-key";
+  const digest = "ab".repeat(32); // 64 hex chars
+  const fx = legacyBindingFixtures(cursorKey, digest.slice(0, 32), digest);
+  t.after(() => { platforms.delete(keyHash(cursorKey)); sessions.delete(fx.session.id); });
+  const opened = await openTool(fx.session);
+  assert.equal(opened.round.conversationBinding, "", "precondition: legacy round has no binding");
+
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody(
+    [{ toolCallId: opened.call.wireId, content: "old result", isError: false }],
+    {
+      userText: "fresh text, same conversation",
+      clientMessageId: "ccm2_legacy_bind_match",
+      invocationId: "invocation-legacy-bind-match-0001",
+      conversationBinding: digest, // prefix matches sess_<digest[0:32]>
+    },
+    { sessionId: "legacy-bind-match-newbody" },
+  ), cursorKey);
+  await waitFor(() => response.ended, "legacy same-conversation completion");
+
+  assert.equal(opened.round.conversationBinding, digest, "round binding self-healed from the matching request");
+  assert.notEqual(opened.round.terminal && opened.round.terminal.reason, TerminalReason.CLIENT_CANCELLED,
+    "same-conversation fresh intent must not split");
+  assert.equal(fx.sends(), 1);
+  assert.match(typeof fx.sentMessage() === "string" ? fx.sentMessage() : fx.sentMessage().text, /fresh text, same conversation/);
+});
+
+test("a mismatching request binding PROVES epoch change on a legacy round and splits even in warn mode (P2.1)", async (t) => {
+  const cursorKey = "legacy-bind-mismatch-key";
+  const sessionDigest = "cd".repeat(16); // sess_ prefix differs from the request binding
+  const requestBinding = "ef".repeat(32);
+  const fx = legacyBindingFixtures(cursorKey, sessionDigest, requestBinding);
+  t.after(() => { platforms.delete(keyHash(cursorKey)); sessions.delete(fx.session.id); });
+  const opened = await openTool(fx.session);
+
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody(
+    [{ toolCallId: opened.call.wireId, content: "old result", isError: false }],
+    {
+      userText: "fresh text after slash-new on legacy round",
+      clientMessageId: "ccm2_legacy_bind_mismatch",
+      invocationId: "invocation-legacy-bind-mismatch-0001",
+      conversationBinding: requestBinding,
+    },
+    { sessionId: "legacy-bind-mismatch-new" },
+  ), cursorKey);
+  await waitFor(() => response.ended, "legacy epoch-change split completion");
+
+  assert.equal(opened.round.terminal.reason, TerminalReason.CLIENT_CANCELLED, "proven epoch change must split");
+  assert.equal(opened.round.deferredInputs.length, 0, "fresh intent must not be journaled on the old round");
+  assert.equal(fx.sends(), 1);
+  assert.equal(sessions.get("legacy-bind-mismatch-new").conversationBinding, requestBinding);
+});
+
+test("a non-derivable legacy session id splits by default with an explicit warn migration escape hatch (P2.1)", async (t) => {
+  // Safe default: ambiguity splits; fresh intent never journals onto the old round.
+  const warnKey = "legacy-bind-unknown-warn-key";
+  const warnSession = new Session("legacy-fork-shaped-session", warnKey, "");
+  warnSession.clientEnv = { workspaceUnknown: true };
+  warnSession.advertise = advertised();
+  warnSession.beginResponse(new MockResponse());
+  sessions.set(warnSession.id, warnSession);
+  platforms.set(keyHash(warnKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() {
+        return {
+          async send() {
+            return { async wait() { return { status: "finished", result: "warn answer" }; }, async cancel() {} };
+          },
+          async close() {},
+        };
+      },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT, lastUsed: Date.now(), fp: keyFingerprint(warnKey),
+  });
+  t.after(() => { platforms.delete(keyHash(warnKey)); sessions.delete(warnSession.id); delete process.env.CURSOR_COMPOSER_BINDING_FAIL_CLOSED; });
+  const warnOpened = await openTool(warnSession);
+  const warnResponse = new MockResponse();
+  delete process.env.CURSOR_COMPOSER_BINDING_FAIL_CLOSED;
+  await handleContinue(request(), warnResponse, continuationBody(
+    [{ toolCallId: warnOpened.call.wireId, content: "old result", isError: false }],
+    {
+      userText: "ambiguous fresh text",
+      clientMessageId: "ccm2_legacy_bind_unknown",
+      invocationId: "invocation-legacy-bind-unknown-0001",
+      conversationBinding: "12".repeat(32),
+    },
+    { sessionId: "legacy-unknown-new" },
+  ), warnKey);
+  await waitFor(() => warnResponse.ended, "default-mode ambiguous completion");
+  assert.equal(warnOpened.round.terminal && warnOpened.round.terminal.reason, TerminalReason.CLIENT_CANCELLED,
+    "default mode must split a non-derivable legacy round");
+  assert.equal(warnOpened.round.deferredInputs.length, 0,
+    "ambiguous fresh intent must not be journaled on the old round by default");
+
+  // Explicit rolling-migration escape hatch: an operator may temporarily retain
+  // the old warning behavior, but it is never the default.
+  const enforceKey = "legacy-bind-unknown-enforce-key";
+  const enforceSession = new Session("legacy-fork-shaped-session-2", enforceKey, "");
+  enforceSession.clientEnv = { workspaceUnknown: true };
+  enforceSession.advertise = advertised();
+  enforceSession.beginResponse(new MockResponse());
+  sessions.set(enforceSession.id, enforceSession);
+  platforms.set(keyHash(enforceKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() {
+        return {
+          async send() {
+            return { async wait() { return { status: "finished", result: "enforce answer" }; }, async cancel() {} };
+          },
+          async close() {},
+        };
+      },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT, lastUsed: Date.now(), fp: keyFingerprint(enforceKey),
+  });
+  t.after(() => { platforms.delete(keyHash(enforceKey)); sessions.delete(enforceSession.id); });
+  const enforceOpened = await openTool(enforceSession);
+  process.env.CURSOR_COMPOSER_BINDING_FAIL_CLOSED = "warn";
+  const enforceResponse = new MockResponse();
+  await handleContinue(request(), enforceResponse, continuationBody(
+    [{ toolCallId: enforceOpened.call.wireId, content: "old result", isError: false }],
+    {
+      userText: "ambiguous fresh text under enforce",
+      clientMessageId: "ccm2_legacy_bind_enforce",
+      invocationId: "invocation-legacy-bind-enforce-0001",
+      conversationBinding: "34".repeat(32),
+    },
+    { sessionId: "legacy-enforce-new" },
+  ), enforceKey);
+  await waitFor(() => enforceResponse.ended, "warn-mode ambiguous completion");
+  assert.notEqual(enforceOpened.round.terminal && enforceOpened.round.terminal.reason, TerminalReason.CLIENT_CANCELLED,
+    "explicit warn mode retains the temporary rolling-migration behavior");
+});
+
+test("CURSOR_COMPOSER_REQUIRE_CONTINUE_BINDING rejects binding-less continuations with a typed 400 (P2.4)", async (t) => {
+  const cursorKey = "require-binding-key";
+  const session = new Session("require-binding-session", cursorKey, "");
+  session.clientEnv = { workspaceUnknown: true };
+  session.advertise = advertised();
+  session.beginResponse(new MockResponse());
+  sessions.set(session.id, session);
+  t.after(() => { delete process.env.CURSOR_COMPOSER_REQUIRE_CONTINUE_BINDING; sessions.delete(session.id); });
+  const opened = await openTool(session);
+  process.env.CURSOR_COMPOSER_REQUIRE_CONTINUE_BINDING = "1";
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody(
+    [{ toolCallId: opened.call.wireId, content: "old result", isError: false }],
+    { clientMessageId: "ccm2_require_binding", invocationId: "invocation-require-binding-0001" },
+    { sessionId: session.id },
+  ), cursorKey);
+  assert.equal(response.status, 400, "binding-less continuation under REQUIRE must fail closed with 400");
+  assert.match(response.text(), /"(error)?[Cc]ode":"conversation_binding_required"/);
+});
+
 test("completed receipts replay ordered reasoning, text, tool frames, usage, and terminal metadata", async () => {
   const cursorKey = "cursor-key";
   const sessionId = "ordered-completed-replay";
@@ -3162,7 +4121,7 @@ test("cross-process receipt races elect one fresh owner and completed state is a
     const bridge = await import(${JSON.stringify(moduleUrl)});
     ${waitUntil(at)}
     try {
-      bridge.writeFreshDeliveryReceipt(
+      await bridge.writeFreshDeliveryReceipt(
         ${JSON.stringify(cursorKey)},
         ${JSON.stringify(sessionId)},
         ${JSON.stringify(clientMessageId)},
@@ -3792,7 +4751,7 @@ test("cold restart delivers a journaled mixed user turn exactly once after faith
   const cursorKey = "cursor-key";
   const { session } = seedSession("mixed-cold-restart", cursorKey);
   session.agentId = `${session.id}_ct5_ctrecover_priorroute`;
-  session.persistDurableAlias();
+  await session.persistDurableAlias();
   const priorAgentId = session.agentId;
   const opened = await openTool(session);
   opened.round.terminalize("shutdown", "bridge restarted");
@@ -4993,6 +5952,11 @@ test("disk-pressure admission rejects new turns before creating recoverability s
   const result = JSON.parse(exit.stdout);
   assert.equal(result.status, 507);
   assert.equal(result.body.error.code, "durable_state_capacity");
+  assert.equal(result.body.error.retryable, true);
+  assert.equal(result.body.error.retryAfterMs, 1000);
+  assert.ok(result.body.error.requestedBytes > 0);
+  assert.ok(result.body.error.availableBytes < result.body.error.requestedBytes);
+  assert.equal(result.body.error.priority, 10);
   assert.equal(result.sessions, 0);
   assert.equal(result.replayStatus, 200);
   assert.match(result.replayBody, /completed_turn_replay/);
@@ -5027,14 +5991,14 @@ test("request-shape rejections do not consume shared unresolved receipt quota", 
   assert.equal(count(), before);
 });
 
-test("durable maintenance sweeps aged unclaimed candidates without a canonical record", () => {
+test("durable maintenance sweeps aged unclaimed candidates without a canonical record", async () => {
   const dir = path.join(TEST_STATE_ROOT, ".cct-completed-turns");
   mkdirSync(dir, { recursive: true });
   const orphan = path.join(dir, `${"a".repeat(64)}.json.cas.r1.crashed.candidate`);
   writeFileSync(orphan, "orphan\n");
   const old = new Date(0);
   utimesSync(orphan, old, old);
-  runDurableMaintenance();
+  await runDurableMaintenance();
   assert.equal(existsSync(orphan), false);
 });
 

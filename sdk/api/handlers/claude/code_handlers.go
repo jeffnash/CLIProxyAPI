@@ -11,9 +11,11 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -336,8 +338,13 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
 }
 
 type claudeErrorDetail struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
+	Type           string `json:"type"`
+	Message        string `json:"message"`
+	Code           string `json:"code,omitempty"`
+	RequestedBytes *int64 `json:"requested_bytes,omitempty"`
+	AvailableBytes *int64 `json:"available_bytes,omitempty"`
+	Priority       *int   `json:"priority,omitempty"`
+	RetryAfterMS   *int64 `json:"retry_after_ms,omitempty"`
 }
 
 type claudeErrorResponse struct {
@@ -360,12 +367,34 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 		}
 	}
 	errType, message := claudeErrorDetailFromText(status, errText)
+	detail := claudeErrorDetail{Type: errType, Message: message}
+	if msg != nil && msg.Error != nil {
+		var structured interface{ APIErrorBody() []byte }
+		if errors.As(msg.Error, &structured) && structured != nil {
+			var payload struct {
+				Error claudeErrorDetail `json:"error"`
+			}
+			if body := structured.APIErrorBody(); len(body) > 0 && json.Unmarshal(body, &payload) == nil {
+				// Keep the Claude envelope while retaining the typed executor's bounded,
+				// redacted fields. Missing type/message values still fall back to the
+				// normal Claude status mapping above.
+				if strings.TrimSpace(payload.Error.Type) != "" {
+					detail.Type = strings.TrimSpace(payload.Error.Type)
+				}
+				if strings.TrimSpace(payload.Error.Message) != "" {
+					detail.Message = strings.TrimSpace(payload.Error.Message)
+				}
+				detail.Code = payload.Error.Code
+				detail.RequestedBytes = payload.Error.RequestedBytes
+				detail.AvailableBytes = payload.Error.AvailableBytes
+				detail.Priority = payload.Error.Priority
+				detail.RetryAfterMS = payload.Error.RetryAfterMS
+			}
+		}
+	}
 	return claudeErrorResponse{
-		Type: "error",
-		Error: claudeErrorDetail{
-			Type:    errType,
-			Message: message,
-		},
+		Type:  "error",
+		Error: detail,
 	}
 }
 
@@ -382,6 +411,15 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 			c.Writer.Header().Del(key)
 			for _, value := range values {
 				c.Writer.Header().Add(key, value)
+			}
+		}
+	}
+	if msg != nil && msg.Error != nil {
+		var retryAfter interface{ RetryAfter() *time.Duration }
+		if errors.As(msg.Error, &retryAfter) && retryAfter != nil {
+			if d := retryAfter.RetryAfter(); d != nil && *d > 0 {
+				seconds := int64((*d + time.Second - 1) / time.Second)
+				c.Writer.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 			}
 		}
 	}

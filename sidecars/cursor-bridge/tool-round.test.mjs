@@ -181,7 +181,8 @@ test("journal creates, revises, and detects stale revisions", (t) => {
 test("crash-left temporary snapshots never replace the last committed revision", (t) => {
   const dir = withTempDir(t);
   const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 15) });
-  const round = new ToolRound({ sessionId: "sess", journal, codec });
+  const conversationBinding = "c".repeat(64);
+  const round = new ToolRound({ sessionId: "sess", conversationBinding, journal, codec });
   const committed = readFileSync(journal.file(round.route), "utf8");
   writeFileSync(path.join(journal.dir, `.${round.route}.json.crash.tmp`), "{not-json", { mode: 0o600 });
   assert.equal(readFileSync(journal.file(round.route), "utf8"), committed);
@@ -250,7 +251,8 @@ test("journal immutable revision claims fence concurrent writers without stealab
 test("ToolRound persists registration before exposing a call", (t) => {
   const dir = withTempDir(t);
   const { journal, codec } = createRoundInfrastructure(dir, { secret: Buffer.alloc(32, 4) });
-  const round = new ToolRound({ sessionId: "sess", journal, codec });
+  const conversationBinding = "c".repeat(64);
+  const round = new ToolRound({ sessionId: "sess", conversationBinding, journal, codec });
   const call = round.openCall({ rawToolCallId: "sdk-a", name: "Bash", input: { command: "pwd" }, callback: callbackLog([], "a") });
   const saved = journal.read(round.route);
   assert.equal(saved.calls.length, 1);
@@ -258,6 +260,8 @@ test("ToolRound persists registration before exposing a call", (t) => {
   assert.equal(codec.parse(call.wireId).route, round.route);
   assert.equal(saved.calls[0].rawIdHash.length, 64);
   assert.equal(saved.calls[0].state, CallState.REGISTERED);
+  assert.equal(saved.conversationBinding, conversationBinding);
+  assert.equal(ToolRound.load(journal, codec, round.route).conversationBinding, conversationBinding);
 });
 
 test("raw SDK id may refine registered arguments but freezes at transport handoff", () => {

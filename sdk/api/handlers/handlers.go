@@ -1441,13 +1441,17 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 					}
 
 					status := http.StatusInternalServerError
-					if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
+					// errors.As so wrapped typed errors keep their status through bootstrap
+					// wrapping (P1.3: no more 507→500 downgrade on first-chunk paths).
+					var se interface{ StatusCode() int }
+					if errors.As(streamErr, &se) && se != nil {
 						if code := se.StatusCode(); code > 0 {
 							status = code
 						}
 					}
 					var addon http.Header
-					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
+					var he interface{ Headers() http.Header }
+					if errors.As(streamErr, &he) && he != nil {
 						if hdr := he.Headers(); hdr != nil {
 							addon = hdr.Clone()
 						}
@@ -1606,7 +1610,11 @@ func statusFromError(err error) int {
 	if err == nil {
 		return 0
 	}
-	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+	// errors.As (not a direct assertion) so wrapped typed errors — e.g. a conductor
+	// streamBootstrapError carrying an executor's composerBridgeStatusError — preserve
+	// their status (a 507 stays a 507) instead of collapsing to 500 (P1.3).
+	var se interface{ StatusCode() int }
+	if errors.As(err, &se) && se != nil {
 		if code := se.StatusCode(); code > 0 {
 			return code
 		}
@@ -2459,7 +2467,33 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 
-	body := BuildErrorResponseBody(status, errText)
+	// P1.3: a typed executor error (e.g. the composer bridge's capacity shed or round-lost
+	// errors) may supply its own redacted OpenAI-compatible JSON body, so the client sees the
+	// symbolic code and bounded capacity/retry fields instead of a generic re-wrap. The
+	// error's RetryAfter hint becomes a standard Retry-After header.
+	var body []byte
+	if msg != nil && msg.Error != nil {
+		var structured interface{ APIErrorBody() []byte }
+		if errors.As(msg.Error, &structured) && structured != nil {
+			body = structured.APIErrorBody()
+		}
+		var retryAfter interface{ RetryAfter() *time.Duration }
+		if errors.As(msg.Error, &retryAfter) && retryAfter != nil {
+			if d := retryAfter.RetryAfter(); d != nil && *d > 0 {
+				seconds := int64(*d / time.Second)
+				if int64(*d)%int64(time.Second) != 0 {
+					seconds++
+				}
+				if seconds < 1 {
+					seconds = 1
+				}
+				c.Writer.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+			}
+		}
+	}
+	if len(body) == 0 {
+		body = BuildErrorResponseBody(status, errText)
+	}
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {

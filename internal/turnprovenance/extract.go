@@ -62,6 +62,13 @@ func mergeMessageMetadata(top, msg gjson.Result) gjson.Result {
 	return top
 }
 
+// MessageText is the CANONICAL user-message text extraction shared by provenance
+// resolution and the composer executor's routing/rendering (P2.6). Previously the two
+// layers carried divergent parsers (this whitelisted part types; the executor accepted any
+// part with a text field), so non-standard content parts could make the same message hash
+// differently in the two subsystems. One parser, one fingerprint, one routing decision.
+func MessageText(m gjson.Result) string { return messageText(m) }
+
 func messageText(m gjson.Result) string {
 	content := m.Get("content")
 	if content.Type == gjson.String {
@@ -74,7 +81,7 @@ func messageText(m gjson.Result) string {
 	for _, part := range content.Array() {
 		typ := part.Get("type").String()
 		switch typ {
-		case "text", "":
+		case "text", "input_text", "output_text", "":
 			if t := part.Get("text").String(); t != "" {
 				if b.Len() > 0 {
 					b.WriteByte('\n')

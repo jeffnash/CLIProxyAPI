@@ -76,6 +76,12 @@ func (e *CursorExecutor) prepareCursorDirect(ctx context.Context, auth *cliproxy
 	log.Infof("cursor e2e (xlate): from=%s to=openai original=%d bytes msgs=%d translated=%d bytes msgs=%d",
 		from, originalBytes, originalMsgs, len(req.Payload), countJSONMessages(req.Payload))
 	tenant := composerTenant(auth, opts)
+	// Provenance and durable Composer routing share one explicit-identity
+	// contract. Reject contradictory aliases before either path can issue a
+	// clarification or observe state under a different conversation key.
+	if _, identityErr := resolveComposerConversationIdentity(opts); identityErr != nil {
+		return nil, identityErr
+	}
 	if rewritten, cerr := resolveComposerProvenance(tenant, req.Payload, opts, false); cerr != nil {
 		return nil, cerr
 	} else if rewritten != nil {

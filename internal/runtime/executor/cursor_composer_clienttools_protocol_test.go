@@ -515,9 +515,11 @@ func TestRBT017_MultiReplicaContinuationIsOpaqueBridgeRouting(t *testing.T) {
 	if !strings.HasPrefix(sessB, "sess_") {
 		t.Fatalf("RBT-017: instance B must derive a real session id, got %q", sessB)
 	}
-	// The advisory session remains deterministic, but correctness is carried by the signed id.
-	if sessB != sessA {
-		t.Fatalf("RBT-017: advisory session should remain deterministic across replicas (A=%s B=%s)", sessA, sessB)
+	// The advisory lineage may differ because the continuation's replay opener differs from the original
+	// request. Correctness is carried exclusively by the signed ToolRound route; it must never depend on which
+	// process-local lineage happened to claim a shared base session first.
+	if sessA == "" || sessB == "" {
+		t.Fatalf("RBT-017: both advisory sessions must be valid (A=%s B=%s)", sessA, sessB)
 	}
 
 	resp, errB := instanceB.executeComposer(context.Background(), auth, "k", contReq, conv)
@@ -536,6 +538,10 @@ func TestRBT017_MultiReplicaContinuationIsOpaqueBridgeRouting(t *testing.T) {
 	}
 	if it := gjson.GetBytes(gotBody, "input.type").String(); it != "tool_results" {
 		t.Fatalf("RBT-017: B's continuation bridge body must be input.type=tool_results, got %q (%s)", it, string(gotBody))
+	}
+	wantBinding := composerConversationBinding(composerTenant(auth, conv), "k", "rbt017-conv")
+	if got := gjson.GetBytes(gotBody, "input.conversationBinding").String(); got != wantBinding {
+		t.Fatalf("RBT-017: continuation must carry the authenticated conversation binding (got %q want %q)", got, wantBinding)
 	}
 	if gjson.GetBytes(gotBody, "input.results.0.toolCallId").String() != signedID {
 		t.Fatalf("RBT-017: signed id was not forwarded byte-for-byte, got %s", string(gotBody))
@@ -617,8 +623,8 @@ func TestP01_Reseed410ContinuationCarryingOpener(t *testing.T) {
 	if !errors.As(err, &se) || se.StatusCode() != 410 {
 		t.Fatalf("P0-1 inverted: expected typed 410, got %T %v", err, err)
 	}
-	if !strings.Contains(se.Error(), "round_lost") {
-		t.Fatalf("P0-1 inverted: 410 message must contain round_lost, got %q", se.Error())
+	if !strings.Contains(se.Error(), "state_gone") || strings.Contains(se.Error(), "round_lost") {
+		t.Fatalf("P0-1 inverted: untyped 410 must stay generic rather than invent round_lost, got %q", se.Error())
 	}
 	// Stream: must also surface 410
 	_, errS := e.executeComposerStream(context.Background(), auth, "k", cont(), protoOpts("p01-ok-s"))
@@ -678,7 +684,8 @@ func TestP01_Reseed410ThinContinuationStays410(t *testing.T) {
 
 // P0-1 recovery extension inverted per section 8: thin mixed no longer recovers; trailing user text is not
 // processed after dropping results. Harness must re-send user text as new turn. Returns 410 round_lost.
-func TestP01_Reseed410ThinMixedContinuationRecoversUserText(t *testing.T) {
+// (Renamed 2026-07-20: the old name promised recovery this body asserts the opposite of — audit P0.4.)
+func TestP01_Reseed410ThinMixedContinuationStays410(t *testing.T) {
 	var bodies [][]byte
 	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -904,6 +911,31 @@ func TestP03_HistoryAggregateCap(t *testing.T) {
 	}
 	if !utf8.ValidString(giantOut) || !strings.Contains(giantOut, "OPENER") || !strings.Contains(giantOut, "TAILMSG") {
 		t.Fatalf("P0-3: giant-line bounding must preserve valid UTF-8 head and tail")
+	}
+}
+
+// P9: realistic replay sizes — the incident recovery carried 569,341 bytes; the plan targets
+// 600KiB and 2MiB replays. At every cap the transcript stays bounded with head + tail + the
+// explicit middle-loss marker (the semantic gap P7 checkpoints supersede with exact content).
+func TestP03_HistoryAggregateCapRealisticReplaySizes(t *testing.T) {
+	var lines []string
+	for i := 0; i < 1200; i++ {
+		lines = append(lines, fmt.Sprintf("ASSISTANT: record-%04d %s", i, strings.Repeat("y", 2048)))
+	}
+	for _, capBytes := range []int{600 << 10, 2 << 20} {
+		out := boundComposerHistoryLines(lines, capBytes)
+		if len(out) > capBytes {
+			t.Fatalf("cap %d: bounded history exceeds the cap, got %d bytes", capBytes, len(out))
+		}
+		if !strings.Contains(out, "record-0000") || !strings.Contains(out, "record-1199") {
+			t.Fatalf("cap %d: head and tail records must survive", capBytes)
+		}
+		if !strings.Contains(out, "omitted to bound the replayed history") {
+			t.Fatalf("cap %d: the dropped middle must be marked (transcript ≈2.4MiB > cap)", capBytes)
+		}
+		if !utf8.ValidString(out) {
+			t.Fatalf("cap %d: bounded history must remain valid UTF-8", capBytes)
+		}
 	}
 }
 

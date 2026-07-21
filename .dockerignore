@@ -53,3 +53,5 @@ debug
 node_modules
 sidecars/cursor-bridge/node_modules
 sidecars/cursor-bridge/.cursor-agent-store
+sidecars/cursor-bridge/jail-poc
+sidecars/cursor-bridge/steer-poc

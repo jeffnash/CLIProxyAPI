@@ -36,6 +36,7 @@ import {
   accessSync,
   closeSync,
   constants,
+  existsSync,
   fsyncSync,
   linkSync,
   mkdirSync,
@@ -64,7 +65,8 @@ import {
   probeStateRoot,
 } from "./tool-round.mjs";
 import { SseWriter } from "./sse-writer.mjs";
-import { collectSdkAgents, sdkAgentGCEnabled } from "./sdk-agent-gc.mjs";
+import { cancelSdkAgentQuarantine, collectSdkAgents, markerPath, readMarker, writeMarker, sdkAgentGCEnabled } from "./sdk-agent-gc.mjs";
+import { AgentLeaseBusyError, DurableAgentLeaseManager } from "./agent-use-lease.mjs";
 import { DurableCASConflict, DurableJSONCAS } from "./durable-json-cas.mjs";
 import {
   TURN_RECEIPT_VERSION,
@@ -91,8 +93,17 @@ import {
   hasStreamResumeCapability,
 } from "./stream-journal.mjs";
 import {
+  ADMISSION_PRIORITY,
   AdaptiveMemoryBudget,
+  CapacityAdmissionError,
   DEFAULT_ADAPTIVE_MEMORY_INITIAL_BYTES,
+  PriorityAdmissionQueue,
+  exactReservationBytes,
+  exactUnmaterializedReservationBytes,
+  reserveExactBytes,
+  resizeExactBytes,
+  releaseExactBytes,
+  reconcileExactBytes,
 } from "./adaptive-reservation.mjs";
 
 
@@ -170,6 +181,15 @@ const INTERNAL_ATTEMPT_MAX_BYTES = 4 << 20;
 // emitted; a 0 TTL would evict a session immediately) — floor them at 1ms via min:1.
 const PENDING_TIMEOUT_MS = envInt("CURSOR_AGENT_PENDING_TIMEOUT_MS", 600000, { min: 1 });
 const SESSION_TTL_MS = envInt("CURSOR_AGENT_SESSION_TTL_MS", 1800000, { min: 1 });
+// Test-only crash injection for the SIGKILL recovery harness (P9). crashPoint(name) exits
+// 137 at the named durable transition, but ONLY under NODE_ENV=test — a production start
+// with BRIDGE_CRASH_POINT set fails closed at boot instead of arming the trap.
+const BRIDGE_CRASH_POINT = process.env.NODE_ENV === "test" ? (process.env.BRIDGE_CRASH_POINT || "") : "";
+if (process.env.BRIDGE_CRASH_POINT && process.env.NODE_ENV !== "test") {
+  console.error("[bridge] BRIDGE_CRASH_POINT requires NODE_ENV=test; refusing to start");
+  process.exit(1);
+}
+function crashPoint(name) { if (BRIDGE_CRASH_POINT && BRIDGE_CRASH_POINT === name) process.exit(137); }
 const CANCEL_CLEANUP_MS = envInt("CURSOR_AGENT_CANCEL_CLEANUP_MS", 5000, { min: 100, max: 60000 });
 const MAX_SESSIONS = envInt("CURSOR_AGENT_MAX_SESSIONS", 1000, { min: 1 });
 const TERMINAL_ROUND_TTL_MS = envInt("CURSOR_AGENT_TERMINAL_ROUND_TTL_MS", 7 * 24 * 60 * 60 * 1000, { min: 0 });
@@ -285,6 +305,13 @@ const SYNTHETIC_ARTIFACT_RESULT_WINDOW = 8;
 // best-effort anyway (the unsupportedHardGuarantees advisory still tells the model it is non-enforced). Past
 // the cap we inline a short note instead of the full schema. A SIZE bound on prompt text, not a timeout.
 const COMPOSER_SCHEMA_INLINE_MAX_BYTES = envInt("CURSOR_AGENT_SCHEMA_INLINE_MAX_BYTES", 8 * 1024, { min: 1 });
+// P8: fleet default grok-4.5 effort when the client does not pin one via the model-id
+// suffix (cursor-grok-4.5-low|medium|high — that suffix remains the per-request control).
+// high matches the historical default; canary medium to trade some latency headroom.
+const COMPOSER_GROK_EFFORT_DEFAULT = (() => {
+  const v = (process.env.CURSOR_COMPOSER_GROK_EFFORT_DEFAULT || "high").trim().toLowerCase();
+  return v === "low" || v === "medium" || v === "high" ? v : "high";
+})();
 const STATE_ROOT_MIN_FREE_BYTES = envInt(
   "CURSOR_COMPOSER_STATE_ROOT_MIN_FREE_BYTES",
   64 * 1024 * 1024,
@@ -300,18 +327,78 @@ const UNRESOLVED_RESERVATION_ORPHAN_MS = envInt(
   60 * 60 * 1000,
   { min: 60_000 },
 );
+const UNRESOLVED_RESERVATION_MAX_ENTRIES = envInt(
+  "CURSOR_COMPOSER_UNRESOLVED_RESERVATION_MAX_ENTRIES", 4096, { min: 64 },
+);
+// P5: with 16 shards a conflict means ~16 writers collided on one nibble; shed with a
+// typed retryable error instead of the old 8192-retry IO amplification against one ledger.
+const UNRESOLVED_RESERVATION_CAS_MAX_ATTEMPTS = envInt(
+  "CURSOR_COMPOSER_UNRESOLVED_RESERVATION_CAS_MAX_ATTEMPTS", 256, { min: 64, max: 65536 },
+);
+const FRESH_RECEIPT_INITIAL_RESERVATION_BYTES = envInt(
+  "CURSOR_COMPOSER_UNRESOLVED_RECEIPT_INITIAL_BYTES",
+  DEFAULT_ADAPTIVE_MEMORY_INITIAL_BYTES,
+  { min: 64 * 1024, max: MAX_AGENT_TURN_BYTES * 2 },
+);
+const DELIVERY_ADMISSION_ACTIVE_BYTES = envInt(
+  "CURSOR_COMPOSER_ADMISSION_ACTIVE_BYTES",
+  128 * 1024 * 1024,
+  { min: FRESH_RECEIPT_INITIAL_RESERVATION_BYTES },
+);
+const DELIVERY_ADMISSION_MAX_QUEUED = envInt(
+  "CURSOR_COMPOSER_ADMISSION_MAX_QUEUED", 1024, { min: 1 },
+);
+const deliveryAdmission = new PriorityAdmissionQueue({
+  limit: DELIVERY_ADMISSION_ACTIVE_BYTES,
+  maxQueued: DELIVERY_ADMISSION_MAX_QUEUED,
+});
+const DELIVERY_ADMISSION_LEASE = Symbol("deliveryAdmissionLease");
+function releaseInputDeliveryAdmission(input) {
+  const lease = input && input[DELIVERY_ADMISSION_LEASE];
+  if (!lease) return;
+  delete input[DELIVERY_ADMISSION_LEASE];
+  lease.release();
+}
 // This performs a remote full-agent census and repeatedly scans durable state.
 // It must be an explicit maintenance-window opt-in, never a data-plane default.
 const SDK_AGENT_GC_ENABLED = sdkAgentGCEnabled(process.env.CURSOR_COMPOSER_AGENT_GC);
 const SDK_AGENT_GC_MIN_IDLE_MS = envInt(
-  "CURSOR_COMPOSER_AGENT_GC_MIN_IDLE_MS", 7 * 24 * 60 * 60 * 1000, { min: 60_000 },
+  "CURSOR_COMPOSER_AGENT_GC_MIN_IDLE_MS", 24 * 60 * 60 * 1000, { min: 60_000 },
+);
+const SDK_AGENT_GC_TERMINAL_IDLE_MS = envInt(
+  "CURSOR_COMPOSER_AGENT_GC_TERMINAL_IDLE_MS", 60 * 60 * 1000, { min: 60_000 },
+);
+const SDK_AGENT_GC_RUNNING_IDLE_MS = envInt(
+  "CURSOR_COMPOSER_AGENT_GC_RUNNING_IDLE_MS", 7 * 24 * 60 * 60 * 1000, { min: 60_000 },
+);
+const SDK_AGENT_ALIAS_TTL_MS = envInt(
+  "CURSOR_COMPOSER_AGENT_ALIAS_TTL_MS", 24 * 60 * 60 * 1000, { min: 60_000 },
 );
 const SDK_AGENT_GC_QUARANTINE_MS = envInt(
   "CURSOR_COMPOSER_AGENT_GC_QUARANTINE_MS", 24 * 60 * 60 * 1000, { min: 60_000 },
 );
 const SDK_AGENT_GC_MAX_SCAN = envInt("CURSOR_COMPOSER_AGENT_GC_MAX_SCAN", 10_000, { min: 1 });
 const SDK_AGENT_GC_MAX_MUTATIONS = envInt("CURSOR_COMPOSER_AGENT_GC_MAX_MUTATIONS", 50, { min: 1 });
+// P6: physical reclamation policy (tombstones are logical forgets; unlink is the physical
+// reclaim, gated by grace + byte ceilings so terminal state can never grow without bound).
+const TERMINAL_RECLAIM_GRACE_MS = envInt("CURSOR_AGENT_TERMINAL_RECLAIM_GRACE_MS", 60 * 60 * 1000, { min: 60_000 });
+const TERMINAL_JOURNAL_MAX_BYTES = envInt("CURSOR_AGENT_TERMINAL_JOURNAL_MAX_BYTES", 512 * 1024 * 1024, { min: 16 * 1024 * 1024 });
+const TERMINAL_RECEIPT_MAX_BYTES = envInt("CURSOR_AGENT_TERMINAL_RECEIPT_MAX_BYTES", 256 * 1024 * 1024, { min: 16 * 1024 * 1024 });
+const SDK_AGENT_GC_PRESSURE_ENABLED = process.env.CURSOR_COMPOSER_AGENT_GC_PRESSURE === "1"
+  || process.env.CURSOR_COMPOSER_AGENT_GC_PRESSURE === "true";
+const SDK_AGENT_GC_PRESSURE_HIGH_PCT = envInt(
+  "CURSOR_COMPOSER_AGENT_GC_PRESSURE_HIGH_PCT", 85, { min: 76, max: 99 },
+);
+const SDK_AGENT_GC_PRESSURE_LOW_PCT = envInt(
+  "CURSOR_COMPOSER_AGENT_GC_PRESSURE_LOW_PCT", 75,
+  { min: 1, max: SDK_AGENT_GC_PRESSURE_HIGH_PCT - 1 },
+);
 const SDK_AGENT_GC_DIR = path.join(STATE_ROOT, ".cct-agent-gc");
+const agentLeaseManager = new DurableAgentLeaseManager(path.join(STATE_ROOT, ".cct-agent-leases"));
+const withAliasPublicationLease = (cursorKey, agentId, publish) => agentLeaseManager.withLock({
+  scope: keyHash(cursorKey),
+  agentId,
+}, publish);
 
 function stateRootDiskStatus(requiredBytes = 0, statfs = statfsSync) {
   try {
@@ -1423,6 +1510,19 @@ function keyHash(k) { return createHash("sha256").update(String(k || "")).digest
 // + durable state — a truncated-collision-but-different-full-key is rejected in getPlatform/platformHasSession.
 function keyFingerprint(k) { return createHash("sha256").update(String(k || "")).digest("hex"); }
 
+function canonicalConversationBinding(value, { required = false } = {}) {
+  const binding = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!binding && !required) return "";
+  if (!/^[a-f0-9]{64}$/.test(binding)) {
+    throw new ToolRoundError(
+      "conversation_binding_invalid",
+      "conversationBinding must be a 64-character lowercase SHA-256 digest",
+      422,
+    );
+  }
+  return binding;
+}
+
 // A recovery or rotation can deliberately move one external conversation onto a replacement durable Cursor
 // agent. Persist that indirection under STATE_ROOT so a bridge restart does not silently fall back to the
 // original agent and lose the recovered context. The credential itself is never written; its full one-way
@@ -1505,8 +1605,18 @@ function validateDurableAgentAlias(record, cursorKey, sessionId) {
   const expectedSessionId = String(sessionId || "");
   const epochValid = (value) => value === undefined
     || (Number.isSafeInteger(value) && value >= 0 && value <= 1024);
+  const v2MetadataValid = record?.version !== 2 || (
+    Number.isSafeInteger(record.createdAt)
+    && Number.isSafeInteger(record.lastUsedAt)
+    && record.createdAt > 0
+    && record.lastUsedAt >= record.createdAt
+    && Number.isSafeInteger(record.generation)
+    && record.generation >= 1
+    && (record.conversationBinding === ""
+      || /^[a-f0-9]{64}$/.test(String(record.conversationBinding || "")))
+  );
   if (!record || typeof record !== "object" || Array.isArray(record)
-      || record.version !== 1
+      || (record.version !== 1 && record.version !== 2)
       || record.keyFingerprint !== keyFingerprint(cursorKey)
       || record.sessionId !== expectedSessionId
       || typeof record.agentId !== "string"
@@ -1517,8 +1627,37 @@ function validateDurableAgentAlias(record, cursorKey, sessionId) {
       || !epochValid(record.modelEpoch)
       || !epochValid(record.keyEpoch)
       || !epochValid(record.contextEpoch)
-      || (record.systemBlockIds !== undefined && !validSystemBlockIds(record.systemBlockIds))) {
+      || (record.systemBlockIds !== undefined && !validSystemBlockIds(record.systemBlockIds))
+      || !v2MetadataValid) {
     throw new Error("durable Cursor agent alias is malformed or belongs to another session/credential");
+  }
+  return record;
+}
+
+function validateDurableAgentAliasRoot(record) {
+  const epochValid = (value) => value === undefined
+    || (Number.isSafeInteger(value) && value >= 0 && value <= 1024);
+  const basicValid = record && typeof record === "object" && !Array.isArray(record)
+    && (record.version === 1 || record.version === 2)
+    && typeof record.keyFingerprint === "string" && record.keyFingerprint.length > 0
+    && typeof record.sessionId === "string" && record.sessionId.length > 0
+    && typeof record.agentId === "string" && record.agentId.length > 0
+    && record.agentId.length <= 512
+    && record.agentId.startsWith(`${record.sessionId}_`)
+    && epochValid(record.recoveryEpoch)
+    && epochValid(record.modelEpoch)
+    && epochValid(record.keyEpoch)
+    && epochValid(record.contextEpoch)
+    && (record.systemBlockIds === undefined || validSystemBlockIds(record.systemBlockIds));
+  const v2Valid = record?.version !== 2 || (
+    Number.isSafeInteger(record.createdAt) && record.createdAt > 0
+    && Number.isSafeInteger(record.lastUsedAt) && record.lastUsedAt >= record.createdAt
+    && Number.isSafeInteger(record.generation) && record.generation >= 1
+    && (record.conversationBinding === ""
+      || /^[a-f0-9]{64}$/.test(String(record.conversationBinding || "")))
+  );
+  if (!basicValid || !v2Valid) {
+    throw new Error("durable Cursor agent alias root is malformed");
   }
   return record;
 }
@@ -1537,9 +1676,15 @@ function readDurableAgentAlias(cursorKey, sessionId) {
     throw new Error(`cannot validate durable Cursor agent alias: ${(error && error.message) || String(error)}`);
   }
 }
-function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
+function writeDurableAgentAliasUnlocked(cursorKey, sessionId, agentId, epochs = {}) {
+  const now = nowMs();
+  let prior;
+  try { prior = readDurableAgentAlias(cursorKey, sessionId); }
+  catch (error) {
+    throw new Error(`cannot persist durable Cursor agent alias: ${(error && error.message) || String(error)}`);
+  }
   const record = {
-    version: 1,
+    version: 2,
     keyFingerprint: keyFingerprint(cursorKey),
     sessionId: String(sessionId || ""),
     agentId: String(agentId || ""),
@@ -1548,6 +1693,11 @@ function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
     keyEpoch: Number.isSafeInteger(epochs.keyEpoch) ? epochs.keyEpoch : 0,
     contextEpoch: Number.isSafeInteger(epochs.contextEpoch) ? epochs.contextEpoch : 0,
     systemBlockIds: validSystemBlockIds(epochs.systemBlockIds) ? [...epochs.systemBlockIds] : [],
+    conversationBinding: canonicalConversationBinding(epochs.conversationBinding)
+      || canonicalConversationBinding(prior?.conversationBinding),
+    createdAt: Number.isSafeInteger(prior?.createdAt) ? prior.createdAt : now,
+    lastUsedAt: now,
+    generation: Number.isSafeInteger(prior?.generation) ? prior.generation + 1 : 1,
   };
   validateDurableAgentAlias(record, cursorKey, sessionId);
   mkdirSync(AGENT_ALIAS_DIR, { recursive: true, mode: 0o700 });
@@ -1571,6 +1721,9 @@ function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
         || persisted.modelEpoch !== record.modelEpoch
         || persisted.keyEpoch !== record.keyEpoch
         || persisted.contextEpoch !== record.contextEpoch
+        || persisted.conversationBinding !== record.conversationBinding
+        || persisted.lastUsedAt !== record.lastUsedAt
+        || persisted.generation !== record.generation
         || !sameStringArray(persisted.systemBlockIds, record.systemBlockIds)) {
       throw new Error("durable Cursor agent alias verification failed");
     }
@@ -1581,6 +1734,12 @@ function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
     try { rmSync(temp, { force: true }); } catch {}
     throw new Error(`cannot persist durable Cursor agent alias: ${(error && error.message) || String(error)}`);
   }
+}
+
+async function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
+  return withAliasPublicationLease(cursorKey, agentId, () => writeDurableAgentAliasUnlocked(
+    cursorKey, sessionId, agentId, epochs,
+  ));
 }
 
 function recoveryTargetAgentId(round) {
@@ -1796,70 +1955,281 @@ function completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, request
 }
 
 const receiptCAS = new DurableJSONCAS();
-const unresolvedReservationFile = path.join(COMPLETED_TURN_DIR, ".unresolved-reservations.json");
+// P5: SHARDED reservation ledger. The pre-P5 single .unresolved-reservations.json
+// serialized every reserve/resize/release from every replica onto one CAS file, re-parsed
+// the whole ledger (up to 4,096 entries) on every attempt, and readdir-ed the completed
+// turns dir on every commit — O(writers × entries × dir-size) with ~4 fsyncs per commit.
+// Sharding by key nibble (16 shards) bounds each shard payload. A short cross-process
+// aggregate lock serializes the 16-shard ceiling/floor decision with the winning shard
+// commit; without it, writers on different shards could independently overcommit.
+const UNRESOLVED_RESERVATION_DIR = path.join(COMPLETED_TURN_DIR, ".unresolved-reservations");
+const RESERVATION_SHARD_NIBBLES = "0123456789abcdef";
+const RESERVATION_AGGREGATE_LOCK = path.join(UNRESOLVED_RESERVATION_DIR, ".aggregate-lock");
+const RESERVATION_AGGREGATE_LOCK_WAIT_MS = 30_000;
+const RESERVATION_AGGREGATE_LOCK_STALE_MS = 5 * 60_000;
+let legacyReservationsMigrated = false;
 
-function mutateUnresolvedReservations(reducer) {
-  for (let attempts = 0; attempts < 64; attempts++) {
-    const state = receiptCAS.readRecover(unresolvedReservationFile);
-    const current = state.record || { version: 1, entries: {} };
+class ReservationAggregateBusy extends Error {}
+
+function tryAcquireReservationAggregateLock() {
+  mkdirSync(UNRESOLVED_RESERVATION_DIR, { recursive: true, mode: 0o700 });
+  const owner = randomUUID();
+  const ownerFile = path.join(RESERVATION_AGGREGATE_LOCK, "owner");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      mkdirSync(RESERVATION_AGGREGATE_LOCK, { mode: 0o700 });
+      try {
+        const fd = openSync(ownerFile, "wx", 0o600);
+        try {
+          writeSync(fd, `${owner}\n`);
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+      } catch (error) {
+        try { rmSync(RESERVATION_AGGREGATE_LOCK, { recursive: true, force: true }); } catch {}
+        throw error;
+      }
+      return () => {
+        let observed = "";
+        try { observed = readFileSync(ownerFile, "utf8").trim(); } catch {}
+        if (observed !== owner) return false;
+        const retired = `${RESERVATION_AGGREGATE_LOCK}.released.${owner}`;
+        try { renameSync(RESERVATION_AGGREGATE_LOCK, retired); }
+        catch (error) {
+          if (error?.code === "ENOENT") return false;
+          throw error;
+        }
+        try {
+          const retiredOwner = readFileSync(path.join(retired, "owner"), "utf8").trim();
+          if (retiredOwner !== owner) {
+            try { renameSync(retired, RESERVATION_AGGREGATE_LOCK); } catch {}
+            return false;
+          }
+          rmSync(retired, { recursive: true, force: true });
+          return true;
+        } catch (error) {
+          try { renameSync(retired, RESERVATION_AGGREGATE_LOCK); } catch {}
+          throw error;
+        }
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      try {
+        const info = statSync(RESERVATION_AGGREGATE_LOCK);
+        if (nowMs() - info.mtimeMs >= RESERVATION_AGGREGATE_LOCK_STALE_MS) {
+          const observedOwner = (() => {
+            try { return readFileSync(ownerFile, "utf8").trim(); } catch { return ""; }
+          })();
+          const retired = `${RESERVATION_AGGREGATE_LOCK}.stale.${randomUUID()}`;
+          try { renameSync(RESERVATION_AGGREGATE_LOCK, retired); }
+          catch (renameError) {
+            if (renameError?.code === "ENOENT" || renameError?.code === "EEXIST") continue;
+            throw renameError;
+          }
+          const retiredOwner = (() => {
+            try { return readFileSync(path.join(retired, "owner"), "utf8").trim(); } catch { return ""; }
+          })();
+          const retiredInfo = (() => {
+            try { return statSync(retired); } catch { return null; }
+          })();
+          if (!observedOwner || retiredOwner !== observedOwner
+              || !retiredInfo || retiredInfo.mtimeMs !== info.mtimeMs) {
+            try { renameSync(retired, RESERVATION_AGGREGATE_LOCK); } catch {}
+            continue;
+          }
+          rmSync(retired, { recursive: true, force: true });
+          continue;
+        }
+      } catch (statError) {
+        if (statError?.code === "ENOENT") continue;
+        throw statError;
+      }
+      throw new ReservationAggregateBusy("durable reservation aggregate is busy");
+    }
+  }
+  throw new ReservationAggregateBusy("durable reservation aggregate is busy");
+}
+
+async function acquireReservationAggregateLock() {
+  const deadline = nowMs() + RESERVATION_AGGREGATE_LOCK_WAIT_MS;
+  for (;;) {
+    try { return tryAcquireReservationAggregateLock(); }
+    catch (error) {
+      if (!(error instanceof ReservationAggregateBusy)) throw error;
+      if (nowMs() >= deadline) {
+        throw new ToolRoundError(
+          "durable_state_capacity",
+          "durable reservation aggregate is busy; retry this turn",
+          503,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+}
+
+async function withReservationAggregateLock(action) {
+  const release = await acquireReservationAggregateLock();
+  try { return await action(); } finally { release(); }
+}
+
+function withReservationAggregateLockSync(action) {
+  const release = tryAcquireReservationAggregateLock();
+  try { return action(); } finally { release(); }
+}
+
+function reservationShardFile(key) {
+  const nibble = /^[a-fA-F0-9]/.test(String(key)) ? String(key)[0].toLowerCase() : "0";
+  return path.join(UNRESOLVED_RESERVATION_DIR, `${nibble}.json`);
+}
+
+function normalizeReservationShard(record) {
+  const entries = record && typeof record.entries === "object" && record.entries ? record.entries : {};
+  return { version: 1, entries };
+}
+
+// Called only while holding RESERVATION_AGGREGATE_LOCK. The legacy file remains authoritative
+// until every shard merge succeeds, so a partial migration can be retried without losing claims.
+function migrateLegacyReservationsLocked() {
+  if (legacyReservationsMigrated) return;
+  const legacyFile = path.join(COMPLETED_TURN_DIR, ".unresolved-reservations.json");
+  let legacy;
+  try { legacy = receiptCAS.readRecover(legacyFile).record; }
+  catch (error) {
+    if (error?.code === "ENOENT") {
+      legacyReservationsMigrated = true;
+      return;
+    }
+    throw error;
+  }
+  if (!legacy) {
+    legacyReservationsMigrated = true;
+    return;
+  }
+  if (typeof legacy.entries !== "object" || !legacy.entries) {
+    throw new Error("legacy durable reservation ledger is malformed");
+  }
+  const byShard = new Map();
+  for (const [key, entry] of Object.entries(legacy.entries)) {
+    const shardFile = reservationShardFile(key);
+    if (!byShard.has(shardFile)) byShard.set(shardFile, {});
+    byShard.get(shardFile)[key] = entry;
+  }
+  for (const [shardFile, entries] of byShard) {
+    mutateReservationShardFile(shardFile, (current) => ({
+      version: 1,
+      entries: { ...entries, ...current.entries },
+    }));
+  }
+  renameSync(legacyFile, `${legacyFile}.migrated-${nowMs()}`);
+  legacyReservationsMigrated = true;
+  lifecycleEvent("reservation_ledger_migrated", { shards: byShard.size });
+}
+
+function ensureLegacyReservationsMigrated() {
+  if (legacyReservationsMigrated) return;
+  // Resize/release are synchronous cleanup paths. They never wait on a foreign lock: if a
+  // startup migration is already in flight, the caller defers and reconciliation heals it.
+  withReservationAggregateLockSync(() => migrateLegacyReservationsLocked());
+}
+
+// Global capacity view: the sum of all 16 shard totals (16 small reads, milliseconds).
+function readAllReservationShardTotals() {
+  let reserved = 0;
+  let unmaterialized = 0;
+  let entries = 0;
+  for (const nibble of RESERVATION_SHARD_NIBBLES) {
+    const record = receiptCAS.readRecover(path.join(UNRESOLVED_RESERVATION_DIR, `${nibble}.json`)).record;
+    const shard = normalizeReservationShard(record);
+    reserved += exactReservationBytes(shard);
+    unmaterialized += exactUnmaterializedReservationBytes(shard);
+    entries += Object.keys(shard.entries).length;
+  }
+  return { reserved, unmaterialized, entries };
+}
+
+function mutateReservationShardFile(shardFile, reducer) {
+  for (let attempts = 0; attempts < UNRESOLVED_RESERVATION_CAS_MAX_ATTEMPTS; attempts++) {
+    const state = receiptCAS.readRecover(shardFile);
+    const current = normalizeReservationShard(state.record);
     const next = reducer(current);
     if (!next) return current;
     try {
-      const committed = receiptCAS.commit(unresolvedReservationFile, state, next).record;
-      receiptCAS.cleanupArtifacts(unresolvedReservationFile, { keepRevision: committed.revision });
-      return committed;
+      // P5.3: no cleanupArtifacts here — artifact sweeps moved to runDurableMaintenance,
+      // off the per-commit hot path (that readdir of the completed-turns dir was the
+      // largest per-op IO cost at 5,174 receipts).
+      return receiptCAS.commit(shardFile, state, next).record;
     } catch (error) {
       if (error instanceof DurableCASConflict) continue;
       throw error;
     }
   }
-  throw new ToolRoundError("durable_state_capacity", "durable reservation ledger is changing too quickly", 503);
+  throw new ToolRoundError(
+    "durable_state_capacity",
+    "durable reservation shard is changing too quickly; retry this turn",
+    503,
+  );
 }
 
-function reserveUnresolvedReceipt(file, bytes) {
+function mutateReservationShard(key, reducer) {
+  return mutateReservationShardFile(reservationShardFile(key), reducer);
+}
+
+async function reserveUnresolvedReceipt(file, bytes, priority = ADMISSION_PRIORITY.FRESH) {
   const key = path.basename(file);
-  return mutateUnresolvedReservations((current) => {
-    const entries = current.entries && typeof current.entries === "object" ? current.entries : {};
-    const existingBytes = Math.max(0, Number(entries[key]?.bytes) || 0);
-    if (existingBytes >= bytes) return null;
-    const reserved = Object.values(entries).reduce((sum, entry) => sum + Math.max(0, Number(entry?.bytes) || 0), 0);
-    const additional = bytes - existingBytes;
-    const disk = stateRootDiskStatus();
-    if (reserved + additional > UNRESOLVED_RECEIPT_MAX_BYTES
-        || disk.freeBytes - reserved - additional < STATE_ROOT_MIN_FREE_BYTES) {
-      throw new ToolRoundError(
-        "durable_state_capacity",
-        "shared durable receipt capacity is occupied; retry this turn after prior uncertain deliveries resolve",
-        507,
-      );
-    }
-    return {
-      version: 1,
-      entries: { ...entries, [key]: { bytes, createdAt: entries[key]?.createdAt || nowMs() } },
-    };
+  return await withReservationAggregateLock(() => {
+    migrateLegacyReservationsLocked();
+    return mutateReservationShard(key, (current) => {
+      // The aggregate lock makes the all-shard byte/entry decision and this shard commit one
+      // transaction across processes. A shard may hold the full global entry count; only the
+      // aggregate count is authoritative, so random hash skew cannot create a false 507 cliff.
+      const shardResult = reserveExactBytes(current, key, bytes, {
+        limit: UNRESOLVED_RECEIPT_MAX_BYTES,
+        availableBytes: Number.POSITIVE_INFINITY,
+        minFreeBytes: 0,
+        createdAt: nowMs(),
+        priority,
+        maxEntries: UNRESOLVED_RESERVATION_MAX_ENTRIES,
+      });
+      if (shardResult.state === current) return null;
+      const totals = readAllReservationShardTotals();
+      const globalReserved = totals.reserved
+        - exactReservationBytes(current) + exactReservationBytes(shardResult.state);
+      const globalUnmaterialized = totals.unmaterialized
+        - exactUnmaterializedReservationBytes(current) + exactUnmaterializedReservationBytes(shardResult.state);
+      const addsEntry = !Object.prototype.hasOwnProperty.call(current.entries, key);
+      const globalEntries = totals.entries + (addsEntry ? 1 : 0);
+      const disk = stateRootDiskStatus();
+      if (globalReserved > UNRESOLVED_RECEIPT_MAX_BYTES
+          || globalEntries > UNRESOLVED_RESERVATION_MAX_ENTRIES
+          || disk.freeBytes - globalUnmaterialized < STATE_ROOT_MIN_FREE_BYTES) {
+        throw new ToolRoundError(
+          "durable_state_capacity",
+          "shared durable receipt capacity is occupied; retry this turn after prior uncertain deliveries resolve",
+          507,
+        );
+      }
+      return shardResult.state;
+    });
   });
 }
 
 function resizeUnresolvedReceipt(file, bytes) {
   const key = path.basename(file);
-  mutateUnresolvedReservations((current) => {
-    const entries = current.entries && typeof current.entries === "object" ? current.entries : {};
-    if (!entries[key] || entries[key].bytes === bytes) return null;
-    return {
-      version: 1,
-      entries: { ...entries, [key]: { ...entries[key], bytes } },
-    };
+  ensureLegacyReservationsMigrated();
+  mutateReservationShard(key, (current) => {
+    const next = resizeExactBytes(current, key, bytes, { materialized: true });
+    return next === current ? null : next;
   });
 }
 
 function releaseUnresolvedReceipt(file) {
   const key = path.basename(file);
-  mutateUnresolvedReservations((current) => {
-    const entries = current.entries && typeof current.entries === "object" ? current.entries : {};
-    if (!entries[key]) return null;
-    const next = { ...entries };
-    delete next[key];
-    return { version: 1, entries: next };
+  ensureLegacyReservationsMigrated();
+  mutateReservationShard(key, (current) => {
+    const next = releaseExactBytes(current, key);
+    return next === current ? null : next;
   });
 }
 
@@ -1868,7 +2238,7 @@ function releasePreReservationWithoutReceipt(input) {
   if (!file) return;
   try {
     const record = readTurnReceiptFile(file);
-    if (unresolvedFreshDeliveryReceipt(record) || record?.status === "completed") return;
+    if (unresolvedFreshDeliveryReceipt(record)) return;
   } catch (error) {
     if (!error || error.code !== "ENOENT") return;
   }
@@ -1876,31 +2246,76 @@ function releasePreReservationWithoutReceipt(input) {
   delete input.preReservedReceiptFile;
 }
 
-function reconcileUnresolvedReservations() {
-  const observed = {};
+async function reconcileUnresolvedReservations() {
+  // Bucket observed receipts by shard, then reconcile each shard independently (one small
+  // CAS domain per shard instead of the whole ledger). Corrupt-evidence semantics are
+  // unchanged: unreadable receipts retain their claim without an orphan TTL.
+  const observedByShard = new Map();
+  const preserveByShard = new Map();
+  let corruptReceipts = 0;
+  const bucketFor = (shardFile) => {
+    if (!observedByShard.has(shardFile)) {
+      observedByShard.set(shardFile, {});
+      preserveByShard.set(shardFile, []);
+    }
+  };
   try {
     for (const name of readdirSync(COMPLETED_TURN_DIR)) {
       if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+      const shardFile = reservationShardFile(name);
+      bucketFor(shardFile);
       const file = path.join(COMPLETED_TURN_DIR, name);
       try {
         const record = readTurnReceiptFile(file);
         if (unresolvedFreshDeliveryReceipt(record)) {
-          observed[name] = { bytes: statSync(file).size, createdAt: Number(record.startedAt) || nowMs() };
+          const bytes = statSync(file).size;
+          observedByShard.get(shardFile)[name] = {
+            bytes,
+            materializedBytes: bytes,
+            createdAt: Number(record.startedAt) || nowMs(),
+          };
         }
-      } catch {}
+      } catch {
+        corruptReceipts++;
+        try {
+          const stats = statSync(file);
+          observedByShard.get(shardFile)[name] = {
+            bytes: stats.size,
+            materializedBytes: stats.size,
+            createdAt: Number.isFinite(stats.mtimeMs) ? Math.floor(stats.mtimeMs) : nowMs(),
+          };
+        } catch {
+          // If even metadata is unreadable, retain any existing claim without
+          // an orphan TTL. Corrupt uncertainty is never permission to free it.
+          preserveByShard.get(shardFile).push(name);
+        }
+      }
     }
   } catch (error) {
     if (!error || error.code !== "ENOENT") throw error;
   }
-  mutateUnresolvedReservations((current) => {
-    const entries = current.entries && typeof current.entries === "object" ? current.entries : {};
-    const cutoff = nowMs() - UNRESOLVED_RESERVATION_ORPHAN_MS;
-    for (const [name, entry] of Object.entries(entries)) {
-      if (!observed[name] && Number(entry?.createdAt) >= cutoff) observed[name] = entry;
+  // Reconciliation can add crash-recovered claims, so its shard commits participate in the
+  // same aggregate transaction as admission. The receipt census above stays outside the lock.
+  await withReservationAggregateLock(() => {
+    migrateLegacyReservationsLocked();
+    for (const nibble of RESERVATION_SHARD_NIBBLES) {
+      const shardFile = path.join(UNRESOLVED_RESERVATION_DIR, `${nibble}.json`);
+      const observed = observedByShard.get(shardFile) || {};
+      const preserveKeys = preserveByShard.get(shardFile) || [];
+      try {
+        mutateReservationShardFile(shardFile, (current) => {
+          const cutoff = nowMs() - UNRESOLVED_RESERVATION_ORPHAN_MS;
+          const next = reconcileExactBytes(current, observed, { orphanCutoff: cutoff, preserveKeys });
+          return canonicalJSONString(current?.entries || {}) === canonicalJSONString(next.entries) ? null : next;
+        });
+      } catch (error) {
+        dbg("reservation shard reconcile deferred", "shard=" + nibble, (error && error.message) || String(error));
+      }
     }
-    if (canonicalJSONString(entries) === canonicalJSONString(observed)) return null;
-    return { version: 1, entries: observed };
   });
+  if (corruptReceipts > 0) {
+    console.error("[cursor-agent-bridge] durable reservation reconciliation preserved corrupt receipt evidence", JSON.stringify({ corruptReceipts }));
+  }
 }
 
 function readTurnReceiptFile(file) {
@@ -2063,7 +2478,12 @@ function writeCompletedTurnReceipt(
     return { commit: true, record };
   });
   completedTurnReceipts.set(file, committed);
-  releaseUnresolvedReceipt(file);
+  try { releaseUnresolvedReceipt(file); }
+  catch (error) {
+    // The replay receipt is already durable. Accounting cleanup is healable by
+    // reconciliation and must not turn a proven completion into uncertainty.
+    dbg("completed-turn reservation cleanup deferred", (error && error.message) || String(error));
+  }
   return committed;
 }
 
@@ -2127,7 +2547,7 @@ function readFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, request
   }
 }
 
-function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, {
+async function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, {
   generation,
   agentId,
   idempotencyKey,
@@ -2173,7 +2593,7 @@ function writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, reques
   }
   mkdirSync(COMPLETED_TURN_DIR, { recursive: true, mode: 0o700 });
   const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
-  reserveUnresolvedReceipt(file, bytes.length);
+  await reserveUnresolvedReceipt(file, bytes.length);
   const committed = mutateTurnReceipt(file, (raw) => {
     completedTurnReceipts.delete(file);
     const existingFresh = raw && validFreshDeliveryReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash);
@@ -2335,8 +2755,124 @@ function cleanupCompletedTurnReceipts({ ttlMs = TERMINAL_ROUND_TTL_MS, maxTermin
   }
 }
 
-function sdkAgentGCRoots() {
+// P3.4: fail SAFE on corrupt durable records. The pre-P3 choices were both wrong: fail-open
+// (HEAD) silently unprotected agents; fail-closed-by-throw (early worktree) let ONE corrupt
+// file wedge every future GC run until manual repair. Instead: rename the bad file aside
+// (atomic, operator-recoverable), log loudly, and — when an agentId is still extractable —
+// treat that agent as a protected root. A corrupt file can no longer stall all maintenance,
+// and corruption is never permission to delete. (GC *markers* stay fail-closed: they are the
+// tombstone evidence, and an aborted run is safe there.)
+const BAD_DURABLE_DIR = path.join(STATE_ROOT, ".cct-quarantine-bad");
+function quarantineBadDurableFile(file, reason) {
+  let moved = file;
+  try {
+    mkdirSync(BAD_DURABLE_DIR, { recursive: true, mode: 0o700 });
+    const target = path.join(BAD_DURABLE_DIR, `${path.basename(file)}.bad-${nowMs()}`);
+    renameSync(file, target);
+    moved = target;
+  } catch {}
+  lifecycleEvent("bad_record_quarantined", {
+    file: moved,
+    reason: (reason && reason.message) || String(reason),
+  });
+  console.error("[cursor-agent-bridge] corrupt durable record quarantined:", moved,
+    (reason && reason.message) || String(reason));
+}
+
+// P4: the agentIds a durable round protects (live rounds protect their agent, any recovery
+// replacement, and deferred delivery agents; TERMINAL rounds with no unresolved deferred
+// inputs protect nothing). Works on both live ToolRound instances and plain journal records.
+function rootAgentIdsFromRoundRecord(record) {
+  const unresolvedDeferred = Array.isArray(record?.deferredInputs)
+    && record.deferredInputs.some((item) => item && (
+      item.state === DeferredInputState.QUEUED || item.state === DeferredInputState.DELIVERING
+    ));
+  if (record?.state === RoundState.TERMINAL && !unresolvedDeferred) return [];
+  const ids = new Set();
+  if (typeof record?.agentId === "string" && record.agentId) ids.add(record.agentId);
+  if (typeof record?.recovery?.replacementAgentId === "string") ids.add(record.recovery.replacementAgentId);
+  for (const item of record?.deferredInputs || []) {
+    if (typeof item?.deliveryAgentId === "string" && item.deliveryAgentId) ids.add(item.deliveryAgentId);
+  }
+  return [...ids];
+}
+
+// Moving corrupt evidence aside must never turn it into deletion permission on the next
+// census. Recoverable agent ids remain hard roots; an unreadable/anonymous quarantined file
+// blocks GC until an operator resolves it.
+function quarantinedDurableRoots() {
   const roots = new Set();
+  let entries = [];
+  try { entries = readdirSync(BAD_DURABLE_DIR, { withFileTypes: true }); }
+  catch (error) {
+    if (error?.code === "ENOENT") return roots;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    let record;
+    try { record = JSON.parse(readFileSync(path.join(BAD_DURABLE_DIR, entry.name), "utf8")); }
+    catch (error) {
+      throw new Error(`unresolved corrupt durable evidence blocks SDK agent GC: ${entry.name}: ${error.message}`);
+    }
+    const ids = new Set(rootAgentIdsFromRoundRecord(record));
+    if (typeof record?.agentId === "string" && record.agentId) ids.add(record.agentId);
+    if (ids.size === 0) {
+      throw new Error(`unresolved corrupt durable evidence has no recoverable agent id: ${entry.name}`);
+    }
+    for (const id of ids) roots.add(id);
+  }
+  return roots;
+}
+
+// Full journal+receipt census. It runs in the isolated worker before destructive GC checks,
+// never on the HTTP/SSE event loop.
+function censusRootSources() {
+  const sources = {};
+  const { journal } = getRoundInfrastructure();
+  for (const record of journal.records()) {
+    const ids = rootAgentIdsFromRoundRecord(record);
+    if (ids.length && typeof record?.route === "string") sources[`round:${record.route}`] = ids;
+  }
+  try {
+    for (const name of readdirSync(COMPLETED_TURN_DIR)) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+      const receiptFile = path.join(COMPLETED_TURN_DIR, name);
+      let record;
+      try {
+        record = receiptCAS.readRecover(receiptFile).record;
+      } catch (error) {
+        try {
+          const raw = JSON.parse(readFileSync(receiptFile, "utf8"));
+          if (raw && typeof raw.agentId === "string" && raw.agentId) sources[`receipt:${name}`] = [raw.agentId];
+        } catch {}
+        quarantineBadDurableFile(receiptFile, error);
+        continue;
+      }
+      if (isUnresolvedAcceptanceRecord(record)
+          && typeof record?.agentId === "string" && record.agentId) {
+        sources[`receipt:${name}`] = [record.agentId];
+      }
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return sources;
+}
+
+// Flat union of the census (the worker/audit interface).
+function sdkAgentGCCensus() {
+  const roots = new Set();
+  for (const ids of Object.values(censusRootSources())) {
+    for (const id of ids) roots.add(id);
+  }
+  for (const id of quarantinedDurableRoots()) roots.add(id);
+  return roots;
+}
+
+function sdkAgentGCRoots(censusRoots = new Set()) {
+  const roots = new Set(censusRoots);
+  for (const id of quarantinedDurableRoots()) roots.add(id);
   for (const session of sessions.values()) {
     if (session?.agentId) roots.add(session.agentId);
     if (session?.pendingRecoveryAlias) roots.add(session.pendingRecoveryAlias);
@@ -2344,36 +2880,24 @@ function sdkAgentGCRoots() {
   try {
     for (const name of readdirSync(AGENT_ALIAS_DIR)) {
       if (!name.endsWith(".json")) continue;
-      try {
-        const record = JSON.parse(readFileSync(path.join(AGENT_ALIAS_DIR, name), "utf8"));
-        if (typeof record?.agentId === "string" && record.agentId) roots.add(record.agentId);
-      } catch {}
-    }
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  const { journal } = getRoundInfrastructure();
-  for (const record of journal.records()) {
-    const unresolvedDeferred = Array.isArray(record?.deferredInputs)
-      && record.deferredInputs.some((item) => item && (
-        item.state === DeferredInputState.QUEUED || item.state === DeferredInputState.DELIVERING
-      ));
-    if (record?.state !== RoundState.TERMINAL || unresolvedDeferred) {
-      if (typeof record?.agentId === "string" && record.agentId) roots.add(record.agentId);
-      if (typeof record?.recovery?.replacementAgentId === "string") roots.add(record.recovery.replacementAgentId);
-      for (const item of record?.deferredInputs || []) {
-        if (typeof item?.deliveryAgentId === "string" && item.deliveryAgentId) roots.add(item.deliveryAgentId);
+      const file = path.join(AGENT_ALIAS_DIR, name);
+      let record;
+      let recordError = null;
+      try { record = JSON.parse(readFileSync(file, "utf8")); }
+      catch (error) { recordError = error; }
+      if (!recordError) {
+        try { validateDurableAgentAliasRoot(record); }
+        catch (error) { recordError = error; }
       }
-    }
-  }
-  try {
-    for (const name of readdirSync(COMPLETED_TURN_DIR)) {
-      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
-      try {
-        const record = receiptCAS.readRecover(path.join(COMPLETED_TURN_DIR, name)).record;
-        if (isUnresolvedAcceptanceRecord(record)
-            && typeof record?.agentId === "string" && record.agentId) roots.add(record.agentId);
-      } catch {}
+      if (recordError) {
+        // Conservative protection first: a half-readable alias may still name a live agent.
+        if (record && typeof record.agentId === "string" && record.agentId) roots.add(record.agentId);
+        quarantineBadDurableFile(file, recordError);
+        continue;
+      }
+      const lastUsedAt = Number.isSafeInteger(record.lastUsedAt)
+        ? record.lastUsedAt : Math.floor(statSync(file).mtimeMs);
+      if (nowMs() - lastUsedAt < SDK_AGENT_ALIAS_TTL_MS) roots.add(record.agentId);
     }
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
@@ -2393,7 +2917,83 @@ function sdkAgentLiveRoots(durableRoots) {
   return roots;
 }
 
+// Cheap generation token bracketing each authoritative worker census. Durable CAS commits
+// publish by rename, which changes the containing directory metadata. If any namespace moves
+// after the final census, the mutation is fenced and retried on a later maintenance tick.
+export function sdkAgentRootGeneration() {
+  const { journal } = getRoundInfrastructure();
+  const parts = [];
+  for (const dir of [AGENT_ALIAS_DIR, journal.dir, COMPLETED_TURN_DIR, BAD_DURABLE_DIR]) {
+    try {
+      const info = statSync(dir, { bigint: true });
+      parts.push(`${dir}\0${info.dev}\0${info.ino}\0${info.mtimeNs}\0${info.ctimeNs}\0${info.size}`);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      parts.push(`${dir}\0missing`);
+    }
+  }
+  return createHash("sha256").update(parts.join("\0")).digest("hex");
+}
+
+function sdkAgentAliasGeneration() {
+  try {
+    const info = statSync(AGENT_ALIAS_DIR, { bigint: true });
+    return `${info.dev}\0${info.ino}\0${info.mtimeNs}\0${info.ctimeNs}\0${info.size}`;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    return "missing";
+  }
+}
+
+// The slow worker scans journal/receipt evidence. Alias publication is a separate, fast
+// namespace and may rotate an agent on another replica without first holding the target use
+// lease. Retry only that local scan until its directory generation is stable; then capture
+// the all-namespace generation used by the final pre-mutation fence.
+async function readAuthoritativeSdkAgentRoots(rootScanner) {
+  const census = await rootScanner.scan();
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const aliasBefore = sdkAgentAliasGeneration();
+    const roots = sdkAgentLiveRoots(sdkAgentGCRoots(census.roots));
+    if (process.env.NODE_ENV === "test" && typeof globalThis.__CCT_TEST_AFTER_ALIAS_ROOTS === "function") {
+      await globalThis.__CCT_TEST_AFTER_ALIAS_ROOTS();
+    }
+    const aliasAfter = sdkAgentAliasGeneration();
+    if (aliasBefore !== aliasAfter) continue;
+    const generation = sdkAgentRootGeneration();
+    if (sdkAgentAliasGeneration() !== aliasAfter) continue;
+    return { roots, complete: true, generation };
+  }
+  return { roots: new Set(), complete: false, generation: null };
+}
+
 let sdkAgentGCRunning = false;
+const sdkAgentGCScanCursors = new Map();
+// P3.5: persist the listing cursor so a restart resumes pagination instead of relisting the
+// whole fleet from zero (which, combined with per-mutation root refreshes, made GC re-walk
+// the entire agent population after every bridge restart). Best-effort: a read/write failure
+// degrades to a fresh cursor, never to incorrect deletions.
+function scanCursorPath(scope) {
+  const safe = String(scope || "").replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 128);
+  return path.join(SDK_AGENT_GC_DIR, `cursor-${safe}.json`);
+}
+function loadScanCursor(scope) {
+  try {
+    const record = JSON.parse(readFileSync(scanCursorPath(scope), "utf8"));
+    return typeof record?.cursor === "string" ? record.cursor : "";
+  } catch { return ""; }
+}
+function saveScanCursor(scope, cursor) {
+  try {
+    mkdirSync(SDK_AGENT_GC_DIR, { recursive: true, mode: 0o700 });
+    const file = scanCursorPath(scope);
+    const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temp, `${JSON.stringify({ cursor: String(cursor || ""), updatedAt: nowMs() })}\n`, { mode: 0o600 });
+    renameSync(temp, file);
+  } catch (error) {
+    dbg("scan cursor persist failed (will relist next run)", (error && error.message) || String(error));
+  }
+}
+const sdkAgentGCPressureActive = new Map();
 function createSdkAgentRootScanner() {
   const worker = new Worker(new URL("./sdk-agent-root-scanner.mjs", import.meta.url), {
     // `node --input-type=module -e ...` is useful for Railway maintenance
@@ -2421,7 +3021,10 @@ function createSdkAgentRootScanner() {
     }
     scans++;
     elapsedMs += Number(message.elapsedMs) || 0;
-    waiter.resolve(new Set(Array.isArray(message.roots) ? message.roots : []));
+    waiter.resolve({
+      roots: new Set(Array.isArray(message.roots) ? message.roots : []),
+      elapsedMs: Number(message.elapsedMs) || 0,
+    });
   });
   worker.on("error", fail);
   worker.on("exit", (code) => {
@@ -2452,54 +3055,312 @@ async function runSdkAgentMaintenance() {
   sdkAgentGCRunning = true;
   let rootScanner = null;
   try {
-    // Durable root discovery touches thousands of JSON receipts in mature
-    // deployments. Keep that synchronous filesystem work off the HTTP/SSE
-    // event loop; only the small resulting Set crosses the worker boundary.
-    rootScanner = createSdkAgentRootScanner();
-    for (const [scope, entry] of platforms.entries()) {
+    await agentLeaseManager.withLeader("sdk-agent-gc", async () => {
+      rootScanner = createSdkAgentRootScanner();
+      for (const [scope, entry] of platforms.entries()) {
       const platform = await entry.promise;
-      const durableRoots = sdkAgentLiveRoots(await rootScanner.scan());
+      let pressure = null;
+      if (SDK_AGENT_GC_PRESSURE_ENABLED) {
+        const fs = statfsSync(entry.stateRoot);
+        const totalBytes = Number(fs.blocks) * Number(fs.bsize);
+        const freeBytes = Number(fs.bavail) * Number(fs.bsize);
+        pressure = {
+          usedBytes: Math.max(0, totalBytes - freeBytes),
+          highWaterBytes: Math.floor(totalBytes * SDK_AGENT_GC_PRESSURE_HIGH_PCT / 100),
+          lowWaterBytes: Math.floor(totalBytes * SDK_AGENT_GC_PRESSURE_LOW_PCT / 100),
+          active: sdkAgentGCPressureActive.get(scope) === true,
+        };
+      }
+      if (!sdkAgentGCScanCursors.has(scope)) sdkAgentGCScanCursors.set(scope, loadScanCursor(scope));
+      // The journal and receipts are the deletion authority. Take a fresh worker census
+      // before every mutation, then bracket it with a durable-namespace generation token.
+      // This is deliberately slower than an advisory index, but it cannot delete a live
+      // agent because an index update was missed or a process crashed between two commits.
+      const readAuthoritativeRoots = () => readAuthoritativeSdkAgentRoots(rootScanner);
+      let durableRoots = await readAuthoritativeRoots();
       const stats = await collectSdkAgents({
         platform,
         scope,
         quarantineRoot: SDK_AGENT_GC_DIR,
         localStateRoot: entry.stateRoot,
         protectedAgentIds: durableRoots,
-        // Re-read shared durable roots before every mutation. Multiple bridge
-        // processes may overlap during deploys, so the initial census is not
-        // deletion authority.
-        refreshProtectedAgentIds: async () => sdkAgentLiveRoots(await rootScanner.scan()),
+        refreshProtectedAgentIds: async () => {
+          durableRoots = await readAuthoritativeRoots();
+          return durableRoots;
+        },
         minIdleMs: SDK_AGENT_GC_MIN_IDLE_MS,
+        terminalIdleMs: SDK_AGENT_GC_TERMINAL_IDLE_MS,
+        runningIdleMs: SDK_AGENT_GC_RUNNING_IDLE_MS,
         quarantineMs: SDK_AGENT_GC_QUARANTINE_MS,
         maxScan: SDK_AGENT_GC_MAX_SCAN,
         maxMutations: SDK_AGENT_GC_MAX_MUTATIONS,
+        scanCursor: sdkAgentGCScanCursors.get(scope) || "",
+        withAgentMutationLease: (context, mutate) => agentLeaseManager.withMutation(context, mutate),
+        // P3.1: wire the generation fence (the sdk-agent-gc seam was dead code before).
+        // Reject a mutation if the durable root namespaces changed since the final root
+        // snapshot — i.e. a concurrent request published routing evidence (alias/journal/
+        // receipt write). GC's own marker writes live in .cct-agent-gc and never bump the
+        // token, so self-writes cannot fence the run.
+        validateMutationGeneration: async ({ generation }) => {
+          if (!generation) return true; // no token available: the double root refresh still fences
+          return sdkAgentRootGeneration() === generation;
+        },
+        // Per-agent attribution trail (P0): map each GC mutation onto a lifecycle
+        // event line so a future "resume failed: not found" is always attributable
+        // to the exact run that removed the agent.
+        onEvent: (event) => lifecycleEvent(
+          event.operation === "quarantined" ? "agent_quarantined"
+            : event.operation === "deleted" ? "agent_deleted"
+            : event.operation === "local-deleted" ? "agent_local_deleted"
+            : event.operation === "restored" ? "agent_restored"
+            : "agent_gc_event",
+          event),
+        pressure,
       });
-      if (stats.quarantined || stats.deleted || stats.localDeleted
+        sdkAgentGCScanCursors.set(scope, stats.nextScanCursor || "");
+        saveScanCursor(scope, stats.nextScanCursor || "");
+        if (pressure) sdkAgentGCPressureActive.set(scope, stats.pressureActive === true);
+        if (stats.quarantined || stats.deleted || stats.localDeleted
           || stats.markersCleared || stats.restored || stats.skipped) {
-        console.log("[cursor-agent-bridge] SDK agent GC", JSON.stringify({
-          scope,
-          ...stats,
-          ...rootScanner.metrics(),
-        }));
+          console.log("[cursor-agent-bridge] SDK agent GC", JSON.stringify({
+            scope,
+            ...stats,
+            ...rootScanner.metrics(),
+          }));
+        }
       }
-    }
+    });
   } catch (error) {
-    console.error("[cursor-agent-bridge] SDK agent GC failed closed; preserving state:",
-      (error && error.message) || String(error));
+    if (error instanceof AgentLeaseBusyError) {
+      dbg("SDK agent GC skipped; another bridge owns the shared maintenance lease");
+    } else {
+      console.error("[cursor-agent-bridge] SDK agent GC failed closed; preserving state:",
+        (error && error.message) || String(error));
+    }
   } finally {
     if (rootScanner) await rootScanner.close().catch(() => {});
     sdkAgentGCRunning = false;
   }
 }
 
-function runDurableMaintenance() {
+// P1.2: one-shot TOMBSTONE BACKFILL for agents deleted by pre-tombstone GC builds (the
+// Jul-20 incident generation). Those deletions left durable aliases naming agents that no
+// longer exist; with no tombstone present, a resume of one used to degrade to a silent
+// blank create. For every alias whose agent 404s on its platform, write a status:"deleted"
+// tombstone so the next resolve goes through the ensureAgent evidence table (faithful
+// bounded reseed or typed 410).
+//   - env-gated:  CURSOR_COMPOSER_BACKFILL_TOMBSTONES=dry-run|apply (default off)
+//   - marker-guarded: backfill-tombstones.done on completion; once per STATE_ROOT (apply mode)
+//   - rate-limited: ≤ BACKFILL_TOMBSTONES_BATCH platform probes per maintenance tick
+//   - fail-safe: any non-404 outcome skips the alias — uncertainty never writes a tombstone
+const BACKFILL_TOMBSTONES_BATCH = envInt("CURSOR_COMPOSER_BACKFILL_TOMBSTONES_BATCH", 50, { min: 1 });
+function backfillTombstonesIsNotFound(error) {
+  return /not found|no agents matched/i.test((error && error.message) || String(error));
+}
+async function backfillTombstonesTick() {
+  // Read per tick (not at load) so operators/tests can arm it without a restart.
+  const mode = (process.env.CURSOR_COMPOSER_BACKFILL_TOMBSTONES || "").trim().toLowerCase();
+  if (mode !== "dry-run" && mode !== "apply") return;
+  const dryRun = mode === "dry-run";
+  try { mkdirSync(SDK_AGENT_GC_DIR, { recursive: true, mode: 0o700 }); } catch {}
+  const doneFile = path.join(SDK_AGENT_GC_DIR, "backfill-tombstones.done");
+  if (existsSync(doneFile)) return;
+  let aliasFiles = [];
+  try {
+    aliasFiles = readdirSync(AGENT_ALIAS_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map((entry) => path.join(AGENT_ALIAS_DIR, entry.name));
+  } catch (error) {
+    if (error?.code !== "ENOENT") dbg("backfillTombstones alias dir unreadable", (error && error.message) || String(error));
+    return;
+  }
+  let probed = 0, missing = 0, written = 0, alive = 0, skipped = 0, capped = false;
+  for (const file of aliasFiles) {
+    if (probed >= BACKFILL_TOMBSTONES_BATCH) { capped = true; break; }
+    let record;
+    try { record = JSON.parse(readFileSync(file, "utf8")); } catch { skipped++; continue; }
+    if (typeof record?.agentId !== "string" || typeof record?.keyFingerprint !== "string") { skipped++; continue; }
+    let match = null;
+    for (const [scope, entry] of platforms.entries()) {
+      if (entry.fp === record.keyFingerprint) { match = { scope, entry }; break; }
+    }
+    if (!match) { skipped++; continue; }
+    try {
+      // An existing marker (tombstone or quarantine) means this alias is already healed.
+      if (readMarker(markerPath(SDK_AGENT_GC_DIR, match.scope, record.agentId))) { skipped++; continue; }
+    } catch { skipped++; continue; }
+    let platformApi;
+    try { platformApi = await match.entry.promise; } catch { skipped++; continue; }
+    if (typeof platformApi.getAgent !== "function") { skipped++; continue; }
+    probed++;
+    try {
+      await platformApi.getAgent(record.agentId);
+      alive++;
+    } catch (error) {
+      if (!backfillTombstonesIsNotFound(error)) { skipped++; continue; }
+      missing++;
+      if (dryRun) {
+        lifecycleEvent("backfill_tombstone_candidate", { agentId: record.agentId, scope: match.scope });
+        continue;
+      }
+      writeMarker(markerPath(SDK_AGENT_GC_DIR, match.scope, record.agentId), {
+        version: 1,
+        scope: match.scope,
+        agentId: record.agentId,
+        quarantinedAt: nowMs(),
+        status: "deleted",
+        deletedAt: nowMs(),
+      });
+      written++;
+      lifecycleEvent("agent_deleted", { agentId: record.agentId, scope: match.scope, cause: "backfill_tombstone" });
+    }
+  }
+  if (probed || missing) {
+    lifecycleEvent("backfill_tick", { dryRun, probed, missing, written, alive, skipped, totalAliases: aliasFiles.length });
+  }
+  if (!capped && !dryRun) {
+    try {
+      writeFileSync(doneFile, JSON.stringify({ completedAt: nowMs(), missing, written, skipped }) + "\n", { mode: 0o600 });
+      lifecycleEvent("backfill_complete", { missing, written, skipped, totalAliases: aliasFiles.length });
+    } catch (error) {
+      dbg("backfillTombstones done-marker write failed", (error && error.message) || String(error));
+    }
+  }
+}
+
+function unlinkFileWithCasArtifacts(file) {
+  let bytes = 0;
+  try { bytes = statSync(file).size; } catch {}
+  try { rmSync(file, { force: true }); } catch { return null; }
+  try {
+    const dir = path.dirname(file);
+    const base = path.basename(file);
+    for (const entry of readdirSync(dir)) {
+      if (entry.startsWith(`${base}.cas.`)) rmSync(path.join(dir, entry), { force: true });
+    }
+  } catch {}
+  return bytes;
+}
+
+// P6.1/6.3: physical reclamation. Tombstoned terminals (journal deleted:true / receipt
+// status:"expired") are unlinked after a grace period; byte ceilings then reclaim the
+// OLDEST completed terminals over budget. Unresolved acceptance evidence is NEVER touched.
+function reclaimTombstonedDurableFiles() {
+  const now = nowMs();
+  let reclaimedFiles = 0, reclaimedBytes = 0;
+  // Receipts.
+  const completedReceipts = [];
+  try {
+    for (const name of readdirSync(COMPLETED_TURN_DIR)) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+      const file = path.join(COMPLETED_TURN_DIR, name);
+      let raw;
+      try { raw = JSON.parse(readFileSync(file, "utf8")); } catch { continue; } // corrupt records are the quarantine path's job
+      if (raw?.status === "expired" && Number.isSafeInteger(raw.expiredAt) && now - raw.expiredAt >= TERMINAL_RECLAIM_GRACE_MS) {
+        const bytes = unlinkFileWithCasArtifacts(file);
+        if (bytes !== null) { reclaimedFiles++; reclaimedBytes += bytes; }
+        continue;
+      }
+      if (!isUnresolvedAcceptanceRecord(raw)
+          && (raw?.status === "completed" || raw?.acceptancePhase === "completed" || raw?.status === "expired")) {
+        try {
+          const info = statSync(file);
+          completedReceipts.push({
+            file, size: info.size, mtimeMs: info.mtimeMs,
+            reclaimable: now - info.mtimeMs >= TERMINAL_RECLAIM_GRACE_MS,
+          });
+        } catch {}
+      }
+    }
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  let receiptTotal = completedReceipts.reduce((sum, entry) => sum + entry.size, 0);
+  if (receiptTotal > TERMINAL_RECEIPT_MAX_BYTES) {
+    completedReceipts.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const entry of completedReceipts) {
+      if (receiptTotal <= TERMINAL_RECEIPT_MAX_BYTES) break;
+      if (!entry.reclaimable) continue;
+      try {
+        const raw = JSON.parse(readFileSync(entry.file, "utf8"));
+        if (isUnresolvedAcceptanceRecord(raw)) continue; // revalidate under the race
+      } catch { continue; }
+      const bytes = unlinkFileWithCasArtifacts(entry.file);
+      if (bytes === null) continue;
+      reclaimedFiles++; reclaimedBytes += bytes; receiptTotal -= entry.size;
+    }
+  }
+  // Journal.
+  const { journal } = getRoundInfrastructure();
+  const terminalRounds = [];
+  try {
+    for (const entry of readdirSync(journal.dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const file = path.join(journal.dir, entry.name);
+      let raw;
+      try { raw = JSON.parse(readFileSync(file, "utf8")); } catch { continue; }
+      if (raw?.deleted === true) {
+        const tombstoneAt = Number.isSafeInteger(raw.updatedAt) ? raw.updatedAt : 0;
+        if (tombstoneAt && now - tombstoneAt >= TERMINAL_RECLAIM_GRACE_MS) {
+          const bytes = unlinkFileWithCasArtifacts(file);
+          if (bytes !== null) { reclaimedFiles++; reclaimedBytes += bytes; }
+        }
+        continue;
+      }
+      const unresolvedDeferred = Array.isArray(raw?.deferredInputs)
+        && raw.deferredInputs.some((item) => item && (
+          item.state === DeferredInputState.QUEUED || item.state === DeferredInputState.DELIVERING
+        ));
+      if (raw?.state === RoundState.TERMINAL && !unresolvedDeferred) {
+        try {
+          const info = statSync(file);
+          terminalRounds.push({
+            file, size: info.size, mtimeMs: info.mtimeMs,
+            reclaimable: now - info.mtimeMs >= TERMINAL_RECLAIM_GRACE_MS,
+          });
+        } catch {}
+      }
+    }
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") throw error;
+  }
+  let journalTotal = terminalRounds.reduce((sum, entry) => sum + entry.size, 0);
+  if (journalTotal > TERMINAL_JOURNAL_MAX_BYTES) {
+    terminalRounds.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const entry of terminalRounds) {
+      if (journalTotal <= TERMINAL_JOURNAL_MAX_BYTES) break;
+      if (!entry.reclaimable) continue;
+      try {
+        const raw = JSON.parse(readFileSync(entry.file, "utf8"));
+        const unresolvedDeferred = Array.isArray(raw?.deferredInputs)
+          && raw.deferredInputs.some((item) => item && (
+            item.state === DeferredInputState.QUEUED || item.state === DeferredInputState.DELIVERING
+          ));
+        // Revalidate under the race: never reclaim non-terminal evidence.
+        if (raw?.deleted === true || raw?.state !== RoundState.TERMINAL || unresolvedDeferred) continue;
+      } catch { continue; }
+      const bytes = unlinkFileWithCasArtifacts(entry.file);
+      if (bytes === null) continue;
+      reclaimedFiles++; reclaimedBytes += bytes; journalTotal -= entry.size;
+    }
+  }
+  if (reclaimedFiles > 0) {
+    lifecycleEvent("retention_reclaimed", { reclaimedFiles, reclaimedBytes });
+  }
+}
+
+async function runDurableMaintenance() {
   const { journal } = getRoundInfrastructure();
   journal.cas.sweepDirectory(journal.dir, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
   receiptCAS.sweepDirectory(COMPLETED_TURN_DIR, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
+  // P5.3: reservation CAS artifacts are swept here, off the commit hot path.
+  receiptCAS.sweepDirectory(UNRESOLVED_RESERVATION_DIR, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
   journal.cleanupTerminal({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
   cleanupCompletedTurnReceipts({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
-  reconcileUnresolvedReservations();
+  await reconcileUnresolvedReservations();
+  reclaimTombstonedDurableFiles();
   void runSdkAgentMaintenance();
+  void backfillTombstonesTick();
 }
 
 function sdkUserTextHash(message) {
@@ -2814,10 +3675,21 @@ class AdvertisedToolRegistry extends ToolContractRegistry {
 }
 
 class Session {
-  constructor(id, cursorKey) {
+  constructor(id, cursorKey, conversationBinding = "") {
     this.id = id;
     this.cursorKey = cursorKey || API_KEY; // the Cursor key whose platform this session runs on
     const durableAlias = readDurableAgentAlias(this.cursorKey, id);
+    const requestedConversationBinding = canonicalConversationBinding(conversationBinding);
+    const durableConversationBinding = canonicalConversationBinding(durableAlias?.conversationBinding);
+    if (requestedConversationBinding && durableConversationBinding
+        && requestedConversationBinding !== durableConversationBinding) {
+      throw new ToolRoundError(
+        "conversation_identity_conflict",
+        "the durable agent alias belongs to a different client conversation",
+        409,
+      );
+    }
+    this.conversationBinding = requestedConversationBinding || durableConversationBinding;
     // C05: the DURABLE Cursor agent id is DECOUPLED from the external sessionID. `id` is the stable routing
     // key the Go executor derives (continuations keep routing here); `agentId` is what we hand to
     // resumeAgent/createAgent. They start equal, but on ERROR_CONVERSATION_TOO_LONG we ROTATE `agentId`
@@ -2839,6 +3711,8 @@ class Session {
                                   // requests a DIFFERENT model rotates the durable agent (the old agent is bound
                                   // to the old model) + forces a re-seed, instead of silently answering from it.
     this.agent = null; this.agentPromise = null; this.run = null;
+    this.agentUseLease = null;
+    this.reseedAllowed = false;
     this.utilityOneShot = false;
     // A restart-recovery target is not the durable active alias until its
     // first SDK send resolves. Keeping this intent process-local is safe: the
@@ -3089,6 +3963,7 @@ class Session {
       runEpoch: this.runEpoch,
       roundSeq: ++this.roundSeq,
       tenantFingerprint: keyFingerprint(this.cursorKey),
+      conversationBinding: this.conversationBinding,
       model: this.model || "",
       clientLeaseToken: this.clientLeaseToken,
       recoveryContext: this.roundRecoveryContext,
@@ -3120,15 +3995,24 @@ class Session {
     this.seededSystemBlockIds = [];
     this.historyFingerprint = null;
   }
-  persistDurableAlias() {
-    writeDurableAgentAlias(this.cursorKey, this.id, this.agentId, this);
+  async persistDurableAlias() {
+    await writeDurableAgentAlias(this.cursorKey, this.id, this.agentId, this);
   }
-  promotePendingRecoveryAlias() {
+  async touchDurableAlias() {
+    const record = readDurableAgentAlias(this.cursorKey, this.id);
+    const refreshAfterMs = Math.max(60_000, Math.floor(SDK_AGENT_ALIAS_TTL_MS / 4));
+    if (record?.version === 2 && record.agentId === this.agentId
+        && record.conversationBinding === this.conversationBinding
+        && nowMs() - record.lastUsedAt < refreshAfterMs) return false;
+    await this.persistDurableAlias();
+    return true;
+  }
+  async promotePendingRecoveryAlias() {
     if (!this.pendingRecoveryAlias) return;
     if (this.pendingRecoveryAlias !== this.agentId) {
       throw new Error("pending recovery alias no longer matches the active SDK agent");
     }
-    this.persistDurableAlias();
+    await this.persistDurableAlias();
     this.pendingRecoveryAlias = "";
   }
   async finishRotationCancel() { await this.cancel(); this.done = false; }
@@ -4038,7 +4922,7 @@ class Session {
     const targetAgentId = this.composeAgentId({ recoveryEpoch: nextRecoveryEpoch });
     // The durable alias is the rotation commit point. If fsync/rename fails,
     // no in-memory identity changes and the next request can retry safely.
-    writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
+    await writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
       recoveryEpoch: nextRecoveryEpoch,
       modelEpoch: this.modelEpoch,
       keyEpoch: this.keyEpoch,
@@ -4071,7 +4955,7 @@ class Session {
     if (nextModelEpoch === this.modelEpoch) {
       dbg("rotateForModelChange cap reached -> keep last agentId, force re-seed", "session=" + this.id, "agentId=" + this.agentId, "epoch=" + this.modelEpoch);
     }
-    writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
+    await writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
       recoveryEpoch: this.recoveryEpoch,
       modelEpoch: nextModelEpoch,
       keyEpoch: this.keyEpoch,
@@ -4106,7 +4990,7 @@ class Session {
     if (nextKeyEpoch === this.keyEpoch) {
       dbg("rotateForKeyChange cap reached -> keep last agentId, force re-seed", "session=" + this.id, "agentId=" + this.agentId, "epoch=" + this.keyEpoch);
     }
-    writeDurableAgentAlias(targetKey, this.id, targetAgentId, {
+    await writeDurableAgentAlias(targetKey, this.id, targetAgentId, {
       recoveryEpoch: this.recoveryEpoch,
       modelEpoch: this.modelEpoch,
       keyEpoch: nextKeyEpoch,
@@ -4138,7 +5022,7 @@ class Session {
     const oldAgentId = this.agentId;
     const nextContextEpoch = this.contextEpoch + 1;
     const targetAgentId = this.composeAgentId({ contextEpoch: nextContextEpoch });
-    writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
+    await writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
       recoveryEpoch: this.recoveryEpoch,
       modelEpoch: this.modelEpoch,
       keyEpoch: this.keyEpoch,
@@ -4170,7 +5054,7 @@ class Session {
     const targetAgentId = this.composeAgentId({ contextEpoch: nextContextEpoch });
     const systemBlockIds = validSystemBlockIds(this.seededSystemBlockIds)
       ? [...this.seededSystemBlockIds] : [];
-    writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
+    await writeDurableAgentAlias(this.cursorKey, this.id, targetAgentId, {
       recoveryEpoch: this.recoveryEpoch,
       modelEpoch: this.modelEpoch,
       keyEpoch: this.keyEpoch,
@@ -4194,11 +5078,11 @@ class Session {
     }
     const target = `${this.id}_legacy_${recoveryKey.slice("clr1_".length)}`;
     if (this.agentId === target) {
-      writeDurableAgentAlias(this.cursorKey, this.id, target, this);
+      await writeDurableAgentAlias(this.cursorKey, this.id, target, this);
       return;
     }
     const oldAgentId = this.agentId;
-    writeDurableAgentAlias(this.cursorKey, this.id, target, {
+    await writeDurableAgentAlias(this.cursorKey, this.id, target, {
       recoveryEpoch: this.recoveryEpoch,
       modelEpoch: this.modelEpoch,
       keyEpoch: this.keyEpoch,
@@ -4224,6 +5108,13 @@ class Session {
     this.pendingDeltas = []; this.pendingDeltaBytes = 0; // #14: drop any undelivered text/reasoning; the run is over
     this.beginReplaySegment(); // completion has committed it, or the failed/cancelled turn must release it
     this.activeAdvertise = null; // ADD-40: the turn-scoped effective tool policy ends with the run
+    const useLease = this.agentUseLease;
+    this.agentUseLease = null;
+    this.reseedAllowed = false;
+    if (useLease) void useLease.release().catch((error) => {
+      dbg("agent use lease release failed", "session=" + this.id,
+        (error && error.message) || String(error));
+    });
   }
   emitCancellationTerminalReceipt(terminalReason, detail) {
     if (!this.activeRes || !this.responseWriter || this.writeFailed
@@ -4448,17 +5339,35 @@ function composerModelSelection(model, { utilityOneShot = false } = {}) {
   }
   if (id === "grok-4.5") {
     if (utilityOneShot) return { id: "grok-4.5", params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }] };
-    // Bare / missing level => effort=high (matches CLI's primary "Cursor Grok 4.5" = grok-4.5-xhigh).
+    // Bare / missing level => the fleet default (P8: CURSOR_COMPOSER_GROK_EFFORT_DEFAULT,
+    // historically high, matching the CLI's primary "Cursor Grok 4.5" = grok-4.5-xhigh).
     // Always set fast explicitly so we never silently inherit Cursor's costly fast=true default.
     // SDK id stays "grok-4.5" regardless of the client-facing cursor- prefix.
-    const effort = mapGrokEffort(thinking) || "high";
+    const effort = mapGrokEffort(thinking) || COMPOSER_GROK_EFFORT_DEFAULT;
     return { id: "grok-4.5", params: [{ id: "fast", value: fast }, { id: "effort", value: effort }] };
   }
   return { id: raw }; // non-recognized: pass the original id through (Cursor resolves its default)
 }
 
+function turnFailureMetadata(error) {
+  const code = typeof error?.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(error.code)
+    ? error.code
+    : "";
+  const retryable = error?.retryable === true;
+  const identicalReplaySafe = retryable
+    && ["agent_lifecycle_busy", "local_replay_capacity"].includes(code);
+  const retryAfterMs = Number.isSafeInteger(error?.retryAfterMs) && error.retryAfterMs > 0
+    ? error.retryAfterMs
+    : code === "agent_lifecycle_busy" ? 1_000 : 0;
+  return {
+    ...(code ? { errorCode: code } : {}),
+    ...(retryable ? { retryable: true, retryMode: identicalReplaySafe ? "identical" : "none" } : {}),
+    ...(retryAfterMs > 0 ? { retryAfterMs } : {}),
+  };
+}
+
 async function ensureAgent(session, model) {
-  if (session.agent) return session.agent;
+  if (session.agent && !SDK_AGENT_GC_ENABLED) return session.agent;
   if (session.agentPromise) return session.agentPromise;          // guard TOCTOU
   session.agentPromise = (async () => {
     const platform = await getPlatform(session.cursorKey);
@@ -4482,6 +5391,56 @@ async function ensureAgent(session, model) {
     }
     // C05: resume/create against the DURABLE agentId (rotates on too-long), not the external session id.
     const agentId = session.agentId || session.id;
+    if (SDK_AGENT_GC_ENABLED && !session.agentUseLease) {
+      let quarantine = { restored: false, missing: false };
+      session.agentUseLease = await agentLeaseManager.acquireUse(
+        keyHash(session.cursorKey),
+        agentId,
+        {
+          beforeAcquire: async () => {
+            quarantine = await cancelSdkAgentQuarantine({
+              platform,
+              scope: keyHash(session.cursorKey),
+              quarantineRoot: SDK_AGENT_GC_DIR,
+              agentId,
+              withAgentMutationLease: async (_context, restore) => restore(),
+            });
+          },
+          // P3.2 fail-closed: a renew-failing lease must not let the turn run on into the
+          // window where GC could legally collect its agent. Refresh durable roots (alias
+          // touch) so protection holds even if the lease file lapses, then abort the turn
+          // with a typed retryable terminal — an in-process abandonment guard (AGENTS.md
+          // exception class), never an upstream timeout.
+          onLeaseLost: async (info) => {
+            lifecycleEvent("lease_renewal_failed", {
+              sessionId: session.id, agentId,
+              consecutiveFailures: info.consecutiveFailures,
+            });
+            try { await session.touchDurableAlias(); } catch {}
+            cancelSessionDetached(session, {
+              terminalReason: TerminalReason.LEASE_LOST,
+              detail: `agent lifecycle lease renewal failed ${info.consecutiveFailures}x; aborting fail-closed so GC can never collect an active agent`,
+            });
+          },
+        },
+      );
+      if (quarantine.missing && !session.reseedAllowed) {
+        lifecycleEvent("agent_blank_create_REFUSED", { sessionId: session.id, agentId, cause: "quarantine_missing", historyAvailable: false });
+        await session.agentUseLease.release();
+        session.agentUseLease = null;
+        throw new ToolRoundError(
+          "collected_agent_history_required",
+          "the durable agent was collected and bounded history is required for faithful reseeding",
+          410,
+        );
+      }
+      if (quarantine.missing) {
+        lifecycleEvent("agent_reseeded", { sessionId: session.id, agentId, cause: "quarantine_missing", historyAvailable: true });
+        session.resetSeedState();
+        session.reseeding = true;
+      }
+    }
+    if (session.agent) return session.agent;
     try {
       if (session.utilityOneShot) {
         dbg("ensureAgent createAgent (ephemeral utility)", "session=" + session.id, "agentId=" + agentId);
@@ -4533,7 +5492,68 @@ async function ensureAgent(session, model) {
       const msg = (err && err.message) || String(err);
       dbg("ensureAgent resumeAgent FAILED", "session=" + session.id, "agentId=" + agentId, msg);
       if (!/not found/i.test(msg)) { dbg("ensureAgent rethrow (not 'not found')", "session=" + session.id); throw err; }
-      dbg("ensureAgent createAgent (was not found)", "session=" + session.id, "agentId=" + agentId);
+      // NEVER silently blank-create (P1.1 / audit R1). A not-found durable agent is decided
+      // by an evidence table, and this branch runs regardless of whether GC is enabled:
+      //
+      //   tombstone (status:"deleted") OR durable alias naming this agentId OR any GC marker
+      //   for this id  =>  prior life PROVEN:
+      //       bounded history available => faithful reseed (resetSeedState + reseeding);
+      //       no history                => typed 410 collected_agent_history_required.
+      //
+      //   NO evidence at all => genuine first use (this id was never created) OR a deletion
+      //   that left no trace (pre-tombstone GC builds, or server-side eviction). First use is
+      //   provable only when no alias for this session has EVER existed and no marker/tombstone
+      //   is present; in that case createAgent is the correct mint. Otherwise — with history —
+      //   we reseed LOUDLY (not_found_bare is an ERROR-level attribution event), and without
+      //   history we fail closed with 410 agent_missing_history_required.
+      //
+      // An UNREADABLE marker fails closed toward protection: corrupt evidence is still
+      // evidence of prior life (P3.4 philosophy), never permission to blank-create.
+      const durableAlias = readDurableAgentAlias(session.cursorKey, session.id);
+      const aliasNamesAgent = durableAlias?.agentId === agentId;
+      let priorMarker = null;
+      let markerCorrupt = false;
+      try {
+        priorMarker = readMarker(markerPath(SDK_AGENT_GC_DIR, keyHash(session.cursorKey), agentId));
+      } catch (markerErr) {
+        markerCorrupt = true;
+        dbg("ensureAgent marker unreadable; treating as prior-life evidence", "session=" + session.id, (markerErr && markerErr.message) || String(markerErr));
+      }
+      const priorLifeProven = aliasNamesAgent || !!priorMarker || markerCorrupt;
+      const historyAvailable = session.reseedAllowed || session.reseeding;
+      // Replay history is only ever sent AFTER a first contact (renderComposerHistory is
+      // empty for a true first turn), so a not-found resume WITH history cannot be first
+      // use: the agent was lost and must be reseeded loudly, never minted silently.
+      const firstUse = !durableAlias && !priorMarker && !markerCorrupt && !historyAvailable;
+      if (!firstUse) {
+        const cause = markerCorrupt ? "tombstone_corrupt"
+          : priorMarker?.status === "deleted" ? "tombstoned"
+          : aliasNamesAgent ? "aliased"
+          : priorMarker ? "quarantined_missing"
+          : "not_found_bare";
+        if (cause === "not_found_bare" || cause === "tombstone_corrupt") {
+          console.error("[cursor-agent-bridge] durable agent missing without clean evidence; failing closed toward reseed/410",
+            JSON.stringify({ sessionId: session.id, agentId, cause }));
+        }
+        if (!historyAvailable) {
+          lifecycleEvent("agent_blank_create_REFUSED", { sessionId: session.id, agentId, cause, historyAvailable: false });
+          throw new ToolRoundError(
+            cause === "not_found_bare" || cause === "tombstone_corrupt"
+              ? "agent_missing_history_required"
+              : "collected_agent_history_required",
+            "the durable agent is missing and bounded history is required for faithful reseeding",
+            410,
+          );
+        }
+        lifecycleEvent("agent_reseeded", { sessionId: session.id, agentId, cause, historyAvailable: true });
+        if (session.reseedAllowed) {
+          session.resetSeedState();
+          session.reseeding = true;
+        }
+        dbg("ensureAgent createAgent (reseed after missing agent)", "session=" + session.id, "agentId=" + agentId, "cause=" + cause);
+      } else {
+        dbg("ensureAgent createAgent (first use)", "session=" + session.id, "agentId=" + agentId);
+      }
       session.agent = await platform.createAgent({ agentId, ...opts });
     }
     return session.agent;
@@ -4943,6 +5963,18 @@ function streamCallbacks(session, ep, onUserMessageAppended = null) {
 // error messages) — turn routing decisions and failures only, never request/response bodies.
 function safeJson(a) { try { return typeof a === "string" ? a : JSON.stringify(a); } catch { return String(a); } }
 function dbg(...args) { if (!COMPOSER_DEBUG) return; try { writeSync(1, "[cct] " + args.map(safeJson).join(" ") + "\n"); } catch { /* never throw from logging */ } }
+
+// lifecycleEvent emits ONE structured JSON line for a lifecycle state transition (GC
+// delete/archive/restore, reseed, blank-create refusal, lease loss). Unlike dbg it is
+// ALWAYS emitted: these events are the attribution trail for future incidents — the
+// absence of a per-agent deletion log is exactly what made the 2026-07-20 destructive-GC
+// incident unattributable at the resume point. Fields are content-free (ids, ages, causes)
+// and never carry request/response bodies.
+function lifecycleEvent(type, fields) {
+  try {
+    writeSync(1, "[cursor-agent-bridge] lifecycle " + JSON.stringify({ type, at: nowMs(), ...(fields || {}) }) + "\n");
+  } catch { /* never throw from logging */ }
+}
 
 // dbgToolFormat (debug-only): dumps the EXACT per-tool shape the model receives via tools/list / mcpState —
 // name, description length, and inputSchema property/required counts. A tool whose real schema was lost and
@@ -5729,9 +6761,39 @@ function toolResultRecoveryPlan(round, input, session) {
   };
 }
 
+// continuationHasDeferredInput detects FRESH user intent riding on a signed continuation:
+// the normalized bridge input represents all user-role content as userText/images (Go folds
+// content parts into these before /agent/continue — tool RESULTS travel via the signed route,
+// never as user content). Anything here is intent the client wants delivered, distinct from
+// the old round's tool-result effects.
 function continuationHasDeferredInput(input) {
   return !!input && ((typeof input.userText === "string" && input.userText.length > 0)
     || (Array.isArray(input.images) && input.images.length > 0));
+}
+
+// P2.1: fail-closed conversation-boundary detection for binding-less legacy rounds. Go
+// derives BOTH the opaque conversation binding (full SHA-256 digest) and the stable session
+// id ("sess_" + the first 32 hex chars of the SAME digest) from one preimage
+// (composerConversationBinding / composerStableBaseSessionID). So a binding stamped on the
+// request can be compared against a round's durable session id without learning the client
+// identity: prefix match PROVES same conversation; prefix mismatch PROVES the client changed
+// conversation epoch (/new) — cryptographic evidence, not a heuristic. Fork-shaped session
+// ids are not derivable and return null (staged warn/enforce policy applies).
+function roundBindingMatchesRequest(binding, sessionId) {
+  if (typeof binding !== "string" || !/^[a-f0-9]{64}$/.test(binding)) return null;
+  if (typeof sessionId !== "string" || !sessionId.startsWith("sess_")) return null;
+  const sessionDigest = sessionId.slice(5);
+  if (!/^[a-f0-9]{32}$/.test(sessionDigest)) return null;
+  return sessionDigest === binding.slice(0, 32);
+}
+function bindingFailClosedEnforced() {
+  // Ambiguous legacy rounds are unsafe to merge: doing so can attach fresh /new
+  // intent to the old conversation. Fail closed by default. `warn` remains an
+  // explicit rolling-migration escape hatch, never the production default.
+  return String(process.env.CURSOR_COMPOSER_BINDING_FAIL_CLOSED || "").trim().toLowerCase() !== "warn";
+}
+function continueBindingRequired() {
+  return String(process.env.CURSOR_COMPOSER_REQUIRE_CONTINUE_BINDING || "").trim().toLowerCase() === "1";
 }
 
 function deferredUserInput(round, item, input) {
@@ -5877,11 +6939,76 @@ function validateCompletedContinuationPayload(results, cursorKey) {
   }
 }
 
+function continuationAdmissionPriority(body) {
+  const results = body?.input?.type === "tool_results" && Array.isArray(body.input.results)
+    ? body.input.results : [];
+  if (results.length === 0) return ADMISSION_PRIORITY.TOOL_CONTINUATION;
+  try {
+    const { codec } = getRoundInfrastructure();
+    const routes = new Set(results.map((result) => codec.parse(result?.toolCallId).route));
+    // A valid signed route without process-local callbacks necessarily needs
+    // durable recovery. Malformed/untrusted input never earns elevated priority.
+    if (routes.size > 0 && [...routes].every((route) => !liveToolRounds.has(route))) {
+      return ADMISSION_PRIORITY.RECOVERY;
+    }
+  } catch {}
+  return ADMISSION_PRIORITY.TOOL_CONTINUATION;
+}
+
 // `/agent/continue` is the sole continuation ingress. It routes by the signed tool-call ids, validates and
 // journals the complete batch before writing SSE headers, and only then settles the paused SDK callbacks.
 async function handleContinue(req, res, body, cursorKey, casAttempt = 0, historicalDispositions = []) {
+  let lease;
+  const admissionAbort = new AbortController();
+  const abortAdmissionWait = () => admissionAbort.abort(new Error("client disconnected while waiting for admission"));
+  res.once?.("close", abortAdmissionWait);
+  if (res.destroyed) abortAdmissionWait();
+  try {
+    lease = await deliveryAdmission.acquire({
+      bytes: 64 * 1024,
+      priority: continuationAdmissionPriority(body),
+      id: `continue:${body?.sessionId || "unknown"}:${body?.input?.clientMessageId || randomUUID()}`,
+      signal: admissionAbort.signal,
+    });
+    if (admissionAbort.signal.aborted || res.destroyed) {
+      lease.release();
+      lease = null;
+      return;
+    }
+    return await handleContinueAdmitted(req, res, body, cursorKey, casAttempt, historicalDispositions);
+  } catch (error) {
+    if (admissionAbort.signal.aborted || res.destroyed) return;
+    if (error instanceof CapacityAdmissionError) {
+      if (error.retryAfterMs > 0) {
+        res.setHeader("Retry-After", String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
+      }
+      continuationFailure(res, error.status, error.code, error.message, error.toJSON());
+      return;
+    }
+    throw error;
+  } finally {
+    res.off?.("close", abortAdmissionWait);
+    if (lease) lease.release();
+  }
+}
+
+async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0, historicalDispositions = []) {
   const input = body && body.input;
   if (body && !validClientEnv(body.clientEnv)) body.clientEnv = { workspaceUnknown: true };
+  let conversationBinding = "";
+  try {
+    conversationBinding = canonicalConversationBinding(
+      input && input.conversationBinding || body && body.conversationBinding,
+    );
+  } catch (error) {
+    continuationFailure(
+      res,
+      error instanceof ToolRoundError ? error.status : 422,
+      error instanceof ToolRoundError ? error.code : "conversation_binding_invalid",
+      (error && error.message) || String(error),
+    );
+    return;
+  }
   let results = input && input.type === "tool_results" && Array.isArray(input.results) ? input.results : null;
   if (!results || results.length === 0) {
     continuationFailure(res, 422, "empty_tool_results", "a continuation requires at least one tool result");
@@ -6031,7 +7158,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         })));
       }
       const nextBody = { ...body, input: { ...input, results: primary.groupResults } };
-      return handleContinue(req, res, nextBody, cursorKey, casAttempt, [
+      return handleContinueAdmitted(req, res, nextBody, cursorKey, casAttempt, [
         ...historicalDispositions,
         ...acknowledged,
       ]);
@@ -6044,17 +7171,100 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
     if (continuationTenantMismatch(round, cursorKey)) {
       throw new ToolRoundError("tenant_mismatch", "the signed tool round belongs to a different Cursor credential", 403);
     }
+    // P2.4 (staged, default off): once every replica emits bindings, a continuation with
+    // no request binding AND no stamped round binding is a protocol violation, not a guess.
+    if (continueBindingRequired() && !conversationBinding && !round.conversationBinding) {
+      throw new ToolRoundError(
+        "conversation_binding_required",
+        "this bridge requires a conversation binding on continuations; upgrade the proxy fleet",
+        400,
+      );
+    }
+    // P2.2: self-heal legacy binding-less rounds. A signed continuation whose request
+    // binding provably matches this round's durable session id carries this conversation's
+    // binding; stamp it so future continues compare bindings directly (never overwrites).
+    if (conversationBinding && !round.conversationBinding
+        && roundBindingMatchesRequest(conversationBinding, round.sessionId) === true) {
+      try {
+        round.stampConversationBinding(conversationBinding);
+      } catch (stampErr) {
+        dbg("round binding stamp skipped", "route=" + round.route, (stampErr && stampErr.message) || String(stampErr));
+      }
+    }
+    const hasDeferredInput = continuationHasDeferredInput(input);
+    // P2.1: fail-closed boundary decision. With a stamped binding, mismatch splits. With a
+    // legacy binding-less round, the shared-digest prefix relation proves the epoch change;
+    // non-derivable ids split by default. An explicit `warn` setting is only a temporary
+    // rolling-migration escape hatch for fleets that do not yet stamp request bindings.
+    let crossesConversationBoundary = false;
+    if (hasDeferredInput && conversationBinding) {
+      if (round.conversationBinding) {
+        crossesConversationBoundary = conversationBinding !== round.conversationBinding;
+      } else {
+        const sameConversation = roundBindingMatchesRequest(conversationBinding, round.sessionId);
+        if (sameConversation === false) {
+          crossesConversationBoundary = true; // proven: the client changed conversation epoch
+        } else if (sameConversation === null) {
+          if (bindingFailClosedEnforced()) {
+            crossesConversationBoundary = true;
+          } else {
+            lifecycleEvent("binding_failopen_would_split", {
+              route: round.route, sessionId: round.sessionId,
+            });
+          }
+        }
+      }
+    }
+    if (crossesConversationBoundary) {
+      // A signed route owns the old tool-result effects, never fresh intent
+      // from a different client conversation epoch. Commit the immutable old
+      // receipts, abandon the old paused callbacks, then execute the trailing
+      // intent exactly once through the normal fresh-turn receipt machinery.
+      const wasTerminal = round.state === RoundState.TERMINAL;
+      round.commitResults(results, {
+        allowTerminalReceipt: !hasLiveCallbacks && wasTerminal,
+        allowRegisteredReceipt: true,
+        preferDurableReceipt: true,
+      });
+      if (!wasTerminal) {
+        round.terminalize(
+          TerminalReason.CLIENT_CANCELLED,
+          "client conversation changed before deferred user intent was delivered",
+        );
+      }
+      const freshInput = {
+        ...input,
+        type: "user",
+        text: typeof input.userText === "string" ? input.userText : "",
+        images: Array.isArray(input.images) ? input.images : [],
+      };
+      delete freshInput.results;
+      delete freshInput.userText;
+      delete freshInput.legacyUnsignedReplay;
+      dbg("cross-conversation continuation split",
+        "oldSession=" + round.sessionId,
+        "newSession=" + String(body && body.sessionId || ""),
+        "route=" + round.route);
+      return handleTurn(req, res, { ...body, input: freshInput }, cursorKey);
+    }
     // The signed ToolRound is authoritative for continuation routing. The
     // request body's sessionId is only advisory and may be the shared parent
     // conversation id used by concurrent Claude subagents. Return the routed
     // session over this authenticated bridge hop so Go can bind outward
     // response ids and previous_response_id mappings to the actual child.
     res.setHeader("X-CLIProxy-Composer-Session", round.sessionId);
+    // The signed round also owns the conversation epoch. A client may have
+    // already issued /new while an old tool result is still in flight, so the
+    // request binding is advisory for pure result delivery just like sessionId.
+    // Return the authenticated journal binding so Go never mints the old
+    // continuation's response id under the new conversation epoch.
+    if (round.conversationBinding) {
+      res.setHeader("X-CLIProxy-Composer-Conversation-Binding", round.conversationBinding);
+    }
     const liveRoundSession = sessions.get(round.sessionId);
     if (liveRoundSession) liveRoundSession.clientLeaseToken = round.clientLeaseToken;
 
     const wasTerminal = round.state === RoundState.TERMINAL;
-    const hasDeferredInput = continuationHasDeferredInput(input);
     if (hasDeferredInput) {
       deferredRound = round;
       deferredInputId = continuationClientMessageId;
@@ -6425,9 +7635,9 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
 
       if (!session) {
         if (!sessionCapHasRoomForNew()) throw new ToolRoundError("session_capacity", "session capacity is full", 429);
-        session = new Session(round.sessionId, cursorKey);
+        session = new Session(round.sessionId, cursorKey, round.conversationBinding);
         if (exactDeliveryRetry) {
-          writeDurableAgentAlias(session.cursorKey, session.id, uncertainDeliveryAgentId, session);
+          await writeDurableAgentAlias(session.cursorKey, session.id, uncertainDeliveryAgentId, session);
           session.agentId = uncertainDeliveryAgentId;
         } else if (isRecovery) {
           const targetAgentId = recoveryTargetAgentId(round);
@@ -6435,7 +7645,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
           session.pendingRecoveryAlias = targetAgentId;
           session.resetSeedState();
         } else if (round.agentId) {
-          writeDurableAgentAlias(session.cursorKey, session.id, round.agentId, session);
+          await writeDurableAgentAlias(session.cursorKey, session.id, round.agentId, session);
           session.agentId = round.agentId;
         }
         sessions.set(session.id, session);
@@ -6622,7 +7832,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
       session.currentRound = null;
     } else {
       if (!sessionCapHasRoomForNew()) throw new ToolRoundError("session_capacity", "session capacity is full", 429);
-      session = new Session(round.sessionId, cursorKey);
+      session = new Session(round.sessionId, cursorKey, round.conversationBinding);
       sessions.set(session.id, session);
     }
     session.clientLeaseToken = round.clientLeaseToken;
@@ -6692,7 +7902,7 @@ async function handleContinue(req, res, body, cursorKey, casAttempt = 0, histori
         }
         dbg("continuation CAS changed concurrently -> reload and retry",
           "attempt=" + (casAttempt + 1), (error && error.message) || String(error));
-        return handleContinue(req, res, body, cursorKey, casAttempt + 1, historicalDispositions);
+        return handleContinueAdmitted(req, res, body, cursorKey, casAttempt + 1, historicalDispositions);
       }
       // A continuation conflict must never become a transport-level 409 loop.
       // Known replay conflicts are resolved above; this is the fail-safe for a
@@ -6737,13 +7947,27 @@ async function handleTurn(req, res, body, cursorKey) {
   const input = body.input || (body.text != null ? { type: "user", text: body.text } : { type: "user", text: "" });
   const model = body.model || "composer-2.5";
   const sessionId = body.sessionId;
-  const fail = (code, msg, errorCode = "") => {
+  const fail = (code, msg, errorCode = "", errorDetails = null) => {
     dbg("handleTurn FAIL", code, "session=" + sessionId, "inputType=" + (input && input.type), msg);
+    if (res.destroyed) return;
     res.writeHead(code, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: errorCode ? { code: errorCode, message: msg } : msg }));
+    res.end(JSON.stringify({
+      error: errorDetails || (errorCode ? { code: errorCode, message: msg } : msg),
+    }));
   };
   // Validate BEFORE opening the SSE so we can return a real HTTP status.
   if (!sessionId) { fail(400, "sessionId is required"); return; }
+  let conversationBinding = "";
+  try {
+    conversationBinding = canonicalConversationBinding(
+      input && input.conversationBinding || body.conversationBinding,
+    );
+  } catch (error) {
+    fail(error instanceof ToolRoundError ? error.status : 422,
+      (error && error.message) || String(error),
+      error instanceof ToolRoundError ? error.code : "conversation_binding_invalid");
+    return;
+  }
   let requestIdentity;
   let requestClientMessageHash;
   try {
@@ -6861,21 +8085,79 @@ async function handleTurn(req, res, body, cursorKey) {
   }
 
   let preReservedReceiptFile = "";
+  let deliveryAdmissionLease = null;
+  let deliveryPriority = ADMISSION_PRIORITY.FRESH;
+  const releaseDeliveryAdmission = () => {
+    releaseInputDeliveryAdmission(input);
+    deliveryAdmissionLease = null;
+  };
   const releasePreReservedReceipt = () => {
+    releaseDeliveryAdmission();
     if (!preReservedReceiptFile) return;
     try { releaseUnresolvedReceipt(preReservedReceiptFile); } catch {}
     preReservedReceiptFile = "";
     delete input.preReservedReceiptFile;
   };
+  if (input.type === "user") {
+    const capabilities = input.capabilities || input.clientCapabilities || "";
+    deliveryPriority = freshDeliveryReceipt
+      ? ADMISSION_PRIORITY.RECOVERY
+      : input.streamResume === true || hasStreamResumeCapability(capabilities)
+      ? ADMISSION_PRIORITY.STREAM_RESUME
+      : ADMISSION_PRIORITY.FRESH;
+    const admissionAbort = new AbortController();
+    const abortAdmissionWait = () => admissionAbort.abort(new Error("client disconnected while waiting for admission"));
+    res.once?.("close", abortAdmissionWait);
+    if (res.destroyed) abortAdmissionWait();
+    try {
+      deliveryAdmissionLease = await deliveryAdmission.acquire({
+        bytes: FRESH_RECEIPT_INITIAL_RESERVATION_BYTES,
+        priority: deliveryPriority,
+        id: `${sessionId}:${requestClientMessageId || randomUUID()}`,
+        signal: admissionAbort.signal,
+      });
+      if (admissionAbort.signal.aborted || res.destroyed) {
+        deliveryAdmissionLease.release();
+        deliveryAdmissionLease = null;
+        return;
+      }
+      res.off?.("close", abortAdmissionWait);
+      input[DELIVERY_ADMISSION_LEASE] = deliveryAdmissionLease;
+      res.once?.("close", releaseDeliveryAdmission);
+    } catch (error) {
+      res.off?.("close", abortAdmissionWait);
+      if (admissionAbort.signal.aborted || res.destroyed) return;
+      if (error instanceof CapacityAdmissionError && error.retryAfterMs > 0) {
+        res.setHeader("Retry-After", String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
+      }
+      fail(error instanceof CapacityAdmissionError ? error.status : 503,
+        (error && error.message) || String(error),
+        error instanceof CapacityAdmissionError ? error.code : "admission_capacity",
+        error instanceof CapacityAdmissionError ? error.toJSON() : null);
+      return;
+    }
+  }
   // Exact retries with an existing UNKNOWN/RUNNING receipt can recover without
   // allocating another large envelope. A genuinely fresh send reserves shared
   // durable capacity only after every request-shape/admission preflight above,
   // but before invocation binding, session mutation, or SDK work.
-  if (input.type === "user" && !freshDeliveryReceipt
-      && !stateRootDiskStatus(MAX_AGENT_TURN_BYTES * 2).ok) {
+  const diskStatus = input.type === "user" && !freshDeliveryReceipt
+    ? stateRootDiskStatus(FRESH_RECEIPT_INITIAL_RESERVATION_BYTES)
+    : null;
+  if (diskStatus && !diskStatus.ok) {
+    releaseDeliveryAdmission();
     fail(507,
       "durable state storage does not have enough free capacity to accept a new recoverable turn",
-      "durable_state_capacity");
+      "durable_state_capacity",
+      {
+        code: "durable_state_capacity",
+        message: "durable state storage does not have enough free capacity to accept a new recoverable turn",
+        retryable: true,
+        retryAfterMs: 1000,
+        requestedBytes: FRESH_RECEIPT_INITIAL_RESERVATION_BYTES,
+        availableBytes: Math.max(0, diskStatus.freeBytes - STATE_ROOT_MIN_FREE_BYTES),
+        priority: deliveryPriority,
+      });
     return;
   }
   if (input.type === "user" && requestClientMessageId && !freshDeliveryReceipt) {
@@ -6883,11 +8165,17 @@ async function handleTurn(req, res, body, cursorKey) {
       cursorKey, sessionId, requestClientMessageId, requestClientMessageHash,
     );
     try {
-      reserveUnresolvedReceipt(preReservedReceiptFile, MAX_AGENT_TURN_BYTES * 2);
+      await reserveUnresolvedReceipt(
+        preReservedReceiptFile,
+        FRESH_RECEIPT_INITIAL_RESERVATION_BYTES,
+        deliveryPriority,
+      );
     } catch (error) {
+      releaseDeliveryAdmission();
       fail(error instanceof ToolRoundError ? error.status : 507,
         (error && error.message) || String(error),
-        "durable_state_capacity");
+        error instanceof CapacityAdmissionError ? error.code : "durable_state_capacity",
+        error instanceof CapacityAdmissionError ? error.toJSON() : null);
       return;
     }
     input.preReservedReceiptFile = preReservedReceiptFile;
@@ -6914,7 +8202,7 @@ async function handleTurn(req, res, body, cursorKey) {
     // ADD-63 (LOAD-SHED): reject a NEW session when at cap and nothing idle can be shed. Never evict a live or
     // paused session to admit this one. ADD-75: likewise reject a NEW tenant (new platform) at the platform cap.
     try {
-      session = new Session(sessionId, cursorKey);
+      session = new Session(sessionId, cursorKey, conversationBinding);
     } catch (error) {
       releasePreReservedReceipt();
       fail(503, `durable session continuity state is unavailable: ${(error && error.message) || String(error)}`);
@@ -6936,6 +8224,17 @@ async function handleTurn(req, res, body, cursorKey) {
       dbg("handleTurn REUSE with CHANGED cursor key -> rotateForKeyChange (ADD-79)", sessionId, "oldKeyHash=" + keyHash(session.cursorKey), "newKeyHash=" + keyHash(cursorKey));
       try { await session.rotateForKeyChange(cursorKey); }
       catch (error) { releasePreReservedReceipt(); throw error; }
+    }
+    if (conversationBinding && session.conversationBinding
+        && conversationBinding !== session.conversationBinding) {
+      releasePreReservedReceipt();
+      fail(409,
+        "the explicit conversation binding conflicts with the active durable session",
+        "conversation_identity_conflict");
+      return;
+    }
+    if (conversationBinding && !session.conversationBinding) {
+      session.conversationBinding = conversationBinding;
     }
   }
   // Exact active retries retain their original generation and SDK envelope.
@@ -7061,6 +8360,8 @@ function enqueueTurn(req, res, session, model, input, constraints, continuation 
     res.off("close", onWaitClose);
     if (typeof res.off === "function") res.off("drain", onDrainQueue);
     session.waiters = Math.max(0, session.waiters - 1);
+    releasePreReservationWithoutReceipt(input);
+    releaseInputDeliveryAdmission(input);
     try { res.end(); } catch {}
   };
   res.on("close", onWaitClose);
@@ -7419,16 +8720,22 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     session.resetLoopBounds();   // ADD-106: a fresh send begins a new logical run -> reset the agentic-loop counters
     session.done = false;
     session.lastRunError = null;  // BR2: a fresh run starts clean; a prior run's error must not leak forward
+    // Only request-carried bounded history authorizes a reseed. Local checkpoint
+    // experiments were partial and must never turn a thin request into permission
+    // to recreate a collected agent.
+    session.reseedAllowed = typeof input.history === "string" && input.history.trim().length > 0;
     let agent;
     try {
       agent = await ensureAgent(session, model);
     } catch (error) {
+      releaseInputDeliveryAdmission(input);
       if (frozenDelivery) session.advertise = advertiseBeforeFrozenRetry;
       throw error;
     }
     // ensureAgent's resume/create is a network round-trip; if the client disconnected during it, onClose
     // already settled+cancelled this turn. Bail BEFORE agent.send so we don't spawn an orphan run.
     if (settled) {
+      releaseInputDeliveryAdmission(input);
       if (frozenDelivery) session.advertise = advertiseBeforeFrozenRetry;
       return;
     }
@@ -7445,7 +8752,10 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         }
         await session.rotateForSystemReplacement(contextPlan.ids || []);
         agent = await ensureAgent(session, model);
-        if (settled) return;
+        if (settled) {
+          releaseInputDeliveryAdmission(input);
+          return;
+        }
         contextPlan = systemContextPlan(session, input);
       }
     }
@@ -7463,7 +8773,8 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       if (!session.seeded) {
         const parts = [];
         if (input.system) parts.push(input.system);
-        if (input.history) parts.push("Previous conversation:\n" + input.history);
+        const seedHistory = input.history;
+        if (seedHistory) parts.push("Previous conversation:\n" + seedHistory);
         text = parts.join("\n\n");
         session.seeded = true;
         session.seededSystem = input.system || "";
@@ -7573,7 +8884,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       clientMessageGeneration,
     );
     if (clientMessageKind === "fresh" && clientMessageId && !frozenDelivery) {
-      writeFreshDeliveryReceipt(
+      await writeFreshDeliveryReceipt(
         session.cursorKey,
         session.id,
         clientMessageId,
@@ -7634,6 +8945,9 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         );
       }
     }
+    // The exact fresh envelope and acceptance boundary are now durable. The
+    // upstream stream itself is not retained in this local envelope budget.
+    releaseInputDeliveryAdmission(input);
     markDeferred(DeferredInputState.DELIVERING, {
       agentId: session.agentId,
       textHash: expectedUserTextHash,
@@ -7676,20 +8990,22 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       try {
         session.run = await agent.send(msg, sendCallbacks);
         session.sendPending = false;
-        if (!session.utilityOneShot && !session.pendingRecoveryAlias
-            && !sameStringArray(seededSystemBlockIdsBefore, session.seededSystemBlockIds)) {
+        if (!session.utilityOneShot && !session.pendingRecoveryAlias) {
           try {
-            session.persistDurableAlias();
+            await session.touchDurableAlias();
           } catch (aliasError) {
-            // The exact frozen delivery receipt still protects an invocation
-            // retry. Keep the live run available; after a process loss the
-            // conservative fallback is rotate-and-reseed, never silent reuse.
-            dbg("system block identity persistence unavailable; live run remains recoverable by exact receipt",
+            // P3.3 fail-LOUD: a failed touch is an alias-TTL hazard (the on-disk lastUsedAt
+            // stays stale, so a quiet-but-live agent could age out of GC roots). The exact
+            // frozen delivery receipt still protects an invocation retry and the stale
+            // lastUsedAt makes the next successful turn retry the touch immediately — but
+            // this must be visible, never dbg-silent.
+            lifecycleEvent("alias_touch_failed", { sessionId: session.id, agentId: session.agentId });
+            console.error("[cursor-agent-bridge] durable agent alias touch failed; next turn retries (stale lastUsedAt retained):",
               "session=" + session.id, (aliasError && aliasError.message) || String(aliasError));
           }
         }
         try {
-          session.promotePendingRecoveryAlias();
+          await session.promotePendingRecoveryAlias();
         } catch (aliasError) {
           // The ToolRound journal retains the deterministic replacement id,
           // so a restart retries this exact recovery target. Never publish a
@@ -7710,7 +9026,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
             session.run = await agent.send(msg, { ...sendCallbacks, local: { force: true } });
             session.sendPending = false;
             try {
-              session.promotePendingRecoveryAlias();
+              await session.promotePendingRecoveryAlias();
             } catch (aliasError) {
               dbg("recovery alias promotion unavailable after forced agent.send; retaining prior durable alias",
                 "session=" + session.id, (aliasError && aliasError.message) || String(aliasError));
@@ -7937,14 +9253,19 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
         if (round.state !== RoundState.TERMINAL) round.terminalize(TerminalReason.INTERRUPTED, detail);
         await cancelStaleRun(TerminalReason.INTERRUPTED, detail);
         const redirectedAgentId = `${session.id}_redirect_${round.route.slice(0, 10)}`;
-        writeDurableAgentAlias(session.cursorKey, session.id, redirectedAgentId, session);
+        await writeDurableAgentAlias(session.cursorKey, session.id, redirectedAgentId, session);
         session.agentId = redirectedAgentId;
         session.resetSeedState();
         const redirected = buildResultRecoveryInput(round, input);
         // driveUserSend already merges input.images (the trailing user
         // payload); pass only images recovered from durable tool receipts so
         // the user images are not duplicated.
-        await driveUserSend(redirected.text, recoveryPlan.resultImages, redirected.recoveryContext);
+        session.reseeding = true;
+        try {
+          await driveUserSend(redirected.text, recoveryPlan.resultImages, redirected.recoveryContext);
+        } finally {
+          session.reseeding = false;
+        }
       } else {
         const applied = round.applyCommittedResults(committedIds);
         if (applied.length > 0) session.lastSdkActivityAt = nowMs();
@@ -7991,15 +9312,13 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     dbg("runTurn CATCH exception", "session=" + session.id, (e && e.stack) || (e && e.message) || String(e));
     const turnFailure = (e && e.message) || String(e);
     releasePreReservationWithoutReceipt(input);
+    releaseInputDeliveryAdmission(input);
     session.rejectAllPending(`turn failed: ${turnFailure}`, TerminalReason.RUN_ERROR);
     if (!settled) session.sse({
       type: "turn_end",
       stop_reason: "error",
       error: (e && e.message) || String(e),
-      ...(e && e.code === "local_replay_capacity" ? {
-        errorCode: "local_replay_capacity",
-        retryable: true,
-      } : {}),
+      ...turnFailureMetadata(e),
     });
     // ADD-101: ALWAYS settle the turn on an error so the per-turn latch (turnSettled) resolves — otherwise a
     // throw before any settle() call leaves the latch unresolved (queue/lifecycle stalls). settle() is idempotent.
@@ -8638,7 +9957,7 @@ if (RUN_AS_MAIN) {
     receiptCAS.sweepDirectory(COMPLETED_TURN_DIR, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
     journal.cleanupTerminal({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
     cleanupCompletedTurnReceipts({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
-    reconcileUnresolvedReservations();
+    await reconcileUnresolvedReservations();
   }
   catch (e) { console.error(`[bridge] STATE_ROOT ${path.resolve(STATE_ROOT)} is not writable: ${e.message}`); process.exit(1); }
   console.log(`[bridge] mode=${MULTI_TENANT ? "multi-tenant (per-key platforms, X-Bridge-Auth gated)" : "single-tenant (one CURSOR_API_KEY)"} durable stateRoot=${path.resolve(STATE_ROOT)} (sqlite session+checkpoint state is written here; NOT a 'zero-FS' guarantee — only TOOL EXECUTION is FS-isolated to the client)`);
@@ -8659,11 +9978,10 @@ if (RUN_AS_MAIN) {
     .then(() => {
       bridgeReady = true;
       const maintenance = setInterval(() => {
-        try { runDurableMaintenance(); }
-        catch (error) {
+        void runDurableMaintenance().catch((error) => {
           console.error("[cursor-agent-bridge] durable maintenance failed; preserving state:",
             (error && error.message) || String(error));
-        }
+        });
       }, DURABLE_MAINTENANCE_MS);
       maintenance.unref();
       server.listen(PORT, BRIDGE_HOST, () => console.log(`[cursor-agent-bridge] listening on http://${BRIDGE_HOST}:${PORT} (ready, patched CJS, native-unreachable + bundle-seam + result-serialization self-tests passed, durable stateRoot=${STATE_ROOT})`));
@@ -8671,8 +9989,8 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { runDurableMaintenance, runSdkAgentMaintenance, sdkAgentGCRoots };
-export { CC_CASES, composerModelSelection, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
+export { runDurableMaintenance, runSdkAgentMaintenance, sdkAgentGCRoots, sdkAgentGCCensus, readAuthoritativeSdkAgentRoots, continuationAdmissionPriority, lifecycleEvent, crashPoint, backfillTombstonesTick, reserveUnresolvedReceipt, resizeUnresolvedReceipt, releaseUnresolvedReceipt, reclaimTombstonedDurableFiles };
+export { CC_CASES, composerModelSelection, turnFailureMetadata, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
 export {
   TURN_RECEIPT_VERSION,
   ACCEPTANCE_PHASE,

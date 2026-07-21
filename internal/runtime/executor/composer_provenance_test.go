@@ -38,6 +38,19 @@ func TestResolveComposerProvenanceLegacyClientPreservesAmbiguousColdStartForAllS
 	}
 }
 
+func TestComposerProvenanceUsesCanonicalClaudeAndHeaderConversationIdentity(t *testing.T) {
+	claude := []byte(`{"metadata":{"user_id":"user_abc_account_def_session_new-session"}}`)
+	if got := composerConversationIDForProvenance(nil, cliproxyexecutor.Options{OriginalRequest: claude}); got != "claude:new-session" {
+		t.Fatalf("Claude provenance identity = %q, want %q", got, "claude:new-session")
+	}
+
+	headers := make(http.Header)
+	headers.Set("X-Conversation-Id", "header-conversation")
+	if got := composerConversationIDForProvenance(nil, cliproxyexecutor.Options{Headers: headers}); got != "header-conversation" {
+		t.Fatalf("header provenance identity = %q, want %q", got, "header-conversation")
+	}
+}
+
 func TestResolveComposerProvenanceCapableClientGetsSignedClarification(t *testing.T) {
 	t.Setenv("CLIPROXY_TURN_PROVENANCE_SECRET", "provenance-test-secret")
 	composerProvenanceOnce = sync.Once{}

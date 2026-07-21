@@ -47,6 +47,15 @@ function canonicalClientLeaseToken(value) {
   return /^[1-9][0-9]{0,19}$/.test(token) ? token : "";
 }
 
+function canonicalConversationBinding(value) {
+  const binding = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!binding) return "";
+  if (!/^[a-f0-9]{64}$/.test(binding)) {
+    throw new ToolRoundError("conversation_binding_invalid", "conversation binding must be a SHA-256 hex digest", 422);
+  }
+  return binding;
+}
+
 export const RoundState = Object.freeze({
   COLLECTING: "COLLECTING",
   AWAITING_RESULTS: "AWAITING_RESULTS",
@@ -67,6 +76,10 @@ export const TerminalReason = Object.freeze({
   ROUND_LOST: "round_lost",
   LOOP_BOUND: "loop_bound",
   SHUTDOWN: "shutdown",
+  // P3.2: the durable agent lifecycle lease stopped renewing. The turn aborts fail-closed
+  // (typed, retryable) rather than running on while its lease file expires — after which GC
+  // could legally collect an agent that is still mid-send.
+  LEASE_LOST: "lease_lost",
 });
 
 export const CallState = Object.freeze({
@@ -851,6 +864,7 @@ export class ToolRound {
     route = null,
     roundId = null,
     tenantFingerprint = "",
+    conversationBinding = "",
     model = "",
     clientLeaseToken = "",
     journal = null,
@@ -880,6 +894,7 @@ export class ToolRound {
       this.runEpoch = record.runEpoch;
       this.roundSeq = record.roundSeq;
       this.tenantFingerprint = record.tenantFingerprint || "";
+      this.conversationBinding = canonicalConversationBinding(record.conversationBinding);
       this.model = record.model || "";
       this.clientLeaseToken = canonicalClientLeaseToken(record.clientLeaseToken);
       this.createdAt = record.createdAt;
@@ -910,6 +925,7 @@ export class ToolRound {
     this.runEpoch = runEpoch;
     this.roundSeq = roundSeq;
     this.tenantFingerprint = tenantFingerprint;
+    this.conversationBinding = canonicalConversationBinding(conversationBinding);
     this.model = model;
     this.clientLeaseToken = canonicalClientLeaseToken(clientLeaseToken);
     this.createdAt = this.clock();
@@ -965,6 +981,7 @@ export class ToolRound {
       sessionId: this.sessionId,
       state: this.state,
       tenantFingerprint: this.tenantFingerprint,
+      conversationBinding: this.conversationBinding,
       terminal: this.terminal,
       updatedAt: this.updatedAt,
       version: ROUND_JOURNAL_VERSION,
@@ -981,6 +998,19 @@ export class ToolRound {
     this.revision = saved.revision;
     this.updatedAt = saved.updatedAt;
     return saved;
+  }
+
+  // P2.2: self-heal legacy (pre-binding) rounds. A signed continuation whose request
+  // binding provably matches this round's durable session id carries THIS conversation's
+  // binding; stamp it so future continues compare bindings directly. Never overwrites a
+  // stamped binding and never runs on a round that already has one.
+  stampConversationBinding(binding) {
+    if (this.conversationBinding) return false;
+    const canonical = canonicalConversationBinding(binding);
+    if (!canonical) return false;
+    this.conversationBinding = canonical;
+    this.persistRecord(this.toRecord());
+    return true;
   }
 
   nextWireId(ordinal) {

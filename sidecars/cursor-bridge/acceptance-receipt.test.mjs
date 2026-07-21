@@ -90,12 +90,12 @@ test("illegal and backward transitions are rejected fail-closed", () => {
   assert.equal(isLegalAcceptanceTransition(PHASE.PREPARED_DURABLE, PHASE.MAYBE_ACCEPTED), true);
 });
 
-test("crash after envelope commit before MAYBE_ACCEPTED leaves PREPARED_DURABLE", () => {
+test("crash after envelope commit before MAYBE_ACCEPTED leaves PREPARED_DURABLE", async () => {
   const cursorKey = "k-prepared";
   const sessionId = "s-prepared";
   const clientMessageId = "ccm2_prepared";
   const requestHash = "a".repeat(64);
-  const committed = writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  const committed = await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   assert.equal(committed.version, TURN_RECEIPT_VERSION);
   assert.equal(committed.acceptancePhase, PHASE.PREPARED_DURABLE);
   assert.equal(committed.status, undefined);
@@ -105,12 +105,12 @@ test("crash after envelope commit before MAYBE_ACCEPTED leaves PREPARED_DURABLE"
   assert.equal(recoveryActionForPhase(resolveAcceptancePhase(disk)), "transition_and_send_same_envelope");
 });
 
-test("crash after MAYBE_ACCEPTED before agent.send retains MAYBE_ACCEPTED for exact reattachment", () => {
+test("crash after MAYBE_ACCEPTED before agent.send retains MAYBE_ACCEPTED for exact reattachment", async () => {
   const cursorKey = "k-maybe";
   const sessionId = "s-maybe";
   const clientMessageId = "ccm2_maybe";
   const requestHash = "b".repeat(64);
-  writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   const maybe = transitionAcceptancePhase(
     cursorKey, sessionId, clientMessageId, requestHash, PHASE.MAYBE_ACCEPTED,
   );
@@ -124,7 +124,7 @@ test("crash after MAYBE_ACCEPTED before agent.send retains MAYBE_ACCEPTED for ex
   );
 });
 
-test("durable transition failure proves agent.send never called", () => {
+test("durable transition failure proves agent.send never called", async () => {
   let sendCalls = 0;
   const agent = {
     async send() {
@@ -144,7 +144,7 @@ test("durable transition failure proves agent.send never called", () => {
   const sessionId = "s-gate";
   const clientMessageId = "ccm2_gate";
   const requestHash = "c".repeat(64);
-  writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   // Force an illegal transition attempt from PREPARED_DURABLE backward — fail closed, no send.
   assert.throws(
     () => applyAcceptanceTransition(
@@ -156,12 +156,12 @@ test("durable transition failure proves agent.send never called", () => {
   assert.equal(sendCalls, 0);
 });
 
-test("agent.send rejection retains MAYBE_ACCEPTED", () => {
+test("agent.send rejection retains MAYBE_ACCEPTED", async () => {
   const cursorKey = "k-reject";
   const sessionId = "s-reject";
   const clientMessageId = "ccm2_reject";
   const requestHash = "d".repeat(64);
-  writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   transitionAcceptancePhase(cursorKey, sessionId, clientMessageId, requestHash, PHASE.MAYBE_ACCEPTED);
   // Simulate post-boundary throw: no ACCEPTED transition, no REJECTED.
   const disk = readFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash);
@@ -179,7 +179,7 @@ test("both acceptance signals racing converge on one ACCEPTED", async () => {
   const sessionId = "s-race-accept";
   const clientMessageId = "ccm2_race_accept";
   const requestHash = "e".repeat(64);
-  writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   transitionAcceptancePhase(cursorKey, sessionId, clientMessageId, requestHash, PHASE.MAYBE_ACCEPTED);
   const [a, b] = await Promise.all([
     Promise.resolve(transitionAcceptancePhase(
@@ -197,12 +197,12 @@ test("both acceptance signals racing converge on one ACCEPTED", async () => {
   assert.equal(disk.acceptancePhase, PHASE.ACCEPTED);
 });
 
-test("terminal receipt commits before COMPLETED phase", () => {
+test("terminal receipt commits before COMPLETED phase", async () => {
   const cursorKey = "k-complete";
   const sessionId = "s-complete";
   const clientMessageId = "ccm2_complete";
   const requestHash = "f".repeat(64);
-  writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   transitionAcceptancePhase(cursorKey, sessionId, clientMessageId, requestHash, PHASE.MAYBE_ACCEPTED);
   transitionAcceptancePhase(
     cursorKey, sessionId, clientMessageId, requestHash, PHASE.ACCEPTED,
@@ -238,12 +238,12 @@ test("concurrent writers cannot fork one invocation", async () => {
   assert.equal(disk.deliveryIdempotencyKey, wins[0].value.deliveryIdempotencyKey);
 });
 
-test("restart exact-envelope recovery without duplicate execution", () => {
+test("restart exact-envelope recovery without duplicate execution", async () => {
   const cursorKey = "k-restart";
   const sessionId = "s-restart";
   const clientMessageId = "ccm2_restart";
   const requestHash = "2".repeat(64);
-  const first = writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  const first = await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   transitionAcceptancePhase(cursorKey, sessionId, clientMessageId, requestHash, PHASE.MAYBE_ACCEPTED);
   const recovered = readFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash);
   assert.equal(recovered.acceptancePhase, PHASE.MAYBE_ACCEPTED);
@@ -251,17 +251,17 @@ test("restart exact-envelope recovery without duplicate execution", () => {
   assert.equal(recovered.deliveryIdempotencyKey, first.deliveryIdempotencyKey);
   assert.equal(recoveryActionForPhase(PHASE.MAYBE_ACCEPTED), "exact_reattachment_only");
   // Second prepare for same invocation must fail closed (no fork / duplicate generation).
-  assert.throws(
-    () => writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope({ generation: 2 })),
+  await assert.rejects(
+    writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope({ generation: 2 })),
   );
 });
 
-test("REJECTED_BEFORE_SEND only from pre-boundary phases", () => {
+test("REJECTED_BEFORE_SEND only from pre-boundary phases", async () => {
   const cursorKey = "k-rej";
   const sessionId = "s-rej";
   const clientMessageId = "ccm2_rej";
   const requestHash = "3".repeat(64);
-  writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   const rejected = transitionAcceptancePhase(
     cursorKey, sessionId, clientMessageId, requestHash, PHASE.REJECTED_BEFORE_SEND,
     { reason: "local cancel before send" },
@@ -270,12 +270,12 @@ test("REJECTED_BEFORE_SEND only from pre-boundary phases", () => {
   assert.equal(recoveryActionForPhase(PHASE.REJECTED_BEFORE_SEND), "new_attempt_ok");
 });
 
-test("legacy transitionFreshAttemptState running shim maps to ACCEPTED", () => {
+test("legacy transitionFreshAttemptState running shim maps to ACCEPTED", async () => {
   const cursorKey = "k-shim";
   const sessionId = "s-shim";
   const clientMessageId = "ccm2_shim";
   const requestHash = "4".repeat(64);
-  writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   transitionAcceptancePhase(cursorKey, sessionId, clientMessageId, requestHash, PHASE.MAYBE_ACCEPTED);
   const accepted = transitionFreshAttemptState(
     cursorKey, sessionId, clientMessageId, requestHash, "running",
@@ -290,12 +290,12 @@ test("sameFrozenEnvelope detects mutation after boundary", () => {
   assert.equal(sameFrozenEnvelope(left, right), false);
 });
 
-test("crash matrix: MAYBE_ACCEPTED before send retains exact envelope", () => {
+test("crash matrix: MAYBE_ACCEPTED before send retains exact envelope", async () => {
   const cursorKey = "k-crash-maybe";
   const sessionId = "s-crash-maybe";
   const clientMessageId = "ccm2_crash_maybe";
   const requestHash = "5".repeat(64);
-  const prepared = writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  const prepared = await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   assert.equal(prepared.acceptancePhase, PHASE.PREPARED_DURABLE);
   const maybe = transitionAcceptancePhase(
     cursorKey, sessionId, clientMessageId, requestHash, PHASE.MAYBE_ACCEPTED,
@@ -311,12 +311,12 @@ test("crash matrix: MAYBE_ACCEPTED before send retains exact envelope", () => {
   );
 });
 
-test("crash matrix: event after ACCEPTED cannot roll back", () => {
+test("crash matrix: event after ACCEPTED cannot roll back", async () => {
   const cursorKey = "k-crash-acc";
   const sessionId = "s-crash-acc";
   const clientMessageId = "ccm2_crash_acc";
   const requestHash = "6".repeat(64);
-  writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, clientMessageId, requestHash, baseEnvelope());
   transitionAcceptancePhase(cursorKey, sessionId, clientMessageId, requestHash, PHASE.MAYBE_ACCEPTED);
   transitionAcceptancePhase(cursorKey, sessionId, clientMessageId, requestHash, PHASE.ACCEPTED);
   assert.throws(() =>

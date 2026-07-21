@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -109,5 +110,68 @@ func TestEnrichAuthSelectionError_IgnoresOtherErrors(t *testing.T) {
 	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
 	if out != in {
 		t.Fatalf("expected original error to be returned unchanged")
+	}
+}
+
+// P1.3: a typed executor error wrapped by the conductor's bootstrap wrapper must keep its
+// status through errors.As (no 507→500 downgrade), and a structured APIErrorBody must reach
+// the client verbatim with the error's Retry-After hint as a standard header.
+type p13StatusError struct{ code int }
+
+func (e *p13StatusError) Error() string   { return "typed boom" }
+func (e *p13StatusError) StatusCode() int { return e.code }
+
+type p13Wrapper struct{ inner error }
+
+func (e *p13Wrapper) Error() string { return "wrapped: " + e.inner.Error() }
+func (e *p13Wrapper) Unwrap() error { return e.inner }
+
+func TestStatusFromErrorUnwrapsTypedStatus(t *testing.T) {
+	if got := statusFromError(&p13Wrapper{inner: &p13StatusError{code: http.StatusInsufficientStorage}}); got != http.StatusInsufficientStorage {
+		t.Fatalf("statusFromError(wrapped 507) = %d, want 507 (must unwrap, not downgrade to 500)", got)
+	}
+	if got := statusFromError(&p13Wrapper{inner: errors.New("plain")}); got != 0 {
+		t.Fatalf("statusFromError(wrapped plain) = %d, want 0", got)
+	}
+}
+
+type p13StructuredError struct {
+	body       []byte
+	retryAfter *time.Duration
+}
+
+func (e *p13StructuredError) Error() string              { return "plain text fallback" }
+func (e *p13StructuredError) APIErrorBody() []byte       { return e.body }
+func (e *p13StructuredError) RetryAfter() *time.Duration { return e.retryAfter }
+
+func TestWriteErrorResponse_StructuredAPIErrorBodyAndRetryAfter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	d := 2 * time.Second
+	structured := &p13StructuredError{
+		body:       []byte(`{"error":{"message":"shared durable capacity is occupied","type":"capacity_error","code":"durable_state_capacity","retry_after_ms":2000,"requested_bytes":2097152}}`),
+		retryAfter: &d,
+	}
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusInsufficientStorage,
+		Error:      &p13Wrapper{inner: structured}, // wrapped, like the conductor bootstrap path
+	})
+
+	if recorder.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want 507", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"code":"durable_state_capacity"`) || !strings.Contains(body, `"requested_bytes":2097152`) {
+		t.Fatalf("structured body was re-wrapped instead of passed through: %s", body)
+	}
+	if strings.Contains(body, "internal_server_error") {
+		t.Fatalf("structured body degraded to internal_server_error: %s", body)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want \"2\"", got)
 	}
 }

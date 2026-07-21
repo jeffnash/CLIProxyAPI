@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -142,10 +143,9 @@ func TestLineage3_GrowthSameSession(t *testing.T) {
 }
 
 // ===========================================================================
-// #4 COMPACTION-BRIDGE.
-// Same uuid, /compact rewrites the body but preserves msg[0] opener -> base headDigest flips,
-// compactionSignal true -> CONTINUE baseSid + re-key; composerHistoryFingerprint ALSO flips so
-// inp["historyFingerprint"] drives the bridge warm-reseed. Assert NO fork.
+// #4 COMPACTION ISOLATION.
+// Same uuid, /compact rewrites the retained head while preserving msg[0]. That shape is indistinguishable
+// from a same-opener divergent branch, so it must derive a new deterministic lineage and faithfully re-seed.
 // ===========================================================================
 func TestLineage4_CompactionBridge(t *testing.T) {
 	auth := authL("t4")
@@ -168,12 +168,12 @@ func TestLineage4_CompactionBridge(t *testing.T) {
 		lineageMsg{"user", "continue from here"},
 	)
 	contSid, _ := deriveComposerSessionID(auth, "ckey", compacted, opts)
-	if contSid != baseSid {
-		t.Fatalf("compaction (opener preserved, body rewritten) must CONTINUE baseSid, not fork (got %s want %s)", contSid, baseSid)
+	if contSid == baseSid {
+		t.Fatalf("same-opener changed head must not guess that compaction owns the prior lineage (got %s)", contSid)
 	}
 	after := lineageCountForTenant(tenant)
-	if after != before {
-		t.Fatalf("compaction must NOT add a fork lineage (before=%d after=%d)", before, after)
+	if after != before+1 {
+		t.Fatalf("changed retained head must add one isolated lineage (before=%d after=%d)", before, after)
 	}
 
 	// The compaction signal itself: same opener fingerprint, different head -> true; same head -> false.
@@ -196,15 +196,12 @@ func TestLineage4_CompactionBridge(t *testing.T) {
 
 // ===========================================================================
 // #5 BRANCH/REGENERATE FORK + multi-turn stability.
-// Same id, a branch that diverges at the OPENER (the genuine divergence the splitter targets) -> distinct
-// forkSid; a SECOND new-user turn of that branch re-attaches to the same forkSid (opener-anchored re-key).
+// Same id, a branch that diverges in the retained head -> distinct forkSid; a SECOND new-user turn of that
+// branch re-attaches to the same forkSid because its retained head remains stable.
 // Assert the parent's session is a different id (untouched).
 //
-// NOTE (documented residual, identity-finalplan §2/§6): a branch that PRESERVES the opener (msg[0]) and
-// diverges only at msg[1] is structurally identical to a /compact (same opener, rewritten body) — no content
-// signal separates them, so it is treated as a CONTINUE (the accepted residual). Genuine forks (subagents /
-// parallel fan-out) carry their OWN first task → a distinct opener → split correctly, which is what this
-// test exercises.
+// A branch that preserves msg[0] but changes msg[1] is intentionally isolated too. That shape is structurally
+// identical to compaction, so bounded replay may re-seed a compact; merging would risk parent/child corruption.
 func TestLineage5_BranchForkMultiTurnStability(t *testing.T) {
 	auth := authL("t5")
 	opts := claudeUUIDOpts("uuid-branch")
@@ -311,10 +308,7 @@ func TestLineage_DeterministicMonotonicSlot(t *testing.T) {
 	}
 }
 
-// #11 (review): when a base AND a concurrency-fork share the same opener and a turn's head has moved so it
-// matches BOTH via the compaction signal, the opener bridge must NOT prefer the base (the old tie-break) — that
-// would re-key the parent onto the fork's head (corruption) or pull a fork back to base. >1 match is ambiguous,
-// so the resolver isolates the turn instead of collapsing onto the base.
+// #11 (review): same-opener changed-head routing must never prefer an existing parent.
 func TestLineage_OpenerBridgeAmbiguousDoesNotCollapseToBase(t *testing.T) {
 	store := newComposerLineageStore()
 	tenant := "t11"
@@ -420,17 +414,17 @@ func TestLineage10_EvictionNonForkAndCapBound(t *testing.T) {
 	head := "head10"
 	opener := "opener10"
 
-	// Turn 1 establishes the base lineage.
+	// Turn 1 establishes a deterministic lineage id; no request is privileged merely for arriving first.
 	s1 := store.resolveStableSession(tenant, baseSid, head, opener)
-	if s1 != baseSid {
-		t.Fatalf("first claim must establish baseSid (got %s)", s1)
+	if s1 == baseSid {
+		t.Fatalf("first claim must not inherit the process-order-dependent baseSid (got %s)", s1)
 	}
 	// Age past the TTL and expire.
 	now = now.Add(store.entryTTL + time.Minute)
 	// A returning turn with the SAME id+head must re-CONTINUE (re-establish baseSid), never a divergent fork.
 	s2 := store.resolveStableSession(tenant, baseSid, head, opener)
-	if s2 != baseSid {
-		t.Fatalf("a returning turn after eviction must re-CONTINUE baseSid, not fork (got %s)", s2)
+	if s2 != s1 {
+		t.Fatalf("a returning turn after eviction must re-derive the same lineage (got %s want %s)", s2, s1)
 	}
 
 	// Cap bound: a fan-out of many divergent forks under ONE baseSid is bounded by perBase.
@@ -450,6 +444,117 @@ func TestLineage10_EvictionNonForkAndCapBound(t *testing.T) {
 	to.mu.Unlock()
 	if n > store2.perBase {
 		t.Fatalf("co-resident forks under one baseSid must be bounded by perBase=%d, got %d", store2.perBase, n)
+	}
+}
+
+func TestLineageRestartArrivalOrderCannotSwapParentAndSubagent(t *testing.T) {
+	const (
+		tenant = "restart-order"
+		base   = "sess_restartbase"
+	)
+	first := newComposerLineageStore()
+	parent1 := first.resolveStableSession(tenant, base, "parent-head", "parent-opener")
+	sub1 := first.resolveStableSession(tenant, base, "sub-head", "sub-opener")
+	if parent1 == sub1 || parent1 == base || sub1 == base {
+		t.Fatalf("setup must produce two non-base deterministic lineages: parent=%s sub=%s", parent1, sub1)
+	}
+
+	// Model a full process restart/TTL loss, then deliver the subagent first. Arrival order must not transfer
+	// ownership of the durable parent session to the subagent.
+	restarted := newComposerLineageStore()
+	sub2 := restarted.resolveStableSession(tenant, base, "sub-head", "sub-opener")
+	parent2 := restarted.resolveStableSession(tenant, base, "parent-head", "parent-opener")
+	if parent2 != parent1 || sub2 != sub1 {
+		t.Fatalf("lineage ids changed with reverse post-restart arrival: parent %s/%s sub %s/%s", parent1, parent2, sub1, sub2)
+	}
+}
+
+func TestLineageRestartSameOpenerDivergenceCannotCollapse(t *testing.T) {
+	const (
+		tenant = "restart-same-opener"
+		base   = "sess_restart_same_opener"
+		opener = "shared-opener"
+	)
+	first := newComposerLineageStore()
+	parent1 := first.resolveStableSession(tenant, base, "parent-second-message", opener)
+	sub1 := first.resolveStableSession(tenant, base, "subagent-second-message", opener)
+	if parent1 == sub1 {
+		t.Fatal("same opener with divergent retained head must split before restart")
+	}
+
+	restarted := newComposerLineageStore()
+	sub2 := restarted.resolveStableSession(tenant, base, "subagent-second-message", opener)
+	parent2 := restarted.resolveStableSession(tenant, base, "parent-second-message", opener)
+	if parent2 != parent1 || sub2 != sub1 || parent2 == sub2 {
+		t.Fatalf("same-opener lineages collapsed or moved after reverse restart order: parent %s/%s sub %s/%s", parent1, parent2, sub1, sub2)
+	}
+}
+
+func TestLineageTTLAndGlobalCapNeverEvictLiveSlots(t *testing.T) {
+	store := newComposerLineageStore()
+	now := time.Now()
+	store.nowFn = func() time.Time { return now }
+	store.perCap = 1
+	tenant, base, head := "live-cap", "sess_livecap", "same-head"
+	store.putForkSlotted(tenant, base, head, false)
+	live := store.putForkSlotted(tenant, base, head, true)
+	owner, ok := composerInflight.claim(tenant, live)
+	if !ok {
+		t.Fatal("could not establish live slot lease")
+	}
+	defer composerInflight.release(tenant, live, owner)
+
+	// Force both the global cap and TTL paths while the slot is live.
+	store.resolveStableSession(tenant, "sess_other", "other-head", "other-opener")
+	now = now.Add(store.entryTTL + time.Minute)
+	store.resolveStableSession(tenant, "sess_third", "third-head", "third-opener")
+	v, _ := store.tenants.Load(tenant)
+	to := v.(*tenantLineage)
+	to.mu.Lock()
+	found := false
+	for _, e := range to.byBaseHead {
+		if e.sid == live {
+			found = true
+		}
+	}
+	to.mu.Unlock()
+	if !found {
+		t.Fatal("TTL/global cap evicted a live collision slot")
+	}
+}
+
+func TestLineageAmbiguousIdenticalSlotNeverFallsBackToSlotZero(t *testing.T) {
+	store := newComposerLineageStore()
+	tenant, base, head, opener := "ambiguous-slot", "sess_ambiguous", "same-head", "same-opener"
+	slot0 := store.resolveStableSession(tenant, base, head, opener)
+	slot1 := store.putForkSlotted(tenant, base, head, true)
+	got := store.resolveStableSessionForTurn(tenant, base, head, opener, "exact-later-turn")
+	gotRetry := store.resolveStableSessionForTurn(tenant, base, head, opener, "exact-later-turn")
+	if got == slot0 || got == slot1 || got != gotRetry {
+		t.Fatalf("ambiguous later turn must isolate retry-stably instead of guessing a prior slot: slot0=%s slot1=%s got=%s retry=%s", slot0, slot1, got, gotRetry)
+	}
+}
+
+func TestExplicitLineageIDSeparatesByteIdenticalBranches(t *testing.T) {
+	auth := authL("explicit-lineage")
+	payload := lineagePayload(true, lineageMsg{"user", "identical task"})
+	a := claudeUUIDOpts("shared-conversation")
+	a.Metadata = map[string]any{"lineage_id": "parent"}
+	b := claudeUUIDOpts("shared-conversation")
+	b.Metadata = map[string]any{"lineage_id": "subagent-1"}
+	sa, errA := deriveComposerSessionID(auth, "key", payload, a)
+	sb, errB := deriveComposerSessionID(auth, "key", payload, b)
+	if errA != nil || errB != nil || sa == sb {
+		t.Fatalf("explicit lineage ids must split byte-identical branches: a=%s/%v b=%s/%v", sa, errA, sb, errB)
+	}
+	grown := lineagePayload(true,
+		lineageMsg{"user", "identical task"},
+		lineageMsg{"assistant", "first answer"},
+		lineageMsg{"user", "continue"},
+	)
+	saNext, errNext := deriveComposerSessionID(auth, "key", grown, a)
+	if errNext != nil || saNext != sa {
+		t.Fatalf("stable explicit lineage identity must survive transcript growth: first=%s next=%s err=%v", sa, saNext, errNext)
 	}
 }
 
@@ -500,7 +605,7 @@ func TestLineage_ForgetReleasesOnlyTargetSid(t *testing.T) {
 	tenant := "tforget"
 	base := "sess_baseforget"
 	// Establish a base + one fork under it.
-	store.resolveStableSession(tenant, base, "hbase", "opbase")
+	parentSid := store.resolveStableSession(tenant, base, "hbase", "opbase")
 	forkSid := store.resolveStableSession(tenant, base, "hfork", "opfork")
 	if forkSid == base {
 		t.Fatalf("setup: fork must differ from base")
@@ -513,8 +618,8 @@ func TestLineage_ForgetReleasesOnlyTargetSid(t *testing.T) {
 	if got := tenantLineageLen(store, tenant); got != 1 {
 		t.Fatalf("forgetting a fork must drop exactly one lineage (remaining=%d)", got)
 	}
-	// Forget the base too: the tenant submap is deleted once empty.
-	store.forget(tenant, base)
+	// Forget the parent lineage too: the tenant submap is deleted once empty.
+	store.forget(tenant, parentSid)
 	if _, ok := store.tenants.Load(tenant); ok {
 		t.Fatalf("the tenant submap must be deleted once empty")
 	}
@@ -576,17 +681,16 @@ func TestConcurrencyForkDistinctSessions(t *testing.T) {
 		t.Fatalf("a third concurrent sibling must also be distinct (a=%s b=%s c=%s)", a, b, c)
 	}
 
-	// Release A (its run reached a terminal end). A NEW same-content turn must REUSE A's freed session, not
-	// fork — concurrency forking splits only turns that are ACTUALLY concurrent.
+	// Release A. Because several byte-identical lineage owners now exist and the client supplied no stable
+	// branch id, a new request must not guess that it owns A/slot0; it isolates and faithfully re-seeds.
 	composerInflight.release(tenant, a, ownerA)
 	d, ownerD, _ := deriveComposerSessionIDLive(auth, "ckey", turn, opts, "ccm2-subagent-d")
-	if d != a {
-		t.Fatalf("after release, a same-content turn must REUSE the freed session, not fork (a=%s d=%s)", a, d)
+	if d == a || d == b || d == c {
+		t.Fatalf("ambiguous same-content owner must not guess a prior slot (a=%s b=%s c=%s d=%s)", a, b, c, d)
 	}
 
-	// Clean up leases so the global registry does not leak into other tests. D re-claimed A's session, so its
-	// lease carries ownerD (the fresh mint), not the released ownerA.
-	composerInflight.release(tenant, a, ownerD)
+	// Clean up leases so the global registry does not leak into other tests.
+	composerInflight.release(tenant, d, ownerD)
 	composerInflight.release(tenant, b, ownerB)
 	composerInflight.release(tenant, c, ownerC)
 }
@@ -728,8 +832,8 @@ func TestContinuationLeaseMetadataFailsSafe(t *testing.T) {
 	}
 }
 
-// Comment 2 (stable secret): a configured CURSOR_COMPOSER_LINEAGE_SECRET yields a deterministic key (so fork
-// ids are stable across restart/replica); an unset secret is per-process random.
+// The optional secret remains deterministic when configured and process-random when absent. Lineage routing
+// itself must no longer depend on it: response-route fallback authentication is its only consumer.
 func TestLineageSecretStableFromEnv(t *testing.T) {
 	cfg := func(string) string { return "deadbeefcafe0123deadbeefcafe0123deadbeefcafe0123deadbeefcafe0123" }
 	a := loadComposerLineageSecret(cfg)
@@ -745,6 +849,17 @@ func TestLineageSecretStableFromEnv(t *testing.T) {
 	r2 := loadComposerLineageSecret(func(string) string { return "" })
 	if string(r1) == string(r2) {
 		t.Fatalf("an UNSET secret must be per-process random (two loads must differ)")
+	}
+
+	messages := gjson.Parse(`{"messages":[{"role":"user","content":"restart-stable head"}]}`).Get("messages").Array()
+	savedSecret := serverSecret
+	defer func() { serverSecret = savedSecret }()
+	serverSecret = bytes.Repeat([]byte{0x11}, 32)
+	headA, _ := lineageForkKeysForRequest("tenant-restart", messages, cliproxyexecutor.Options{})
+	serverSecret = bytes.Repeat([]byte{0x22}, 32)
+	headB, _ := lineageForkKeysForRequest("tenant-restart", messages, cliproxyexecutor.Options{})
+	if headA != headB {
+		t.Fatalf("lineage routing must remain stable when the process-local fallback secret changes: %s != %s", headA, headB)
 	}
 }
 
@@ -793,9 +908,8 @@ func TestConcurrencyForkPreviousResponseIDResume(t *testing.T) {
 // This is the built-in equivalent of the Anthropic path's metadata.user_id for non-Claude-Code clients.
 // ---------------------------------------------------------------------------
 
-// A no-conv-id conversation (stateless replaying client) must keep ONE durable session across a new-user
-// follow-up: the full transcript is replayed every turn, so the opener is byte-identical and resolves to the
-// same session — NOT a fresh mint (the regression that made opendesign "not continue turns").
+// A no-conv-id conversation is deterministically keyed by its retained replay head. The one-message bootstrap
+// may move once the assistant reply completes that head; subsequent tail growth stays on that lineage.
 func TestContentKey_NoConvIDDurableAcrossTurns(t *testing.T) {
 	auth := authL("tck-dur")
 	noID := cliproxyexecutor.Options{} // no header, no metadata.user_id, no conversation_id
@@ -807,7 +921,7 @@ func TestContentKey_NoConvIDDurableAcrossTurns(t *testing.T) {
 	if !strings.HasPrefix(s1, "sess_") {
 		t.Fatalf("content-keyed session must be a real sess_ id, got %q", s1)
 	}
-	// New-user follow-up: same opener replayed at the head + new tail. Must resolve to the SAME session.
+	// New-user follow-up completes the retained head. It may re-seed rather than conflate a same-opener branch.
 	t2 := lineagePayload(true,
 		lineageMsg{"user", "implement the OAuth device flow"},
 		lineageMsg{"assistant", "done — added the device_code grant"},
@@ -816,8 +930,15 @@ func TestContentKey_NoConvIDDurableAcrossTurns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("turn 2 derive: %v", err)
 	}
-	if s1 != s2 {
-		t.Fatalf("a no-conv-id conversation must keep ONE durable session across turns (opener-keyed); got s1=%q s2=%q", s1, s2)
+	t3 := lineagePayload(true,
+		lineageMsg{"user", "implement the OAuth device flow"},
+		lineageMsg{"assistant", "done — added the device_code grant"},
+		lineageMsg{"user", "now add token refresh"},
+		lineageMsg{"assistant", "refresh added"},
+		lineageMsg{"user", "add tests"})
+	s3, err := deriveComposerSessionID(auth, "ckey", t3, noID)
+	if err != nil || s2 != s3 || s1 == s2 {
+		t.Fatalf("completed retained head must stay durable while the ambiguous bootstrap is isolated: s1=%q s2=%q s3=%q err=%v", s1, s2, s3, err)
 	}
 }
 

@@ -40,6 +40,14 @@ func TestResolveExplicitStandingAndCurrent(t *testing.T) {
 	}
 }
 
+func TestExtractSegmentsRecognizesOpenAITextPartVariants(t *testing.T) {
+	raw := []byte(`{"messages":[{"role":"user","content":[{"type":"input_text","text":"first"},{"type":"output_text","text":"second"}]}]}`)
+	segs := ExtractSegments(raw, gjson.Result{})
+	if len(segs) != 1 || segs[0].ByteLength != len("first\nsecond") {
+		t.Fatalf("OpenAI text parts must contribute to provenance identity, got %+v", segs)
+	}
+}
+
 func TestResolveCompleteFragments(t *testing.T) {
 	raw := []byte(`{"messages":[
 		{"role":"user","content":"part-a","metadata":{"cliproxy":{"provenance":"fragment","fragment_group_id":"g1","fragment_index":0,"fragment_count":2}}},
@@ -227,5 +235,31 @@ func TestIncidentRestartStandingDoesNotDisplaceCurrent(t *testing.T) {
 	}
 	if len(d.CurrentSegments) != 1 || len(d.StandingSegments) != 1 {
 		t.Fatalf("current=%v standing=%v", d.CurrentSegments, d.StandingSegments)
+	}
+}
+
+// P2.6: MessageText is the single canonical user-message text parser shared with the
+// composer executor's routing/rendering (cursorMessageText delegates here). Non-standard
+// part types (e.g. tool_result inside a user message) must NOT contribute, so provenance
+// fingerprints and routing decisions see identical text in both subsystems.
+func TestMessageTextCanonicalExtraction(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		want string
+	}{
+		{name: "string content", msg: `{"content":"hello"}`, want: "hello"},
+		{name: "text parts newline-joined", msg: `{"content":[{"type":"text","text":"foo"},{"type":"text","text":"bar"}]}`, want: "foo\nbar"},
+		{name: "non-text parts excluded", msg: `{"content":[{"type":"tool_result","text":"stale"},{"type":"text","text":"fresh"}]}`, want: "fresh"},
+		{name: "empty text parts skipped", msg: `{"content":[{"type":"text","text":""},{"type":"text","text":"kept"}]}`, want: "kept"},
+		{name: "input_text accepted", msg: `{"content":[{"type":"input_text","text":"in"}]}`, want: "in"},
+		{name: "fallback to top-level text", msg: `{"text":"top"}`, want: "top"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := MessageText(gjson.Parse(tc.msg)); got != tc.want {
+				t.Fatalf("MessageText(%s) = %q, want %q", tc.msg, got, tc.want)
+			}
+		})
 	}
 }
