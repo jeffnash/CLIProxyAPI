@@ -3110,6 +3110,7 @@ async function runSdkAgentMaintenance() {
         // to the exact run that removed the agent.
         onEvent: (event) => lifecycleEvent(
           event.operation === "quarantined" ? "agent_quarantined"
+            : event.operation === "requarantined" ? "agent_requarantined"
             : event.operation === "deleted" ? "agent_deleted"
             : event.operation === "local-deleted" ? "agent_local_deleted"
             : event.operation === "restored" ? "agent_restored"
@@ -3120,7 +3121,7 @@ async function runSdkAgentMaintenance() {
         sdkAgentGCScanCursors.set(scope, stats.nextScanCursor || "");
         saveScanCursor(scope, stats.nextScanCursor || "");
         if (pressure) sdkAgentGCPressureActive.set(scope, stats.pressureActive === true);
-        if (stats.quarantined || stats.deleted || stats.localDeleted
+        if (stats.quarantined || stats.requarantined || stats.deleted || stats.localDeleted
           || stats.markersCleared || stats.restored || stats.skipped) {
           console.log("[cursor-agent-bridge] SDK agent GC", JSON.stringify({
             scope,
