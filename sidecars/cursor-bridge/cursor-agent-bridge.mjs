@@ -342,16 +342,40 @@ const FRESH_RECEIPT_INITIAL_RESERVATION_BYTES = envInt(
 );
 const DELIVERY_ADMISSION_ACTIVE_BYTES = envInt(
   "CURSOR_COMPOSER_ADMISSION_ACTIVE_BYTES",
-  128 * 1024 * 1024,
+  16 * 1024 * 1024,
   { min: FRESH_RECEIPT_INITIAL_RESERVATION_BYTES },
 );
 const DELIVERY_ADMISSION_MAX_QUEUED = envInt(
-  "CURSOR_COMPOSER_ADMISSION_MAX_QUEUED", 1024, { min: 1 },
+  "CURSOR_COMPOSER_ADMISSION_MAX_QUEUED", 32, { min: 1 },
 );
 const deliveryAdmission = new PriorityAdmissionQueue({
   limit: DELIVERY_ADMISSION_ACTIVE_BYTES,
   maxQueued: DELIVERY_ADMISSION_MAX_QUEUED,
 });
+const AGENT_INITIALIZATION_MAX_ACTIVE = envInt(
+  "CURSOR_COMPOSER_INIT_MAX_ACTIVE", 8, { min: 1 },
+);
+const AGENT_INITIALIZATION_MAX_QUEUED = envInt(
+  "CURSOR_COMPOSER_INIT_MAX_QUEUED", 32, { min: 1 },
+);
+const agentInitializationAdmission = new PriorityAdmissionQueue({
+  limit: AGENT_INITIALIZATION_MAX_ACTIVE,
+  maxQueued: AGENT_INITIALIZATION_MAX_QUEUED,
+});
+const BRIDGE_MAX_RSS_BYTES = envInt(
+  "CURSOR_COMPOSER_MAX_RSS_BYTES", 1536 * 1024 * 1024, { min: 64 * 1024 * 1024 },
+);
+const BRIDGE_MAX_EVENT_LOOP_LAG_MS = envInt(
+  "CURSOR_COMPOSER_MAX_EVENT_LOOP_LAG_MS", 2000, { min: 100 },
+);
+let bridgeEventLoopLagMs = 0;
+let bridgeEventLoopExpectedAt = Date.now() + 1000;
+const bridgeEventLoopMonitor = setInterval(() => {
+  const now = Date.now();
+  bridgeEventLoopLagMs = Math.max(0, now - bridgeEventLoopExpectedAt);
+  bridgeEventLoopExpectedAt = now + 1000;
+}, 1000);
+bridgeEventLoopMonitor.unref?.();
 const DELIVERY_ADMISSION_LEASE = Symbol("deliveryAdmissionLease");
 function releaseInputDeliveryAdmission(input) {
   const lease = input && input[DELIVERY_ADMISSION_LEASE];
@@ -5371,6 +5395,12 @@ async function ensureAgent(session, model) {
   if (session.agent && !SDK_AGENT_GC_ENABLED) return session.agent;
   if (session.agentPromise) return session.agentPromise;          // guard TOCTOU
   session.agentPromise = (async () => {
+    const initializationLease = await agentInitializationAdmission.acquire({
+      bytes: 1,
+      priority: ADMISSION_PRIORITY.FRESH,
+      id: `agent-init:${session.id}`,
+    });
+    try {
     const platform = await getPlatform(session.cursorKey);
     const modelSel = composerModelSelection(model, { utilityOneShot: session.utilityOneShot });
     dbg("ensureAgent modelSelection", "session=" + session.id, "model=" + model, "selection=" + safeJson(modelSel));
@@ -5558,6 +5588,9 @@ async function ensureAgent(session, model) {
       session.agent = await platform.createAgent({ agentId, ...opts });
     }
     return session.agent;
+    } finally {
+      initializationLease.release();
+    }
   })();
   try { return await session.agentPromise; } finally { session.agentPromise = null; }
 }
@@ -6324,16 +6357,52 @@ function validateBindHost(host, hasToken, allowInsecure = false) {
 function healthBody(req) {
   const h = (req && req.headers) || {};
   const authed = BRIDGE_TOKEN && constEq(h["x-bridge-auth"], BRIDGE_TOKEN);
-  if (isLoopbackRemote(req) || authed) return { ok: true, ready: bridgeReady, patched: true, sessions: sessions.size };
+  if (isLoopbackRemote(req) || authed) {
+    return {
+      ok: true,
+      ready: readinessStatus().ready,
+      patched: true,
+      sessions: sessions.size,
+      admission: {
+        activeBytes: deliveryAdmission.used,
+        activeLimitBytes: deliveryAdmission.limit,
+        queued: deliveryAdmission.queued,
+        maxQueued: deliveryAdmission.maxQueued,
+      },
+      initialization: {
+        active: agentInitializationAdmission.used,
+        activeLimit: agentInitializationAdmission.limit,
+        queued: agentInitializationAdmission.queued,
+        maxQueued: agentInitializationAdmission.maxQueued,
+      },
+      rssBytes: process.memoryUsage().rss,
+      eventLoopLagMs: bridgeEventLoopLagMs,
+    };
+  }
   return { ok: true };
 }
 
-function readinessBody() {
-  if (!bridgeReady) return { ok: false, ready: false };
+function readinessStatus() {
+  if (!bridgeReady) return { ok: false, ready: false, reason: "starting" };
   if (!stateRootDiskStatus().ok) {
     return { ok: false, ready: false, reason: "durable_state_capacity" };
   }
+  const rssBytes = process.memoryUsage().rss;
+  if (rssBytes >= BRIDGE_MAX_RSS_BYTES) {
+    return { ok: false, ready: false, reason: "memory_pressure", rssBytes };
+  }
+  if (bridgeEventLoopLagMs >= BRIDGE_MAX_EVENT_LOOP_LAG_MS) {
+    return { ok: false, ready: false, reason: "event_loop_lag", eventLoopLagMs: bridgeEventLoopLagMs };
+  }
+  if (deliveryAdmission.queued >= deliveryAdmission.maxQueued
+      || agentInitializationAdmission.queued >= agentInitializationAdmission.maxQueued) {
+    return { ok: false, ready: false, reason: "admission_capacity" };
+  }
   return { ok: true, ready: true };
+}
+
+function readinessBody() {
+  return readinessStatus();
 }
 
 function classifyMcpRoute(req) {

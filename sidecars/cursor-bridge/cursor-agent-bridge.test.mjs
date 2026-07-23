@@ -5878,12 +5878,18 @@ test("authorization is constant-policy for single and multi tenant modes", () =>
 });
 
 test("health and readiness distinguish liveness from completed startup gates", () => {
-  assert.deepEqual(readinessBody(), { ok: false, ready: false });
+  assert.deepEqual(readinessBody(), { ok: false, ready: false, reason: "starting" });
   assert.deepEqual(healthBody(request("203.0.113.1")), { ok: true });
   const local = healthBody(request("127.0.0.1"));
   assert.equal(local.ok, true);
   assert.equal(local.ready, false);
   assert.equal(local.patched, true);
+  assert.equal(local.admission.activeLimitBytes, 16 * 1024 * 1024);
+  assert.equal(local.admission.maxQueued, 32);
+  assert.equal(local.initialization.activeLimit, 8);
+  assert.equal(local.initialization.maxQueued, 32);
+  assert.equal(typeof local.rssBytes, "number");
+  assert.equal(typeof local.eventLoopLagMs, "number");
   assert.equal(isLoopbackRemote(request("127.0.0.1")), true);
   assert.equal(stateRootDiskStatus(0, () => ({ bavail: 1, bsize: 1 })).ok, false);
   assert.equal(stateRootDiskStatus(0, () => ({ bavail: Number.MAX_SAFE_INTEGER, bsize: 1 })).ok, true);

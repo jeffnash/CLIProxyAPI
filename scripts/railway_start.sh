@@ -972,6 +972,11 @@ trap shutdown_children TERM INT
 # outage.
 bridge_restart_delay=1
 bridge_stable_uptime=60
+bridge_liveness_failures=0
+bridge_liveness_failure_limit="${CURSOR_BRIDGE_LIVENESS_FAILURE_LIMIT:-3}"
+if [[ ! "${bridge_liveness_failure_limit}" =~ ^[1-9][0-9]*$ ]]; then
+  bridge_liveness_failure_limit=3
+fi
 while true; do
   if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
     set +e
@@ -981,14 +986,27 @@ while true; do
     stop_cursor_bridge_process
     exit "${server_status}"
   fi
+  bridge_restart_reason=""
   if ! kill -0 "${CURSOR_BRIDGE_PID}" >/dev/null 2>&1; then
+    bridge_restart_reason="process exited"
+  elif probe_cursor_bridge_live; then
+    bridge_liveness_failures=0
+  else
+    bridge_liveness_failures=$((bridge_liveness_failures + 1))
+    if ((bridge_liveness_failures >= bridge_liveness_failure_limit)); then
+      bridge_restart_reason="liveness failed ${bridge_liveness_failures} consecutive probes"
+      err "Cursor bridge ${bridge_restart_reason}; stopping unresponsive sidecar"
+      stop_cursor_bridge_process readiness
+    fi
+  fi
+  if [[ -n "${bridge_restart_reason}" ]]; then
     set +e
     wait "${CURSOR_BRIDGE_PID}"
     bridge_status=$?
     set -e
     bridge_uptime=$((SECONDS - CURSOR_BRIDGE_STARTED_AT))
     update_cursor_bridge_restart_delay "${bridge_uptime}"
-    err "Cursor bridge exited after startup (status=${bridge_status}, uptime=${bridge_uptime}s); restarting isolated sidecar in ${bridge_restart_delay}s while API remains available"
+    err "Cursor bridge unavailable after startup (${bridge_restart_reason}, status=${bridge_status}, uptime=${bridge_uptime}s); restarting isolated sidecar in ${bridge_restart_delay}s while API remains available"
     while kill -0 "${SERVER_PID}" >/dev/null 2>&1; do
       if ! wait_cursor_bridge_restart_delay "${bridge_restart_delay}"; then
         break
@@ -1002,6 +1020,7 @@ while true; do
       bridge_ready_status=$?
       set -e
       if [[ "${bridge_ready_status}" == "0" ]]; then
+        bridge_liveness_failures=0
         info "Cursor Composer Client-Tools agent bridge recovered"
         break
       fi

@@ -63,6 +63,33 @@ cursor_bridge_ready_with_curl() {
     -fsS "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/ready" >/dev/null 2>&1
 }
 
+cursor_bridge_live_with_curl() {
+  curl --connect-timeout "${CURSOR_BRIDGE_READY_CONNECT_TIMEOUT_SECONDS}" \
+    --max-time "${CURSOR_BRIDGE_READY_MAX_TIME_SECONDS}" \
+    -fsS "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/health" >/dev/null 2>&1
+}
+
+cursor_bridge_live_with_wget() {
+  command -v timeout >/dev/null 2>&1 || return 1
+  timeout --foreground --kill-after=1 \
+    "${CURSOR_BRIDGE_READY_MAX_TIME_SECONDS}s" \
+    wget -qO- --tries=1 \
+      --connect-timeout="${CURSOR_BRIDGE_READY_CONNECT_TIMEOUT_SECONDS}" \
+      --read-timeout="${CURSOR_BRIDGE_READY_MAX_TIME_SECONDS}" \
+      "http://127.0.0.1:${CURSOR_AGENT_BRIDGE_PORT}/health" >/dev/null 2>&1
+}
+
+probe_cursor_bridge_live() {
+  cursor_bridge_ready_probe_timeouts
+  if command -v curl >/dev/null 2>&1; then
+    cursor_bridge_live_with_curl
+  elif command -v wget >/dev/null 2>&1; then
+    cursor_bridge_live_with_wget
+  else
+    return 1
+  fi
+}
+
 cursor_bridge_ready_with_wget() {
   # GNU wget has separate DNS/connect/read timeouts but no whole-transfer
   # deadline. The outer coreutils guard keeps a peer that trickles bytes or

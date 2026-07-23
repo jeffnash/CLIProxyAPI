@@ -86,6 +86,46 @@ if command -v wget >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
   stop_cursor_bridge_process readiness
 fi
 
+# Runtime supervision uses the liveness endpoint, not readiness. Capacity
+# pressure may deliberately make /ready fail and must never cause a healthy
+# bridge to be killed, while a lost listener must fail promptly.
+CURSOR_AGENT_BRIDGE_PORT=1
+cursor_bridge_ready_probe_timeouts
+if probe_cursor_bridge_live; then
+  echo "FAIL: liveness accepted a closed bridge port" >&2
+  exit 1
+fi
+
+health_port_file="${TMP_DIR}/health-port"
+: > "${health_port_file}"
+node -e '
+  const fs = require("node:fs");
+  const http = require("node:http");
+  const server = http.createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(503);
+    res.end();
+  });
+  server.listen(0, "127.0.0.1", () => {
+    fs.writeFileSync(process.argv[1], String(server.address().port));
+  });
+' "${health_port_file}" &
+CURSOR_BRIDGE_PID=$!
+for _ in {1..100}; do
+  [[ -s "${health_port_file}" ]] && break
+  sleep 0.01
+done
+CURSOR_AGENT_BRIDGE_PORT="$(<"${health_port_file}")"
+if ! probe_cursor_bridge_live; then
+  echo "FAIL: liveness rejected a healthy bridge whose readiness is degraded" >&2
+  exit 1
+fi
+stop_cursor_bridge_process readiness
+
 # An alive-but-unready attempt must be killed and reaped before its PID can be
 # overwritten by the next start attempt.
 sleep 30 &
@@ -184,4 +224,4 @@ if [[ "${bridge_restart_delay}" != "1" ]]; then
   exit 1
 fi
 
-echo "PASS: Cursor bridge supervisor bounds readiness, preserves graceful shutdown, interrupts backoff, and reaps on API death"
+echo "PASS: Cursor bridge supervisor bounds readiness, probes runtime liveness, preserves graceful shutdown, interrupts backoff, and reaps on API death"
