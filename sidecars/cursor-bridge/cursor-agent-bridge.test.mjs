@@ -2697,6 +2697,59 @@ test("mixed-route continuation acknowledges terminal history and applies the one
   assert.equal(journalRecord(oldCall.round.route).calls[0].receipt.result.content, "old durable value");
 });
 
+test("an invocation-identified mixed-route continuation is grouped, not refused as ambiguous", async () => {
+  // A stateless harness (notably a resumed CLI session) replays an older tool
+  // result alongside the current one. Under INVOCATION_V1 this used to throw a
+  // blanket 409 multi_route_invocation_ambiguous telling the client to "submit
+  // each round independently" — advice a client cannot act on, because it cannot
+  // split signed rounds. The contained 409 reached callers as a terminal 500 and
+  // the identical retry failed the same way, so the turn could never progress.
+  // Grouping keeps the invariant the rejection was protecting: the non-primary
+  // route is receipted durably and the turn continues on the single live round.
+  const oldSession = seedSession("invocation-mixed-old", "cursor-key").session;
+  const oldCall = await openTool(oldSession, { rawId: "old" });
+  const oldResult = { toolCallId: oldCall.call.wireId, content: "old durable value", isError: false };
+  oldCall.round.applyResults([oldResult]);
+  await oldCall.promise;
+
+  const liveSession = seedSession("invocation-mixed-live", "cursor-key").session;
+  const liveCall = await openTool(liveSession, { rawId: "live" });
+  const res = new MockResponse();
+  const handling = handleContinue(request(), res, continuationBody([
+    { ...oldResult, content: "historical projection drift" },
+    { toolCallId: liveCall.call.wireId, content: "live value", isError: false },
+  ], { invocationId: "invocation-mixed-route-grouping-0001" }), "cursor-key");
+  assert.equal((await liveCall.promise).content, "live value");
+  await handling;
+  assert.equal(res.status, 200);
+  assert.doesNotMatch(res.text(), /multi_route_invocation_ambiguous/);
+  assert.match(res.text(), /historical_receipt_acknowledged/);
+  assert.equal(journalRecord(oldCall.round.route).calls[0].receipt.result.content, "old durable value");
+});
+
+test("two live routes under an invocation identity still defer instead of failing the turn", async () => {
+  const a = seedSession("invocation-live-a", "cursor-key").session;
+  const openA = await openTool(a, { rawId: "a" });
+  const b = seedSession("invocation-live-b", "cursor-key").session;
+  const openB = await openTool(b, { rawId: "b" });
+  const res = new MockResponse();
+  await handleContinue(request(), res, continuationBody([
+    { toolCallId: openA.call.wireId, content: "A" },
+    { toolCallId: openB.call.wireId, content: "B" },
+  ], { invocationId: "invocation-two-live-rounds-0001" }), "cursor-key");
+  // The genuinely ambiguous case is still refused — but as a retryable "split"
+  // receipt that consumes no result, so each conversation can retry on its own.
+  assert.equal(res.status, 200);
+  assert.doesNotMatch(res.text(), /multi_route_invocation_ambiguous/);
+  assert.match(res.text(), /multiple_live_tool_rounds_deferred/);
+  assert.equal(openA.call.resultHash, null);
+  assert.equal(openB.call.resultHash, null);
+  openA.round.terminalize("client_cancelled", "cleanup");
+  openB.round.terminalize("client_cancelled", "cleanup");
+  await assert.rejects(openA.promise);
+  await assert.rejects(openB.promise);
+});
+
 test("an expired historical route cannot make a valid mixed-route continuation fail wholesale", async () => {
   const { codec } = createRoundInfrastructure(TEST_STATE_ROOT);
   const absentRoute = codec.newRoute();

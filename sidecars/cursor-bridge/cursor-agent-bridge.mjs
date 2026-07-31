@@ -7141,13 +7141,16 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
     const parsed = results.map((result) => codec.parse(result && result.toolCallId));
     const route = parsed[0].route;
     if (parsed.some((token) => token.route !== route)) {
-	  if (continuationIdentity.policy === TURN_IDENTITY_POLICY.INVOCATION_V1) {
-	    throw new ToolRoundError(
-	      "multi_route_invocation_ambiguous",
-	      "one invocation identity cannot span multiple signed tool rounds; submit each round independently",
-	      409,
-	    );
-	  }
+      // Every identity policy takes the grouping path below, INVOCATION_V1
+      // included. Grouping receipts the non-primary routes durably and re-enters
+      // with ONLY the primary route's results, so an invocation still resolves to
+      // exactly one signed round — the invariant a blanket rejection here was
+      // trying to protect. Rejecting instead stranded the turn: the bridge asked
+      // the client to "submit each round independently", but a client cannot
+      // split signed rounds, so the contained 409 surfaced as a terminal 500 and
+      // the identical retry failed the same way. The genuinely ambiguous case —
+      // two simultaneously live callback-owning rounds — is still refused below,
+      // as a retryable "split" receipt that consumes no results.
       const grouped = new Map();
       for (let index = 0; index < parsed.length; index++) {
         const group = grouped.get(parsed[index].route) || [];
