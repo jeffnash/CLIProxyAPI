@@ -366,6 +366,10 @@ type composerBridgeStatusError struct {
 	requestedBytes *int64
 	availableBytes *int64
 	priority       *int
+	// detail carries the bridge's own explanation for a repair-class conflict,
+	// where the remedy (e.g. "submit each round independently") IS the payload
+	// the caller needs. Only set for statuses whose message is client-actionable.
+	detail string
 }
 
 func (e *composerBridgeStatusError) Error() string {
@@ -381,6 +385,21 @@ func (e *composerBridgeStatusError) Error() string {
 		// capacity. Tell the client to back off — rapid retries re-trip the limit and prolong the outage.
 		return fmt.Sprintf("cursor composer: upstream is rate-limiting this account or the proxy is at capacity; "+
 			"back off and retry in a few seconds — rapid retries make it worse (correlation %s)", e.correlation)
+	}
+	if e.status == http.StatusConflict {
+		// A repair-class conflict is not a server fault: the request itself must
+		// change. Say so, so the caller does not spend its retry budget replaying
+		// the identical body — the one thing that provably cannot succeed.
+		detail := e.detail
+		if detail == "" {
+			detail = "the request conflicts with durable bridge state"
+		}
+		if e.bridgeCode != "" {
+			return fmt.Sprintf("cursor composer: bridge request failed with status 409 (%s; %s); the request must be changed before retrying — an identical retry fails the same way (correlation %s)",
+				e.bridgeCode, detail, e.correlation)
+		}
+		return fmt.Sprintf("cursor composer: bridge request failed with status 409 (%s); the request must be changed before retrying — an identical retry fails the same way (correlation %s)",
+			detail, e.correlation)
 	}
 	if e.bridgeCode != "" {
 		if e.requestedBytes != nil || e.availableBytes != nil || e.priority != nil {
@@ -462,7 +481,9 @@ func (e *composerBridgeStatusError) APIErrorBody() []byte {
 		if code == "" {
 			code = "durable_state_capacity"
 		}
-	case e.status == http.StatusGone, e.status == http.StatusBadRequest:
+	case e.status == http.StatusGone, e.status == http.StatusBadRequest, e.status == http.StatusConflict:
+		// 409 is a property of the request, not of the server — classify it so
+		// clients that branch on type do not treat it as a transient fault.
 		errType = "invalid_request_error"
 	case e.status >= http.StatusInternalServerError:
 		if code == "" {
@@ -628,6 +649,28 @@ func composerBridgeTurnFailure(responseID string, ev gjson.Result) error {
 			}
 		}
 		return newComposerBridgeUnavailableError(responseID, errors.New(emsg))
+	}
+	// A non-retryable terminal that names a REPAIR-class retry mode is telling us
+	// the body must change ("repair") or be decomposed ("split") before it can
+	// succeed. Collapsing that into an ordinary terminal surfaced HTTP 500, which
+	// reads as a server fault and invites the caller to replay the identical body
+	// — provably the one request that cannot work, so the retry budget burns and
+	// the conversation dies. Map it to a typed 409 instead: the status says
+	// "your request", the detail carries the bridge's remedy, and the disposition
+	// (SelectedExecution, not auth-attributable) still blocks credential failover.
+	// ``none``/absent keeps ordinary terminal semantics.
+	switch ev.Get("retryMode").String() {
+	case "repair", "split":
+		corr := composerCorrelationID()
+		code := ev.Get("errorCode").String()
+		log.Errorf("[composer %s] bridge REPAIR-CLASS TERMINAL corr=%s code=%s mode=%s (-> 409)",
+			responseID, corr, code, ev.Get("retryMode").String())
+		return &composerBridgeStatusError{
+			status:      http.StatusConflict,
+			correlation: corr,
+			bridgeCode:  code,
+			detail:      emsg,
+		}
 	}
 	return &composerSelectedExecutionError{cause: fmt.Errorf("cursor composer: bridge turn failed: %s", emsg)}
 }

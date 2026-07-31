@@ -951,6 +951,61 @@ func TestComposerRetryableCancellationTerminalMapsToTyped503(t *testing.T) {
 	}
 }
 
+func TestComposerRepairClassTerminalMapsToTyped409(t *testing.T) {
+	// The bridge contains a repair-class conflict as a non-retryable receipt that
+	// still names its remedy. Treating it as an ordinary terminal produced a 500,
+	// so callers replayed the identical body and exhausted their retry budget on
+	// the one request that cannot succeed.
+	for _, mode := range []string{"repair", "split"} {
+		ev := gjson.Parse(`{"type":"turn_end","stop_reason":"error","receipt":"continuation_conflict_contained",` +
+			`"retryable":false,"retryMode":"` + mode + `","errorCode":"invocation_payload_conflict",` +
+			`"error":"the invocation identity is already bound to a different request payload"}`)
+		err := composerBridgeTurnFailure("resp_repair_"+mode, ev)
+
+		var statusErr cliproxyexecutor.StatusError
+		if !errors.As(err, &statusErr) || statusErr.StatusCode() != http.StatusConflict {
+			t.Fatalf("retryMode=%q must map to a typed 409, got %T %v", mode, err, err)
+		}
+		var bridgeErr *composerBridgeStatusError
+		if !errors.As(err, &bridgeErr) {
+			t.Fatalf("retryMode=%q lost the typed bridge error: %T", mode, err)
+		}
+		if bridgeErr.bridgeCode != "invocation_payload_conflict" {
+			t.Fatalf("retryMode=%q lost the bridge code: %#v", mode, bridgeErr)
+		}
+		// The remedy is the actionable payload — it must reach the caller.
+		if !strings.Contains(err.Error(), "already bound to a different request payload") {
+			t.Fatalf("retryMode=%q dropped the bridge remedy: %v", mode, err)
+		}
+		if !strings.Contains(err.Error(), "identical retry fails the same way") {
+			t.Fatalf("retryMode=%q must warn against an identical replay: %v", mode, err)
+		}
+		// Client-side fault: never a transient server error, never blamed on the
+		// credential, and never replayed through a different one.
+		if body := string(bridgeErr.APIErrorBody()); !strings.Contains(body, `"type":"invalid_request_error"`) {
+			t.Fatalf("retryMode=%q must classify as invalid_request_error: %s", mode, body)
+		}
+		if bridgeErr.AuthAttributable() {
+			t.Fatalf("retryMode=%q must not be auth-attributable: %#v", mode, bridgeErr)
+		}
+		if bridgeErr.RetryScope() != cliproxyexecutor.RetryScopeSelectedExecution {
+			t.Fatalf("retryMode=%q must stay on the selected execution: %#v", mode, bridgeErr.RetryScope())
+		}
+	}
+
+	// retryMode="none" and an absent retryMode keep ordinary terminal semantics.
+	for _, raw := range []string{
+		`{"type":"turn_end","stop_reason":"error","retryable":false,"retryMode":"none","error":"contract failed"}`,
+		`{"type":"turn_end","stop_reason":"error","retryable":false,"error":"contract failed"}`,
+	} {
+		err := composerBridgeTurnFailure("resp_terminal", gjson.Parse(raw))
+		var statusErr cliproxyexecutor.StatusError
+		if errors.As(err, &statusErr) {
+			t.Fatalf("non-repair terminal must not become a typed status error: %v", err)
+		}
+	}
+}
+
 func TestComposerAmbiguousTrailingUserSegmentsFailClosed(t *testing.T) {
 	messages := gjson.Parse(`[
 		{"role":"user","content":"transfer the newest bundle"},
