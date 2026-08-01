@@ -961,6 +961,19 @@ export class ToolRound {
     }
     return count;
   }
+
+  get unreceiptedHandedCallCount() {
+    let count = 0;
+    for (const call of this.calls.values()) {
+      // After a process restart there is no transport left that can expose a
+      // merely REGISTERED call. Only calls durably marked as handed were
+      // visible to the client and may therefore require a result before a
+      // trailing user instruction can be recovered.
+      if (!call.receipt && !call.callbackAppliedAt
+          && call.state === CallState.HANDED_TO_TRANSPORT) count++;
+    }
+    return count;
+  }
   get isTerminal() { return this.state === RoundState.TERMINAL; }
 
   toRecord() {

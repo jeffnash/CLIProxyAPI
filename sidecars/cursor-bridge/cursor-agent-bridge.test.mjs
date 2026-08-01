@@ -75,6 +75,7 @@ const {
   readAuthoritativeSdkAgentRoots,
   runBoundedShutdownTasks,
   runDurableMaintenance,
+  runDurableMaintenanceInWorker,
   turnInvocationIdentity,
   turnFailureMetadata,
   validCompletedTurnReceipt,
@@ -5283,6 +5284,85 @@ test("a registered parallel sibling is handed before mixed input can redirect th
   assert.match(duplicate.text(), /"stop_reason":"error"/);
 });
 
+test("cold recovery ignores registered siblings that were never handed to the client", async () => {
+  const cursorKey = "cold-unhanded-sibling-key";
+  const { session } = seedSession("cold-unhanded-sibling", cursorKey);
+  const first = await openTool(session, { rawId: "cold-handed-first" });
+  first.promise.catch(() => {});
+  const secondPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "cold-registered-second",
+    name: "Lookup",
+    input: { q: "never exposed" },
+    resultAdapter: (value) => value,
+  });
+  secondPromise.catch(() => {});
+  await waitFor(() => first.round.fifo.length === 2, "cold sibling registration");
+  const second = first.round.calls.get(first.round.fifo[1]);
+  assert.equal(first.call.state, "HANDED_TO_TRANSPORT");
+  assert.equal(second.state, "REGISTERED");
+  assert.equal(first.round.unreceiptedOwedCallCount, 2);
+  assert.equal(first.round.unreceiptedHandedCallCount, 1);
+
+  // Model the abrupt sidecar death: durable state remains, but no Session or
+  // callback survives to flush the registered sibling onto a response.
+  liveToolRounds.delete(first.round.route);
+  sessions.delete(session.id);
+
+  const sent = [];
+  const recoveredAgent = {
+    async send(message) {
+      sent.push(message);
+      return {
+        async wait() { return { status: "finished", result: "COLD_UNHANDED_RECOVERY_OK" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return recoveredAgent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  try {
+    const response = new MockResponse();
+    await handleContinue(request(), response, continuationBody([{
+      toolCallId: first.call.wireId,
+      content: "the visible question was declined",
+      isError: true,
+    }], {
+      history: "bounded prior conversation",
+      userText: "explain the choices and select the best one",
+      clientMessageId: "ccm2_cold_unhanded_recovery",
+      interruptRequested: true,
+    }), cursorKey);
+    await waitFor(() => response.ended, "cold unhanded sibling recovery terminal");
+
+    assert.equal(response.status, 200);
+    assert.doesNotMatch(response.text(), /partial_results_deferred_for_fidelity/);
+    assert.match(response.text(), /COLD_UNHANDED_RECOVERY_OK/);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /the visible question was declined/);
+    assert.match(sent[0], /explain the choices and select the best one/);
+  } finally {
+    platforms.delete(keyHash(cursorKey));
+    sessions.delete(session.id);
+    for (const call of first.round.calls.values()) {
+      first.round.clearTimer(call);
+      try { call.callback?.reject(new Error("test cleanup")); } catch {}
+      call.callback = null;
+      call.waiters = [];
+    }
+  }
+});
+
 test("a finished SDK run with an unresolved callback emits an error terminal, never end_turn", async () => {
   const { session, output } = seedSession("unfinished-callback", "key");
   const opened = await openTool(session);
@@ -6059,6 +6139,17 @@ test("durable maintenance sweeps aged unclaimed candidates without a canonical r
   utimesSync(orphan, old, old);
   await runDurableMaintenance();
   assert.equal(existsSync(orphan), false);
+});
+
+test("scheduled durable maintenance runs off the request event loop", async () => {
+  let eventLoopAdvanced = false;
+  const maintenance = runDurableMaintenanceInWorker();
+  await new Promise((resolve) => setTimeout(() => {
+    eventLoopAdvanced = true;
+    resolve();
+  }, 0));
+  assert.equal(eventLoopAdvanced, true);
+  await maintenance;
 });
 
 test("the SDK MCP HTTP route is loopback-only and path decoding fails closed", () => {

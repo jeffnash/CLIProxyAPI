@@ -3375,6 +3375,12 @@ function reclaimTombstonedDurableFiles() {
 }
 
 async function runDurableMaintenance() {
+  await runDurableFileMaintenance();
+  void runSdkAgentMaintenance();
+  void backfillTombstonesTick();
+}
+
+async function runDurableFileMaintenance() {
   const { journal } = getRoundInfrastructure();
   journal.cas.sweepDirectory(journal.dir, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
   receiptCAS.sweepDirectory(COMPLETED_TURN_DIR, { orphanAgeMs: UNRESOLVED_RESERVATION_ORPHAN_MS });
@@ -3384,8 +3390,34 @@ async function runDurableMaintenance() {
   cleanupCompletedTurnReceipts({ ttlMs: TERMINAL_ROUND_TTL_MS, maxTerminal: TERMINAL_ROUND_MAX });
   await reconcileUnresolvedReservations();
   reclaimTombstonedDurableFiles();
-  void runSdkAgentMaintenance();
-  void backfillTombstonesTick();
+}
+
+let durableMaintenanceWorker = null;
+function runDurableMaintenanceInWorker() {
+  if (durableMaintenanceWorker) return durableMaintenanceWorker;
+  const startedAt = nowMs();
+  durableMaintenanceWorker = new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./durable-maintenance-worker.mjs", import.meta.url), {
+      execArgv: process.execArgv.filter((arg) => !arg.startsWith("--input-type")),
+    });
+    let settled = false;
+    const settle = (error) => {
+      if (settled) return;
+      settled = true;
+      durableMaintenanceWorker = null;
+      if (error) reject(error);
+      else resolve({ elapsedMs: nowMs() - startedAt });
+    };
+    worker.once("message", (message) => {
+      if (message?.error) settle(new Error(message.error));
+      else settle(null);
+    });
+    worker.once("error", settle);
+    worker.once("exit", (code) => {
+      if (!settled) settle(code === 0 ? null : new Error(`durable maintenance worker exited with code ${code}`));
+    });
+  });
+  return durableMaintenanceWorker;
 }
 
 function sdkUserTextHash(message) {
@@ -7470,7 +7502,13 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
         deferredInputId = deferred.clientMessageId;
       }
     }
-    const remainingUnreceipted = round.unreceiptedOwedCallCount;
+    // A live process can still flush REGISTERED siblings onto its response,
+    // so every durable call remains an obligation. After a restart, however,
+    // a REGISTERED-but-never-handed sibling was never visible to the client
+    // and cannot legitimately block recovery of trailing user input.
+    const remainingUnreceipted = hasLiveCallbacks
+      ? round.unreceiptedOwedCallCount
+      : round.unreceiptedHandedCallCount;
     const liveOwner = hasLiveCallbacks ? sessions.get(round.sessionId) : null;
     const canHandRegisteredSibling = !!(liveOwner
       && liveOwner.currentRound === round
@@ -10051,7 +10089,15 @@ if (RUN_AS_MAIN) {
     .then(() => {
       bridgeReady = true;
       const maintenance = setInterval(() => {
-        void runDurableMaintenance().catch((error) => {
+        // Durable receipt/journal retention performs filesystem-wide scans.
+        // Keep those synchronous operations off the HTTP event loop so the
+        // liveness endpoint and active streams remain responsive on a large
+        // persistent volume.
+        void runDurableMaintenanceInWorker().then(({ elapsedMs }) => {
+          dbg("durable maintenance worker complete", "elapsedMs=" + elapsedMs);
+          void runSdkAgentMaintenance();
+          void backfillTombstonesTick();
+        }).catch((error) => {
           console.error("[cursor-agent-bridge] durable maintenance failed; preserving state:",
             (error && error.message) || String(error));
         });
@@ -10062,7 +10108,7 @@ if (RUN_AS_MAIN) {
     .catch((e) => { console.error("[bridge]", (e && e.message) || e); process.exit(1); });
 }
 
-export { runDurableMaintenance, runSdkAgentMaintenance, sdkAgentGCRoots, sdkAgentGCCensus, readAuthoritativeSdkAgentRoots, continuationAdmissionPriority, lifecycleEvent, crashPoint, backfillTombstonesTick, reserveUnresolvedReceipt, resizeUnresolvedReceipt, releaseUnresolvedReceipt, reclaimTombstonedDurableFiles };
+export { runDurableMaintenance, runDurableFileMaintenance, runDurableMaintenanceInWorker, runSdkAgentMaintenance, sdkAgentGCRoots, sdkAgentGCCensus, readAuthoritativeSdkAgentRoots, continuationAdmissionPriority, lifecycleEvent, crashPoint, backfillTombstonesTick, reserveUnresolvedReceipt, resizeUnresolvedReceipt, releaseUnresolvedReceipt, reclaimTombstonedDurableFiles };
 export { CC_CASES, composerModelSelection, turnFailureMetadata, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
 export {
   TURN_RECEIPT_VERSION,
