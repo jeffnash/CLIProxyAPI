@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -249,6 +250,38 @@ func TestManagedProviderExecutorOpenAIStreamNormalizesSSEFrames(t *testing.T) {
 	}
 	if !strings.Contains(got, `"content":"ok"`) {
 		t.Fatalf("stream chunks missing content: %q", got)
+	}
+}
+
+func TestManagedProviderExecutorStreamFinalNon2xxReturnsError(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	cfg := managedProviderTestConfig(srv.URL + "/v1")
+	exec := NewManagedProviderExecutor("example-provider", cfg)
+	result, err := exec.ExecuteStream(context.Background(), managedProviderTestAuth(srv.URL+"/v1"), cliproxyexecutor.Request{
+		Model:   "qwen3.7-max",
+		Payload: []byte(`{"model":"qwen3.7-max","stream":true,"messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: sdktranslator.FormatOpenAI,
+		Metadata: map[string]any{
+			cliproxyexecutor.ManagedProviderTransportMetadataKey: "openai-completions",
+		},
+	})
+	if err == nil {
+		t.Fatalf("ExecuteStream result=%#v, want upstream error", result)
+	}
+	var upstreamErr statusErr
+	if !errors.As(err, &upstreamErr) || upstreamErr.code != http.StatusBadGateway || !strings.Contains(err.Error(), "upstream unavailable") {
+		t.Fatalf("ExecuteStream error=%q, want upstream 502 body", err)
+	}
+	if got := strings.Join(paths, ","); got != "/v1/chat/completions,/v1/messages" {
+		t.Fatalf("paths=%q, want final non-2xx after fallback", got)
 	}
 }
 

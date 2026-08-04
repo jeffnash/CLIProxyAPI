@@ -256,10 +256,13 @@ func (e *ManagedProviderExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			continue
 		}
 	}
-	if bootstrap == nil || bootstrap.Response == nil {
+	if selectedTransport == "" {
 		if lastErr != nil {
 			return nil, lastErr
 		}
+		return nil, fmt.Errorf("%s executor: no stream transport succeeded", e.Identifier())
+	}
+	if bootstrap == nil || bootstrap.Response == nil || bootstrap.Scanner == nil {
 		return nil, fmt.Errorf("%s executor: missing response", e.Identifier())
 	}
 
