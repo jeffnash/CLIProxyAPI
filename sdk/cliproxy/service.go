@@ -3051,7 +3051,7 @@ func (s *Service) applyProviderModelPriority(providerName, explicitPrefix string
 		filtered := make([]*registry.ModelInfo, 0, len(models))
 		for _, m := range models {
 			// Always retain provider-prefixed aliases (explicit routing handles).
-			if strings.HasPrefix(m.ID, explicitPrefix) {
+			if isManagedProviderExplicitModelID(m.ID, explicitPrefix) {
 				filtered = append(filtered, m)
 				continue
 			}
@@ -3078,6 +3078,28 @@ func (s *Service) applyProviderModelPriority(providerName, explicitPrefix string
 			reg.RegisterClient(a.ID, providerName, filtered)
 		}
 	}
+}
+
+func isManagedProviderExplicitModelID(modelID, providerPrefix string) bool {
+	modelID = strings.TrimSpace(modelID)
+	providerPrefix = strings.TrimSpace(providerPrefix)
+	if modelID == "" || providerPrefix == "" {
+		return false
+	}
+	if strings.HasPrefix(modelID, providerPrefix) {
+		return true
+	}
+	for _, protocolPrefix := range []string{
+		registry.ManagedProviderAnthropicProtocolPrefix,
+		registry.ManagedProviderOpenAIProtocolPrefix,
+		registry.ManagedProviderOpenAIResponsesProtocolPrefix,
+		registry.ManagedProviderOpenAICompletionsProtocolPrefix,
+	} {
+		if strings.HasPrefix(modelID, protocolPrefix+providerPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {

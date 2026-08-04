@@ -96,6 +96,10 @@ func TestService_applyManagedProviderModelPriorities_PreservesManagedAliases(t *
 	reg.RegisterClient(managedAuth.ID, "example-provider", []*registry.ModelInfo{
 		{ID: "glm-5.2"},
 		{ID: "example-glm-5.2"},
+		{ID: "openai-example-glm-5.2"},
+		{ID: "openai-responses-example-glm-5.2"},
+		{ID: "openai-completions-example-glm-5.2"},
+		{ID: "anthropic-example-glm-5.2"},
 		{ID: "only-managed-model"},
 		{ID: "example-only-managed-model"},
 	})
@@ -139,6 +143,16 @@ func TestService_applyManagedProviderModelPriorities_PreservesManagedAliases(t *
 	}
 	if !has("example-glm-5.2") {
 		t.Fatalf("expected example-glm-5.2 alias to be preserved")
+	}
+	for _, id := range []string{
+		"openai-example-glm-5.2",
+		"openai-responses-example-glm-5.2",
+		"openai-completions-example-glm-5.2",
+		"anthropic-example-glm-5.2",
+	} {
+		if !has(id) {
+			t.Fatalf("expected %s transport alias to be preserved", id)
+		}
 	}
 	if !has("only-managed-model") {
 		t.Fatalf("expected only-managed-model to be preserved")
