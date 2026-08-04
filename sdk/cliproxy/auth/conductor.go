@@ -3283,6 +3283,14 @@ func pinnedAuthIDFromMetadata(meta map[string]any) string {
 	}
 }
 
+func forcedProviderFromMetadata(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	forced, ok := meta["forced_provider"].(bool)
+	return ok && forced
+}
+
 func disallowFreeAuthFromMetadata(meta map[string]any) bool {
 	if len(meta) == 0 {
 		return false
@@ -4816,6 +4824,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	forcedProvider := forcedProviderFromMetadata(opts.Metadata)
 
 	m.mu.RLock()
 	selector := m.selector
@@ -4839,15 +4848,6 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	// Check if this is a forced provider route (e.g., copilot- prefix).
 	// If so, skip the ClientSupportsModel check since the user explicitly
 	// requested routing to this provider even if the model isn't registered.
-	forcedProvider := false
-	if opts.Metadata != nil {
-		if v, ok := opts.Metadata["forced_provider"]; ok {
-			if b, okBool := v.(bool); okBool && b {
-				forcedProvider = true
-			}
-		}
-	}
-
 	for _, candidate := range m.auths {
 		if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
 			continue
@@ -4909,7 +4909,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return auth, exec, err
 	}
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if forcedProviderFromMetadata(opts.Metadata) || m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	if strings.TrimSpace(model) != "" {
@@ -4972,6 +4972,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	forcedProvider := forcedProviderFromMetadata(opts.Metadata)
 
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -5021,7 +5022,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := m.executors[providerKey]; !ok {
 			continue
 		}
-		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+		if !forcedProvider && modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -5073,7 +5074,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	if forcedProviderFromMetadata(opts.Metadata) || m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 

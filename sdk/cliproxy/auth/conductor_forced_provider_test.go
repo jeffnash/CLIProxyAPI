@@ -100,6 +100,36 @@ func TestPickNext_ForcedProviderBypassesModelCheck(t *testing.T) {
 	}
 }
 
+func TestPickNext_ForcedProviderBypassesSchedulerModelSet(t *testing.T) {
+	ctx := context.Background()
+	const (
+		provider = "vsllm"
+		authID   = "forced-provider-scheduler-vsllm"
+		alias    = "vsllm-kimi-k3"
+		model    = "kimi-k3"
+	)
+
+	registerSchedulerModels(t, provider, alias, authID)
+	mgr := NewManager(nil, &RoundRobinSelector{}, NoopHook{})
+	mgr.RegisterExecutor(&mockProviderExecutor{id: provider})
+	if _, err := mgr.Register(ctx, &Auth{ID: authID, Provider: provider}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{"forced_provider": true}}
+	if auth, _, err := mgr.pickNext(ctx, provider, model, opts, nil); err != nil {
+		t.Fatalf("pickNext() error = %v, want forced auth", err)
+	} else if auth == nil || auth.ID != authID {
+		t.Fatalf("pickNext() auth = %#v, want %q", auth, authID)
+	}
+
+	if auth, _, selectedProvider, err := mgr.pickNextMixed(ctx, []string{provider}, model, opts, nil); err != nil {
+		t.Fatalf("pickNextMixed() error = %v, want forced auth", err)
+	} else if auth == nil || auth.ID != authID || selectedProvider != provider {
+		t.Fatalf("pickNextMixed() = auth %#v, provider %q; want %q, %q", auth, selectedProvider, authID, provider)
+	}
+}
+
 // TestPickNext_ForcedProviderMetadataTypes tests that forced_provider metadata
 // is correctly parsed from different types.
 func TestPickNext_ForcedProviderMetadataTypes(t *testing.T) {
