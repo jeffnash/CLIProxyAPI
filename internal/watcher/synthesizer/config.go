@@ -149,6 +149,9 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 			if r.PreserveReasoningContent {
 				attrs["preserve_reasoning_content"] = "true"
 			}
+			if r.TruncateTools {
+				attrs["truncate_tools"] = "true"
+			}
 			if r.SupportsDeveloperRole != nil {
 				attrs["supports_developer_role"] = strconv.FormatBool(*r.SupportsDeveloperRole)
 			}

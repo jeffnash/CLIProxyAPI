@@ -251,6 +251,11 @@ type PassthruRoute struct {
 	// route's upstream. Shorthand for a payload drop-tools rule scoped to this
 	// route; useful when a strict upstream rejects specific tool schemas.
 	DropTools []string `yaml:"drop-tools,omitempty" json:"drop-tools,omitempty"`
+	// TruncateTools enables automatic truncation and mapping of tool names longer than 64 characters.
+	// When enabled, tool names exceeding 64 chars are deterministically shortened to 64 with a hash suffix
+	// before forwarding to the upstream, and restored on the response. Required for strict upstreams
+	// like api.meta.ai that enforce a 64-char limit (e.g., chrome-devtools-mcp tools).
+	TruncateTools bool `yaml:"truncate-tools,omitempty" json:"truncate-tools,omitempty"`
 }
 
 // PassthruPayload defines route-scoped payload parameter rules.
