@@ -615,6 +615,8 @@ func (s *Server) setupRoutes() {
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+		// Cooldown clear — Bearer api-keys auth (any valid key), per-provider or provider×model
+		v1.POST("/cooldown/clear", s.handlers.ClearCooldown)
 	}
 
 	openaiV1 := s.engine.Group("/openai/v1")

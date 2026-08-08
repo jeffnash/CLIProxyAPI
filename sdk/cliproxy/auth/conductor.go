@@ -838,6 +838,161 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	return snapshot, models, nil
 }
 
+// ClearCooldown clears cooldown/suspension state for a provider, or a single provider×model pair.
+// provider is required (case-insensitive match against Auth.Provider). If model is empty, all
+// models for matching auths are cleared (provider-wide). Otherwise only that model (case-insensitive)
+// under matching provider auths is cleared. It mirrors ResetQuota but scoped, resumes registry and
+// persists auth + cooldown state. Returns affected auth IDs and cleared model IDs.
+func (m *Manager) ClearCooldown(ctx context.Context, provider, model string) ([]string, []string, error) {
+	if m == nil {
+		return nil, nil, fmt.Errorf("auth manager is nil")
+	}
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" {
+		return nil, nil, fmt.Errorf("provider is required")
+	}
+	now := time.Now()
+	m.mu.Lock()
+	// Collect matching auths (copy pointers while holding lock; mutation under same lock).
+	matching := make([]*Auth, 0)
+	for _, a := range m.auths {
+		if a == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(a.Provider), provider) {
+			matching = append(matching, a)
+		}
+	}
+	if len(matching) == 0 {
+		m.mu.Unlock()
+		return nil, nil, fmt.Errorf("no auth found for provider %q", provider)
+	}
+	type pending struct {
+		authID        string
+		snapshot      *Auth
+		persistSnap   *Auth
+		before        []CooldownStateRecord
+		after         []CooldownStateRecord
+		clearedModels []string
+	}
+	pendings := make([]pending, 0, len(matching))
+	allClearedSet := make(map[string]struct{})
+	trackCooldown := m.cooldownStore != nil
+	for _, auth := range matching {
+		var before []CooldownStateRecord
+		if trackCooldown {
+			before = m.cooldownStateRecordsForAuthLocked(auth, now)
+		}
+		var cleared []string
+		if model == "" {
+			// provider-wide: collect all model keys before reset
+			set := make(map[string]struct{})
+			for k := range auth.ModelStates {
+				k = strings.TrimSpace(k)
+				if k != "" {
+					set[k] = struct{}{}
+				}
+			}
+			for _, rm := range modelsForRegisteredAuth(auth.ID) {
+				rm = strings.TrimSpace(rm)
+				if rm != "" {
+					set[rm] = struct{}{}
+				}
+			}
+			for _, st := range auth.ModelStates {
+				if st != nil {
+					resetModelState(st, now)
+				}
+			}
+			auth.Unavailable = false
+			auth.NextRetryAfter = time.Time{}
+			auth.Quota = QuotaState{}
+			auth.UpdatedAt = now
+			updateAggregatedAvailability(auth, now)
+			for k := range set {
+				cleared = append(cleared, k)
+			}
+			// If no models known, still ensure at least provider-level cleared (leave cleared empty but auth status cleared)
+		} else {
+			// provider×model: case-insensitive lookup
+			var matchedKey string
+			for k := range auth.ModelStates {
+				if strings.EqualFold(strings.TrimSpace(k), model) {
+					matchedKey = k
+					break
+				}
+			}
+			target := model
+			if matchedKey != "" {
+				target = matchedKey
+				if st := auth.ModelStates[matchedKey]; st != nil {
+					resetModelState(st, now)
+				}
+			}
+			updateAggregatedAvailability(auth, now)
+			cleared = []string{target}
+		}
+		if !auth.Disabled && auth.Status != StatusDisabled && !hasModelError(auth, now) {
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
+		}
+		auth.UpdatedAt = now
+		if len(cleared) == 0 {
+			// Fallback: at least include model param or registered models for registry resume
+			if model != "" {
+				cleared = []string{model}
+			} else {
+				cleared = modelsForRegisteredAuth(auth.ID)
+			}
+		}
+		cleared = dedupeStrings(cleared)
+		snap := auth.Clone()
+		psnap := snap.Clone()
+		var after []CooldownStateRecord
+		if trackCooldown {
+			after = m.cooldownStateRecordsForAuthLocked(auth, now)
+		}
+		pendings = append(pendings, pending{authID: auth.ID, snapshot: snap, persistSnap: psnap, before: before, after: after, clearedModels: cleared})
+		for _, cm := range cleared {
+			allClearedSet[cm] = struct{}{}
+		}
+	}
+	m.mu.Unlock()
+	// Persist and resume outside lock
+	cooldownChanged := false
+	for _, p := range pendings {
+		if errPersist := m.persist(ctx, p.persistSnap); errPersist != nil {
+			return nil, nil, errPersist
+		}
+		for _, mk := range p.clearedModels {
+			registry.GetGlobalRegistry().ClearModelQuotaExceeded(p.authID, mk)
+			registry.GetGlobalRegistry().ResumeClientModel(p.authID, mk)
+		}
+		if m.scheduler != nil && p.snapshot != nil {
+			m.scheduler.upsertAuth(p.snapshot)
+		}
+		if !cooldownChanged && trackCooldown && !cooldownStateRecordsEqual(p.before, p.after) {
+			cooldownChanged = true
+		}
+	}
+	if cooldownChanged {
+		m.persistCooldownStates(ctx)
+	}
+	authIDs := make([]string, 0, len(pendings))
+	for _, p := range pendings {
+		authIDs = append(authIDs, p.authID)
+	}
+	models := make([]string, 0, len(allClearedSet))
+	for k := range allClearedSet {
+		models = append(models, k)
+	}
+	models = dedupeStrings(models)
+	return authIDs, models, nil
+}
+
+
 func modelsForRegisteredAuth(authID string) []string {
 	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(authID)
 	models := make([]string, 0, len(supportedModels))
