@@ -112,6 +112,7 @@ Default merge safety rules:
 - `CURSOR_AGENT_MAX_PLATFORMS` (default `64`) / `CURSOR_AGENT_PLATFORM_TTL_MS` (default `3600000`) - bound + idle-evict the per-key platform pool (multi-tenant only; the single-tenant platform is always resident).
 - `MANAGED_PROVIDERS_JSON` (default unset) - JSON array of generic managed providers. Use this for API-key providers with Anthropic/messages, OpenAI Chat Completions, and/or OpenAI Responses transports. Keep each real key in a separate Railway variable and reference it with `api-key-env`.
   - Example alias families for a provider with `prefix: "example-"`: `example-<model>`, `anthropic-example-<model>`, `openai-example-<model>`, `openai-responses-example-<model>`, and `openai-completions-example-<model>`.
+  - Set `supports-developer-role: false` when the provider's OpenAI Chat Completions endpoint accepts `system` but rejects the newer `developer` role.
   - `route-health` in each provider controls persisted transport health, fallback cooldowns, alternate transport probes, and optional stream first-event bootstrap failover.
   - Health state uses `RAILWAY_VOLUME_MOUNT_PATH/managed_provider_health.json` when a Railway volume is attached, otherwise the configured auth directory.
 - Secret DLP runtime env (all optional unless enabling file-backed restore mappings):

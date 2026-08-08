@@ -998,6 +998,7 @@ func TestConfigSynthesizer_CodexKeys_SkipsEmptyAndHeaders(t *testing.T) {
 }
 
 func TestConfigSynthesizer_ManagedProviderKey(t *testing.T) {
+	supportsDeveloperRole := false
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{
 		Config: &config.Config{
@@ -1021,6 +1022,7 @@ func TestConfigSynthesizer_ManagedProviderKey(t *testing.T) {
 		Now:         time.Now(),
 		IDGenerator: NewStableIDGenerator(),
 	}
+	ctx.Config.ManagedProviders[0].SupportsDeveloperRole = &supportsDeveloperRole
 
 	auths, err := synth.Synthesize(ctx)
 	if err != nil {
@@ -1054,6 +1056,9 @@ func TestConfigSynthesizer_ManagedProviderKey(t *testing.T) {
 		if got := auth.Attributes[key]; got != want {
 			t.Fatalf("attr[%s]=%q, want %q", key, got, want)
 		}
+	}
+	if got := auth.Attributes["supports_developer_role"]; got != "false" {
+		t.Fatalf("attr[supports_developer_role]=%q, want false", got)
 	}
 }
 

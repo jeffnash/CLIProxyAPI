@@ -332,6 +332,9 @@ func (s *ConfigSynthesizer) synthesizeManagedProviderKeys(ctx *SynthesisContext)
 		if provider.DefaultTransport != "" {
 			attrs["default_transport"] = provider.DefaultTransport
 		}
+		if provider.SupportsDeveloperRole != nil {
+			attrs["supports_developer_role"] = strconv.FormatBool(*provider.SupportsDeveloperRole)
+		}
 		if provider.Priority != "" {
 			attrs["priority"] = provider.Priority
 		}

@@ -825,6 +825,9 @@ func (e *ManagedProviderExecutor) prepareRequestBody(ctx context.Context, auth *
 	}
 	body = helps.ApplyTemperatureSuffix(body, req.Model, opts, target.String())
 	if target == sdktranslator.FormatOpenAI {
+		if !managedProviderSupportsDeveloperRole(creds.provider, attrsFromAuth(auth)) {
+			body = helps.ConvertDeveloperRoleToSystem(body)
+		}
 		body = helps.RepairMissingReasoningContentForToolCalls(auth, body)
 		if stream {
 			body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
@@ -1361,6 +1364,18 @@ func (e *ManagedProviderExecutor) creds(auth *cliproxyauth.Auth) managedProvider
 	out.openAIResponsePath = normalizeManagedProviderPath(out.openAIResponsePath)
 	out.modelsPath = normalizeManagedProviderPath(out.modelsPath)
 	return out
+}
+
+func managedProviderSupportsDeveloperRole(provider config.ManagedProviderConfig, attrs map[string]string) bool {
+	for _, key := range []string{"supports_developer_role", "supports-developer-role"} {
+		switch strings.TrimSpace(strings.ToLower(attrs[key])) {
+		case "false", "0", "no":
+			return false
+		case "true", "1", "yes":
+			return true
+		}
+	}
+	return provider.SupportsDeveloperRole == nil || *provider.SupportsDeveloperRole
 }
 
 func (c managedProviderCredentials) protocolAliasPrefixes() []string {

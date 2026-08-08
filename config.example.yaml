@@ -568,6 +568,7 @@ nonstream-keepalive-interval: 0
 #    openai-responses-path: ""            # optional; direct Responses passthrough only when configured
 #    transport-mode: "auto"               # auto (default), anthropic/claude, openai, openai-responses, or openai-completions
 #    default-transport: "claude"          # claude (default), openai, or openai-responses when no explicit/native preference applies
+#    supports-developer-role: false        # set false when the OpenAI chat endpoint rejects the developer role
 #    model-discovery:
 #      enabled: true
 #      path: "/models"

@@ -164,6 +164,44 @@ func TestManagedProviderExecutorOpenAISourceUsesChatCompletionsEndpoint(t *testi
 	}
 }
 
+func TestManagedProviderPrepareOpenAIDeveloperRoleCapability(t *testing.T) {
+	falseValue := false
+	trueValue := true
+	tests := []struct {
+		name       string
+		capability *bool
+		wantRole   string
+	}{
+		{name: "unsupported", capability: &falseValue, wantRole: "system"},
+		{name: "supported", capability: &trueValue, wantRole: "developer"},
+		{name: "unset defaults to supported", wantRole: "developer"},
+	}
+
+	for _, tt := range tests {
+		for _, stream := range []bool{false, true} {
+			streamName := "non-stream"
+			if stream {
+				streamName = "stream"
+			}
+			t.Run(tt.name+"/"+streamName, func(t *testing.T) {
+				cfg := managedProviderTestConfig("https://provider.example/v1")
+				cfg.ManagedProviders[0].SupportsDeveloperRole = tt.capability
+				exec := NewManagedProviderExecutor("example-provider", cfg)
+				prepared, err := exec.prepareRequestBody(context.Background(), managedProviderTestAuth("https://provider.example/v1"), cliproxyexecutor.Request{
+					Model:   "qwen3.7-max",
+					Payload: []byte(`{"model":"qwen3.7-max","messages":[{"role":"developer","content":"instructions"},{"role":"user","content":"hello"}]}`),
+				}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, ResponseFormat: sdktranslator.FormatOpenAI}, managedProviderTransportOpenAI, stream)
+				if err != nil {
+					t.Fatalf("prepareRequestBody error: %v", err)
+				}
+				if got := gjson.GetBytes(prepared.body, "messages.0.role").String(); got != tt.wantRole {
+					t.Fatalf("messages.0.role=%q, want %q; body=%s", got, tt.wantRole, prepared.body)
+				}
+			})
+		}
+	}
+}
+
 func TestManagedProviderExecutorOpenAIReasoningEffortPassesThroughDiscoveredModel(t *testing.T) {
 	clearManagedProviderStateForTest(t)
 	var sawChat bool

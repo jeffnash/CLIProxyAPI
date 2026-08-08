@@ -143,6 +143,10 @@ type ManagedProviderConfig struct {
 	ProxyURL              string                              `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 	MaxRetries            *int                                `yaml:"max-retries,omitempty" json:"max-retries,omitempty"`
 	RetryBackoff          string                              `yaml:"retry-backoff,omitempty" json:"retry-backoff,omitempty"`
+	// SupportsDeveloperRole controls whether the OpenAI Chat Completions transport
+	// may include the OpenAI "developer" role. Set false for upstreams that only
+	// accept system/user/assistant/tool roles.
+	SupportsDeveloperRole *bool `yaml:"supports-developer-role,omitempty" json:"supports-developer-role,omitempty"`
 	// QuotaCooldownMaxSeconds caps how long a 429/quota error cools this provider
 	// down. The global cooldown escalates up to 30m; set this (e.g. 60) to hard-cap
 	// the lockout for this provider so it recovers quickly. 0/unset uses the default.
