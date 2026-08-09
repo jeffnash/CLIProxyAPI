@@ -35,6 +35,32 @@ func TestServiceIdentifierFindingDoesNotMutateToolNameOrContentMention(t *testin
 	}
 }
 
+func TestServiceNestedProtocolIdentifiersAreNotRedactedFromContent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	evidenceRef := "ev_0x8mKiozUEl3LjbEayZkHiZsTN1YZr1HKhTyU"
+	svc := newSegmentPolicyTestService(t)
+	svc.scanner = staticScanner{{Secret: evidenceRef, RuleID: "bare-credential-prefixed", Source: "builtin", Confidence: 0.85}}
+
+	nested := `{"evidence_refs":["` + evidenceRef + `"],"task_id":"4d45ec6e041b4fc2a2212bcc64b3bb10"}`
+	content, err := json.Marshal(nested)
+	if err != nil {
+		t.Fatalf("json.Marshal(): %v", err)
+	}
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"tool","tool_call_id":"call_123456789012","content":` + string(content) + `}]}`)
+	c := newSecretDLPTestGinContext("/v1/chat/completions")
+
+	redacted, session, err := svc.RedactGinPayload(c, body)
+	if err != nil {
+		t.Fatalf("RedactGinPayload(): %v", err)
+	}
+	if session != nil {
+		t.Fatalf("session = %+v, want nil because nested protocol identifier finding is rejected", session)
+	}
+	if string(redacted) != string(body) {
+		t.Fatalf("redacted body = %q, want nested protocol identifiers unchanged %q", redacted, body)
+	}
+}
+
 func TestServiceCredentialShapedIdentifierStillRedactsContentMention(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	token := "tp-s8lnnc4nf0a0s296fb63ya9vqzvctz0ohk26q1ewrks0252f"

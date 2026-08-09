@@ -584,8 +584,13 @@ func filterFindings(findings []Finding, ids IdentifierSet, cfg Config) (accepted
 		}
 		f.Secret = secret
 		f.Confidence = confidenceForFinding(f)
-		if ids.containsOrEmbeds(secret) && !credentialFindingOverridesIdentifier(f) {
-			continue
+		if ids.containsOrEmbeds(secret) {
+			if ids.containsProtocolOrEmbeds(secret) && ambiguousCredentialFinding(f) {
+				continue
+			}
+			if !credentialFindingOverridesIdentifier(f) {
+				continue
+			}
 		}
 		if f.Confidence >= cfg.RedactThreshold {
 			accepted = append(accepted, f)
@@ -594,6 +599,17 @@ func filterFindings(findings []Finding, ids IdentifierSet, cfg Config) (accepted
 		}
 	}
 	return findingsFromMap(findingsBySecret(accepted)), findingsFromMap(findingsBySecret(shadow))
+}
+
+func ambiguousCredentialFinding(f Finding) bool {
+	switch strings.ToLower(f.RuleID) {
+	case "bare-credential-prefixed", "bare-credential-hexpair", "high-entropy":
+		return true
+	default:
+		// Unknown external rules do not get to override structural protocol
+		// identity. Explicit built-in credential families remain authoritative.
+		return !credentialFindingOverridesIdentifier(f)
+	}
 }
 
 func credentialFindingOverridesIdentifier(f Finding) bool {

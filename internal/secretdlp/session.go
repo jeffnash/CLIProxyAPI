@@ -332,8 +332,14 @@ func isSecretDLPBlockedJSONPath(path []string) bool {
 	return secretDLPProtocolJSONStringKeys[last]
 }
 
-func isSecretDLPRestorableJSONPath(path []string) bool {
-	return !isSecretDLPBlockedJSONPath(path)
+func isSecretDLPRestorableJSONPath(_ []string) bool {
+	// Redaction exclusions protect provider protocol and schema identifiers from
+	// mutation. They must not restrict response restoration: a placeholder is a
+	// request-scoped capability that resolves only through this session or its
+	// client-bound durable mapping. If the provider echoes it in an id, name,
+	// schema, or nested tool argument, restoring it is both safe and necessary to
+	// keep internal DLP tokens invisible to the client.
+	return true
 }
 
 func normalizeJSONPathKey(key string) string {
@@ -347,14 +353,20 @@ func (s *Session) restoreJSONValueLocked(value any, path []string, resolver Plac
 	switch v := value.(type) {
 	case map[string]any:
 		restored := 0
+		nextMap := make(map[string]any, len(v))
 		for key, child := range v {
-			next, count := s.restoreJSONValueLocked(child, append(path, key), resolver)
-			if count > 0 {
-				v[key] = next
-				restored += count
+			nextKey, keyCount := s.restoreJSONStringLocked(key, append(path, key), resolver)
+			if nextKey != key {
+				if _, collision := v[nextKey]; collision {
+					nextKey = key
+					keyCount = 0
+				}
 			}
+			next, count := s.restoreJSONValueLocked(child, append(path, nextKey), resolver)
+			nextMap[nextKey] = next
+			restored += keyCount + count
 		}
-		return v, restored
+		return nextMap, restored
 	case []any:
 		restored := 0
 		for i, child := range v {

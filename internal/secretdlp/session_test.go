@@ -236,7 +236,7 @@ func TestSessionLeavesFabricatedPlaceholderUnchanged(t *testing.T) {
 	}
 }
 
-func TestSessionRestoresJSONContentButNotToolNames(t *testing.T) {
+func TestSessionRestoresJSONPlaceholdersInEveryResponsePath(t *testing.T) {
 	session := NewSession([]byte("master-key"), "client-key", time.Minute, ModeRestore)
 	secret := "sk-testdlpfixture0000000000000000000000000000"
 	redacted := redactRawForTest(t, session, []byte(`{"message":"sk-testdlpfixture0000000000000000000000000000"}`), []Finding{{Secret: secret, RuleID: "manual", Source: "test"}})
@@ -252,7 +252,7 @@ func TestSessionRestoresJSONContentButNotToolNames(t *testing.T) {
 				}]
 			}
 		}],
-		"tools":[{"type":"function","function":{"name":"` + placeholder + `"}}]
+		"tools":[{"type":"function","function":{"name":"` + placeholder + `","parameters":{"properties":{"` + placeholder + `":{"type":"string"}}}}}]
 	}`)
 	restored := session.RestoreJSON(response)
 	root := decodeJSONForTest(t, restored)
@@ -266,12 +266,16 @@ func TestSessionRestoresJSONContentButNotToolNames(t *testing.T) {
 		t.Fatalf("tool arguments = %q, want restored secret and no placeholder", args)
 	}
 	name := message["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["name"].(string)
-	if name != placeholder {
-		t.Fatalf("tool call name = %q, want placeholder left untouched", name)
+	if name != secret {
+		t.Fatalf("tool call name = %q, want restored secret", name)
 	}
 	toolName := root["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["name"].(string)
-	if toolName != placeholder {
-		t.Fatalf("schema tool name = %q, want placeholder left untouched", toolName)
+	if toolName != secret {
+		t.Fatalf("schema tool name = %q, want restored secret", toolName)
+	}
+	properties := root["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)["properties"].(map[string]any)
+	if _, ok := properties[secret]; !ok {
+		t.Fatalf("schema properties = %v, want placeholder restored in object key", properties)
 	}
 }
 
@@ -362,15 +366,15 @@ func TestSessionPlaceholderPatternMatchesLargeCountersAndRestores(t *testing.T) 
 	}
 }
 
-func TestSessionStreamingRestoreDocumentsBlockedPathBehavior(t *testing.T) {
+func TestSessionStructuredAndStreamingRestoreProtocolPaths(t *testing.T) {
 	session := NewSession([]byte("master-key"), "client-key", time.Minute, ModeRestore)
 	secret := "sk-SHL5JPzaa0VUlLJ7rZYrn78C6GHjrA2kDAPWnlCSWGFzy3S0"
 	redacted := redactRawForTest(t, session, []byte(`{"message":"`+secret+`"}`), []Finding{{Secret: secret, RuleID: "test", Source: "test"}})
 	placeholder := extractPlaceholderForTest(t, string(redacted))
 
 	structured := session.RestoreJSON([]byte(`{"tools":[{"type":"function","function":{"name":"` + placeholder + `"}}]}`))
-	if !strings.Contains(string(structured), placeholder) || strings.Contains(string(structured), secret) {
-		t.Fatalf("structured restore = %q, want blocked tool name placeholder left unchanged", structured)
+	if strings.Contains(string(structured), placeholder) || !strings.Contains(string(structured), secret) {
+		t.Fatalf("structured restore = %q, want placeholder restored in tool name", structured)
 	}
 
 	streamed := session.RestoreStreamJSONChunk([]byte(`data: {"tools":[{"type":"function","function":{"name":"` + placeholder + `"}}]}` + "\n\n"))

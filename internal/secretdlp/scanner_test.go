@@ -386,6 +386,38 @@ func TestFilterFindingsStillSubtractsGenericTokenEqualToToolName(t *testing.T) {
 	}
 }
 
+func TestFilterFindingsProtocolIdentifierBeatsAmbiguousCredentialHeuristic(t *testing.T) {
+	identifier := "ev_0x8mKiozUEl3LjbEayZkHiZsTN1YZr1HKhTyU"
+	ids := make(IdentifierSet)
+	ids.addProtocol(identifier)
+
+	accepted, shadow := filterFindings([]Finding{{
+		Secret:     identifier,
+		RuleID:     "bare-credential-prefixed",
+		Source:     "builtin",
+		Confidence: 0.85,
+	}}, ids, Config{RedactThreshold: 0.80})
+	if len(accepted) != 0 || len(shadow) != 0 {
+		t.Fatalf("filterFindings() accepted=%v shadow=%v, want structural protocol id suppression", accepted, shadow)
+	}
+}
+
+func TestFilterFindingsExplicitProviderSecretStillBeatsProtocolIdentifier(t *testing.T) {
+	secret := "sk-proj-0123456789abcdefghijklmnopqrstuvwxyzABCD"
+	ids := make(IdentifierSet)
+	ids.addProtocol(secret)
+
+	accepted, shadow := filterFindings([]Finding{{
+		Secret:     secret,
+		RuleID:     "sk-distinct",
+		Source:     "builtin",
+		Confidence: 0.98,
+	}}, ids, Config{RedactThreshold: 0.80})
+	if len(accepted) != 1 || len(shadow) != 0 {
+		t.Fatalf("filterFindings() accepted=%v shadow=%v, want explicit provider secret retained", accepted, shadow)
+	}
+}
+
 func TestFindingsBySecretKeepsHighestConfidence(t *testing.T) {
 	token := "ghp_A1b2C3d4E5f6A1b2C3d4E5f6A1b2C3d4E5f6"
 	findings := findingsBySecret([]Finding{
