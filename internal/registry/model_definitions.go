@@ -125,7 +125,8 @@ func GetXAIModels() []*ModelInfo {
 
 // GetCursorModels returns the standard Cursor model definitions plus cursor- explicit-routing
 // aliases (same pattern as GetCopilotModels / GenerateCopilotAliases). Bare ids are the SDK
-// ids (composer-2.5, grok-4.5); cursor-grok-4.5 forces Cursor when xAI also has grok-4.5.
+// ids (composer-2.5, grok-4.5, grok-4.6); cursor-grok-* forces Cursor when xAI
+// also owns the same bare Grok id.
 // Uses hard-coded builtins to survive remote catalog replacements (see model_updater.go).
 func GetCursorModels() []*ModelInfo {
 	return GenerateCursorAliases(cloneModelInfos(cursorBuiltinModels()))
@@ -142,6 +143,9 @@ var cursorBuiltinModelDefs = []*ModelInfo{
 	// Params: effort{low,medium,high} + fast{false,true}; default variant = high+fast=true.
 	{ID: "grok-4.5", Object: "model", Created: 1783526400, OwnedBy: "cursor", Type: "cursor", DisplayName: "Cursor Grok 4.5", Description: "Cursor Grok 4.5 - Non-fast high effort (use cursor-grok-4.5 to force Cursor vs xAI)", ContextLength: 500000, MaxCompletionTokens: 65536},
 	{ID: "grok-4.5-fast", Object: "model", Created: 1783526400, OwnedBy: "cursor", Type: "cursor", DisplayName: "Cursor Grok 4.5 Fast", Description: "Cursor Grok 4.5 Fast - Fast high effort (use cursor-grok-4.5-fast to force Cursor vs xAI)", ContextLength: 500000, MaxCompletionTokens: 65536},
+	// Grok 4.6 adds a native xhigh effort value; the other model-selection semantics match Grok 4.5.
+	{ID: "grok-4.6", Object: "model", Created: 1786492800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Cursor Grok 4.6", Description: "Cursor Grok 4.6 - Non-fast high effort (use cursor-grok-4.6 to force Cursor vs xAI)", ContextLength: 500000, MaxCompletionTokens: 65536},
+	{ID: "grok-4.6-fast", Object: "model", Created: 1786492800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Cursor Grok 4.6 Fast", Description: "Cursor Grok 4.6 Fast - Fast high effort (use cursor-grok-4.6-fast to force Cursor vs xAI)", ContextLength: 500000, MaxCompletionTokens: 65536},
 }
 
 // composerReasoningLevels is the GPT-standard reasoning-effort set advertised as composer dash-suffix variants
@@ -155,14 +159,18 @@ var composerReasoningLevels = []string{"low", "medium", "high", "xhigh"}
 // GetCursorModels wraps these with GenerateCursorAliases so cursor-grok-4.5-xhigh etc. also force-route.
 var grok45EffortLevels = []string{"low", "medium", "high", "xhigh"}
 
-// cursorBuiltinModels returns the static composer + grok-4.5 models PLUS the generated reasoning/fast
+// grok46EffortLevels is the native Cursor Grok 4.6 SDK effort set. Unlike Grok 4.5,
+// the SDK accepts xhigh directly.
+var grok46EffortLevels = []string{"low", "medium", "high", "xhigh"}
+
+// cursorBuiltinModels returns the static composer + Grok models PLUS the generated reasoning/fast
 // dash-suffix variants (mirrors the codex `-<level>` generation), so a client can select e.g.
-// composer-2.5-high, composer-2.5-fast-xhigh, grok-4.5-xhigh, or grok-4.5-fast-medium.
-// Bare composer-2.5 / grok-4.5 stay the non-fast tier — the bridge passes fast=false (Cursor's bare
+// composer-2.5-high, composer-2.5-fast-xhigh, grok-4.6-xhigh, or grok-4.5-fast-medium.
+// Bare composer-2.5 / grok-4.x stay the non-fast tier — the bridge passes fast=false (Cursor's bare
 // default for both is the costly fast tier; see composerModelSelection). Explicit Cursor force uses
-// the cursor- prefix aliases from GenerateCursorAliases (cursor-grok-4.5, cursor-composer-2.5, …).
+// the cursor- prefix aliases from GenerateCursorAliases (cursor-grok-4.6, cursor-composer-2.5, …).
 func cursorBuiltinModels() []*ModelInfo {
-	out := make([]*ModelInfo, 0, len(cursorBuiltinModelDefs)+len(composerReasoningLevels)*4+len(grok45EffortLevels)*2)
+	out := make([]*ModelInfo, 0, len(cursorBuiltinModelDefs)+len(composerReasoningLevels)*4+len(grok45EffortLevels)*2+len(grok46EffortLevels)*2)
 	out = append(out, cursorBuiltinModelDefs...)
 	for _, base := range []struct{ id, name string }{{"composer-2.5", "Composer 2.5"}, {"composer-2", "Composer 2"}} {
 		for _, fast := range []struct{ suffix, label string }{{"", ""}, {"-fast", " Fast"}} {
@@ -178,17 +186,26 @@ func cursorBuiltinModels() []*ModelInfo {
 			}
 		}
 	}
-	// grok-4.5 effort/fast variants (bare SDK ids; GenerateCursorAliases adds cursor- force aliases).
-	for _, fast := range []struct{ suffix, label string }{{"", ""}, {"-fast", " Fast"}} {
-		for _, level := range grok45EffortLevels {
-			out = append(out, &ModelInfo{
-				ID: "grok-4.5" + fast.suffix + "-" + level, Object: "model", Created: 1783526400,
-				OwnedBy: "cursor", Type: "cursor",
-				DisplayName:         "Cursor Grok 4.5" + fast.label + " " + strings.ToUpper(level[:1]) + level[1:],
-				Description:         "Cursor grok-4.5" + fast.suffix + " (effort " + level + "; force with cursor- prefix vs xAI)",
-				ContextLength:       500000,
-				MaxCompletionTokens: 65536,
-			})
+	// Grok effort/fast variants (bare SDK ids; GenerateCursorAliases adds cursor- force aliases).
+	for _, grok := range []struct {
+		id, name string
+		created  int64
+		levels   []string
+	}{
+		{id: "grok-4.5", name: "Cursor Grok 4.5", created: 1783526400, levels: grok45EffortLevels},
+		{id: "grok-4.6", name: "Cursor Grok 4.6", created: 1786492800, levels: grok46EffortLevels},
+	} {
+		for _, fast := range []struct{ suffix, label string }{{"", ""}, {"-fast", " Fast"}} {
+			for _, level := range grok.levels {
+				out = append(out, &ModelInfo{
+					ID: grok.id + fast.suffix + "-" + level, Object: "model", Created: grok.created,
+					OwnedBy: "cursor", Type: "cursor",
+					DisplayName:         grok.name + fast.label + " " + strings.ToUpper(level[:1]) + level[1:],
+					Description:         "Cursor " + grok.id + fast.suffix + " (effort " + level + "; force with cursor- prefix vs xAI)",
+					ContextLength:       500000,
+					MaxCompletionTokens: 65536,
+				})
+			}
 		}
 	}
 	return out

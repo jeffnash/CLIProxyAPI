@@ -2393,6 +2393,27 @@
       "max_completion_tokens": 256000
     },
     {
+      "id": "grok-4.6",
+      "object": "model",
+      "created": 1786492800,
+      "owned_by": "xai",
+      "type": "xai",
+      "display_name": "Grok 4.6",
+      "name": "grok-4.6",
+      "description": "xAI Grok 4.6 model for agentic coding and reasoning workloads.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
       "id": "grok-4.5",
       "object": "model",
       "created": 1783526400,
@@ -2595,6 +2616,36 @@
       "type": "cursor",
       "display_name": "Cursor Grok 4.5 Fast",
       "description": "Cursor Grok 4.5 Fast (SDK id grok-4.5, fast=true). Force with cursor-grok-4.5-fast.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": ["low", "medium", "high", "xhigh"]
+      }
+    },
+    {
+      "id": "grok-4.6",
+      "object": "model",
+      "created": 1786492800,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Cursor Grok 4.6",
+      "description": "Cursor Grok 4.6 (SDK id grok-4.6). Force Cursor vs xAI with cursor-grok-4.6. Variants: grok-4.6-fast, grok-4.6-{low,medium,high,xhigh}.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": ["low", "medium", "high", "xhigh"]
+      }
+    },
+    {
+      "id": "grok-4.6-fast",
+      "object": "model",
+      "created": 1786492800,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Cursor Grok 4.6 Fast",
+      "description": "Cursor Grok 4.6 Fast (SDK id grok-4.6, fast=true). Force with cursor-grok-4.6-fast.",
       "context_length": 500000,
       "max_completion_tokens": 65536,
       "thinking": {

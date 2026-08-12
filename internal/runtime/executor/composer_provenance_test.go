@@ -19,6 +19,8 @@ func TestResolveComposerProvenanceLegacyClientPreservesAmbiguousColdStartForAllS
 		"composer-2.5-fast-high",
 		"grok-4.5",
 		"grok-4.5-fast-high",
+		"grok-4.6",
+		"grok-4.6-fast-xhigh",
 	} {
 		t.Run(model, func(t *testing.T) {
 			raw := []byte(`{"model":"` + model + `","messages":[

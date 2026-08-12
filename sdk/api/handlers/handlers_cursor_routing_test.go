@@ -7,8 +7,8 @@ import (
 )
 
 // TestGetRequestDetails_CursorPrefixRouting locks the cursor- force-prefix path
-// (same pattern as copilot-/codex-). Used to disambiguate Cursor Grok 4.5 from xAI
-// grok-4.5: client requests "cursor-grok-4.5" → provider cursor, model "grok-4.5".
+// (same pattern as copilot-/codex-). Used to disambiguate Cursor Grok from xAI:
+// client requests "cursor-grok-4.6" → provider cursor, model "grok-4.6".
 // Grok 4.3 has no Cursor variant — bare "grok-4.3" only routes via xAI registration.
 func TestGetRequestDetails_CursorPrefixRouting(t *testing.T) {
 	if registry.CursorModelPrefix != "cursor-" {
@@ -24,6 +24,9 @@ func TestGetRequestDetails_CursorPrefixRouting(t *testing.T) {
 		{name: "cursor-grok-4.5", modelName: "cursor-grok-4.5", expectedNormalizedModel: "grok-4.5"},
 		{name: "cursor-grok-4.5-fast", modelName: "cursor-grok-4.5-fast", expectedNormalizedModel: "grok-4.5-fast"},
 		{name: "cursor-grok-4.5-xhigh", modelName: "cursor-grok-4.5-xhigh", expectedNormalizedModel: "grok-4.5-xhigh"},
+		{name: "cursor-grok-4.6", modelName: "cursor-grok-4.6", expectedNormalizedModel: "grok-4.6"},
+		{name: "cursor-grok-4.6-fast", modelName: "cursor-grok-4.6-fast", expectedNormalizedModel: "grok-4.6-fast"},
+		{name: "cursor-grok-4.6-xhigh", modelName: "cursor-grok-4.6-xhigh", expectedNormalizedModel: "grok-4.6-xhigh"},
 		{name: "cursor-composer-2.5", modelName: "cursor-composer-2.5", expectedNormalizedModel: "composer-2.5"},
 		{name: "cursor-composer-2.5-fast", modelName: "cursor-composer-2.5-fast", expectedNormalizedModel: "composer-2.5-fast"},
 	}

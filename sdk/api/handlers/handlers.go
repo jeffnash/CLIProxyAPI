@@ -1703,8 +1703,8 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 		rawModel = strings.TrimSpace(rawModel[len(registry.IFlowModelPrefix):])
 		forcedProvider = "iflow"
 	case strings.HasPrefix(lower, registry.CursorModelPrefix):
-		// cursor-grok-4.5 → force Cursor (vs xAI's bare grok-4.5). Same pattern as copilot-/codex-.
-		// Strips to the bare SDK id (grok-4.5 / composer-2.5 / …) for the bridge/executor.
+		// cursor-grok-4.6 → force Cursor (vs xAI's bare grok-4.6). Same pattern as copilot-/codex-.
+		// Strips to the bare SDK id (grok-4.6 / composer-2.5 / …) for the bridge/executor.
 		rawModel = strings.TrimSpace(rawModel[len(registry.CursorModelPrefix):])
 		forcedProvider = "cursor"
 	}

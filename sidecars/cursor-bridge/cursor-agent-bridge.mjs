@@ -5360,28 +5360,33 @@ function writeDurableFingerprint(cursorKey, agentId, fp) {
 //     Bare SDK/CLI forms (grok-4.5, grok-4.5-fast, …) are still accepted when the request is already on the
 //     cursor bridge path (e.g. a model alias that rewrites to the upstream SDK id).
 //
+//   Cursor Grok 4.6 (SDK id "grok-4.6"; display "Cursor Grok 4.6"):
+//     Uses the same fast/effort matrix, but the SDK accepts xhigh as a native fourth effort value.
+//     CLIENT-FACING ids remain namespaced `cursor-grok-4.6*` to disambiguate them from xAI.
+//
 // Non-recognized ids pass through unchanged (Cursor resolves their own default). Composer thinking levels are
-// passed THROUGH (Cursor validates). Grok effort is clamped to the SDK's {low,medium,high} set.
+// passed THROUGH (Cursor validates). Grok 4.5 effort is clamped to {low,medium,high}; Grok 4.6 also supports xhigh.
 const COMPOSER_THINKING_LEVELS = new Set(["minimal", "none", "low", "medium", "high", "xhigh", "max"]);
-// Map GPT/CLI-style effort suffixes onto the grok-4.5 SDK `effort` values (only low|medium|high exist).
-function mapGrokEffort(level) {
+// Map GPT/CLI-style effort suffixes onto each Grok SDK model's supported values.
+function mapGrokEffort(level, modelId) {
   if (!level) return null;
   const l = String(level).toLowerCase();
   if (l === "low" || l === "medium" || l === "high") return l;
-  if (l === "xhigh" || l === "max") return "high";
+  if (l === "xhigh") return modelId === "grok-4.6" ? "xhigh" : "high";
+  if (l === "max") return modelId === "grok-4.6" ? "xhigh" : "high";
   if (l === "minimal" || l === "none") return "low";
   return null;
 }
 function composerModelSelection(model, { utilityOneShot = false } = {}) {
   const raw = String(model || "");
   let id = raw;
-  // Disambiguate from xAI grok-4.5: client-facing Cursor ids are cursor-grok-4.5*. Strip only that prefix.
-  if (/^cursor-grok-4\.5/i.test(id)) id = id.slice("cursor-".length);
+  // Disambiguate from xAI: client-facing Cursor Grok ids carry cursor-. Strip it only for supported SDK ids.
+  if (/^cursor-grok-4\.(?:5|6)(?:$|-)/i.test(id)) id = id.slice("cursor-".length);
   let fast = "false";
   let thinking = null;
   // Suffix order is base[-fast][-<level>]: strip the innermost reasoning level first, then the -fast variant, so
   // composer-2.5-fast-high -> { fast:true, thinking:high }, composer-2.5-high -> { fast:false, thinking:high }.
-  // Same strip applies to (cursor-)grok-4.5-fast-xhigh -> base grok-4.5 + fast + effort.
+  // Same strip applies to (cursor-)grok-4.6-fast-xhigh -> base grok-4.6 + fast + effort.
   const d = id.lastIndexOf("-");
   if (d > 0 && COMPOSER_THINKING_LEVELS.has(id.slice(d + 1).toLowerCase())) {
     thinking = id.slice(d + 1).toLowerCase();
@@ -5394,14 +5399,14 @@ function composerModelSelection(model, { utilityOneShot = false } = {}) {
     if (thinking) params.push({ id: "thinking", value: thinking });
     return { id, params };
   }
-  if (id === "grok-4.5") {
-    if (utilityOneShot) return { id: "grok-4.5", params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }] };
+  if (id === "grok-4.5" || id === "grok-4.6") {
+    if (utilityOneShot) return { id, params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }] };
     // Bare / missing level => the fleet default (P8: CURSOR_COMPOSER_GROK_EFFORT_DEFAULT,
     // historically high, matching the CLI's primary "Cursor Grok 4.5" = grok-4.5-xhigh).
     // Always set fast explicitly so we never silently inherit Cursor's costly fast=true default.
-    // SDK id stays "grok-4.5" regardless of the client-facing cursor- prefix.
-    const effort = mapGrokEffort(thinking) || COMPOSER_GROK_EFFORT_DEFAULT;
-    return { id: "grok-4.5", params: [{ id: "fast", value: fast }, { id: "effort", value: effort }] };
+    // SDK id stays bare regardless of the client-facing cursor- prefix.
+    const effort = mapGrokEffort(thinking, id) || COMPOSER_GROK_EFFORT_DEFAULT;
+    return { id, params: [{ id: "fast", value: fast }, { id: "effort", value: effort }] };
   }
   return { id: raw }; // non-recognized: pass the original id through (Cursor resolves its default)
 }

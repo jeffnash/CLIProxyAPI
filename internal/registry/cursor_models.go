@@ -2,8 +2,8 @@ package registry
 
 // GenerateCursorAliases creates cursor- prefixed aliases for explicit routing.
 // Same pattern as GenerateCopilotAliases / GenerateCodexAliases: when a bare model
-// id is shared with another provider (e.g. xAI also has "grok-4.5"), clients can
-// request "cursor-grok-4.5" to force the Cursor provider. handlers.go recognizes
+// id is shared with another provider (e.g. xAI also has "grok-4.6"), clients can
+// request "cursor-grok-4.6" to force the Cursor provider. handlers.go recognizes
 // CursorModelPrefix, strips it, and sets forced_provider=true.
 //
 // Grok 4.3 has no Cursor variant — bare "grok-4.3" only exists under xAI, so no

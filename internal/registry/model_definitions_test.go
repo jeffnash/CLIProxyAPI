@@ -45,9 +45,25 @@ func TestWithXAIBuiltinsIncludesComposerReasoningAliases(t *testing.T) {
 	}
 }
 
-func TestGetCursorModelsIncludesGrok45FastAndNonFast(t *testing.T) {
-	// Bare SDK ids (grok-4.5, grok-4.5-fast, …) plus GenerateCursorAliases force-routing forms
-	// (cursor-grok-4.5, …) — same pattern as copilot-/codex-. Grok 4.3 has no Cursor variant.
+func TestGetXAIModelsIncludesGrok46(t *testing.T) {
+	for _, model := range GetXAIModels() {
+		if model == nil || model.ID != "grok-4.6" {
+			continue
+		}
+		if model.Type != "xai" || model.OwnedBy != "xai" {
+			t.Fatalf("grok-4.6 ownership/type = %s/%s, want xai/xai", model.OwnedBy, model.Type)
+		}
+		if model.Thinking == nil || len(model.Thinking.Levels) != 4 {
+			t.Fatalf("grok-4.6 thinking support = %#v, want four effort levels", model.Thinking)
+		}
+		return
+	}
+	t.Fatal("expected xAI model grok-4.6")
+}
+
+func TestGetCursorModelsIncludesGrok45And46Variants(t *testing.T) {
+	// Bare SDK ids plus GenerateCursorAliases force-routing forms use the same pattern
+	// as copilot-/codex-. Grok 4.3 has no Cursor variant.
 	models := GetCursorModels()
 	found := map[string]*ModelInfo{}
 	for _, model := range models {
@@ -58,11 +74,13 @@ func TestGetCursorModelsIncludesGrok45FastAndNonFast(t *testing.T) {
 	}
 
 	for _, id := range []string{
-		// bare (SDK ids)
+		// Grok 4.5 bare SDK ids and explicit force aliases.
 		"grok-4.5", "grok-4.5-fast", "grok-4.5-xhigh", "grok-4.5-fast-medium",
-		// explicit force aliases (disambiguate from xAI grok-4.5)
 		"cursor-grok-4.5", "cursor-grok-4.5-fast", "cursor-grok-4.5-xhigh", "cursor-grok-4.5-fast-medium",
-		// composer force aliases too
+		// Grok 4.6 preserves native xhigh and has the same fast matrix.
+		"grok-4.6", "grok-4.6-fast", "grok-4.6-xhigh", "grok-4.6-fast-medium",
+		"cursor-grok-4.6", "cursor-grok-4.6-fast", "cursor-grok-4.6-xhigh", "cursor-grok-4.6-fast-medium",
+		// Composer force aliases remain available.
 		"cursor-composer-2.5", "cursor-composer-2.5-fast",
 	} {
 		m := found[id]
