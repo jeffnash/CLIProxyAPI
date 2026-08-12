@@ -596,8 +596,17 @@ func TestXAIExecutorAppliesThinkingSuffix(t *testing.T) {
 }
 
 func TestXAIExecutorAppliesGrok46DashThinkingAlias(t *testing.T) {
-	for _, effort := range []string{"high", "xhigh"} {
-		t.Run(effort, func(t *testing.T) {
+	tests := []struct {
+		name       string
+		model      string
+		wantEffort string
+	}{
+		{name: "high alias", model: "grok-4.6-high", wantEffort: "high"},
+		{name: "xhigh alias", model: "grok-4.6-xhigh", wantEffort: "xhigh"},
+		{name: "explicit suffix overrides alias", model: "grok-4.6-high(low)", wantEffort: "low"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			var gotBody []byte
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var errRead error
@@ -621,7 +630,7 @@ func TestXAIExecutorAppliesGrok46DashThinkingAlias(t *testing.T) {
 			}
 
 			_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
-				Model:   "grok-4.6-" + effort,
+				Model:   tt.model,
 				Payload: []byte(`{"model":"grok-4.6","input":"hello"}`),
 			}, cliproxyexecutor.Options{
 				SourceFormat: sdktranslator.FormatOpenAIResponse,
@@ -634,8 +643,8 @@ func TestXAIExecutorAppliesGrok46DashThinkingAlias(t *testing.T) {
 			if got := gjson.GetBytes(gotBody, "model").String(); got != "grok-4.6" {
 				t.Fatalf("model = %q, want grok-4.6; body=%s", got, string(gotBody))
 			}
-			if got := gjson.GetBytes(gotBody, "reasoning.effort").String(); got != effort {
-				t.Fatalf("reasoning.effort = %q, want %s; body=%s", got, effort, string(gotBody))
+			if got := gjson.GetBytes(gotBody, "reasoning.effort").String(); got != tt.wantEffort {
+				t.Fatalf("reasoning.effort = %q, want %s; body=%s", got, tt.wantEffort, string(gotBody))
 			}
 		})
 	}

@@ -812,10 +812,11 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 
 func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool, to sdktranslator.Format) (*xaiPreparedRequest, error) {
 	modelForThinking := req.Model
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	parsedModel := thinking.ParseSuffix(req.Model)
+	baseModel := parsedModel.ModelName
 	if info := registry.LookupModelInfo(baseModel, "xai"); info != nil && strings.TrimSpace(info.UpstreamID) != "" {
 		baseModel = strings.TrimSpace(info.UpstreamID)
-		if effort := strings.TrimSpace(info.ReasoningEffort); effort != "" {
+		if effort := strings.TrimSpace(info.ReasoningEffort); effort != "" && !parsedModel.HasSuffix {
 			modelForThinking = fmt.Sprintf("%s(%s)", baseModel, effort)
 		}
 	}
