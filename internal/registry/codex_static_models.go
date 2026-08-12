@@ -10,7 +10,7 @@ const codex55Created = 1776902400
 func enrichCodexModels(models []*ModelInfo) []*ModelInfo {
 	base := cloneModelInfos(models)
 	base = appendMissingModelInfos(base, forkAdditionalCodexModels()...)
-	return expandCodexReasoningAliases(base)
+	return expandReasoningAliases(base)
 }
 
 // GetOpenAIModels preserves the fork's legacy helper used by Codex alias tests.
@@ -126,49 +126,4 @@ func appendMissingModelInfos(dst []*ModelInfo, extras ...*ModelInfo) []*ModelInf
 		dst = append(dst, cloneModelInfo(model))
 	}
 	return dst
-}
-
-func expandCodexReasoningAliases(models []*ModelInfo) []*ModelInfo {
-	if len(models) == 0 {
-		return nil
-	}
-
-	result := make([]*ModelInfo, 0, len(models)*2)
-	seen := make(map[string]struct{}, len(models)*2)
-	for _, model := range models {
-		if model == nil || strings.TrimSpace(model.ID) == "" {
-			continue
-		}
-		result = appendUniqueModelInfo(result, seen, model)
-		if model.Thinking == nil || len(model.Thinking.Levels) == 0 {
-			continue
-		}
-		for _, level := range model.Thinking.Levels {
-			level = strings.ToLower(strings.TrimSpace(level))
-			if level == "" {
-				continue
-			}
-			alias := cloneModelInfo(model)
-			alias.ID = model.ID + "-" + level
-			alias.DisplayName = model.DisplayName + " " + strings.ToUpper(level[:1]) + level[1:]
-			alias.Description = model.Description + " (" + level + " reasoning effort)"
-			result = appendUniqueModelInfo(result, seen, alias)
-		}
-	}
-	return result
-}
-
-func appendUniqueModelInfo(dst []*ModelInfo, seen map[string]struct{}, model *ModelInfo) []*ModelInfo {
-	if model == nil {
-		return dst
-	}
-	key := strings.ToLower(strings.TrimSpace(model.ID))
-	if key == "" {
-		return dst
-	}
-	if _, exists := seen[key]; exists {
-		return dst
-	}
-	seen[key] = struct{}{}
-	return append(dst, cloneModelInfo(model))
 }

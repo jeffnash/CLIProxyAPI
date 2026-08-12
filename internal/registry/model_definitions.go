@@ -222,7 +222,8 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 // WithXAIBuiltins injects hard-coded xAI model definitions that should
 // not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	extras := []*ModelInfo{xaiBuiltinGrok46ModelInfo(), xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo()}
+	extras := expandReasoningAliases([]*ModelInfo{xaiBuiltinGrok46ModelInfo()}, "high", "xhigh")
+	extras = append(extras, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo())
 	extras = append(extras, xaiComposerReasoningAliases()...)
 	return upsertModelInfos(models, extras...)
 }
@@ -242,6 +243,7 @@ func xaiComposerReasoningAliases() []*ModelInfo {
 			Description:         "xAI Composer 2.5 Fast with " + level + " reasoning effort.",
 			ContextLength:       200000,
 			MaxCompletionTokens: 32768,
+			UpstreamID:          "grok-composer-2.5-fast",
 			Thinking: &ThinkingSupport{
 				Levels: []string{"low", "medium", "high"},
 			},

@@ -2414,6 +2414,48 @@
       }
     },
     {
+      "id": "grok-4.6-high",
+      "object": "model",
+      "created": 1786492800,
+      "owned_by": "xai",
+      "type": "xai",
+      "display_name": "Grok 4.6 High",
+      "name": "grok-4.6-high",
+      "description": "xAI Grok 4.6 with high reasoning effort.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "grok-4.6-xhigh",
+      "object": "model",
+      "created": 1786492800,
+      "owned_by": "xai",
+      "type": "xai",
+      "display_name": "Grok 4.6 Xhigh",
+      "name": "grok-4.6-xhigh",
+      "description": "xAI Grok 4.6 with xhigh reasoning effort.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
       "id": "grok-4.5",
       "object": "model",
       "created": 1783526400,

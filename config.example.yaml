@@ -412,8 +412,8 @@ nonstream-keepalive-interval: 0
 # Get your API key from cursor.com Settings > Integrations.
 # The key starts with "crsr_" and provides access to Composer 2.5, Cursor Grok, and other models.
 # Cursor Grok 4.5/4.6 (SDK ids "grok-4.5"/"grok-4.6"). Same force-prefix pattern as copilot-/codex-/chutes-:
-#   grok-4.6 / grok-4.6-fast / grok-4.6-{low,medium,high,xhigh}     bare ids (may also match xAI)
-#   cursor-grok-4.6 / cursor-grok-4.6-fast / …                      force Cursor provider
+#   grok-4.6-high / grok-4.6-xhigh                                  auto-route across registered providers, including xAI
+#   cursor-grok-4.6 / cursor-grok-4.6-fast / cursor-grok-4.6-*      force Cursor provider
 # Grok 4.3 has no Cursor variant — only xAI owns bare "grok-4.3".
 #cursor-api-key:
 #  - api-key: "crsr_..."          # your Cursor user API key (required)

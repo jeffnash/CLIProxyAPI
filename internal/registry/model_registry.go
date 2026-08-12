@@ -78,6 +78,10 @@ type ModelInfo struct {
 	// nvidia/Gemma-4-31B-IT-NVFP4 while requiring variant IDs such as
 	// google/gemma-4-31B-turbo-TEE at request time.
 	UpstreamID string `json:"-"`
+
+	// ReasoningEffort is the provider-native effort selected by a public model alias.
+	// It is execution metadata and is not exposed in model-list responses.
+	ReasoningEffort string `json:"-"`
 }
 
 type availableModelsCacheEntry struct {

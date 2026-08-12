@@ -46,19 +46,55 @@ func TestWithXAIBuiltinsIncludesComposerReasoningAliases(t *testing.T) {
 }
 
 func TestWithXAIBuiltinsIncludesGrok46WithoutRemoteCatalog(t *testing.T) {
+	found := map[string]*ModelInfo{}
 	for _, model := range WithXAIBuiltins(nil) {
-		if model == nil || model.ID != "grok-4.6" {
-			continue
+		if model != nil {
+			found[model.ID] = model
+		}
+	}
+
+	for _, id := range []string{"grok-4.6", "grok-4.6-high", "grok-4.6-xhigh"} {
+		model := found[id]
+		if model == nil {
+			t.Fatalf("expected xAI builtin model %s", id)
 		}
 		if model.Type != "xai" || model.OwnedBy != "xai" {
-			t.Fatalf("grok-4.6 ownership/type = %s/%s, want xai/xai", model.OwnedBy, model.Type)
+			t.Fatalf("%s ownership/type = %s/%s, want xai/xai", id, model.OwnedBy, model.Type)
 		}
 		if model.Thinking == nil || len(model.Thinking.Levels) != 4 {
-			t.Fatalf("grok-4.6 thinking support = %#v, want four effort levels", model.Thinking)
+			t.Fatalf("%s thinking support = %#v, want four effort levels", id, model.Thinking)
 		}
-		return
+		if id != "grok-4.6" {
+			if model.UpstreamID != "grok-4.6" {
+				t.Fatalf("%s upstream id = %q, want grok-4.6", id, model.UpstreamID)
+			}
+			if model.ReasoningEffort != id[len("grok-4.6-"):] {
+				t.Fatalf("%s reasoning effort = %q", id, model.ReasoningEffort)
+			}
+		}
 	}
-	t.Fatal("expected xAI builtin model grok-4.6")
+}
+
+func TestGrok46EffortAliasesUseAutomaticProviderRegistry(t *testing.T) {
+	modelRegistry := newTestModelRegistry()
+	modelRegistry.RegisterClient("xai-auth", "xai", GetXAIModels())
+	modelRegistry.RegisterClient("cursor-auth", "cursor", GetCursorModels())
+
+	for _, id := range []string{"grok-4.6-high", "grok-4.6-xhigh"} {
+		providers := modelRegistry.GetModelProviders(id)
+		found := map[string]bool{}
+		for _, provider := range providers {
+			found[provider] = true
+		}
+		if !found["xai"] || !found["cursor"] {
+			t.Fatalf("%s providers = %v, want automatic xai and cursor candidates", id, providers)
+		}
+
+		xaiInfo := modelRegistry.GetModelInfo(id, "xai")
+		if xaiInfo == nil || xaiInfo.UpstreamID != "grok-4.6" {
+			t.Fatalf("%s xAI model info = %#v, want upstream grok-4.6", id, xaiInfo)
+		}
+	}
 }
 
 func TestGetCursorModelsIncludesGrok45And46Variants(t *testing.T) {

@@ -811,9 +811,13 @@ func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxye
 }
 
 func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool, to sdktranslator.Format) (*xaiPreparedRequest, error) {
+	modelForThinking := req.Model
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	if aliasBaseModel, ok := resolveXAIComposerAlias(baseModel); ok {
-		baseModel = aliasBaseModel
+	if info := registry.LookupModelInfo(baseModel, "xai"); info != nil && strings.TrimSpace(info.UpstreamID) != "" {
+		baseModel = strings.TrimSpace(info.UpstreamID)
+		if effort := strings.TrimSpace(info.ReasoningEffort); effort != "" {
+			modelForThinking = fmt.Sprintf("%s(%s)", baseModel, effort)
+		}
 	}
 	from := opts.SourceFormat
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
@@ -829,7 +833,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	})
 
 	var err error
-	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())
+	body, err = thinking.ApplyThinking(body, modelForThinking, from.String(), e.Identifier(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
@@ -1049,20 +1053,6 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 		}
 	}
 	return body
-}
-
-func resolveXAIComposerAlias(model string) (baseModel string, ok bool) {
-	normalized := strings.ToLower(strings.TrimSpace(model))
-	for _, level := range []string{"low", "medium", "high"} {
-		suffix := "-" + level
-		if strings.HasSuffix(normalized, suffix) {
-			base := strings.TrimSuffix(normalized, suffix)
-			if base == "grok-composer-2.5-fast" {
-				return base, true
-			}
-		}
-	}
-	return "", false
 }
 
 func normalizeXAITools(body []byte) []byte {
