@@ -5605,6 +5605,18 @@ test("utility one-shots lower reasoning without enabling the costly fast tier", 
     id: "grok-4.6",
     params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }],
   });
+  assert.deepEqual(composerModelSelection("composer-2.5-high", { utilityOneShot: true }), {
+    id: "composer-2.5",
+    params: [{ id: "fast", value: "false" }, { id: "thinking", value: "high" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.6-high", { utilityOneShot: true }), {
+    id: "grok-4.6",
+    params: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.6-fast-xhigh", { utilityOneShot: true }), {
+    id: "grok-4.6",
+    params: [{ id: "fast", value: "true" }, { id: "effort", value: "xhigh" }],
+  });
 });
 
 test("tool-choice gating does not widen the advertised set or fake native success", () => {

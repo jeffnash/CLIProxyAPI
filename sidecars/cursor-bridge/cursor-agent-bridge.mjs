@@ -5394,18 +5394,18 @@ function composerModelSelection(model, { utilityOneShot = false } = {}) {
   }
   if (/-fast$/.test(id)) { fast = "true"; id = id.slice(0, id.length - "-fast".length); }
   if (id === "composer-2.5" || id === "composer-2") {
-    if (utilityOneShot) return { id, params: [{ id: "fast", value: "false" }, { id: "thinking", value: "low" }] };
     const params = [{ id: "fast", value: fast }];
-    if (thinking) params.push({ id: "thinking", value: thinking });
+    const effectiveThinking = thinking || (utilityOneShot ? "low" : null);
+    if (effectiveThinking) params.push({ id: "thinking", value: effectiveThinking });
     return { id, params };
   }
   if (id === "grok-4.5" || id === "grok-4.6") {
-    if (utilityOneShot) return { id, params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }] };
     // Bare / missing level => the fleet default (P8: CURSOR_COMPOSER_GROK_EFFORT_DEFAULT,
     // historically high, matching the CLI's primary "Cursor Grok 4.5" = grok-4.5-xhigh).
+    // Utility one-shots default to low, but an explicit model suffix always wins.
     // Always set fast explicitly so we never silently inherit Cursor's costly fast=true default.
     // SDK id stays bare regardless of the client-facing cursor- prefix.
-    const effort = mapGrokEffort(thinking, id) || COMPOSER_GROK_EFFORT_DEFAULT;
+    const effort = mapGrokEffort(thinking, id) || (utilityOneShot ? "low" : COMPOSER_GROK_EFFORT_DEFAULT);
     return { id, params: [{ id: "fast", value: fast }, { id: "effort", value: effort }] };
   }
   return { id: raw }; // non-recognized: pass the original id through (Cursor resolves its default)
