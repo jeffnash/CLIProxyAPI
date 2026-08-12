@@ -45,8 +45,8 @@ func TestWithXAIBuiltinsIncludesComposerReasoningAliases(t *testing.T) {
 	}
 }
 
-func TestGetXAIModelsIncludesGrok46(t *testing.T) {
-	for _, model := range GetXAIModels() {
+func TestWithXAIBuiltinsIncludesGrok46WithoutRemoteCatalog(t *testing.T) {
+	for _, model := range WithXAIBuiltins(nil) {
 		if model == nil || model.ID != "grok-4.6" {
 			continue
 		}
@@ -58,7 +58,7 @@ func TestGetXAIModelsIncludesGrok46(t *testing.T) {
 		}
 		return
 	}
-	t.Fatal("expected xAI model grok-4.6")
+	t.Fatal("expected xAI builtin model grok-4.6")
 }
 
 func TestGetCursorModelsIncludesGrok45And46Variants(t *testing.T) {

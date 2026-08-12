@@ -9,6 +9,7 @@ import (
 const (
 	codexBuiltinImage15ModelID      = "gpt-image-1.5"
 	codexBuiltinImageModelID        = "gpt-image-2"
+	xaiBuiltinGrok46ModelID         = "grok-4.6"
 	xaiBuiltinImageModelID          = "grok-imagine-image"
 	xaiBuiltinImageQualityModelID   = "grok-imagine-image-quality"
 	xaiBuiltinVideoModelID          = "grok-imagine-video"
@@ -218,10 +219,10 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 	return upsertModelInfos(models, codexBuiltinImage15ModelInfo(), codexBuiltinImageModelInfo())
 }
 
-// WithXAIBuiltins injects hard-coded xAI image/video model definitions that should
+// WithXAIBuiltins injects hard-coded xAI model definitions that should
 // not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	extras := []*ModelInfo{xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo()}
+	extras := []*ModelInfo{xaiBuiltinGrok46ModelInfo(), xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15PreviewModelInfo()}
 	extras = append(extras, xaiComposerReasoningAliases()...)
 	return upsertModelInfos(models, extras...)
 }
@@ -278,6 +279,25 @@ func codexBuiltinImageModelInfo() *ModelInfo {
 		Type:        "openai",
 		DisplayName: "GPT Image 2",
 		Version:     codexBuiltinImageModelID,
+	}
+}
+
+func xaiBuiltinGrok46ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  xaiBuiltinGrok46ModelID,
+		Object:              "model",
+		Created:             1786492800,
+		OwnedBy:             "xai",
+		Type:                "xai",
+		DisplayName:         "Grok 4.6",
+		Name:                xaiBuiltinGrok46ModelID,
+		Description:         "xAI Grok 4.6 model for agentic coding and reasoning workloads.",
+		ContextLength:       500000,
+		MaxCompletionTokens: 65536,
+		Thinking: &ThinkingSupport{
+			ZeroAllowed: true,
+			Levels:      []string{"low", "medium", "high", "xhigh"},
+		},
 	}
 }
 
