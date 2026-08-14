@@ -2769,23 +2769,209 @@ test("an expired historical route cannot make a valid mixed-route continuation f
   assert.match(res.text(), new RegExp(absentId));
 });
 
-test("signed round tenant fingerprint prevents cross-credential result injection", async () => {
+test("key rotation defaults to immediate recovery and receipts before refusing missing history", async () => {
   const { session } = seedSession("tenant", "key-a");
   const opened = await openTool(session);
   const res = new MockResponse();
-  await handleContinue(request(), res, continuationBody([{ toolCallId: opened.call.wireId, content: "stolen" }]), "key-b");
+  await handleContinue(request(), res, continuationBody([{ toolCallId: opened.call.wireId, content: "owned result" }]), "key-b");
+  assert.equal(res.status, 410);
+  assert.equal(opened.call.receipt.result.content, "owned result");
+  assert.equal(journalRecord(opened.round.route).terminal.reason, "credential_rotated");
+  await assert.rejects(opened.promise, /credential_rotated/);
+});
+
+test("strict key affinity preserves cross-credential rejection", async (t) => {
+  const prior = process.env.CURSOR_COMPOSER_STRICT_KEY_AFFINITY;
+  process.env.CURSOR_COMPOSER_STRICT_KEY_AFFINITY = "true";
+  t.after(() => {
+    if (prior === undefined) delete process.env.CURSOR_COMPOSER_STRICT_KEY_AFFINITY;
+    else process.env.CURSOR_COMPOSER_STRICT_KEY_AFFINITY = prior;
+  });
+  const { session } = seedSession("strict-tenant", "key-a");
+  const opened = await openTool(session);
+  const res = new MockResponse();
+  await handleContinue(request(), res, continuationBody([{ toolCallId: opened.call.wireId, content: "rejected" }]), "key-b");
   assert.equal(res.status, 403);
   assert.equal(opened.call.resultHash, null);
   opened.round.terminalize("client_cancelled", "cleanup");
   await assert.rejects(opened.promise);
 });
 
+test("key rotation immediately reseeds a live tool continuation under the current key", async (t) => {
+  const oldKey = "rotation-old-key";
+  const newKey = "rotation-new-key";
+  const { session } = seedSession("key-rotation-reseed", oldKey);
+  const opened = await openTool(session);
+  const sent = [];
+  const agent = {
+    async send(message) {
+      sent.push(message);
+      return {
+        async wait() { return { status: "finished", result: "continued on replacement key" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(newKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(newKey),
+  });
+  t.after(() => platforms.delete(keyHash(newKey)));
+
+  const res = new MockResponse();
+  await handleContinue(request(), res, continuationBody([{
+    toolCallId: opened.call.wireId,
+    content: "result from my tool",
+  }], { history: "bounded prior conversation" }), newKey);
+  await waitFor(() => res.ended, "credential rotation recovery terminal");
+
+  assert.equal(res.status, 200);
+  assert.match(res.text(), /continued on replacement key/);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /result from my tool/);
+  assert.equal(sessions.get(session.id).cursorKey, newKey);
+  assert.equal(journalRecord(opened.round.route).terminal.reason, "credential_rotated");
+  await assert.rejects(opened.promise, /credential_rotated/);
+});
+
 test("multi-tenant continuation refuses a round with a missing tenant fingerprint", () => {
   assert.equal(continuationTenantMismatch({ tenantFingerprint: "" }, "cursor-key", true), true);
   assert.equal(continuationTenantMismatch({}, "cursor-key", true), true);
-  assert.equal(continuationTenantMismatch({ tenantFingerprint: "" }, "cursor-key", false), false);
+  assert.equal(continuationTenantMismatch({ tenantFingerprint: "" }, "cursor-key", false), true);
   assert.equal(continuationTenantMismatch({ tenantFingerprint: keyFingerprint("cursor-key") }, "cursor-key", true), false);
   assert.equal(continuationTenantMismatch({ tenantFingerprint: keyFingerprint("other-key") }, "cursor-key", true), true);
+});
+
+test("continuation key affinity is permissive by default", () => {
+  assert.equal(continuationTenantMismatch({ tenantFingerprint: keyFingerprint("old-key") }, "new-key"), false);
+});
+
+test("a retry under the replacement key does not cancel the active reseed", async (t) => {
+  const oldKey = "rotation-retry-old";
+  const newKey = "rotation-retry-new";
+  const { session } = seedSession("key-rotation-retry", oldKey);
+  const opened = await openTool(session);
+  opened.promise.catch(() => {});
+  let releaseSend;
+  const sendGate = new Promise((resolve) => { releaseSend = resolve; });
+  let sendStartedResolve;
+  const sendStarted = new Promise((resolve) => { sendStartedResolve = resolve; });
+  let cancels = 0;
+  const agent = {
+    async send() {
+      sendStartedResolve();
+      await sendGate;
+      return {
+        async wait() { return { status: "finished", result: "rotation retry completed" }; },
+        async cancel() { cancels++; },
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(newKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(newKey),
+  });
+  t.after(() => platforms.delete(keyHash(newKey)));
+  const result = { toolCallId: opened.call.wireId, content: "retry-safe result" };
+  const input = { history: "bounded prior conversation", clientMessageId: "ccm1_rotation_retry" };
+  const firstResponse = new MockResponse();
+  const first = handleContinue(request(), firstResponse, continuationBody([result], input), newKey);
+  await sendStarted;
+  const replacement = sessions.get(session.id);
+  assert.equal(replacement.cursorKey, newKey);
+
+  const retryResponse = new MockResponse();
+  const retry = handleContinue(request(), retryResponse, continuationBody([result], input), newKey);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(sessions.get(session.id), replacement);
+  assert.equal(cancels, 0);
+  releaseSend();
+  await Promise.all([first, retry]);
+  await waitFor(() => retryResponse.ended, "rotation retry handoff terminal");
+  assert.equal(cancels, 0);
+});
+
+test("key rotation waits for every handed sibling before reseeding", async (t) => {
+  const oldKey = "rotation-partial-old";
+  const newKey = "rotation-partial-new";
+  const { session } = seedSession("key-rotation-partial", oldKey);
+  const first = await openTool(session, { rawId: "first" });
+  first.promise.catch(() => {});
+  const secondPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "second",
+    name: "Lookup",
+    input: { q: "second" },
+    resultAdapter: (value) => value,
+  });
+  secondPromise.catch(() => {});
+  await waitFor(() => first.round.fifo.length === 2, "rotation sibling registration");
+  assert.equal(session.flushJournaledCalls(), true);
+  const second = first.round.calls.get(first.round.fifo[1]);
+  await waitFor(() => second.handedAt != null, "rotation sibling handoff");
+  first.round.markAwaitingResults();
+  session.activeRes = null;
+  session.responseWriter = null;
+
+  const sent = [];
+  const agent = {
+    async send(message) {
+      sent.push(message);
+      return {
+        async wait() { return { status: "finished", result: "all rotation results recovered" }; },
+        async cancel() {},
+      };
+    },
+    async close() {},
+  };
+  platforms.set(keyHash(newKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() { return agent; },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(newKey),
+  });
+  t.after(() => platforms.delete(keyHash(newKey)));
+
+  const input = { history: "bounded prior conversation" };
+  const partial = new MockResponse();
+  await handleContinue(request(), partial, continuationBody([{
+    toolCallId: first.call.wireId,
+    content: "first rotation result",
+  }], input), newKey);
+  assert.equal(partial.status, 200);
+  assert.match(partial.text(), /partial_results_deferred_for_fidelity/);
+  assert.equal(sent.length, 0);
+
+  const final = new MockResponse();
+  await handleContinue(request(), final, continuationBody([{
+    toolCallId: second.wireId,
+    content: "second rotation result",
+  }], input), newKey);
+  await waitFor(() => final.ended, "complete rotation sibling recovery");
+  assert.equal(final.status, 200);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /first rotation result/);
+  assert.match(sent[0], /second rotation result/);
+  await assert.rejects(first.promise, /credential_rotated/);
+  await assert.rejects(secondPromise, /credential_rotated/);
 });
 
 test("a valid signed result is receipted across the handoff timestamp crash window", async () => {

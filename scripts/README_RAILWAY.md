@@ -65,6 +65,7 @@ Default merge safety rules:
 - `COPILOT_TRANSPORT` (default `electron`) - Copilot transport selection: `electron` (Chromium net shim) or `go` (disable shim).
 - `INSTALL_ELECTRON` (default `0`) - when set to `1`, `scripts/railway_start.sh` will attempt to install Node.js + Electron at container start if `electron` is missing.
   - This is slower/less reliable than baking Electron into the image, but works for the common “railpack.json + start script” Railway path.
+- `CURSOR_COMPOSER_STRICT_KEY_AFFINITY` (default `false`) - when `true`, signed Cursor tool continuations are restricted to the exact API key that opened the round. The default treats a changed configured key as an authorized rotation and immediately reseeds from bounded history under the current key.
 - `COPILOT_ELECTRON_VERSION` (default `40.4.0`) - pinned Electron version installed by `scripts/railway_start.sh` when `INSTALL_ELECTRON=1`.
   - This avoids non-deterministic `electron@latest` drift across deploys.
 - `COPILOT_ELECTRON_MAX_ATTEMPTS` (default `2`) - in-shim retries for pre-response transient Electron transport errors (`ERR_CONNECTION_CLOSED`, `ERR_TIMED_OUT`, etc.).

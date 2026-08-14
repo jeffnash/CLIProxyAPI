@@ -431,7 +431,7 @@ func (e *composerBridgeStatusError) RetryAfter() *time.Duration { return e.retry
 
 func (e *composerBridgeStatusError) RetryScope() cliproxyexecutor.RetryScope {
 	switch e.bridgeCode {
-	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity":
+	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch":
 		return cliproxyexecutor.RetryScopeSelectedExecution
 	case "upstream_account_rate_limit":
 		return cliproxyexecutor.RetryScopeDefault
@@ -446,7 +446,7 @@ func (e *composerBridgeStatusError) RetryScope() cliproxyexecutor.RetryScope {
 
 func (e *composerBridgeStatusError) AuthAttributable() bool {
 	switch e.bridgeCode {
-	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity":
+	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch":
 		return false
 	case "upstream_account_rate_limit":
 		return true

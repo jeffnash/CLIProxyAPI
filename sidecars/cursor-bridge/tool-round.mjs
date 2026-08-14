@@ -73,6 +73,7 @@ export const TerminalReason = Object.freeze({
   PENDING_TIMEOUT: "pending_timeout",
   SESSION_EVICTED: "session_evicted",
   RESTART_LOST: "restart_lost",
+  CREDENTIAL_ROTATED: "credential_rotated",
   ROUND_LOST: "round_lost",
   LOOP_BOUND: "loop_bound",
   SHUTDOWN: "shutdown",

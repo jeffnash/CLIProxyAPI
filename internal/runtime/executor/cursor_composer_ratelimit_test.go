@@ -208,6 +208,19 @@ func TestComposerBridgeRateLimitAttributionUsesStructuredCode(t *testing.T) {
 	}
 }
 
+func TestComposerBridgeTenantMismatchIsNotCredentialAttributable(t *testing.T) {
+	err := &composerBridgeStatusError{
+		status:     http.StatusForbidden,
+		bridgeCode: "tenant_mismatch",
+	}
+	if got := err.RetryScope(); got != cliproxyexecutor.RetryScopeSelectedExecution {
+		t.Fatalf("RetryScope = %v, want %v", got, cliproxyexecutor.RetryScopeSelectedExecution)
+	}
+	if err.AuthAttributable() {
+		t.Fatal("tenant mismatch must not be attributed to credential health")
+	}
+}
+
 func TestComposerAdmissionGateShedsFreshTurnsAndBypassesToolResults(t *testing.T) {
 	t.Setenv("CURSOR_COMPOSER_GO_ADMISSION", "1")
 	t.Setenv("CURSOR_COMPOSER_ADMISSION_MAX_ACTIVE_PER_KEY", "1")

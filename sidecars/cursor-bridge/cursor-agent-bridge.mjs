@@ -460,6 +460,10 @@ function withClientLease(event, source, terminal) {
 // When unset (default), behavior is single-tenant: the bearer must equal CURSOR_API_KEY and is the key.
 const BRIDGE_TOKEN = process.env.CURSOR_AGENT_BRIDGE_TOKEN || "";
 const MULTI_TENANT = BRIDGE_TOKEN !== "";
+function strictKeyAffinityEnabled() {
+  const value = String(process.env.CURSOR_COMPOSER_STRICT_KEY_AFFINITY || "").trim().toLowerCase();
+  return value === "1" || value === "true";
+}
 // ADD-52: in multi-tenant mode the Authorization bearer is the PER-USER Cursor key CLIProxy forwards; each
 // user must therefore present their own key. The old code fell back to the global CURSOR_API_KEY when the
 // bearer was missing (misconfig / proxy stripping / direct sidecar access), collapsing tenant isolation and
@@ -6948,10 +6952,15 @@ function deferredErrorDetails(round, clientMessageId, details = null) {
   };
 }
 
-function continuationTenantMismatch(round, cursorKey, multiTenant = MULTI_TENANT) {
+function continuationCredentialRotated(round, cursorKey) {
   const stored = typeof round?.tenantFingerprint === "string" ? round.tenantFingerprint : "";
-  if (multiTenant && stored === "") return true;
   return stored !== "" && stored !== keyFingerprint(cursorKey);
+}
+
+function continuationTenantMismatch(round, cursorKey, strictKeyAffinity = strictKeyAffinityEnabled()) {
+  const stored = typeof round?.tenantFingerprint === "string" ? round.tenantFingerprint : "";
+  if (stored === "") return true;
+  return strictKeyAffinity && stored !== keyFingerprint(cursorKey);
 }
 
 function legacyRecoveryKeyFor(sessionId, clientMessageId) {
@@ -7274,10 +7283,11 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
       ]);
     }
     let round = liveToolRounds.get(route);
-    const hasLiveCallbacks = !!round;
+    let hasLiveCallbacks = !!round;
     if (!round) round = ToolRound.load(journal, codec, route);
     if (!round) throw new ToolRoundError("round_lost", "the signed tool round is not present in the durable journal", 410);
     routedRound = round;
+    const credentialRotated = continuationCredentialRotated(round, cursorKey);
     if (continuationTenantMismatch(round, cursorKey)) {
       throw new ToolRoundError("tenant_mismatch", "the signed tool round belongs to a different Cursor credential", 403);
     }
@@ -7456,6 +7466,27 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
       deferredInputId,
       deferredInput: hasDeferredInput ? input : null,
     });
+    let rotationOutstandingResults = 0;
+    if (credentialRotated) {
+      rotationOutstandingResults = round.unreceiptedHandedCallCount;
+      const oldSession = sessions.get(round.sessionId);
+      round.terminalize(
+        TerminalReason.CREDENTIAL_ROTATED,
+        "Cursor credential changed; continuing from durable history under the current credential",
+      );
+      liveToolRounds.delete(round.route);
+      if (oldSession
+          && keyFingerprint(oldSession.cursorKey) !== keyFingerprint(cursorKey)) {
+        await oldSession.cancel({
+          terminalReason: TerminalReason.CREDENTIAL_ROTATED,
+          detail: "Cursor credential changed; replacing the SDK session",
+        });
+        if (sessions.get(round.sessionId) === oldSession) sessions.delete(round.sessionId);
+      }
+      hasLiveCallbacks = false;
+      dbg("continuation credential rotated -> immediate durable recovery",
+        "session=" + round.sessionId, "route=" + round.route);
+    }
     // Bind the final-answer receipt to the immutable result values that the
     // model actually receives. A lossy/conflicting stateless projection may
     // be tolerated before a completion exists, but ToolRound's first durable
@@ -7514,6 +7545,16 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
     const remainingUnreceipted = hasLiveCallbacks
       ? round.unreceiptedOwedCallCount
       : round.unreceiptedHandedCallCount;
+    if (credentialRotated && rotationOutstandingResults > 0) {
+      await writeShortSse(res, {
+        type: "turn_end",
+        stop_reason: "tool_use",
+        receipt: "partial_results_deferred_for_fidelity",
+        outstandingToolCalls: rotationOutstandingResults,
+        ...continuationReceipt(round, committed),
+      }, round, false);
+      return;
+    }
     const liveOwner = hasLiveCallbacks ? sessions.get(round.sessionId) : null;
     const canHandRegisteredSibling = !!(liveOwner
       && liveOwner.currentRound === round
