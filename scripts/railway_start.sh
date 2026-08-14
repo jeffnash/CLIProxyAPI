@@ -926,7 +926,7 @@ info "Starting server and durable-state coordinator"
 SERVER_PID=$!
 
 if [[ -n "${CLIPROXY_STATE_SOCKET:-}" ]]; then
-  state_socket_attempts="${CLIPROXY_STATE_SOCKET_READY_ATTEMPTS:-60}"
+  state_socket_attempts="${CLIPROXY_STATE_SOCKET_READY_ATTEMPTS:-240}"
   for ((attempt = 0; attempt < state_socket_attempts; attempt++)); do
     if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
       wait "${SERVER_PID}" 2>/dev/null || true
