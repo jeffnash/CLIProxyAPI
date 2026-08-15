@@ -1382,6 +1382,28 @@ test("system context uses stable generic blocks for same, append, replacement, a
   );
 });
 
+test("in-turn system replacement preserves the response and bounded reseed authorization", async () => {
+  const session = new Session(`system-replacement-live-${Date.now()}`, "system-replacement-live-key");
+  const response = new MockResponse();
+  const nextBlockId = `csb1_${"d".repeat(40)}`;
+  let closes = 0;
+  session.seeded = true;
+  session.reseedAllowed = true;
+  session.agent = { async close() { closes++; } };
+  session.beginResponse(response);
+
+  await session.rotateForSystemReplacement([nextBlockId]);
+
+  assert.equal(session.reseedAllowed, true, "rotation must retain request-carried history authorization");
+  assert.equal(session.activeRes, response, "rotation must retain the current response");
+  assert.ok(session.responseWriter, "rotation must retain the current response writer");
+  assert.equal(session.done, false);
+  assert.equal(session.agent, null, "the stale SDK agent must not be reused");
+  assert.equal(closes, 1, "the stale SDK agent must be closed");
+  assert.doesNotMatch(response.text(), /session cancelled|stop_reason.*error/,
+    "internal rotation must not emit a client-visible cancellation terminal");
+});
+
 test("a warm agent receives only the new system-block suffix before the current user", async () => {
   const base = { id: `csb1_${"e".repeat(40)}`, text: "base policy must not repeat" };
   const suffix = { id: `csb1_${"f".repeat(40)}`, text: "new append-only policy" };

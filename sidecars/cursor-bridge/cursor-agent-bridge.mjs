@@ -4076,7 +4076,45 @@ class Session {
     await this.persistDurableAlias();
     this.pendingRecoveryAlias = "";
   }
-  async finishRotationCancel() { await this.cancel(); this.done = false; }
+  async finishRotationCancel() {
+    // A context rotation can happen after ensureAgent() resumes the old agent
+    // but before agent.send() installs a run. The current HTTP response and
+    // request-carried reseed authorization belong to the replacement turn;
+    // generic cancel() would terminalize that response and clear both.
+    if (!this.run && this.activeRes) {
+      const staleAgent = this.agent;
+      const staleLease = this.agentUseLease;
+      const cancelledRunEpoch = this.runEpoch;
+      this.agent = null;
+      this.agentPromise = null;
+      this.agentUseLease = null;
+      this.mcpServerKeys = null;
+      if (staleAgent && typeof staleAgent.close === "function") {
+        noteExpectedSdkAbort(this.id, cancelledRunEpoch);
+        await als.run({
+          session: this,
+          sdkCancellation: { sessionId: this.id, runEpoch: cancelledRunEpoch },
+        }, async () => {
+          try { await staleAgent.close(); }
+          catch (error) {
+            dbg("in-turn rotation stale agent cleanup failed", "session=" + this.id,
+              (error && error.message) || String(error));
+          }
+        });
+      }
+      if (staleLease) {
+        try { await staleLease.release(); }
+        catch (error) {
+          dbg("in-turn rotation stale lease release failed", "session=" + this.id,
+            (error && error.message) || String(error));
+        }
+      }
+      this.done = false;
+      return;
+    }
+    await this.cancel();
+    this.done = false;
+  }
   whenLogicalDone() { if (!this.run && !this.sendPending) return Promise.resolve(); return new Promise((r) => this._logicalDone.push(r)); }
   notifyLogicalDone() { const ws = this._logicalDone; this._logicalDone = []; for (const w of ws) { try { w(); } catch {} } }
   whenTurnSettled(token = this.turnToken) {
