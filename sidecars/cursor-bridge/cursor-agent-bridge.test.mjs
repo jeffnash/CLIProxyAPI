@@ -1145,30 +1145,35 @@ test("exact cancellation async context absorbs a multi-error leak after the same
   assert.match(exit.stderr, /expected SDK cancellation/);
 });
 
-test("a global cancellation ticket cannot mask an unrelated live SDK failure", async () => {
+test("a valid cancellation ticket absorbs its detached SDK AbortError while unrelated work stays live", async () => {
   const moduleUrl = new URL("./cursor-agent-bridge.mjs", import.meta.url).href;
   const code = `
     const bridge = await import(${JSON.stringify(moduleUrl)});
     bridge.noteExpectedSdkAbort("already-cancelled", 3);
     bridge.sessions.set("unrelated-live", { run: {}, activeRes: {}, done: false, runEpoch: 1 });
-    const closed = Object.assign(new Error("WritableIterable is closed"), { name: "WriteIterableClosedError" });
-    Promise.reject(closed);
-    setTimeout(() => process.exit(9), 1000);
+    const aborted = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+    Promise.reject(aborted);
+    setTimeout(() => {
+      process.stdout.write("BRIDGE_ALIVE unrelatedRun=true\\n");
+      process.exit(0);
+    }, 100);
   `;
   const exit = await spawnNodeCaptured(["--input-type=module", "--eval", code], {
     cwd: path.dirname(new URL(import.meta.url).pathname),
     env: { ...process.env, CURSOR_AGENT_STATE_ROOT: TEST_STATE_ROOT },
   });
-  assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 1, signal: null });
-  assert.match(exit.stderr, /ambiguous SDK input-stream closure; restarting isolated sidecar/);
+  assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 0, signal: null });
+  assert.match(exit.stdout, /BRIDGE_ALIVE unrelatedRun=true/);
+  assert.match(exit.stderr, /expected SDK cancellation lifecycle rejection ignored session=already-cancelled runEpoch=3 kind=AbortError/);
+  assert.doesNotMatch(exit.stderr, /restarting isolated sidecar/);
 });
 
-test("an unticketed identity-less SDK closure restarts only the sidecar instead of stranding a run", async () => {
+test("an unticketed identity-less SDK AbortError restarts only the sidecar instead of stranding a run", async () => {
   const moduleUrl = new URL("./cursor-agent-bridge.mjs", import.meta.url).href;
   const code = `
     await import(${JSON.stringify(moduleUrl)});
-    const closed = Object.assign(new Error("WritableIterable is closed"), { name: "WriteIterableClosedError" });
-    Promise.reject(closed);
+    const aborted = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+    Promise.reject(aborted);
     setTimeout(() => process.exit(9), 1000);
   `;
   const exit = await spawnNodeCaptured(["--input-type=module", "--eval", code], {
@@ -1176,7 +1181,7 @@ test("an unticketed identity-less SDK closure restarts only the sidecar instead 
     env: { ...process.env, CURSOR_AGENT_STATE_ROOT: TEST_STATE_ROOT },
   });
   assert.deepEqual({ code: exit.code, signal: exit.signal }, { code: 1, signal: null });
-  assert.match(exit.stderr, /unattributed SDK input-stream closure; restarting isolated sidecar/);
+  assert.match(exit.stderr, /unattributed SDK AbortError; restarting isolated sidecar/);
 });
 
 test("concurrent Session.cancel calls share one SDK teardown and upgrade notify", async () => {

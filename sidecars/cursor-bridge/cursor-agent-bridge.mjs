@@ -9772,7 +9772,7 @@ function noteExpectedSdkAbort(sessionId = "", runEpoch = null) {
   });
   pruneExpectedSdkAbortTickets(now);
 }
-function consumeExpectedSdkAbort(sessionsMap = sessions) {
+function consumeExpectedSdkAbortTicket(sessionsMap = sessions) {
   const now = nowMs();
   pruneExpectedSdkAbortTickets(now);
   const index = expectedSdkAbortTickets.findIndex((ticket) => {
@@ -9787,20 +9787,25 @@ function consumeExpectedSdkAbort(sessionsMap = sessions) {
         && Number.isSafeInteger(session.runEpoch)
         && session.runEpoch > ticket.runEpoch);
   });
-  if (index < 0) return false;
-  expectedSdkAbortTickets[index].matchesRemaining--;
+  if (index < 0) return null;
+  const ticket = expectedSdkAbortTickets[index];
+  const match = { sessionId: ticket.sessionId, runEpoch: ticket.runEpoch };
+  ticket.matchesRemaining--;
   pruneExpectedSdkAbortTickets(now);
-  return true;
+  return match;
+}
+function consumeExpectedSdkAbort(sessionsMap = sessions) {
+  return consumeExpectedSdkAbortTicket(sessionsMap) !== null;
 }
 // Cursor's SDK can leak WriteIterableClosedError / "Iterator was closed" from
 // internal async iterators after run.cancel()/agent.close(), outside the
-// promise being awaited. The rejection carries no session id. A recent
-// explicit-cancel ticket is weak temporal evidence for this SDK lifecycle
-// family. The unhandled-rejection policy may use it only when no live SDK work
-// exists; otherwise it restarts rather than letting a global ticket mask an
-// unrelated failure.
+// promise being awaited. The rejection carries no session id, so preserve the
+// matched explicit-cancel ticket for process-level attribution and logging.
+function consumeExpectedSdkLifecycleClosureTicket(sessionsMap = sessions) {
+  return consumeExpectedSdkAbortTicket(sessionsMap);
+}
 function consumeExpectedSdkLifecycleClosure(sessionsMap = sessions) {
-  return consumeExpectedSdkAbort(sessionsMap);
+  return consumeExpectedSdkLifecycleClosureTicket(sessionsMap) !== null;
 }
 function isSdkAbortError(reason) {
   return !!reason && (reason.name === "AbortError" || /operation was aborted/i.test(String(reason.message || "")));
@@ -9811,14 +9816,6 @@ function currentSdkCancellationContext() {
   if (!context || typeof context.sessionId !== "string" || !Number.isSafeInteger(context.runEpoch)) return null;
   return context;
 }
-function hasLiveSdkWork(sessionsMap = sessions) {
-  if (!sessionsMap || typeof sessionsMap.values !== "function") return false;
-  for (const session of sessionsMap.values()) {
-    if (session && !session.done && (session.run || session.sendPending)) return true;
-  }
-  return false;
-}
-
 let fatalRejectionShutdownStarted = false;
 process.on("unhandledRejection", (reason) => {
   try {
@@ -9834,21 +9831,22 @@ process.on("unhandledRejection", (reason) => {
         (reason && reason.message) || reason);
         return;
       }
-      const temporalTicket = consumeExpectedSdkLifecycleClosure(sessions);
-      if (temporalTicket && !hasLiveSdkWork(sessions)) {
+      const cancellationTicket = consumeExpectedSdkLifecycleClosureTicket(sessions);
+      if (cancellationTicket) {
         // Some SDK builds lose async context when forwarding cleanup through a
-        // native/event-emitter boundary. It is safe to use the bounded temporal
-        // fallback only when no run can be stranded or mistaken for the source.
-        console.error("[cursor-agent-bridge] expected SDK cancellation lifecycle rejection ignored with no live SDK work kind="
-          + sdkLifecycleKind + ":", (reason && reason.message) || reason);
+        // native/event-emitter boundary. The bounded ticket names the explicit
+        // cancellation source and is consumable only after that run is no
+        // longer live, so unrelated sessions must not be restarted with it.
+        console.error("[cursor-agent-bridge] expected SDK cancellation lifecycle rejection ignored session="
+          + cancellationTicket.sessionId + " runEpoch=" + cancellationTicket.runEpoch
+          + " kind=" + sdkLifecycleKind + ":", (reason && reason.message) || reason);
         return;
       }
-      // With live work and no exact async context, neither the global ticket nor
-      // a "sole live session" heuristic can identify the source. Restart the
-      // isolated sidecar: this avoids both killing an arbitrary session and
-      // swallowing a genuine failure that would strand a run forever.
-      console.error("[cursor-agent-bridge] " + (temporalTicket ? "ambiguous" : "unattributed")
-        + " SDK " + sdkLifecycleKind + "; restarting isolated sidecar:", (reason && reason.message) || reason);
+      // No exact context or valid explicit-cancel ticket identifies the source.
+      // Restart the isolated sidecar rather than swallowing a genuine failure
+      // that could strand a run forever.
+      console.error("[cursor-agent-bridge] unattributed SDK " + sdkLifecycleKind
+        + "; restarting isolated sidecar:", (reason && reason.message) || reason);
       void shutdown(1, false);
       return;
     }
