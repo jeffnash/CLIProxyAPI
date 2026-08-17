@@ -335,7 +335,7 @@ func composerBridgeTerminalReplaySafe(ev gjson.Result) bool {
 	switch ev.Get("retryMode").String() {
 	case "identical":
 		return true
-	case "split", "repair", "none":
+	case "split", "repair", "reseed", "none":
 		return false
 	}
 	// Rolling-upgrade compatibility for bridge versions predating retryMode.
@@ -431,7 +431,7 @@ func (e *composerBridgeStatusError) RetryAfter() *time.Duration { return e.retry
 
 func (e *composerBridgeStatusError) RetryScope() cliproxyexecutor.RetryScope {
 	switch e.bridgeCode {
-	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch":
+	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch", "cursor_session_auth_expired", "cursor_session_auth_recovery_unavailable":
 		return cliproxyexecutor.RetryScopeSelectedExecution
 	case "upstream_account_rate_limit":
 		return cliproxyexecutor.RetryScopeDefault
@@ -446,7 +446,7 @@ func (e *composerBridgeStatusError) RetryScope() cliproxyexecutor.RetryScope {
 
 func (e *composerBridgeStatusError) AuthAttributable() bool {
 	switch e.bridgeCode {
-	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch":
+	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch", "cursor_session_auth_expired", "cursor_session_auth_recovery_unavailable":
 		return false
 	case "upstream_account_rate_limit":
 		return true
@@ -650,8 +650,19 @@ func composerBridgeTurnFailure(responseID string, ev gjson.Result) error {
 		}
 		return newComposerBridgeUnavailableError(responseID, errors.New(emsg))
 	}
+	if code := ev.Get("errorCode").String(); code == "cursor_session_auth_recovery_unavailable" {
+		corr := composerCorrelationID()
+		log.Errorf("[composer %s] bridge SESSION-AUTH RECOVERY UNAVAILABLE corr=%s (-> 503)", responseID, corr)
+		return &composerBridgeStatusError{
+			status:      http.StatusServiceUnavailable,
+			correlation: corr,
+			bridgeCode:  code,
+			detail:      emsg,
+		}
+	}
 	// A non-retryable terminal that names a REPAIR-class retry mode is telling us
-	// the body must change ("repair") or be decomposed ("split") before it can
+	// the body must change ("repair"), be decomposed ("split"), or start a new
+	// invocation against a replacement agent ("reseed") before it can
 	// succeed. Collapsing that into an ordinary terminal surfaced HTTP 500, which
 	// reads as a server fault and invites the caller to replay the identical body
 	// — provably the one request that cannot work, so the retry budget burns and
@@ -660,7 +671,7 @@ func composerBridgeTurnFailure(responseID string, ev gjson.Result) error {
 	// (SelectedExecution, not auth-attributable) still blocks credential failover.
 	// ``none``/absent keeps ordinary terminal semantics.
 	switch ev.Get("retryMode").String() {
-	case "repair", "split":
+	case "repair", "split", "reseed":
 		corr := composerCorrelationID()
 		code := ev.Get("errorCode").String()
 		log.Errorf("[composer %s] bridge REPAIR-CLASS TERMINAL corr=%s code=%s mode=%s (-> 409)",

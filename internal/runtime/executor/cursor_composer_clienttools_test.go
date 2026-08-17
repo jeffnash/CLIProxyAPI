@@ -1006,6 +1006,56 @@ func TestComposerRepairClassTerminalMapsToTyped409(t *testing.T) {
 	}
 }
 
+func TestComposerSessionAuthTerminalsPreserveReseedAndUnavailableSemantics(t *testing.T) {
+	reseed := gjson.Parse(`{"type":"turn_end","stop_reason":"error",` +
+		`"receipt":"session_auth_expired_rotated","retryable":false,"retryMode":"reseed",` +
+		`"reseedRequired":true,"errorCode":"cursor_session_auth_expired",` +
+		`"error":"start a new invocation with bounded history"}`)
+	err := composerBridgeTurnFailure("resp_session_auth_reseed", reseed)
+	var bridgeErr *composerBridgeStatusError
+	if !errors.As(err, &bridgeErr) || bridgeErr.StatusCode() != http.StatusConflict {
+		t.Fatalf("session-auth reseed terminal must map to typed 409, got %T %v", err, err)
+	}
+	if bridgeErr.bridgeCode != "cursor_session_auth_expired" {
+		t.Fatalf("session-auth reseed code was lost: %#v", bridgeErr)
+	}
+	if bridgeErr.RetryScope() != cliproxyexecutor.RetryScopeSelectedExecution {
+		t.Fatalf("session-auth reseed must not switch credentials: %v", bridgeErr.RetryScope())
+	}
+	if bridgeErr.AuthAttributable() {
+		t.Fatal("expired SDK session state must not be attributed to the selected API key")
+	}
+	if composerBridgeTerminalReplaySafe(reseed) {
+		t.Fatal("a reseed terminal must never replay the identical accepted request")
+	}
+	if body := string(bridgeErr.APIErrorBody()); !strings.Contains(body, `"type":"invalid_request_error"`) ||
+		!strings.Contains(body, `"code":"cursor_session_auth_expired"`) {
+		t.Fatalf("session-auth reseed API body lost its typed contract: %s", body)
+	}
+
+	unavailable := gjson.Parse(`{"type":"turn_end","stop_reason":"error",` +
+		`"receipt":"session_auth_recovery_unavailable","retryable":false,"retryMode":"none",` +
+		`"errorCode":"cursor_session_auth_recovery_unavailable",` +
+		`"error":"durable recovery state could not be committed"}`)
+	err = composerBridgeTurnFailure("resp_session_auth_unavailable", unavailable)
+	if !errors.As(err, &bridgeErr) || bridgeErr.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("session-auth persistence failure must map to typed 503, got %T %v", err, err)
+	}
+	if bridgeErr.bridgeCode != "cursor_session_auth_recovery_unavailable" {
+		t.Fatalf("session-auth unavailable code was lost: %#v", bridgeErr)
+	}
+	if bridgeErr.RetryScope() != cliproxyexecutor.RetryScopeSelectedExecution {
+		t.Fatalf("session-auth persistence failure must stay on the selected execution: %v", bridgeErr.RetryScope())
+	}
+	if bridgeErr.AuthAttributable() {
+		t.Fatal("local durable-state failure must not be auth-attributable")
+	}
+	if body := string(bridgeErr.APIErrorBody()); !strings.Contains(body, `"type":"server_error"`) ||
+		!strings.Contains(body, `"code":"cursor_session_auth_recovery_unavailable"`) {
+		t.Fatalf("session-auth unavailable API body lost its typed contract: %s", body)
+	}
+}
+
 func TestComposerAmbiguousTrailingUserSegmentsFailClosed(t *testing.T) {
 	messages := gjson.Parse(`[
 		{"role":"user","content":"transfer the newest bundle"},

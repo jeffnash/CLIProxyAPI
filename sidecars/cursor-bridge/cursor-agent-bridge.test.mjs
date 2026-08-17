@@ -48,6 +48,7 @@ const { createRoundInfrastructure, ToolRound, ToolRoundError, TerminalReason } =
 const { ADMISSION_PRIORITY } = await import("./adaptive-reservation.mjs");
 const { markerPath, readMarker } = await import("./sdk-agent-gc.mjs");
 const {
+  ACCEPTANCE_PHASE,
   AdvertisedToolRegistry,
   appendRulesReminder,
   CC_CASES,
@@ -93,6 +94,7 @@ const {
   headlessRequestContext,
   healthBody,
   isConversationTooLong,
+  isCursorSessionAuthExpired,
   isLoopbackRemote,
   classifyMcpRoute,
   keyHash,
@@ -140,6 +142,8 @@ const {
   typedUnavailableResult,
   validateBindHost,
   wrapToolInput,
+  writeFreshDeliveryReceipt,
+  transitionFreshAttemptState,
 } = bridge;
 
 // P3.4: a corrupt alias no longer wedges all root discovery (fail-closed-throw) nor silently
@@ -4303,6 +4307,793 @@ test("a non-durable completion emits delivery-unknown error instead of clean suc
   assert.match(response.text(), /"stop_reason":"error"/);
   assert.doesNotMatch(response.text(), /"stop_reason":"end_turn"/);
   assert.equal(completedTurnReceipts.size, 0);
+});
+
+test("Cursor session auth classification is precise and never inspects successful streamed content", () => {
+  const message = "Authentication error If you are logged in, try logging out and back in.";
+  assert.equal(isCursorSessionAuthExpired(message), true);
+  assert.equal(isCursorSessionAuthExpired({ message }), true);
+  assert.equal(isCursorSessionAuthExpired({ code: "unauthenticated", message }), true);
+  assert.equal(isCursorSessionAuthExpired({ code: "unauthenticated", message: "SDK credential expired" }), false);
+  assert.equal(isCursorSessionAuthExpired("Authentication error"), false);
+  assert.equal(isCursorSessionAuthExpired({ message: `${message} Additional unrelated text.` }), false);
+
+  const session = new Session(`session-auth-stream-content-${Date.now()}`, "cursor-key");
+  const response = new MockResponse();
+  session.turnToken = 1;
+  session.beginResponse(response);
+  session.onRunComplete({ status: "finished", result: message, usage: {} });
+  assert.match(response.text(), /"stop_reason":"end_turn"/);
+  assert.equal(session.authEpoch, 0);
+  assert.equal(session.reseedRequired, false);
+});
+
+test("onRunError rotates only the affected durable agent and leaves same-key siblings and platform live", async (t) => {
+  const cursorKey = `session-auth-run-error-key-${Date.now()}`;
+  const session = new Session(`session-auth-run-error-${Date.now()}`, cursorKey);
+  const sibling = new Session(`session-auth-run-error-sibling-${Date.now()}`, cursorKey);
+  const platformEntry = {
+    promise: Promise.resolve({}),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  };
+  platforms.set(keyHash(cursorKey), platformEntry);
+  sessions.set(session.id, session);
+  sessions.set(sibling.id, sibling);
+  t.after(() => {
+    sessions.delete(session.id);
+    sessions.delete(sibling.id);
+    platforms.delete(keyHash(cursorKey));
+  });
+
+  const input = {
+    type: "user",
+    text: "accepted before onRunError",
+    invocationId: "invocation-session-auth-run-error-0001",
+  };
+  session.activeClientMessageId = input.invocationId;
+  session.activeClientMessageHash = completedTurnRequestHash(input);
+  session.activeClientMessageGeneration = 1;
+  session.activeClientMessageKind = "fresh";
+  session.activeIdentityPolicy = "invocation-v1";
+  session.agent = { async close() {} };
+  await session.persistDurableAlias();
+  const response = new MockResponse();
+  session.beginResponse(response);
+
+  session.onRunError(new Error(
+    "Authentication error If you are logged in, try logging out and back in.",
+  ));
+  await waitFor(() => session.authRecoveryPromise === null
+    && response.text().includes('"errorCode":"cursor_session_auth_expired"'),
+    "onRunError auth recovery");
+
+  assert.match(response.text(), /"errorCode":"cursor_session_auth_expired"/);
+  assert.equal(session.authEpoch, 1);
+  assert.equal(sibling.done, false);
+  assert.equal(platforms.get(keyHash(cursorKey)), platformEntry);
+});
+
+test("a later session-auth expiry advances the auth epoch without consuming another rotation budget", async (t) => {
+  const cursorKey = `session-auth-second-epoch-key-${Date.now()}`;
+  const session = new Session(`session-auth-second-epoch-${Date.now()}`, cursorKey);
+  session.authEpoch = 1;
+  session.agentId = session.composeAgentId();
+  session.reseedRequired = false;
+  session.reseedReason = "";
+  session.activeClientMessageId = "invocation-session-auth-second-epoch-0002";
+  session.activeClientMessageHash = completedTurnRequestHash({
+    type: "user",
+    text: "accepted on the first auth replacement",
+    invocationId: session.activeClientMessageId,
+  });
+  session.activeClientMessageGeneration = 1;
+  session.activeClientMessageKind = "fresh";
+  session.activeIdentityPolicy = "invocation-v1";
+  session.agent = { async close() {} };
+  await session.persistDurableAlias();
+  sessions.set(session.id, session);
+  t.after(() => sessions.delete(session.id));
+  const response = new MockResponse();
+  session.beginResponse(response);
+
+  session.onRunError(new Error(
+    "Authentication error If you are logged in, try logging out and back in.",
+  ));
+  await waitFor(() => session.authRecoveryPromise === null && session.authEpoch === 2,
+    "second session auth rotation");
+
+  assert.match(session.agentId, /_a2$/);
+  assert.equal(session.recoveryEpoch, 0);
+  assert.equal(session.modelEpoch, 0);
+  assert.equal(session.keyEpoch, 0);
+  assert.equal(session.contextEpoch, 0);
+  const cold = new Session(session.id, cursorKey);
+  assert.equal(cold.authEpoch, 2);
+  assert.equal(cold.agentId, session.agentId);
+});
+
+test("credential rotation preserves the durable session-auth epoch", async () => {
+  const oldKey = `session-auth-preserve-old-key-${Date.now()}`;
+  const newKey = `session-auth-preserve-new-key-${Date.now()}`;
+  const session = new Session(`session-auth-preserve-key-rotation-${Date.now()}`, oldKey);
+  session.authEpoch = 2;
+  session.agentId = session.composeAgentId();
+  await session.persistDurableAlias();
+
+  await session.rotateForKeyChange(newKey);
+
+  assert.equal(session.authEpoch, 2);
+  assert.match(session.agentId, /_k1_a2$/);
+  const cold = new Session(session.id, newKey);
+  assert.equal(cold.authEpoch, 2);
+  assert.equal(cold.agentId, session.agentId);
+});
+
+test("an accepted Cursor session auth failure rotates durably and rejects the exact retry", async (t) => {
+  const cursorKey = `session-auth-key-${Date.now()}`;
+  const sessionId = `session-auth-rotation-${Date.now()}`;
+  const input = {
+    type: "user",
+    text: "continue the durable conversation",
+    history: "bounded conversation history",
+    clientMessageId: "ccm2_session_auth_rotation",
+    invocationId: "invocation-session-auth-rotation-0001",
+  };
+  const requestHash = completedTurnRequestHash(input);
+  const session = new Session(sessionId, cursorKey);
+  const oldAgentId = session.agentId;
+  let oldAgentCloses = 0;
+  session.agent = { async close() { oldAgentCloses++; } };
+  session.activeClientMessageId = input.invocationId;
+  session.activeClientMessageHash = requestHash;
+  session.activeClientMessageGeneration = 1;
+  session.activeClientMessageKind = "fresh";
+  session.activeIdentityPolicy = "invocation-v1";
+  session.turnToken = 1;
+  session.streamedText = "partial answer";
+  await session.persistDurableAlias();
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, input.invocationId, requestHash, {
+    generation: 1,
+    agentId: oldAgentId,
+    idempotencyKey: "ccsend2_session_auth_rotation",
+    message: "frozen accepted message",
+    advertise: [],
+    model: "cursor-grok-4.6",
+    toolChoice: "",
+    seededSystem: "",
+    systemBlockIds: [],
+    hasImages: false,
+    identityPolicy: "invocation-v1",
+  });
+  transitionFreshAttemptState(
+    cursorKey,
+    sessionId,
+    input.invocationId,
+    requestHash,
+    ACCEPTANCE_PHASE.MAYBE_ACCEPTED,
+  );
+  transitionFreshAttemptState(
+    cursorKey,
+    sessionId,
+    input.invocationId,
+    requestHash,
+    ACCEPTANCE_PHASE.ACCEPTED,
+  );
+  sessions.set(sessionId, session);
+  t.after(() => sessions.delete(sessionId));
+
+  const first = new MockResponse();
+  session.beginResponse(first);
+  session.onRunComplete({
+    status: "error",
+    error: { message: "Authentication error If you are logged in, try logging out and back in." },
+  });
+  await waitFor(() => first.text().includes('"type":"turn_end"'), "session auth recovery terminal");
+
+  assert.match(first.text(), /"errorCode":"cursor_session_auth_expired"/);
+  assert.match(first.text(), /"receipt":"session_auth_expired_rotated"/);
+  assert.match(first.text(), /"retryMode":"reseed"/);
+  assert.equal([...first.text().matchAll(/"type":"turn_end"/g)].length, 1);
+  assert.equal(session.authEpoch, 1);
+  assert.notEqual(session.agentId, oldAgentId);
+  assert.match(session.agentId, /_a1$/);
+  assert.equal(session.reseedRequired, true);
+  assert.equal(oldAgentCloses, 1);
+
+  const failureFile = exactTurnReceiptFile(cursorKey, sessionId, input.invocationId, input);
+  const persisted = JSON.parse(readFileSync(failureFile, "utf8"));
+  assert.equal(persisted.recordType, "session_auth_failure");
+  assert.equal(persisted.failureCode, "cursor_session_auth_expired");
+  assert.equal(Object.hasOwn(persisted, "agentId"), false);
+  assert.equal(Object.hasOwn(persisted, "deliveryMessage"), false);
+  const reservationKey = path.basename(failureFile);
+  const reservationDir = path.join(TEST_STATE_ROOT, ".cct-completed-turns", ".unresolved-reservations");
+  const reserved = readdirSync(reservationDir)
+    .filter((name) => /^[a-f0-9]\.json$/.test(name))
+    .some((name) => {
+      const ledger = JSON.parse(readFileSync(path.join(reservationDir, name), "utf8"));
+      return Object.hasOwn(ledger.entries || {}, reservationKey);
+    });
+  assert.equal(reserved, true, "the permanent accepted-failure evidence must remain capacity-accounted");
+  const roots = sdkAgentGCRoots();
+  assert.equal(roots.has(oldAgentId), false, "the compact failure receipt must not root the poisoned agent");
+  assert.equal(roots.has(session.agentId), true, "the replacement alias must remain the durable GC root");
+
+  const exactRetry = new MockResponse();
+  await handleTurn(request(), exactRetry, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input,
+  }), cursorKey);
+  assert.equal(exactRetry.status, 409);
+  assert.equal(exactRetry.json().error.code, "cursor_session_auth_expired");
+});
+
+test("ingress idempotently reconciles a crash after auth alias publication", async (t) => {
+  const cursorKey = `session-auth-crash-key-${Date.now()}`;
+  const sessionId = `session-auth-crash-${Date.now()}`;
+  const input = {
+    type: "user",
+    text: "accepted before the bridge crash",
+    history: "bounded history before the crash",
+    invocationId: "invocation-session-auth-crash-0001",
+  };
+  const requestHash = completedTurnRequestHash(input);
+  const primed = new Session(sessionId, cursorKey);
+  const sourceAgentId = primed.agentId;
+  await primed.persistDurableAlias();
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, input.invocationId, requestHash, {
+    generation: 1,
+    agentId: sourceAgentId,
+    idempotencyKey: "ccsend2_session_auth_crash",
+    message: "accepted envelope before crash",
+    advertise: [],
+    model: "cursor-grok-4.6",
+    toolChoice: "",
+    seededSystem: "",
+    systemBlockIds: [],
+    hasImages: false,
+    identityPolicy: "invocation-v1",
+  });
+  transitionFreshAttemptState(cursorKey, sessionId, input.invocationId, requestHash,
+    ACCEPTANCE_PHASE.MAYBE_ACCEPTED);
+  transitionFreshAttemptState(cursorKey, sessionId, input.invocationId, requestHash,
+    ACCEPTANCE_PHASE.ACCEPTED);
+
+  primed.authEpoch = 1;
+  primed.agentId = primed.composeAgentId();
+  primed.reseedRequired = true;
+  primed.reseedReason = "session_auth_expired";
+  primed.pendingSessionAuthFailure = {
+    version: 1,
+    clientMessageId: input.invocationId,
+    requestHash,
+    requestKind: "fresh",
+    identityPolicy: "invocation-v1",
+    generation: 1,
+    sourceAgentId,
+    replacementAgentId: primed.agentId,
+    clientLeaseToken: "77",
+    detectedAt: Date.now(),
+  };
+  await primed.persistDurableAlias();
+  sessions.delete(sessionId);
+  t.after(() => sessions.delete(sessionId));
+
+  const retry = new MockResponse();
+  await handleTurn(request(), retry, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input,
+  }), cursorKey);
+
+  assert.equal(retry.status, 409);
+  assert.equal(retry.json().error.code, "cursor_session_auth_expired");
+  const reconciled = new Session(sessionId, cursorKey);
+  assert.equal(reconciled.agentId, primed.agentId);
+  assert.equal(reconciled.authEpoch, 1);
+  assert.equal(reconciled.reseedRequired, true);
+  assert.equal(reconciled.pendingSessionAuthFailure, null);
+  const failureReceipt = JSON.parse(readFileSync(
+    exactTurnReceiptFile(cursorKey, sessionId, input.invocationId, input),
+    "utf8",
+  ));
+  assert.equal(failureReceipt.recordType, "session_auth_failure");
+  assert.equal(failureReceipt.clientLeaseToken, "77");
+});
+
+test("session-auth recovery persistence failure fences the session and returns typed unavailable", async (t) => {
+  const cursorKey = `session-auth-persist-failure-key-${Date.now()}`;
+  const sessionId = `session-auth-persist-failure-${Date.now()}`;
+  const input = {
+    type: "user",
+    text: "accepted before durable auth recovery fails",
+    history: "bounded history",
+    invocationId: "invocation-session-auth-persist-failure-0001",
+  };
+  const requestHash = completedTurnRequestHash(input);
+  const session = new Session(sessionId, cursorKey);
+  const oldAgentId = session.agentId;
+  let closes = 0;
+  session.agent = { async close() { closes++; } };
+  session.activeClientMessageId = input.invocationId;
+  session.activeClientMessageHash = requestHash;
+  session.activeClientMessageGeneration = 1;
+  session.activeClientMessageKind = "fresh";
+  session.activeIdentityPolicy = "invocation-v1";
+  await session.persistDurableAlias();
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, input.invocationId, requestHash, {
+    generation: 1,
+    agentId: oldAgentId,
+    idempotencyKey: "ccsend2_session_auth_persist_failure",
+    message: "accepted envelope",
+    advertise: [],
+    model: "cursor-grok-4.6",
+    toolChoice: "",
+    seededSystem: "",
+    systemBlockIds: [],
+    hasImages: false,
+    identityPolicy: "invocation-v1",
+  });
+  transitionFreshAttemptState(cursorKey, sessionId, input.invocationId, requestHash,
+    ACCEPTANCE_PHASE.MAYBE_ACCEPTED);
+  transitionFreshAttemptState(cursorKey, sessionId, input.invocationId, requestHash,
+    ACCEPTANCE_PHASE.ACCEPTED);
+  sessions.set(sessionId, session);
+
+  const scope = createHash("sha256")
+    .update(keyFingerprint(cursorKey))
+    .update("\0")
+    .update(sessionId)
+    .digest("hex");
+  const blockedAlias = path.join(TEST_STATE_ROOT, ".cct-agent-alias", `${scope}.json`);
+  rmSync(blockedAlias, { force: true });
+  mkdirSync(blockedAlias, { recursive: true });
+  t.after(() => {
+    sessions.delete(sessionId);
+    rmSync(blockedAlias, { recursive: true, force: true });
+  });
+
+  const failed = new MockResponse();
+  session.beginResponse(failed);
+  session.onRunComplete({
+    status: "error",
+    error: { message: "Authentication error If you are logged in, try logging out and back in." },
+  });
+  await waitFor(() => failed.text().includes('"type":"turn_end"'),
+    "typed auth recovery persistence failure");
+
+  assert.match(failed.text(), /"errorCode":"cursor_session_auth_recovery_unavailable"/);
+  assert.match(failed.text(), /"retryable":false/);
+  assert.match(String(session.sessionAuthRecoveryUnavailable), /cannot (?:read|persist) durable Cursor agent alias/);
+  assert.equal(session.agentId, oldAgentId);
+  assert.equal(session.authEpoch, 0);
+  assert.equal(closes, 0, "the old identity must not be discarded before a replacement alias commits");
+
+  const retry = new MockResponse();
+  await handleTurn(request(), retry, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input: { ...input, invocationId: "invocation-session-auth-persist-failure-new-0002" },
+  }), cursorKey);
+  assert.equal(retry.status, 503);
+  assert.equal(retry.json().error.code, "cursor_session_auth_recovery_unavailable");
+});
+
+test("a new invocation seeds the auth replacement once and durably clears reseed-required", async (t) => {
+  const cursorKey = `session-auth-reseed-key-${Date.now()}`;
+  const sessionId = `session-auth-reseed-${Date.now()}`;
+  const failedInput = {
+    type: "user",
+    text: "the accepted turn that expires",
+    history: "bounded history before expiry",
+    invocationId: "invocation-session-auth-reseed-failed-0001",
+  };
+  const failedHash = completedTurnRequestHash(failedInput);
+  const session = new Session(sessionId, cursorKey);
+  session.agent = { async close() {} };
+  session.activeClientMessageId = failedInput.invocationId;
+  session.activeClientMessageHash = failedHash;
+  session.activeClientMessageGeneration = 1;
+  session.activeClientMessageKind = "fresh";
+  session.activeIdentityPolicy = "invocation-v1";
+  await session.persistDurableAlias();
+  await writeFreshDeliveryReceipt(cursorKey, sessionId, failedInput.invocationId, failedHash, {
+    generation: 1,
+    agentId: session.agentId,
+    idempotencyKey: "ccsend2_session_auth_reseed_failed",
+    message: "accepted failed turn",
+    advertise: [],
+    model: "cursor-grok-4.6",
+    toolChoice: "",
+    seededSystem: "",
+    systemBlockIds: [],
+    hasImages: false,
+    identityPolicy: "invocation-v1",
+  });
+  transitionFreshAttemptState(cursorKey, sessionId, failedInput.invocationId, failedHash,
+    ACCEPTANCE_PHASE.MAYBE_ACCEPTED);
+  transitionFreshAttemptState(cursorKey, sessionId, failedInput.invocationId, failedHash,
+    ACCEPTANCE_PHASE.ACCEPTED);
+  sessions.set(sessionId, session);
+  t.after(() => {
+    sessions.delete(sessionId);
+    platforms.delete(keyHash(cursorKey));
+  });
+  const failed = new MockResponse();
+  session.beginResponse(failed);
+  session.onRunComplete({
+    status: "error",
+    error: { message: "Authentication error If you are logged in, try logging out and back in." },
+  });
+  await waitFor(() => session.reseedRequired === true && session.authRecoveryPromise === null,
+    "durable auth rotation");
+
+  const replacementAgentId = session.agentId;
+  const sent = [];
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent(agentId) {
+        assert.equal(agentId, replacementAgentId);
+        throw new Error("agent not found");
+      },
+      async createAgent({ agentId }) {
+        assert.equal(agentId, replacementAgentId);
+        return {
+          async send(message) {
+            sent.push(message);
+            return {
+              async wait() { return { status: "finished", result: "reseeded answer", usage: {} }; },
+              async cancel() {},
+            };
+          },
+          async close() {},
+        };
+      },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+
+  const replacementInput = {
+    type: "user",
+    text: "continue after the expired session",
+    history: "complete bounded history for replacement",
+    invocationId: "invocation-session-auth-reseed-new-0002",
+  };
+  const response = new MockResponse();
+  await handleTurn(request(), response, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input: replacementInput,
+  }), cursorKey);
+  await waitFor(() => response.text().includes('"stop_reason":"end_turn"'),
+    "replacement completion");
+
+  assert.equal(sent.length, 1);
+  assert.match(String(sent[0]), /complete bounded history for replacement/);
+  assert.equal(session.reseedRequired, false);
+  const cold = new Session(sessionId, cursorKey);
+  assert.equal(cold.agentId, replacementAgentId);
+  assert.equal(cold.reseedRequired, false);
+});
+
+test("an unseeded auth replacement refuses a history-less turn before any SDK call", async (t) => {
+  const cursorKey = `session-auth-no-history-key-${Date.now()}`;
+  const sessionId = `session-auth-no-history-${Date.now()}`;
+  const primed = new Session(sessionId, cursorKey);
+  primed.authEpoch = 1;
+  primed.agentId = primed.composeAgentId();
+  primed.reseedRequired = true;
+  primed.reseedReason = "session_auth_expired";
+  await primed.persistDurableAlias();
+
+  let resumes = 0;
+  let sends = 0;
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() {
+        resumes++;
+        return {
+          async send() {
+            sends++;
+            throw new Error("must not send without bounded history");
+          },
+        };
+      },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  t.after(() => {
+    sessions.delete(sessionId);
+    platforms.delete(keyHash(cursorKey));
+  });
+
+  const response = new MockResponse();
+  await handleTurn(request(), response, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input: {
+      type: "user",
+      text: "continue without replay context",
+      invocationId: "invocation-session-auth-no-history-0001",
+    },
+  }), cursorKey);
+
+  assert.equal(response.status, 410);
+  assert.equal(response.json().error.code, "collected_agent_history_required");
+  assert.equal(resumes, 0);
+  assert.equal(sends, 0);
+});
+
+test("an auth replacement refuses identity-less and unversioned legacy turns even when history is present", async (t) => {
+  const cursorKey = `session-auth-legacy-reseed-key-${Date.now()}`;
+  const sessionId = `session-auth-legacy-reseed-${Date.now()}`;
+  const primed = new Session(sessionId, cursorKey);
+  primed.authEpoch = 1;
+  primed.agentId = primed.composeAgentId();
+  primed.reseedRequired = true;
+  primed.reseedReason = "session_auth_expired";
+  await primed.persistDurableAlias();
+  let resumes = 0;
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent() { resumes++; return {}; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  t.after(() => {
+    sessions.delete(sessionId);
+    platforms.delete(keyHash(cursorKey));
+  });
+
+  const response = new MockResponse();
+  await handleTurn(request(), response, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input: {
+      type: "user",
+      text: "legacy recovery without an invocation identity",
+      history: "bounded history is not enough without a new logical identity",
+    },
+  }), cursorKey);
+
+  assert.equal(response.status, 409);
+  assert.equal(response.json().error.code, "cursor_session_auth_expired");
+
+  const legacyResponse = new MockResponse();
+  await handleTurn(request(), legacyResponse, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input: {
+      type: "user",
+      text: "legacy recovery with an arbitrary old client message id",
+      history: "bounded history is not enough without a new logical identity",
+      clientMessageId: "legacy-session-auth-reseed-0001",
+    },
+  }), cursorKey);
+
+  assert.equal(legacyResponse.status, 409);
+  assert.equal(legacyResponse.json().error.code, "cursor_session_auth_expired");
+  assert.equal(resumes, 0);
+});
+
+test("an auth replacement refuses identity-less and legacy signed continuations before result mutation", async (t) => {
+  const cursorKey = `session-auth-continuation-identity-key-${Date.now()}`;
+  const { session } = seedSession(`session-auth-continuation-identity-${Date.now()}`, cursorKey);
+  const opened = await openTool(session);
+  session.authEpoch = 1;
+  session.agentId = session.composeAgentId();
+  session.reseedRequired = true;
+  session.reseedReason = "session_auth_expired";
+  await session.persistDurableAlias();
+  t.after(async () => {
+    await session.cancel();
+    sessions.delete(session.id);
+  });
+
+  const result = { toolCallId: opened.call.wireId, content: "must remain uncommitted" };
+  for (const extraInput of [{}, { clientMessageId: "legacy-continuation-reseed-0001" }]) {
+    const response = new MockResponse();
+    await handleContinue(request(), response, continuationBody([result], {
+      ...extraInput,
+      history: "bounded recovery history",
+    }), cursorKey);
+
+    assert.equal(response.status, 409);
+    assert.equal(response.json().error.code, "cursor_session_auth_expired");
+    assert.equal(journalRecord(opened.round.route).calls[0].receipt, null);
+  }
+});
+
+test("an unversioned mixed-route continuation is auth-gated before mutating any route", async (t) => {
+  const cursorKey = `session-auth-mixed-route-key-${Date.now()}`;
+  const first = seedSession(`session-auth-mixed-route-first-${Date.now()}`, cursorKey).session;
+  const second = seedSession(`session-auth-mixed-route-second-${Date.now()}`, cursorKey).session;
+  const firstOpened = await openTool(first, { rawId: "mixed-auth-first" });
+  const secondOpened = await openTool(second, { rawId: "mixed-auth-second" });
+  for (const session of [first, second]) {
+    session.authEpoch = 1;
+    session.agentId = session.composeAgentId();
+    session.reseedRequired = true;
+    session.reseedReason = "session_auth_expired";
+    await session.persistDurableAlias();
+  }
+  t.after(async () => {
+    await Promise.all([first.cancel(), second.cancel()]);
+    sessions.delete(first.id);
+    sessions.delete(second.id);
+  });
+
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody([
+    { toolCallId: firstOpened.call.wireId, content: "first must remain uncommitted" },
+    { toolCallId: secondOpened.call.wireId, content: "second must remain uncommitted" },
+  ], {
+    clientMessageId: "legacy-mixed-route-auth-reseed-0001",
+    history: "bounded recovery history",
+  }, {
+    sessionId: first.id,
+  }), cursorKey);
+
+  assert.equal(response.status, 409);
+  assert.equal(response.json().error.code, "cursor_session_auth_expired");
+  assert.equal(journalRecord(firstOpened.round.route).calls[0].receipt, null);
+  assert.equal(journalRecord(secondOpened.round.route).calls[0].receipt, null);
+});
+
+test("a signed continuation reports auth reconciliation failures with the session-auth unavailable code", async (t) => {
+  const cursorKey = `session-auth-continuation-corrupt-alias-key-${Date.now()}`;
+  const { session } = seedSession(`session-auth-continuation-corrupt-alias-${Date.now()}`, cursorKey);
+  const opened = await openTool(session);
+  await session.persistDurableAlias();
+  const aliasScope = createHash("sha256")
+    .update(keyFingerprint(cursorKey))
+    .update("\0")
+    .update(session.id)
+    .digest("hex");
+  const aliasFile = path.join(TEST_STATE_ROOT, ".cct-agent-alias", `${aliasScope}.json`);
+  writeFileSync(aliasFile, "not-json\n");
+  t.after(async () => {
+    await session.cancel();
+    sessions.delete(session.id);
+    rmSync(aliasFile, { force: true });
+  });
+
+  const response = new MockResponse();
+  await handleContinue(request(), response, continuationBody([{
+    toolCallId: opened.call.wireId,
+    content: "must remain uncommitted",
+  }], {
+    invocationId: "invocation-session-auth-corrupt-alias-0001",
+  }), cursorKey);
+
+  assert.equal(response.status, 503);
+  assert.equal(response.json().error.code, "cursor_session_auth_recovery_unavailable");
+  assert.equal(journalRecord(opened.round.route).calls[0].receipt, null);
+});
+
+test("an auth-failed signed continuation returns 409 before mutating tool results", async (t) => {
+  const cursorKey = `session-auth-continuation-key-${Date.now()}`;
+  const { session, output } = seedSession(`session-auth-continuation-${Date.now()}`, cursorKey);
+  const opened = await openTool(session);
+  const input = {
+    type: "tool_results",
+    results: [{ toolCallId: opened.call.wireId, content: "must not be applied after auth expiry" }],
+    invocationId: "invocation-session-auth-continuation-0001",
+  };
+  session.activeClientMessageId = input.invocationId;
+  session.activeClientMessageHash = completedTurnRequestHash(input);
+  session.activeClientMessageGeneration = 1;
+  session.activeClientMessageKind = "continuation";
+  session.activeIdentityPolicy = "invocation-v1";
+  session.agent = { async close() {} };
+  await session.persistDurableAlias();
+  t.after(() => sessions.delete(session.id));
+
+  session.onRunComplete({
+    status: "error",
+    error: { message: "Authentication error If you are logged in, try logging out and back in." },
+  });
+  await waitFor(() => session.authRecoveryPromise === null && session.reseedRequired,
+    "continuation auth recovery");
+  assert.match(output.text(), /"errorCode":"cursor_session_auth_expired"/);
+  assert.equal(journalRecord(opened.round.route).calls[0].receipt, null);
+
+  const retry = new MockResponse();
+  await handleContinue(request(), retry, continuationBody(input.results, {
+    invocationId: input.invocationId,
+  }), cursorKey);
+
+  assert.equal(retry.status, 409);
+  assert.equal(retry.json().error.code, "cursor_session_auth_expired");
+  assert.equal(journalRecord(opened.round.route).calls[0].receipt, null);
+});
+
+test("a new signed continuation recovers on the durable auth replacement instead of a generic recovery agent", async (t) => {
+  const cursorKey = `session-auth-continuation-reseed-key-${Date.now()}`;
+  const { session } = seedSession(`session-auth-continuation-reseed-${Date.now()}`, cursorKey);
+  const opened = await openTool(session);
+  const failedInput = {
+    type: "tool_results",
+    results: [{ toolCallId: opened.call.wireId, content: "accepted before auth expiry" }],
+    invocationId: "invocation-session-auth-continuation-reseed-failed-0001",
+  };
+  session.activeClientMessageId = failedInput.invocationId;
+  session.activeClientMessageHash = completedTurnRequestHash(failedInput);
+  session.activeClientMessageGeneration = 1;
+  session.activeClientMessageKind = "continuation";
+  session.activeIdentityPolicy = "invocation-v1";
+  session.agent = { async close() {} };
+  await session.persistDurableAlias();
+
+  session.onRunComplete({
+    status: "error",
+    error: { message: "Authentication error If you are logged in, try logging out and back in." },
+  });
+  await waitFor(() => session.authRecoveryPromise === null && session.reseedRequired,
+    "continuation auth rotation");
+  const replacementAgentId = session.agentId;
+  const resumed = [];
+  const created = [];
+  const sent = [];
+  platforms.set(keyHash(cursorKey), {
+    promise: Promise.resolve({
+      async resumeAgent(agentId) {
+        resumed.push(agentId);
+        throw new Error("agent not found");
+      },
+      async createAgent({ agentId }) {
+        created.push(agentId);
+        return {
+          async send(message) {
+            sent.push(message);
+            return {
+              async wait() { return { status: "finished", result: "recovered answer", usage: {} }; },
+              async cancel() {},
+            };
+          },
+          async close() {},
+        };
+      },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  t.after(() => {
+    sessions.delete(session.id);
+    platforms.delete(keyHash(cursorKey));
+  });
+
+  const recovery = new MockResponse();
+  await handleContinue(request(), recovery, continuationBody(
+    [{ toolCallId: opened.call.wireId, content: "accepted before auth expiry" }],
+    {
+      invocationId: "invocation-session-auth-continuation-reseed-new-0002",
+      history: "complete bounded history for the continuation replacement",
+    },
+    { model: "cursor-grok-4.6" },
+  ), cursorKey);
+  await waitFor(() => recovery.text().includes('"stop_reason":"end_turn"'),
+    "continuation auth replacement completion");
+
+  assert.deepEqual(resumed, [replacementAgentId]);
+  assert.deepEqual(created, [replacementAgentId]);
+  assert.equal(sent.length, 1);
+  assert.match(String(sent[0]), /complete bounded history for the continuation replacement/);
+  assert.equal(session.agentId, replacementAgentId);
+  assert.equal(session.reseedRequired, false);
 });
 
 test("a post-acceptance fresh run failure retains one frozen generation across retry", async () => {

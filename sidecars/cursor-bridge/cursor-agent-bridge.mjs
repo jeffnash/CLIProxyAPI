@@ -419,10 +419,23 @@ const SDK_AGENT_GC_PRESSURE_LOW_PCT = envInt(
 );
 const SDK_AGENT_GC_DIR = path.join(STATE_ROOT, ".cct-agent-gc");
 const agentLeaseManager = new DurableAgentLeaseManager(path.join(STATE_ROOT, ".cct-agent-leases"));
-const withAliasPublicationLease = (cursorKey, agentId, publish) => agentLeaseManager.withLock({
+const withAliasStateLease = (cursorKey, sessionId, publish) => agentLeaseManager.withLock({
+  scope: keyHash(cursorKey),
+  // The alias path is keyed by credential + external session, not by the
+  // mutable target agent. Lock the stable publication identity so two
+  // rotations cannot concurrently overwrite the same alias through distinct
+  // target-agent locks.
+  agentId: `session-alias-${createHash("sha256").update(String(sessionId || "")).digest("hex").slice(0, 32)}`,
+}, publish);
+const withAgentMutationLease = (cursorKey, agentId, mutate) => agentLeaseManager.withLock({
   scope: keyHash(cursorKey),
   agentId,
-}, publish);
+}, mutate);
+const withAliasPublicationLease = (cursorKey, sessionId, agentId, publish) => withAliasStateLease(
+  cursorKey,
+  sessionId,
+  () => withAgentMutationLease(cursorKey, agentId, publish),
+);
 
 function stateRootDiskStatus(requiredBytes = 0, statfs = statfsSync) {
   try {
@@ -1629,11 +1642,43 @@ function agentAliasPathFor(cursorKey, sessionId) {
     .digest("hex");
   return path.join(AGENT_ALIAS_DIR, `${scope}.json`);
 }
+const DURABLE_AGENT_ALIAS_VERSION = 3;
+const SESSION_AUTH_FAILURE_CODE = "cursor_session_auth_expired";
+const SESSION_AUTH_RESEED_REASON = "session_auth_expired";
+
+function validPendingSessionAuthFailure(value) {
+  if (value == null) return true;
+  return !!value && typeof value === "object" && !Array.isArray(value)
+    && value.version === 1
+    && typeof value.clientMessageId === "string" && value.clientMessageId.length <= 512
+    && /^[a-f0-9]{64}$/.test(String(value.requestHash || ""))
+    && (value.requestKind === "fresh" || value.requestKind === "continuation")
+    && (value.identityPolicy === TURN_IDENTITY_POLICY.NONE
+      || value.identityPolicy === TURN_IDENTITY_POLICY.INVOCATION_V1
+      || value.identityPolicy === TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1)
+    && Number.isSafeInteger(value.generation) && value.generation >= 1
+    && typeof value.sourceAgentId === "string" && value.sourceAgentId.length > 0
+    && typeof value.replacementAgentId === "string" && value.replacementAgentId.length > 0
+    && (value.clientLeaseToken === undefined || typeof value.clientLeaseToken === "string")
+    && Number.isSafeInteger(value.detectedAt) && value.detectedAt > 0;
+}
+
+function normalizeDurableAgentAlias(record) {
+  if (record.version === DURABLE_AGENT_ALIAS_VERSION) return record;
+  return {
+    ...record,
+    authEpoch: 0,
+    reseedRequired: false,
+    reseedReason: "",
+    pendingSessionAuthFailure: null,
+  };
+}
+
 function validateDurableAgentAlias(record, cursorKey, sessionId) {
   const expectedSessionId = String(sessionId || "");
   const epochValid = (value) => value === undefined
     || (Number.isSafeInteger(value) && value >= 0 && value <= 1024);
-  const v2MetadataValid = record?.version !== 2 || (
+  const metadataValid = (record?.version !== 2 && record?.version !== DURABLE_AGENT_ALIAS_VERSION) || (
     Number.isSafeInteger(record.createdAt)
     && Number.isSafeInteger(record.lastUsedAt)
     && record.createdAt > 0
@@ -1643,8 +1688,14 @@ function validateDurableAgentAlias(record, cursorKey, sessionId) {
     && (record.conversationBinding === ""
       || /^[a-f0-9]{64}$/.test(String(record.conversationBinding || "")))
   );
+  const v3Valid = record?.version !== DURABLE_AGENT_ALIAS_VERSION || (
+    Number.isSafeInteger(record.authEpoch) && record.authEpoch >= 0
+    && typeof record.reseedRequired === "boolean"
+    && (record.reseedReason === "" || record.reseedReason === SESSION_AUTH_RESEED_REASON)
+    && validPendingSessionAuthFailure(record.pendingSessionAuthFailure)
+  );
   if (!record || typeof record !== "object" || Array.isArray(record)
-      || (record.version !== 1 && record.version !== 2)
+      || (record.version !== 1 && record.version !== 2 && record.version !== DURABLE_AGENT_ALIAS_VERSION)
       || record.keyFingerprint !== keyFingerprint(cursorKey)
       || record.sessionId !== expectedSessionId
       || typeof record.agentId !== "string"
@@ -1656,17 +1707,18 @@ function validateDurableAgentAlias(record, cursorKey, sessionId) {
       || !epochValid(record.keyEpoch)
       || !epochValid(record.contextEpoch)
       || (record.systemBlockIds !== undefined && !validSystemBlockIds(record.systemBlockIds))
-      || !v2MetadataValid) {
+      || !metadataValid
+      || !v3Valid) {
     throw new Error("durable Cursor agent alias is malformed or belongs to another session/credential");
   }
-  return record;
+  return normalizeDurableAgentAlias(record);
 }
 
 function validateDurableAgentAliasRoot(record) {
   const epochValid = (value) => value === undefined
     || (Number.isSafeInteger(value) && value >= 0 && value <= 1024);
   const basicValid = record && typeof record === "object" && !Array.isArray(record)
-    && (record.version === 1 || record.version === 2)
+    && (record.version === 1 || record.version === 2 || record.version === DURABLE_AGENT_ALIAS_VERSION)
     && typeof record.keyFingerprint === "string" && record.keyFingerprint.length > 0
     && typeof record.sessionId === "string" && record.sessionId.length > 0
     && typeof record.agentId === "string" && record.agentId.length > 0
@@ -1677,14 +1729,20 @@ function validateDurableAgentAliasRoot(record) {
     && epochValid(record.keyEpoch)
     && epochValid(record.contextEpoch)
     && (record.systemBlockIds === undefined || validSystemBlockIds(record.systemBlockIds));
-  const v2Valid = record?.version !== 2 || (
+  const metadataValid = (record?.version !== 2 && record?.version !== DURABLE_AGENT_ALIAS_VERSION) || (
     Number.isSafeInteger(record.createdAt) && record.createdAt > 0
     && Number.isSafeInteger(record.lastUsedAt) && record.lastUsedAt >= record.createdAt
     && Number.isSafeInteger(record.generation) && record.generation >= 1
     && (record.conversationBinding === ""
       || /^[a-f0-9]{64}$/.test(String(record.conversationBinding || "")))
   );
-  if (!basicValid || !v2Valid) {
+  const v3Valid = record?.version !== DURABLE_AGENT_ALIAS_VERSION || (
+    Number.isSafeInteger(record.authEpoch) && record.authEpoch >= 0
+    && typeof record.reseedRequired === "boolean"
+    && (record.reseedReason === "" || record.reseedReason === SESSION_AUTH_RESEED_REASON)
+    && validPendingSessionAuthFailure(record.pendingSessionAuthFailure)
+  );
+  if (!basicValid || !metadataValid || !v3Valid) {
     throw new Error("durable Cursor agent alias root is malformed");
   }
   return record;
@@ -1712,7 +1770,7 @@ function writeDurableAgentAliasUnlocked(cursorKey, sessionId, agentId, epochs = 
     throw new Error(`cannot persist durable Cursor agent alias: ${(error && error.message) || String(error)}`);
   }
   const record = {
-    version: 2,
+    version: DURABLE_AGENT_ALIAS_VERSION,
     keyFingerprint: keyFingerprint(cursorKey),
     sessionId: String(sessionId || ""),
     agentId: String(agentId || ""),
@@ -1720,6 +1778,17 @@ function writeDurableAgentAliasUnlocked(cursorKey, sessionId, agentId, epochs = 
     modelEpoch: Number.isSafeInteger(epochs.modelEpoch) ? epochs.modelEpoch : 0,
     keyEpoch: Number.isSafeInteger(epochs.keyEpoch) ? epochs.keyEpoch : 0,
     contextEpoch: Number.isSafeInteger(epochs.contextEpoch) ? epochs.contextEpoch : 0,
+    authEpoch: Number.isSafeInteger(epochs.authEpoch)
+      ? epochs.authEpoch : Number.isSafeInteger(prior?.authEpoch) ? prior.authEpoch : 0,
+    reseedRequired: Object.prototype.hasOwnProperty.call(epochs, "reseedRequired")
+      ? epochs.reseedRequired === true : prior?.reseedRequired === true,
+    reseedReason: Object.prototype.hasOwnProperty.call(epochs, "reseedReason")
+      ? String(epochs.reseedReason || "") : String(prior?.reseedReason || ""),
+    pendingSessionAuthFailure: Object.prototype.hasOwnProperty.call(epochs, "pendingSessionAuthFailure")
+      ? (epochs.pendingSessionAuthFailure == null
+        ? null : JSON.parse(canonicalJSONString(epochs.pendingSessionAuthFailure)))
+      : (prior?.pendingSessionAuthFailure == null
+        ? null : JSON.parse(canonicalJSONString(prior.pendingSessionAuthFailure))),
     systemBlockIds: validSystemBlockIds(epochs.systemBlockIds) ? [...epochs.systemBlockIds] : [],
     conversationBinding: canonicalConversationBinding(epochs.conversationBinding)
       || canonicalConversationBinding(prior?.conversationBinding),
@@ -1749,12 +1818,18 @@ function writeDurableAgentAliasUnlocked(cursorKey, sessionId, agentId, epochs = 
         || persisted.modelEpoch !== record.modelEpoch
         || persisted.keyEpoch !== record.keyEpoch
         || persisted.contextEpoch !== record.contextEpoch
+        || persisted.authEpoch !== record.authEpoch
+        || persisted.reseedRequired !== record.reseedRequired
+        || persisted.reseedReason !== record.reseedReason
+        || canonicalJSONString(persisted.pendingSessionAuthFailure)
+          !== canonicalJSONString(record.pendingSessionAuthFailure)
         || persisted.conversationBinding !== record.conversationBinding
         || persisted.lastUsedAt !== record.lastUsedAt
         || persisted.generation !== record.generation
         || !sameStringArray(persisted.systemBlockIds, record.systemBlockIds)) {
       throw new Error("durable Cursor agent alias verification failed");
     }
+    return persisted;
   } catch (error) {
     if (fd !== null) {
       try { closeSync(fd); } catch {}
@@ -1765,15 +1840,84 @@ function writeDurableAgentAliasUnlocked(cursorKey, sessionId, agentId, epochs = 
 }
 
 async function writeDurableAgentAlias(cursorKey, sessionId, agentId, epochs = {}) {
-  return withAliasPublicationLease(cursorKey, agentId, () => writeDurableAgentAliasUnlocked(
+  return withAliasPublicationLease(cursorKey, sessionId, agentId, () => writeDurableAgentAliasUnlocked(
     cursorKey, sessionId, agentId, epochs,
   ));
+}
+
+async function reconcilePendingSessionAuthFailure(cursorKey, sessionId) {
+  const observed = readDurableAgentAlias(cursorKey, sessionId);
+  if (!observed?.pendingSessionAuthFailure) return observed;
+  return withAliasStateLease(cursorKey, sessionId, async () => {
+    const alias = readDurableAgentAlias(cursorKey, sessionId);
+    const pending = alias?.pendingSessionAuthFailure;
+    if (!pending) return alias;
+    const persisted = await withAgentMutationLease(
+      cursorKey,
+      pending.replacementAgentId,
+      async () => {
+        await writeSessionAuthFailureReceipt(cursorKey, sessionId, {
+          clientMessageId: pending.clientMessageId,
+          requestHash: pending.requestHash,
+          requestKind: pending.requestKind,
+          identityPolicy: pending.identityPolicy,
+          generation: pending.generation,
+          replacementAgentId: pending.replacementAgentId,
+          clientLeaseToken: pending.clientLeaseToken || "",
+          failedAt: pending.detectedAt,
+        });
+        return writeDurableAgentAliasUnlocked(
+          cursorKey,
+          sessionId,
+          pending.replacementAgentId,
+          {
+            recoveryEpoch: alias.recoveryEpoch,
+            modelEpoch: alias.modelEpoch,
+            keyEpoch: alias.keyEpoch,
+            contextEpoch: alias.contextEpoch,
+            authEpoch: alias.authEpoch,
+            systemBlockIds: alias.systemBlockIds,
+            conversationBinding: alias.conversationBinding,
+            reseedRequired: true,
+            reseedReason: SESSION_AUTH_RESEED_REASON,
+            pendingSessionAuthFailure: null,
+          },
+        );
+      },
+    );
+    const session = sessions.get(String(sessionId || ""));
+    if (session) {
+      session.agentId = persisted.agentId;
+      session.authEpoch = persisted.authEpoch;
+      session.reseedRequired = true;
+      session.reseedReason = SESSION_AUTH_RESEED_REASON;
+      session.pendingSessionAuthFailure = null;
+      session.resetSeedState();
+    }
+    lifecycleEvent("session_auth_recovery_reconciled", {
+      sessionId: String(sessionId || ""),
+      keyHash: keyHash(cursorKey),
+      authEpoch: persisted.authEpoch,
+      requestKind: pending.requestKind,
+    });
+    return persisted;
+  });
 }
 
 function recoveryTargetAgentId(round) {
   const source = String(round?.agentId || round?.sessionId || "");
   const stableSource = source.replace(/_ctrecover_[A-Za-z0-9_-]+$/, "");
   return `${stableSource}_ctrecover_${String(round?.route || "").slice(0, 10)}`;
+}
+
+function recoveryTargetForSession(session, round) {
+  if (session?.reseedRequired
+      && session.reseedReason === SESSION_AUTH_RESEED_REASON
+      && typeof session.agentId === "string"
+      && session.agentId) {
+    return { agentId: session.agentId, aliasAlreadyPublished: true };
+  }
+  return { agentId: recoveryTargetAgentId(round), aliasAlreadyPublished: false };
 }
 
 // Invocation identity and semantic request equivalence are deliberately
@@ -2545,6 +2689,101 @@ function validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId
       || (typeof record.failure === "string" && record.failure && Number.isFinite(record.failedAt)))
     && (phase !== ACCEPTANCE_PHASE.REJECTED_BEFORE_SEND
       || (typeof record.rejectionReason === "string" && record.rejectionReason && Number.isFinite(record.rejectedAt)));
+}
+
+function validSessionAuthFailureReceipt(record, cursorKey, sessionId, clientMessageId, requestHash = "") {
+  return !!record && typeof record === "object" && !Array.isArray(record)
+    && record.recordType === "session_auth_failure"
+    && record.recordVersion === 1
+    && record.acceptancePhase === ACCEPTANCE_PHASE.ACCEPTED
+    && record.terminalDisposition === "RESEED_REQUIRED"
+    && record.failureCode === SESSION_AUTH_FAILURE_CODE
+    && record.keyFingerprint === keyFingerprint(cursorKey)
+    && record.sessionId === String(sessionId || "")
+    && record.clientMessageId === String(clientMessageId || "")
+    && /^[a-f0-9]{64}$/.test(String(record.requestHash || ""))
+    && (!requestHash || record.requestHash === requestHash)
+    && (record.requestKind === "fresh" || record.requestKind === "continuation")
+    && (record.identityPolicy === TURN_IDENTITY_POLICY.NONE
+      || record.identityPolicy === TURN_IDENTITY_POLICY.INVOCATION_V1
+      || record.identityPolicy === TURN_IDENTITY_POLICY.LEGACY_CLIENT_MESSAGE_V1)
+    && Number.isSafeInteger(record.generation) && record.generation >= 1
+    && typeof record.clientLeaseToken === "string"
+    && typeof record.replacementAgentId === "string" && record.replacementAgentId.length > 0
+    && Number.isSafeInteger(record.failedAt) && record.failedAt > 0;
+}
+
+function readSessionAuthFailureReceipt(cursorKey, sessionId, clientMessageId, requestHash) {
+  if (!requestHash) return null;
+  const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
+  const cached = completedTurnReceipts.get(file);
+  if (cached && validSessionAuthFailureReceipt(
+    cached, cursorKey, sessionId, clientMessageId, requestHash,
+  )) return cached;
+  try {
+    const record = readTurnReceiptFile(file);
+    if (!validSessionAuthFailureReceipt(
+      record, cursorKey, sessionId, clientMessageId, requestHash,
+    )) return null;
+    completedTurnReceipts.set(file, record);
+    return record;
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error(`cannot validate exact session-auth failure receipt: ${(error && error.message) || String(error)}`);
+  }
+}
+
+async function writeSessionAuthFailureReceipt(cursorKey, sessionId, {
+  clientMessageId = "",
+  requestHash,
+  requestKind,
+  identityPolicy,
+  generation,
+  replacementAgentId,
+  clientLeaseToken = "",
+  failedAt = nowMs(),
+}) {
+  const record = {
+    version: TURN_RECEIPT_VERSION,
+    recordType: "session_auth_failure",
+    recordVersion: 1,
+    keyFingerprint: keyFingerprint(cursorKey),
+    sessionId: String(sessionId || ""),
+    clientMessageId: String(clientMessageId || ""),
+    requestHash: String(requestHash || ""),
+    requestKind: requestKind === "continuation" ? "continuation" : "fresh",
+    identityPolicy: identityPolicy || TURN_IDENTITY_POLICY.NONE,
+    generation: Number.isSafeInteger(generation) && generation >= 1 ? generation : 1,
+    clientLeaseToken: normalizeClientLeaseToken(clientLeaseToken),
+    acceptancePhase: ACCEPTANCE_PHASE.ACCEPTED,
+    terminalDisposition: "RESEED_REQUIRED",
+    failureCode: SESSION_AUTH_FAILURE_CODE,
+    replacementAgentId: String(replacementAgentId || ""),
+    failedAt: Number.isSafeInteger(failedAt) ? failedAt : nowMs(),
+  };
+  if (!validSessionAuthFailureReceipt(
+    record, cursorKey, sessionId, clientMessageId, requestHash,
+  )) throw new Error("session-auth failure receipt violates the durable continuity contract");
+  mkdirSync(COMPLETED_TURN_DIR, { recursive: true, mode: 0o700 });
+  const file = completedTurnReceiptPath(cursorKey, sessionId, clientMessageId, requestHash);
+  const bytes = Buffer.byteLength(JSON.stringify(record) + "\n", "utf8");
+  await reserveUnresolvedReceipt(file, bytes, ADMISSION_PRIORITY.RECOVERY);
+  const committed = mutateTurnReceipt(file, (raw) => {
+    completedTurnReceipts.delete(file);
+    if (raw && validSessionAuthFailureReceipt(
+      raw, cursorKey, sessionId, clientMessageId, requestHash,
+    )) return { commit: false, record: raw };
+    if (raw && !validFreshDeliveryReceipt(raw, cursorKey, sessionId, clientMessageId, requestHash)) {
+      throw new Error("cannot replace malformed durable turn receipt with session-auth failure evidence");
+    }
+    return { commit: true, record };
+  });
+  completedTurnReceipts.set(file, committed);
+  try { resizeUnresolvedReceipt(file, Buffer.byteLength(JSON.stringify(committed) + "\n", "utf8")); }
+  catch (error) {
+    dbg("session-auth failure reservation resize deferred", (error && error.message) || String(error));
+  }
+  return committed;
 }
 
 function unresolvedFreshDeliveryReceipt(record) {
@@ -3645,6 +3884,18 @@ function isUpstreamUnauthenticated(reason) {
   return /\bunauthenticated\b|\bunauthorized\b/i.test(msg);
 }
 
+function cursorSdkErrorMessage(reason) {
+  if (typeof reason === "string") return reason;
+  if (reason && typeof reason.message === "string") return reason.message;
+  return String(reason || "");
+}
+
+function isCursorSessionAuthExpired(reason) {
+  if (!reason) return false;
+  return /^Authentication error If you are logged in, try logging out and back in\.?$/i
+    .test(cursorSdkErrorMessage(reason).trim());
+}
+
 // recyclePlatform evicts + disposes the cached platform (and its poisoned HTTP/2 connection) for a key hash so
 // the NEXT turn dials a FRESH connection with a clean stream budget. Best-effort dispose (fire-and-forget).
 function recyclePlatform(h) {
@@ -3766,6 +4017,12 @@ class Session {
                                   // the durable agent (bound to the old account) + seeds a fresh agent under the
                                   // new key, instead of silently continuing on the old (possibly revoked) account.
     this.contextEpoch = durableAlias?.contextEpoch || 0; // System-context replacement/removal/reorder rotation.
+    this.authEpoch = durableAlias?.authEpoch || 0;
+    this.reseedRequired = durableAlias?.reseedRequired === true;
+    this.reseedReason = durableAlias?.reseedReason || "";
+    this.pendingSessionAuthFailure = durableAlias?.pendingSessionAuthFailure || null;
+    this.authRecoveryPromise = null;
+    this.sessionAuthRecoveryUnavailable = "";
     this.seededSystemBlockIds = Array.isArray(durableAlias?.systemBlockIds)
       ? [...durableAlias.systemBlockIds] : [];
     this.model = null;            // ADD-62: the model the durable agent was created/resumed under. A turn that
@@ -4062,8 +4319,13 @@ class Session {
   async touchDurableAlias() {
     const record = readDurableAgentAlias(this.cursorKey, this.id);
     const refreshAfterMs = Math.max(60_000, Math.floor(SDK_AGENT_ALIAS_TTL_MS / 4));
-    if (record?.version === 2 && record.agentId === this.agentId
+    if (record?.version === DURABLE_AGENT_ALIAS_VERSION && record.agentId === this.agentId
         && record.conversationBinding === this.conversationBinding
+        && record.authEpoch === this.authEpoch
+        && record.reseedRequired === this.reseedRequired
+        && record.reseedReason === this.reseedReason
+        && canonicalJSONString(record.pendingSessionAuthFailure)
+          === canonicalJSONString(this.pendingSessionAuthFailure)
         && nowMs() - record.lastUsedAt < refreshAfterMs) return false;
     await this.persistDurableAlias();
     return true;
@@ -4075,6 +4337,30 @@ class Session {
     }
     await this.persistDurableAlias();
     this.pendingRecoveryAlias = "";
+  }
+  async completeSessionAuthReseed() {
+    if (!this.reseedRequired || this.reseedReason !== SESSION_AUTH_RESEED_REASON) return false;
+    await writeDurableAgentAlias(this.cursorKey, this.id, this.agentId, {
+      recoveryEpoch: this.recoveryEpoch,
+      modelEpoch: this.modelEpoch,
+      keyEpoch: this.keyEpoch,
+      contextEpoch: this.contextEpoch,
+      authEpoch: this.authEpoch,
+      systemBlockIds: this.seededSystemBlockIds,
+      conversationBinding: this.conversationBinding,
+      reseedRequired: false,
+      reseedReason: "",
+      pendingSessionAuthFailure: null,
+    });
+    this.reseedRequired = false;
+    this.reseedReason = "";
+    this.pendingSessionAuthFailure = null;
+    lifecycleEvent("session_auth_reseed_committed", {
+      sessionId: this.id,
+      keyHash: keyHash(this.cursorKey),
+      authEpoch: this.authEpoch,
+    });
+    return true;
   }
   async finishRotationCancel() {
     // A context rotation can happen after ensureAgent() resumes the old agent
@@ -4115,7 +4401,11 @@ class Session {
     await this.cancel();
     this.done = false;
   }
-  whenLogicalDone() { if (!this.run && !this.sendPending) return Promise.resolve(); return new Promise((r) => this._logicalDone.push(r)); }
+  whenLogicalDone() {
+    if (this.authRecoveryPromise) return this.authRecoveryPromise;
+    if (!this.run && !this.sendPending) return Promise.resolve();
+    return new Promise((r) => this._logicalDone.push(r));
+  }
   notifyLogicalDone() { const ws = this._logicalDone; this._logicalDone = []; for (const w of ws) { try { w(); } catch {} } }
   whenTurnSettled(token = this.turnToken) {
     if (this.lastSettledTurnToken >= token) return Promise.resolve();
@@ -4760,8 +5050,224 @@ class Session {
     cancelSessionDetached(this, { terminalReason: TerminalReason.LOOP_BOUND, detail: reason });
   }
 
+  beginSessionAuthRecovery(runError) {
+    if (this.authRecoveryPromise) return;
+    const message = cursorSdkErrorMessage(runError)
+      || "Authentication error If you are logged in, try logging out and back in.";
+    const sourceAgentId = this.agentId;
+    const failedAt = nowMs();
+    const context = {
+      clientMessageId: this.activeClientMessageId,
+      requestHash: this.activeClientMessageHash,
+      generation: this.activeClientMessageGeneration,
+      requestKind: this.activeClientMessageKind === "continuation" ? "continuation" : "fresh",
+      identityPolicy: this.activeIdentityPolicy || TURN_IDENTITY_POLICY.NONE,
+      clientLeaseToken: this.clientLeaseToken,
+      sourceAgentId,
+      failedAt,
+    };
+    lifecycleEvent("session_auth_expiry_detected", {
+      sessionId: this.id,
+      keyHash: keyHash(this.cursorKey),
+      requestKind: context.requestKind,
+      streamedTextLength: this.streamedText.length,
+    });
+    this.lastRunError = message;
+    this.run = null;
+    this.sendPending = false;
+    this.runEpoch++;
+    const recovery = this.finalizeSessionAuthRecovery(context, message)
+      .catch((error) => this.finishSessionAuthRecoveryUnavailable(context, error));
+    this.authRecoveryPromise = recovery.finally(() => {
+      this.authRecoveryPromise = null;
+      this.notifyLogicalDone();
+    });
+  }
+
+  async finalizeSessionAuthRecovery(context, message) {
+    if (!context.requestHash || !/^[a-f0-9]{64}$/.test(context.requestHash)) {
+      throw new Error("the accepted turn has no durable semantic request hash");
+    }
+    if (!Number.isSafeInteger(this.authEpoch) || this.authEpoch >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("durable Cursor session auth epoch is exhausted");
+    }
+    const nextAuthEpoch = this.authEpoch + 1;
+    const replacementAgentId = this.composeAgentId({ authEpoch: nextAuthEpoch });
+    const pending = {
+      version: 1,
+      clientMessageId: context.clientMessageId || "",
+      requestHash: context.requestHash,
+      requestKind: context.requestKind,
+      identityPolicy: context.identityPolicy,
+      generation: context.generation,
+      sourceAgentId: context.sourceAgentId,
+      replacementAgentId,
+      clientLeaseToken: normalizeClientLeaseToken(context.clientLeaseToken),
+      detectedAt: context.failedAt,
+    };
+    const aliasState = {
+      recoveryEpoch: this.recoveryEpoch,
+      modelEpoch: this.modelEpoch,
+      keyEpoch: this.keyEpoch,
+      contextEpoch: this.contextEpoch,
+      authEpoch: nextAuthEpoch,
+      systemBlockIds: [],
+      conversationBinding: this.conversationBinding,
+      reseedRequired: true,
+      reseedReason: SESSION_AUTH_RESEED_REASON,
+      pendingSessionAuthFailure: pending,
+    };
+    await withAliasStateLease(this.cursorKey, this.id, async () => {
+      const current = readDurableAgentAlias(this.cursorKey, this.id);
+      if (!current || current.agentId !== context.sourceAgentId
+          || current.authEpoch !== this.authEpoch) {
+        throw new Error("durable Cursor agent alias advanced before session-auth recovery committed");
+      }
+      await withAgentMutationLease(this.cursorKey, replacementAgentId, async () => {
+        writeDurableAgentAliasUnlocked(
+          this.cursorKey, this.id, replacementAgentId, aliasState,
+        );
+
+        // The verified marker is the identity commit point. Only now may
+        // process state stop naming the poisoned SDK agent.
+        this.authEpoch = nextAuthEpoch;
+        this.agentId = replacementAgentId;
+        this.reseedRequired = true;
+        this.reseedReason = SESSION_AUTH_RESEED_REASON;
+        this.pendingSessionAuthFailure = pending;
+        this.resetSeedState();
+        lifecycleEvent("session_auth_alias_committed", {
+          sessionId: this.id,
+          keyHash: keyHash(this.cursorKey),
+          authEpoch: nextAuthEpoch,
+        });
+
+        await writeSessionAuthFailureReceipt(this.cursorKey, this.id, {
+          ...context,
+          replacementAgentId,
+        });
+        lifecycleEvent("session_auth_failure_receipt_committed", {
+          sessionId: this.id,
+          keyHash: keyHash(this.cursorKey),
+          authEpoch: nextAuthEpoch,
+          requestKind: context.requestKind,
+        });
+
+        writeDurableAgentAliasUnlocked(this.cursorKey, this.id, replacementAgentId, {
+          ...aliasState,
+          pendingSessionAuthFailure: null,
+        });
+        this.pendingSessionAuthFailure = null;
+      });
+    });
+
+    const round = this.currentRound || this.recoverySourceRound;
+    if (round) {
+      try {
+        if (round.state !== RoundState.TERMINAL) {
+          round.terminalize(TerminalReason.RUN_ERROR, message);
+        }
+        const prior = round.recovery || {};
+        round.recordRecovery({
+          ...prior,
+          decision: "session_auth_expired",
+          failedAt: context.failedAt,
+          replacementAgentId,
+          reason: message,
+        });
+      } catch (error) {
+        dbg("session auth ToolRound recovery evidence unavailable", "session=" + this.id,
+          (error && error.message) || String(error));
+      }
+    }
+    this.recoverySourceRound = null;
+
+    const oldAgent = this.agent;
+    const oldLease = this.agentUseLease;
+    const cancelledRunEpoch = this.runEpoch - 1;
+    this.agent = null;
+    this.agentPromise = null;
+    this.agentUseLease = null;
+    this.mcpServerKeys = null;
+    if (oldAgent && typeof oldAgent.close === "function") {
+      noteExpectedSdkAbort(this.id, cancelledRunEpoch);
+      await als.run({
+        session: this,
+        sdkCancellation: { sessionId: this.id, runEpoch: cancelledRunEpoch },
+      }, async () => {
+        try { await oldAgent.close(); }
+        catch (error) {
+          dbg("session auth poisoned-agent cleanup failed", "session=" + this.id,
+            (error && error.message) || String(error));
+        }
+      });
+      lifecycleEvent("session_auth_poisoned_agent_closed", {
+        sessionId: this.id,
+        keyHash: keyHash(this.cursorKey),
+        authEpoch: this.authEpoch,
+      });
+    }
+    if (oldLease) {
+      try { await oldLease.release(); }
+      catch (error) {
+        dbg("session auth old lease release failed", "session=" + this.id,
+          (error && error.message) || String(error));
+      }
+    }
+
+    this.done = true;
+    this.rejectAllPending(message, TerminalReason.RUN_ERROR);
+    this.sse({
+      type: "turn_end",
+      stop_reason: "error",
+      receipt: "session_auth_expired_rotated",
+      errorCode: SESSION_AUTH_FAILURE_CODE,
+      retryable: false,
+      retryMode: "reseed",
+      reseedRequired: true,
+      error: "The Cursor session credential expired after this turn was accepted. Start a new turn with a new invocation identity and bounded history.",
+    });
+    this.activeClientMessageId = "";
+    this.activeClientMessageHash = "";
+    this.activeClientMessageGeneration = 1;
+    this.activeClientMessageKind = "";
+    this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE;
+    this.activeDeferredInputId = "";
+    this.clearTurnState();
+    this.settle();
+    lifecycleEvent("session_auth_recovery_committed", {
+      sessionId: this.id,
+      keyHash: keyHash(this.cursorKey),
+      authEpoch: this.authEpoch,
+      requestKind: context.requestKind,
+      streamedTextLength: this.streamedText.length,
+    });
+  }
+
+  finishSessionAuthRecoveryUnavailable(_context, error) {
+    const detail = (error && error.message) || String(error);
+    this.sessionAuthRecoveryUnavailable = detail;
+    this.done = true;
+    this.rejectAllPending("session auth recovery state is unavailable", TerminalReason.RUN_ERROR);
+    this.sse({
+      type: "turn_end",
+      stop_reason: "error",
+      receipt: "session_auth_recovery_unavailable",
+      errorCode: "cursor_session_auth_recovery_unavailable",
+      retryable: false,
+      retryMode: "none",
+      error: `the Cursor session failed authentication, but durable recovery state could not be committed: ${detail}`,
+    });
+    this.clearTurnState();
+    this.settle();
+    lifecycleEvent("session_auth_recovery_failed", {
+      sessionId: this.id,
+      keyHash: keyHash(this.cursorKey),
+    });
+  }
+
   onRunComplete(res) {
-    if (this.done) return;
+    if (this.done || this.authRecoveryPromise) return;
     const completedClientMessageId = this.activeClientMessageId;
     const completedClientMessageHash = this.activeClientMessageHash;
     const completedClientMessageGeneration = this.activeClientMessageGeneration;
@@ -4773,8 +5279,12 @@ class Session {
         || (this.currentRound && this.currentRound.deferredInput(completedDeferredInputId)
           ? this.currentRound : null))
       : null;
-    this.done = true; this.run = null; this.sendPending = false;
     const runError = res && res.error != null ? res.error : null;
+    if (res && res.status !== "finished" && isCursorSessionAuthExpired(runError)) {
+      this.beginSessionAuthRecovery(runError);
+      return;
+    }
+    this.done = true; this.run = null; this.sendPending = false;
     // BR2: a non-"finished" terminal means the upstream run failed; remember it so a tool_results turn that
     // finds nothing to resume surfaces the real error instead of a false-success empty turn.
     if (res && res.status !== "finished") this.lastRunError = runError || "run did not finish";
@@ -4916,7 +5426,11 @@ class Session {
     this.notifyLogicalDone(); // real completion -> admit the next queued new-user turn
   }
   onRunError(err) {
-    if (this.done) return;
+    if (this.done || this.authRecoveryPromise) return;
+    if (isCursorSessionAuthExpired(err)) {
+      this.beginSessionAuthRecovery(err);
+      return;
+    }
     const failedClientMessageId = this.activeClientMessageId;
     const failedClientMessageHash = this.activeClientMessageHash;
     const failedClientMessageKind = this.activeClientMessageKind;
@@ -4994,12 +5508,14 @@ class Session {
     modelEpoch = this.modelEpoch,
     keyEpoch = this.keyEpoch,
     contextEpoch = this.contextEpoch,
+    authEpoch = this.authEpoch,
   } = {}) {
     let aid = `${this.id}_${DURABLE_AGENT_CONTEXT_EPOCH}`;
     if (recoveryEpoch > 0) aid += `_r${recoveryEpoch + 1}`; // first too-long rotation -> _r2
     if (modelEpoch > 0) aid += `_m${modelEpoch}`;           // first model change   -> _m1
     if (keyEpoch > 0) aid += `_k${keyEpoch}`;               // ADD-79: first key change -> _k1
     if (contextEpoch > 0) aid += `_c${contextEpoch}`;       // first system-context replacement -> _c1
+    if (authEpoch > 0) aid += `_a${authEpoch}`;
     return aid;
   }
   // rotateDurableAgent tombstones the poisoned durable agent and allocates a fresh agentId (C05). The session
@@ -5026,6 +5542,10 @@ class Session {
       modelEpoch: this.modelEpoch,
       keyEpoch: this.keyEpoch,
       contextEpoch: this.contextEpoch,
+      authEpoch: this.authEpoch,
+      reseedRequired: this.reseedRequired,
+      reseedReason: this.reseedReason,
+      pendingSessionAuthFailure: this.pendingSessionAuthFailure,
       systemBlockIds: [],
     });
     this.recoveryEpoch = nextRecoveryEpoch;
@@ -5059,6 +5579,10 @@ class Session {
       modelEpoch: nextModelEpoch,
       keyEpoch: this.keyEpoch,
       contextEpoch: this.contextEpoch,
+      authEpoch: this.authEpoch,
+      reseedRequired: this.reseedRequired,
+      reseedReason: this.reseedReason,
+      pendingSessionAuthFailure: this.pendingSessionAuthFailure,
       systemBlockIds: [],
     });
     this.modelEpoch = nextModelEpoch;
@@ -5094,6 +5618,10 @@ class Session {
       modelEpoch: this.modelEpoch,
       keyEpoch: nextKeyEpoch,
       contextEpoch: this.contextEpoch,
+      authEpoch: this.authEpoch,
+      reseedRequired: this.reseedRequired,
+      reseedReason: this.reseedReason,
+      pendingSessionAuthFailure: this.pendingSessionAuthFailure,
       systemBlockIds: [],
     });
     this.keyEpoch = nextKeyEpoch;
@@ -5126,6 +5654,10 @@ class Session {
       modelEpoch: this.modelEpoch,
       keyEpoch: this.keyEpoch,
       contextEpoch: nextContextEpoch,
+      authEpoch: this.authEpoch,
+      reseedRequired: this.reseedRequired,
+      reseedReason: this.reseedReason,
+      pendingSessionAuthFailure: this.pendingSessionAuthFailure,
       systemBlockIds: nextBlockIds,
     });
     this.contextEpoch = nextContextEpoch;
@@ -5158,6 +5690,10 @@ class Session {
       modelEpoch: this.modelEpoch,
       keyEpoch: this.keyEpoch,
       contextEpoch: nextContextEpoch,
+      authEpoch: this.authEpoch,
+      reseedRequired: this.reseedRequired,
+      reseedReason: this.reseedReason,
+      pendingSessionAuthFailure: this.pendingSessionAuthFailure,
       systemBlockIds,
     });
     this.contextEpoch = nextContextEpoch;
@@ -5186,6 +5722,10 @@ class Session {
       modelEpoch: this.modelEpoch,
       keyEpoch: this.keyEpoch,
       contextEpoch: this.contextEpoch,
+      authEpoch: this.authEpoch,
+      reseedRequired: this.reseedRequired,
+      reseedReason: this.reseedReason,
+      pendingSessionAuthFailure: this.pendingSessionAuthFailure,
       systemBlockIds: [],
     });
     this.agentId = target;
@@ -7001,6 +7541,71 @@ function continuationTenantMismatch(round, cursorKey, strictKeyAffinity = strict
   return strictKeyAffinity && stored !== keyFingerprint(cursorKey);
 }
 
+async function preflightContinuationSessionAuth(cursorKey, sessionId, identity, requestHash) {
+  const authRecoveryOwner = sessions.get(sessionId);
+  if (authRecoveryOwner?.authRecoveryPromise) await authRecoveryOwner.authRecoveryPromise;
+  if (authRecoveryOwner?.sessionAuthRecoveryUnavailable) {
+    throw new ToolRoundError(
+      "cursor_session_auth_recovery_unavailable",
+      `durable session-auth continuity state is unavailable: ${authRecoveryOwner.sessionAuthRecoveryUnavailable}`,
+      503,
+    );
+  }
+  let alias;
+  try {
+    await reconcilePendingSessionAuthFailure(cursorKey, sessionId);
+    alias = readDurableAgentAlias(cursorKey, sessionId);
+  } catch (error) {
+    throw new ToolRoundError(
+      "cursor_session_auth_recovery_unavailable",
+      `durable session-auth continuity state is unavailable: ${(error && error.message) || String(error)}`,
+      503,
+    );
+  }
+  let failure;
+  try {
+    failure = readSessionAuthFailureReceipt(cursorKey, sessionId, identity.id, requestHash);
+  } catch (error) {
+    throw new ToolRoundError(
+      "durable_turn_receipt_unavailable",
+      (error && error.message) || String(error),
+      503,
+    );
+  }
+  if (failure) {
+    throw new ToolRoundError(
+      SESSION_AUTH_FAILURE_CODE,
+      "the accepted Cursor continuation ended after its durable session credential expired; start a new invocation with bounded history",
+      409,
+      {
+        retryable: false,
+        retryMode: "reseed",
+        reseedRequired: true,
+      },
+    );
+  }
+  if (alias?.reseedRequired === true && !versionedFreshReplayIdentity(identity)) {
+    lifecycleEvent("session_auth_reseed_refused", {
+      sessionId,
+      keyHash: keyHash(cursorKey),
+      authEpoch: alias.authEpoch,
+      reason: "versioned_invocation_identity_absent",
+      requestKind: "continuation",
+    });
+    throw new ToolRoundError(
+      SESSION_AUTH_FAILURE_CODE,
+      "the expired Cursor session requires a new versioned invocation identity and bounded history",
+      409,
+      {
+        retryable: false,
+        retryMode: "reseed",
+        reseedRequired: true,
+      },
+    );
+  }
+  return alias;
+}
+
 function legacyRecoveryKeyFor(sessionId, clientMessageId) {
   return "clr1_" + createHash("sha256")
     .update(String(sessionId || ""))
@@ -7252,6 +7857,18 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
       if (present.length === 0) {
         throw new ToolRoundError("round_lost", "none of the signed tool rounds remain in the durable journal", 410);
       }
+      // A mixed-route request mutates every non-primary round before it
+      // recurses into the primary route. Fence every route's durable auth
+      // replacement first so an old or identity-less batch cannot consume any
+      // result before the new-invocation contract is proven.
+      for (const group of present) {
+        await preflightContinuationSessionAuth(
+          cursorKey,
+          group.groupRound.sessionId,
+          continuationIdentity,
+          completedTurnRequestHash({ ...input, results: group.groupResults }),
+        );
+      }
       // Validate every route before mutating any journal. A stateless harness
       // may project old and current tool results into one request; terminal or
       // process-orphaned routes can be receipted independently and recovered
@@ -7329,6 +7946,12 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
     if (continuationTenantMismatch(round, cursorKey)) {
       throw new ToolRoundError("tenant_mismatch", "the signed tool round belongs to a different Cursor credential", 403);
     }
+    await preflightContinuationSessionAuth(
+      cursorKey,
+      round.sessionId,
+      continuationIdentity,
+      continuationClientMessageHash,
+    );
     // P2.4 (staged, default off): once every replica emits bindings, a continuation with
     // no request binding AND no stamped round binding is a protocol violation, not a guess.
     if (continueBindingRequired() && !conversationBinding && !round.conversationBinding) {
@@ -7835,9 +8458,9 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
           await writeDurableAgentAlias(session.cursorKey, session.id, uncertainDeliveryAgentId, session);
           session.agentId = uncertainDeliveryAgentId;
         } else if (isRecovery) {
-          const targetAgentId = recoveryTargetAgentId(round);
-          session.agentId = targetAgentId;
-          session.pendingRecoveryAlias = targetAgentId;
+          const target = recoveryTargetForSession(session, round);
+          session.agentId = target.agentId;
+          session.pendingRecoveryAlias = target.aliasAlreadyPublished ? "" : target.agentId;
           session.resetSeedState();
         } else if (round.agentId) {
           await writeDurableAgentAlias(session.cursorKey, session.id, round.agentId, session);
@@ -8031,9 +8654,9 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
       sessions.set(session.id, session);
     }
     session.clientLeaseToken = round.clientLeaseToken;
-    const recoveryAgentId = recoveryTargetAgentId(round);
-    session.agentId = recoveryAgentId;
-    session.pendingRecoveryAlias = recoveryAgentId;
+    const recoveryTarget = recoveryTargetForSession(session, round);
+    session.agentId = recoveryTarget.agentId;
+    session.pendingRecoveryAlias = recoveryTarget.aliasAlreadyPublished ? "" : recoveryTarget.agentId;
     session.recoverySourceRound = round;
     session.resetSeedState();
     refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
@@ -8098,6 +8721,10 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
         dbg("continuation CAS changed concurrently -> reload and retry",
           "attempt=" + (casAttempt + 1), (error && error.message) || String(error));
         return handleContinueAdmitted(req, res, body, cursorKey, casAttempt + 1, historicalDispositions);
+      }
+      if (error.code === SESSION_AUTH_FAILURE_CODE) {
+        continuationFailure(res, 409, error.code, error.message, error.details);
+        return;
       }
       // A continuation conflict must never become a transport-level 409 loop.
       // Known replay conflicts are resolved above; this is the fail-safe for a
@@ -8173,6 +8800,40 @@ async function handleTurn(req, res, body, cursorKey) {
     return;
   }
   const requestClientMessageId = requestIdentity.id;
+  try {
+    const authRecoveryOwner = sessions.get(sessionId);
+    if (authRecoveryOwner?.authRecoveryPromise) await authRecoveryOwner.authRecoveryPromise;
+    if (authRecoveryOwner?.sessionAuthRecoveryUnavailable) {
+      fail(503,
+        `durable session-auth continuity state is unavailable: ${authRecoveryOwner.sessionAuthRecoveryUnavailable}`,
+        "cursor_session_auth_recovery_unavailable");
+      return;
+    }
+    await reconcilePendingSessionAuthFailure(cursorKey, sessionId);
+    const authFailure = readSessionAuthFailureReceipt(
+      cursorKey,
+      sessionId,
+      requestClientMessageId,
+      requestClientMessageHash,
+    );
+    if (authFailure) {
+      fail(409,
+        "the accepted Cursor turn ended after its durable session credential expired; start a new invocation with bounded history",
+        SESSION_AUTH_FAILURE_CODE,
+        {
+          code: SESSION_AUTH_FAILURE_CODE,
+          message: "the accepted Cursor turn ended after its durable session credential expired; start a new invocation with bounded history",
+          retryable: false,
+          retryMode: "reseed",
+          reseedRequired: true,
+        });
+      return;
+    }
+  } catch (error) {
+    fail(503, `durable session-auth continuity state is unavailable: ${(error && error.message) || String(error)}`,
+      "cursor_session_auth_recovery_unavailable");
+    return;
+  }
   let freshDeliveryGeneration = 1;
   let freshDeliveryReceipt = null;
   if (requestClientMessageId) {
@@ -8218,6 +8879,47 @@ async function handleTurn(req, res, body, cursorKey) {
     input.deliveryGeneration = freshDeliveryGeneration;
     delete input.freshDeliveryReceipt;
     if (freshDeliveryReceipt) input.freshDeliveryReceipt = freshDeliveryReceipt;
+    try {
+      const alias = readDurableAgentAlias(cursorKey, sessionId);
+      const boundedHistory = typeof input.history === "string" && input.history.trim().length > 0;
+      const exactReplacementSeed = !!freshDeliveryReceipt
+        && freshDeliveryReceipt.agentId === alias?.agentId;
+      if (alias?.reseedRequired === true && !versionedFreshReplayIdentity(requestIdentity)) {
+        lifecycleEvent("session_auth_reseed_refused", {
+          sessionId,
+          keyHash: keyHash(cursorKey),
+          authEpoch: alias.authEpoch,
+          reason: "versioned_invocation_identity_absent",
+        });
+        fail(409,
+          "the expired Cursor session requires a new versioned invocation identity and bounded history",
+          SESSION_AUTH_FAILURE_CODE,
+          {
+            code: SESSION_AUTH_FAILURE_CODE,
+            message: "the expired Cursor session requires a new versioned invocation identity and bounded history",
+            retryable: false,
+            retryMode: "reseed",
+            reseedRequired: true,
+          });
+        return;
+      }
+      if (alias?.reseedRequired === true && !boundedHistory && !exactReplacementSeed) {
+        lifecycleEvent("session_auth_reseed_refused", {
+          sessionId,
+          keyHash: keyHash(cursorKey),
+          authEpoch: alias.authEpoch,
+          reason: "bounded_history_absent",
+        });
+        fail(410,
+          "the durable Cursor agent requires bounded history before it can be reseeded",
+          "collected_agent_history_required");
+        return;
+      }
+    } catch (error) {
+      fail(503, `durable session continuity state is unavailable: ${(error && error.message) || String(error)}`,
+        "cursor_session_auth_recovery_unavailable");
+      return;
+    }
   }
   const legacyRecoveryKey = typeof input.legacyRecoveryKey === "string" ? input.legacyRecoveryKey.trim() : "";
   if (legacyRecoveryKey) {
@@ -9263,6 +9965,22 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
             "session=" + session.id, (error && error.message) || String(error));
         }
       }
+      if (session.reseedRequired && session.reseedReason === SESSION_AUTH_RESEED_REASON) {
+        try {
+          await session.completeSessionAuthReseed();
+        } catch (error) {
+          // The new invocation is already accepted under its durable exact
+          // envelope. Keep reseedRequired set so restart admission proves the
+          // replacement contains a message before treating it as warm.
+          lifecycleEvent("session_auth_reseed_commit_failed", {
+            sessionId: session.id,
+            keyHash: keyHash(session.cursorKey),
+            authEpoch: session.authEpoch,
+          });
+          dbg("session auth reseed alias clear deferred", "session=" + session.id,
+            (error && error.message) || String(error));
+        }
+      }
       // If cancel() ran DURING agent.send (client disconnected mid-send) or a newer run superseded this
       // turn, agent.send still resolved and re-assigned an orphan to session.run. Leaving it there parks
       // the FIFO forever (whenLogicalDone never resolves) and blocks eviction (run!=null). Discard it.
@@ -10191,7 +10909,7 @@ if (RUN_AS_MAIN) {
 }
 
 export { runDurableMaintenance, runDurableFileMaintenance, runDurableMaintenanceInWorker, runSdkAgentMaintenance, sdkAgentGCRoots, sdkAgentGCCensus, readAuthoritativeSdkAgentRoots, continuationAdmissionPriority, lifecycleEvent, crashPoint, backfillTombstonesTick, reserveUnresolvedReceipt, resizeUnresolvedReceipt, releaseUnresolvedReceipt, reclaimTombstonedDurableFiles };
-export { CC_CASES, composerModelSelection, turnFailureMetadata, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
+export { CC_CASES, composerModelSelection, turnFailureMetadata, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, readSessionAuthFailureReceipt, validSessionAuthFailureReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, isCursorSessionAuthExpired, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
 export {
   TURN_RECEIPT_VERSION,
   ACCEPTANCE_PHASE,
