@@ -77,6 +77,7 @@ const {
   runBoundedShutdownTasks,
   runDurableMaintenance,
   runDurableMaintenanceInWorker,
+  scheduleDurableMaintenance,
   turnInvocationIdentity,
   turnFailureMetadata,
   validCompletedTurnReceipt,
@@ -7568,6 +7569,29 @@ test("scheduled durable maintenance runs off the request event loop", async () =
   }, 0));
   assert.equal(eventLoopAdvanced, true);
   await maintenance;
+});
+
+test("startup schedules durable maintenance without waiting for a volume scan", async () => {
+  let releaseMaintenance;
+  const maintenanceBlocked = new Promise((resolve) => { releaseMaintenance = resolve; });
+  let runs = 0;
+  const schedule = scheduleDurableMaintenance({
+    intervalMs: 60_000,
+    runFileMaintenance: async () => {
+      runs++;
+      await maintenanceBlocked;
+      return { elapsedMs: 1 };
+    },
+    runAgentMaintenance: async () => {},
+    runTombstoneBackfill: async () => {},
+  });
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runs, 1, "initial maintenance should start after the event loop advances");
+  } finally {
+    releaseMaintenance();
+    clearInterval(schedule);
+  }
 });
 
 test("the SDK MCP HTTP route is loopback-only and path decoding fails closed", () => {
