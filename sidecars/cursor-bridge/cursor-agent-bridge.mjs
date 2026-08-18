@@ -1645,6 +1645,123 @@ function agentAliasPathFor(cursorKey, sessionId) {
 const DURABLE_AGENT_ALIAS_VERSION = 3;
 const SESSION_AUTH_FAILURE_CODE = "cursor_session_auth_expired";
 const SESSION_AUTH_RESEED_REASON = "session_auth_expired";
+const SESSION_AUTH_RECOVERY_EXHAUSTED_CODE = "cursor_session_auth_recovery_exhausted";
+
+function validSessionAuthAutoRecovery(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value)
+    && value.version === 1
+    && typeof value.recoveryOf === "string" && value.recoveryOf.length <= 512
+    && typeof value.invocationId === "string" && INVOCATION_ID_RE.test(value.invocationId)
+    && value.attempt === 1;
+}
+
+function validSessionAuthRecoveryFence(value) {
+  if (value == null) return true;
+  return validSessionAuthAutoRecovery(value)
+    && /^[a-f0-9]{64}$/.test(String(value.requestHash || ""))
+    && Number.isSafeInteger(value.authEpoch) && value.authEpoch > 0
+    && ["AUTHORIZED", "IN_FLIGHT", "COMPLETED", "EXHAUSTED"].includes(value.state)
+    && Number.isSafeInteger(value.updatedAt) && value.updatedAt > 0;
+}
+
+function sessionAuthAutoRecovery(cursorKey, sessionId, recoveryOf, requestHash, authEpoch) {
+  const digest = createHash("sha256")
+    .update(keyFingerprint(cursorKey))
+    .update("\0")
+    .update(String(sessionId || ""))
+    .update("\0")
+    .update(String(recoveryOf || ""))
+    .update("\0")
+    .update(String(requestHash || ""))
+    .update("\0")
+    .update(String(authEpoch || 0))
+    .digest("base64url");
+  return {
+    version: 1,
+    recoveryOf: String(recoveryOf || ""),
+    invocationId: `car1_${digest}`,
+    attempt: 1,
+  };
+}
+
+function validateSessionAuthRecoveryRequest(input, alias, identity, requestHash) {
+  const value = input && typeof input === "object" ? input : {};
+  const fence = alias?.authRecoveryFence || null;
+  const carriesRecovery = Object.prototype.hasOwnProperty.call(value, "authRecoveryOf")
+    || Object.prototype.hasOwnProperty.call(value, "authRecoveryAttempt")
+    || String(identity?.id || "").startsWith("car1_");
+  if (fence?.state === "EXHAUSTED") {
+    throw new ToolRoundError(
+      SESSION_AUTH_RECOVERY_EXHAUSTED_CODE,
+      "automatic Cursor session-auth recovery is exhausted for this conversation",
+      409,
+    );
+  }
+  if (!carriesRecovery) return null;
+  const candidate = {
+    version: 1,
+    recoveryOf: typeof value.authRecoveryOf === "string" ? value.authRecoveryOf : "",
+    invocationId: String(identity?.id || ""),
+    attempt: value.authRecoveryAttempt,
+  };
+  const exact = validSessionAuthAutoRecovery(candidate)
+    && validSessionAuthRecoveryFence(fence)
+    && fence.state !== "EXHAUSTED"
+    && candidate.recoveryOf === fence.recoveryOf
+    && candidate.invocationId === fence.invocationId
+    && candidate.attempt === fence.attempt
+    && requestHash === fence.requestHash;
+  if (!exact) {
+    throw new ToolRoundError(
+      "cursor_session_auth_recovery_diverged",
+      "automatic Cursor session-auth recovery no longer matches the authorized semantic request",
+      409,
+    );
+  }
+  return candidate;
+}
+
+async function startSessionAuthRecoveryAttempt(session, cursorKey, input, identity, requestHash, candidate) {
+  if (!validSessionAuthAutoRecovery(candidate)) {
+    session.activeAuthRecovery = null;
+    return;
+  }
+  const currentAlias = readDurableAgentAlias(cursorKey, session.id);
+  validateSessionAuthRecoveryRequest(input, currentAlias, identity, requestHash);
+  if (currentAlias.authRecoveryFence.state === "COMPLETED") {
+    throw new ToolRoundError(
+      SESSION_AUTH_RECOVERY_EXHAUSTED_CODE,
+      "the one automatic Cursor session-auth recovery attempt already completed and has no replayable response receipt",
+      409,
+    );
+  }
+  const inFlightFence = {
+    ...currentAlias.authRecoveryFence,
+    state: "IN_FLIGHT",
+    updatedAt: nowMs(),
+  };
+  await writeDurableAgentAlias(cursorKey, session.id, currentAlias.agentId, {
+    recoveryEpoch: currentAlias.recoveryEpoch,
+    modelEpoch: currentAlias.modelEpoch,
+    keyEpoch: currentAlias.keyEpoch,
+    contextEpoch: currentAlias.contextEpoch,
+    authEpoch: currentAlias.authEpoch,
+    systemBlockIds: currentAlias.systemBlockIds,
+    conversationBinding: currentAlias.conversationBinding,
+    reseedRequired: currentAlias.reseedRequired,
+    reseedReason: currentAlias.reseedReason,
+    pendingSessionAuthFailure: currentAlias.pendingSessionAuthFailure,
+    authRecoveryFence: inFlightFence,
+  });
+  session.activeAuthRecovery = candidate;
+  session.authRecoveryFence = inFlightFence;
+  lifecycleEvent("session_auth_recovery_started", {
+    sessionId: session.id,
+    keyHash: keyHash(cursorKey),
+    authEpoch: currentAlias.authEpoch,
+    attempt: candidate.attempt,
+  });
+}
 
 function validPendingSessionAuthFailure(value) {
   if (value == null) return true;
@@ -1659,18 +1776,25 @@ function validPendingSessionAuthFailure(value) {
     && Number.isSafeInteger(value.generation) && value.generation >= 1
     && typeof value.sourceAgentId === "string" && value.sourceAgentId.length > 0
     && typeof value.replacementAgentId === "string" && value.replacementAgentId.length > 0
+    && (value.autoRecovery === undefined || validSessionAuthAutoRecovery(value.autoRecovery))
     && (value.clientLeaseToken === undefined || typeof value.clientLeaseToken === "string")
     && Number.isSafeInteger(value.detectedAt) && value.detectedAt > 0;
 }
 
 function normalizeDurableAgentAlias(record) {
-  if (record.version === DURABLE_AGENT_ALIAS_VERSION) return record;
+  if (record.version === DURABLE_AGENT_ALIAS_VERSION) {
+    return {
+      ...record,
+      authRecoveryFence: record.authRecoveryFence || null,
+    };
+  }
   return {
     ...record,
     authEpoch: 0,
     reseedRequired: false,
     reseedReason: "",
     pendingSessionAuthFailure: null,
+    authRecoveryFence: null,
   };
 }
 
@@ -1693,6 +1817,7 @@ function validateDurableAgentAlias(record, cursorKey, sessionId) {
     && typeof record.reseedRequired === "boolean"
     && (record.reseedReason === "" || record.reseedReason === SESSION_AUTH_RESEED_REASON)
     && validPendingSessionAuthFailure(record.pendingSessionAuthFailure)
+    && validSessionAuthRecoveryFence(record.authRecoveryFence)
   );
   if (!record || typeof record !== "object" || Array.isArray(record)
       || (record.version !== 1 && record.version !== 2 && record.version !== DURABLE_AGENT_ALIAS_VERSION)
@@ -1741,6 +1866,7 @@ function validateDurableAgentAliasRoot(record) {
     && typeof record.reseedRequired === "boolean"
     && (record.reseedReason === "" || record.reseedReason === SESSION_AUTH_RESEED_REASON)
     && validPendingSessionAuthFailure(record.pendingSessionAuthFailure)
+    && validSessionAuthRecoveryFence(record.authRecoveryFence)
   );
   if (!basicValid || !metadataValid || !v3Valid) {
     throw new Error("durable Cursor agent alias root is malformed");
@@ -1789,6 +1915,11 @@ function writeDurableAgentAliasUnlocked(cursorKey, sessionId, agentId, epochs = 
         ? null : JSON.parse(canonicalJSONString(epochs.pendingSessionAuthFailure)))
       : (prior?.pendingSessionAuthFailure == null
         ? null : JSON.parse(canonicalJSONString(prior.pendingSessionAuthFailure))),
+    authRecoveryFence: Object.prototype.hasOwnProperty.call(epochs, "authRecoveryFence")
+      ? (epochs.authRecoveryFence == null
+        ? null : JSON.parse(canonicalJSONString(epochs.authRecoveryFence)))
+      : (prior?.authRecoveryFence == null
+        ? null : JSON.parse(canonicalJSONString(prior.authRecoveryFence))),
     systemBlockIds: validSystemBlockIds(epochs.systemBlockIds) ? [...epochs.systemBlockIds] : [],
     conversationBinding: canonicalConversationBinding(epochs.conversationBinding)
       || canonicalConversationBinding(prior?.conversationBinding),
@@ -1823,6 +1954,8 @@ function writeDurableAgentAliasUnlocked(cursorKey, sessionId, agentId, epochs = 
         || persisted.reseedReason !== record.reseedReason
         || canonicalJSONString(persisted.pendingSessionAuthFailure)
           !== canonicalJSONString(record.pendingSessionAuthFailure)
+        || canonicalJSONString(persisted.authRecoveryFence)
+          !== canonicalJSONString(record.authRecoveryFence)
         || persisted.conversationBinding !== record.conversationBinding
         || persisted.lastUsedAt !== record.lastUsedAt
         || persisted.generation !== record.generation
@@ -1863,6 +1996,7 @@ async function reconcilePendingSessionAuthFailure(cursorKey, sessionId) {
           identityPolicy: pending.identityPolicy,
           generation: pending.generation,
           replacementAgentId: pending.replacementAgentId,
+          autoRecovery: pending.autoRecovery,
           clientLeaseToken: pending.clientLeaseToken || "",
           failedAt: pending.detectedAt,
         });
@@ -1881,6 +2015,13 @@ async function reconcilePendingSessionAuthFailure(cursorKey, sessionId) {
             reseedRequired: true,
             reseedReason: SESSION_AUTH_RESEED_REASON,
             pendingSessionAuthFailure: null,
+            authRecoveryFence: alias.authRecoveryFence || (pending.autoRecovery ? {
+              ...pending.autoRecovery,
+              requestHash: pending.requestHash,
+              authEpoch: alias.authEpoch,
+              state: "AUTHORIZED",
+              updatedAt: nowMs(),
+            } : null),
           },
         );
       },
@@ -1892,6 +2033,7 @@ async function reconcilePendingSessionAuthFailure(cursorKey, sessionId) {
       session.reseedRequired = true;
       session.reseedReason = SESSION_AUTH_RESEED_REASON;
       session.pendingSessionAuthFailure = null;
+      session.authRecoveryFence = persisted.authRecoveryFence || null;
       session.resetSeedState();
     }
     lifecycleEvent("session_auth_recovery_reconciled", {
@@ -2694,7 +2836,7 @@ function validFreshDeliveryReceipt(record, cursorKey, sessionId, clientMessageId
 function validSessionAuthFailureReceipt(record, cursorKey, sessionId, clientMessageId, requestHash = "") {
   return !!record && typeof record === "object" && !Array.isArray(record)
     && record.recordType === "session_auth_failure"
-    && record.recordVersion === 1
+    && (record.recordVersion === 1 || record.recordVersion === 2)
     && record.acceptancePhase === ACCEPTANCE_PHASE.ACCEPTED
     && record.terminalDisposition === "RESEED_REQUIRED"
     && record.failureCode === SESSION_AUTH_FAILURE_CODE
@@ -2710,6 +2852,7 @@ function validSessionAuthFailureReceipt(record, cursorKey, sessionId, clientMess
     && Number.isSafeInteger(record.generation) && record.generation >= 1
     && typeof record.clientLeaseToken === "string"
     && typeof record.replacementAgentId === "string" && record.replacementAgentId.length > 0
+    && (record.recordVersion === 1 || validSessionAuthAutoRecovery(record.autoRecovery))
     && Number.isSafeInteger(record.failedAt) && record.failedAt > 0;
 }
 
@@ -2740,13 +2883,15 @@ async function writeSessionAuthFailureReceipt(cursorKey, sessionId, {
   identityPolicy,
   generation,
   replacementAgentId,
+  autoRecovery = null,
   clientLeaseToken = "",
   failedAt = nowMs(),
 }) {
+  const hasAutoRecovery = validSessionAuthAutoRecovery(autoRecovery);
   const record = {
     version: TURN_RECEIPT_VERSION,
     recordType: "session_auth_failure",
-    recordVersion: 1,
+    recordVersion: hasAutoRecovery ? 2 : 1,
     keyFingerprint: keyFingerprint(cursorKey),
     sessionId: String(sessionId || ""),
     clientMessageId: String(clientMessageId || ""),
@@ -2759,6 +2904,7 @@ async function writeSessionAuthFailureReceipt(cursorKey, sessionId, {
     terminalDisposition: "RESEED_REQUIRED",
     failureCode: SESSION_AUTH_FAILURE_CODE,
     replacementAgentId: String(replacementAgentId || ""),
+    ...(hasAutoRecovery ? { autoRecovery: JSON.parse(canonicalJSONString(autoRecovery)) } : {}),
     failedAt: Number.isSafeInteger(failedAt) ? failedAt : nowMs(),
   };
   if (!validSessionAuthFailureReceipt(
@@ -3449,9 +3595,12 @@ async function backfillTombstonesTick() {
     try { record = JSON.parse(readFileSync(file, "utf8")); } catch { skipped++; continue; }
     if (typeof record?.agentId !== "string" || typeof record?.keyFingerprint !== "string") { skipped++; continue; }
     let match = null;
-    for (const [scope, entry] of platforms.entries()) {
-      if (entry.fp === record.keyFingerprint) { match = { scope, entry }; break; }
-    }
+    const baseScope = String(record.keyFingerprint).slice(0, 16);
+    const targetScope = Number.isSafeInteger(record.authEpoch) && record.authEpoch > 0
+      ? `${baseScope}:session:${isolatedSessionPlatformHash(record.keyFingerprint, record.sessionId)}`
+      : baseScope;
+    const targetEntry = platforms.get(targetScope);
+    if (targetEntry?.fp === record.keyFingerprint) match = { scope: targetScope, entry: targetEntry };
     if (!match) { skipped++; continue; }
     try {
       // An existing marker (tombstone or quarantine) means this alias is already healed.
@@ -3781,13 +3930,37 @@ function recordSanitizedInternalAttempt(session, {
 }
 
 function platformStateRoot(h) { return MULTI_TENANT ? path.join(STATE_ROOT, "k_" + h) : STATE_ROOT; }
+
+function isolatedSessionPlatformHash(keyFingerprintValue, sessionId) {
+  return createHash("sha256")
+    .update(String(keyFingerprintValue || ""))
+    .update("\0")
+    .update(String(sessionId || ""))
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function platformScopeForSession(session) {
+  const h = keyHash(session && session.cursorKey);
+  if (!session || !Number.isSafeInteger(session.authEpoch) || session.authEpoch <= 0) return h;
+  return `${h}:session:${isolatedSessionPlatformHash(keyFingerprint(session.cursorKey), session.id)}`;
+}
+
+function platformStateRootForSession(session) {
+  const h = keyHash(session && session.cursorKey);
+  const base = platformStateRoot(h);
+  if (!session || !Number.isSafeInteger(session.authEpoch) || session.authEpoch <= 0) return base;
+  return path.join(base, ".cct-session-platforms",
+    isolatedSessionPlatformHash(keyFingerprint(session.cursorKey), session.id));
+}
 // PlatformKeyCollisionError marks a 64-bit truncated-hash collision between two DIFFERENT Cursor keys (ADD-53);
 // handleTurn maps it to a 500 rather than running under the wrong account.
 class PlatformKeyCollisionError extends Error { constructor(msg) { super(msg); this.code = "PLATFORM_KEY_COLLISION"; } }
-function getPlatform(cursorKey) {
+function getPlatform(cursorKey, session = null) {
   const h = keyHash(cursorKey);
   const fp = keyFingerprint(cursorKey);
-  let entry = platforms.get(h);
+  const scope = session ? platformScopeForSession(session) : h;
+  let entry = platforms.get(scope);
   if (entry) {
     // ADD-53: same truncated hash but a DIFFERENT full key -> a genuine collision. Never reuse the first key's
     // platform/account/state for the second key; fail loud so the request is rejected, not mis-attributed.
@@ -3796,16 +3969,16 @@ function getPlatform(cursorKey) {
       throw new PlatformKeyCollisionError("cursor key hash collision: two distinct keys share a 64-bit platform hash; refusing to share durable state");
     }
   } else {
-    const stateRoot = platformStateRoot(h);
+    const stateRoot = session ? platformStateRootForSession(session) : platformStateRoot(h);
     try { mkdirSync(stateRoot, { recursive: true }); } catch { /* createAgentPlatform will surface a real error */ }
     // ADD-61: do NOT cache a REJECTED createAgentPlatform promise — a transient init failure (sqlite open,
     // FS blip, SDK init) would otherwise poison this tenant until restart (every later turn reuses the same
     // rejected promise + the pinned entry blocks idle eviction). Evict the entry on reject so the next turn
     // retries cleanly. The .catch re-throws so the awaiting caller still sees the real error this turn.
     const promise = loadSdk().createAgentPlatform({ apiKey: cursorKey, stateRoot })
-      .catch((e) => { if (platforms.get(h) === entry) platforms.delete(h); throw e; });
-    entry = { promise, stateRoot, lastUsed: nowMs(), fp };
-    platforms.set(h, entry);
+      .catch((e) => { if (platforms.get(scope) === entry) platforms.delete(scope); throw e; });
+    entry = { promise, stateRoot, lastUsed: nowMs(), fp, scope };
+    platforms.set(scope, entry);
     enforcePlatformCap();
   }
   entry.lastUsed = nowMs();
@@ -3823,9 +3996,9 @@ async function disposePlatform(entry) {
 // sqlite stores out from under a session that is paused awaiting tool_results (its SDK run is still live,
 // just between HTTP turns, so activeRes is null). Both the cap and the idle timer use this ONE predicate so
 // they never diverge — the original bug was the cap checking only activeRes while the idle timer didn't.
-function platformHasSession(h, sess = sessions) {
+function platformHasSession(scope, sess = sessions) {
   for (const s of sess.values()) {
-    if (keyHash(s.cursorKey) === h) return true;
+    if (platformScopeForSession(s) === scope) return true;
   }
   return false;
 }
@@ -3845,11 +4018,17 @@ function enforcePlatformCap() {
 // the pool is at MAX_PLATFORMS and every platform is pinned (platformHasSession), there is nothing to evict —
 // return false so handleTurn rejects the new tenant with a typed 429 rather than growing past the cap and
 // exhausting fds / sqlite handles / memory. We never dispose a pinned (live/paused) tenant's platform.
-function platformCapHasRoomForNew(cursorKey) {
-  const h = keyHash(cursorKey);
-  if (platforms.has(h)) return true;        // existing tenant: reuses its platform, no new entry
+function platformCapHasRoomForNew(cursorKey, session = null) {
+  const scope = session ? platformScopeForSession(session) : keyHash(cursorKey);
+  if (platforms.has(scope)) return true;    // existing scope: reuses its platform, no new entry
   if (platforms.size < MAX_PLATFORMS) return true;
-  enforcePlatformCap();                      // shed idle (unpinned) platforms if any
+  const sorted = [...platforms.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+  for (const [candidateScope, entry] of sorted) {
+    if (platformHasSession(candidateScope)) continue;
+    platforms.delete(candidateScope);
+    void disposePlatform(entry);
+    break;
+  }
   return platforms.size < MAX_PLATFORMS;
 }
 
@@ -3906,10 +4085,18 @@ function recyclePlatform(h) {
   return true;
 }
 
-function terminalizePoisonedPlatformSessions(h, reason) {
+async function recyclePlatformAndWait(scope) {
+  const entry = platforms.get(scope);
+  if (!entry) return false;
+  platforms.delete(scope);
+  await disposePlatform(entry);
+  return true;
+}
+
+function terminalizePoisonedPlatformSessions(scope, reason) {
   let affected = 0;
   for (const session of sessions.values()) {
-    if (!session || keyHash(session.cursorKey) !== h || session.done) continue;
+    if (!session || platformScopeForSession(session) !== scope || session.done) continue;
     affected++;
     const error = reason instanceof Error ? reason : new Error(String(reason || "upstream connection poisoned"));
     if (session.run || session.sendPending) {
@@ -3979,7 +4166,7 @@ function soleStreamingSession(sessionsMap) {
 function rateLimitedKeyToRecycle(sessionsMap, platformsMap) {
   if (platformsMap && platformsMap.size === 1) return [...platformsMap.keys()][0];
   const s = soleStreamingSession(sessionsMap);
-  return s ? keyHash(s.cursorKey) : null;
+  return s ? platformScopeForSession(s) : null;
 }
 
 class AdvertisedToolRegistry extends ToolContractRegistry {
@@ -4021,7 +4208,9 @@ class Session {
     this.reseedRequired = durableAlias?.reseedRequired === true;
     this.reseedReason = durableAlias?.reseedReason || "";
     this.pendingSessionAuthFailure = durableAlias?.pendingSessionAuthFailure || null;
+    this.authRecoveryFence = durableAlias?.authRecoveryFence || null;
     this.authRecoveryPromise = null;
+    this.activeAuthRecovery = null;
     this.sessionAuthRecoveryUnavailable = "";
     this.seededSystemBlockIds = Array.isArray(durableAlias?.systemBlockIds)
       ? [...durableAlias.systemBlockIds] : [];
@@ -4326,6 +4515,8 @@ class Session {
         && record.reseedReason === this.reseedReason
         && canonicalJSONString(record.pendingSessionAuthFailure)
           === canonicalJSONString(this.pendingSessionAuthFailure)
+        && canonicalJSONString(record.authRecoveryFence)
+          === canonicalJSONString(this.authRecoveryFence)
         && nowMs() - record.lastUsedAt < refreshAfterMs) return false;
     await this.persistDurableAlias();
     return true;
@@ -4351,10 +4542,22 @@ class Session {
       reseedRequired: false,
       reseedReason: "",
       pendingSessionAuthFailure: null,
+      authRecoveryFence: this.authRecoveryFence ? {
+        ...this.authRecoveryFence,
+        state: "COMPLETED",
+        updatedAt: nowMs(),
+      } : null,
     });
     this.reseedRequired = false;
     this.reseedReason = "";
     this.pendingSessionAuthFailure = null;
+    if (this.authRecoveryFence) {
+      this.authRecoveryFence = {
+        ...this.authRecoveryFence,
+        state: "COMPLETED",
+        updatedAt: nowMs(),
+      };
+    }
     lifecycleEvent("session_auth_reseed_committed", {
       sessionId: this.id,
       keyHash: keyHash(this.cursorKey),
@@ -5054,6 +5257,15 @@ class Session {
     if (this.authRecoveryPromise) return;
     const message = cursorSdkErrorMessage(runError)
       || "Authentication error If you are logged in, try logging out and back in.";
+    if (validSessionAuthAutoRecovery(this.activeAuthRecovery)) {
+      const exhausted = this.finishSessionAuthRecoveryExhausted(message)
+        .catch((error) => this.finishSessionAuthRecoveryUnavailable({ requestKind: "fresh" }, error));
+      this.authRecoveryPromise = exhausted.finally(() => {
+        this.authRecoveryPromise = null;
+        this.notifyLogicalDone();
+      });
+      return;
+    }
     const sourceAgentId = this.agentId;
     const failedAt = nowMs();
     const context = {
@@ -5084,6 +5296,80 @@ class Session {
     });
   }
 
+  async finishSessionAuthRecoveryExhausted(message) {
+    this.lastRunError = message;
+    this.run = null;
+    this.sendPending = false;
+    this.runEpoch++;
+    const exhaustedFence = this.authRecoveryFence ? {
+      ...this.authRecoveryFence,
+      state: "EXHAUSTED",
+      updatedAt: nowMs(),
+    } : null;
+    await writeDurableAgentAlias(this.cursorKey, this.id, this.agentId, {
+      recoveryEpoch: this.recoveryEpoch,
+      modelEpoch: this.modelEpoch,
+      keyEpoch: this.keyEpoch,
+      contextEpoch: this.contextEpoch,
+      authEpoch: this.authEpoch,
+      systemBlockIds: this.seededSystemBlockIds,
+      conversationBinding: this.conversationBinding,
+      reseedRequired: true,
+      reseedReason: SESSION_AUTH_RESEED_REASON,
+      pendingSessionAuthFailure: null,
+      authRecoveryFence: exhaustedFence,
+    });
+    this.authRecoveryFence = exhaustedFence;
+    this.reseedRequired = true;
+    this.reseedReason = SESSION_AUTH_RESEED_REASON;
+
+    const oldAgent = this.agent;
+    const oldLease = this.agentUseLease;
+    const cancelledRunEpoch = this.runEpoch - 1;
+    this.agent = null;
+    this.agentPromise = null;
+    this.agentUseLease = null;
+    this.mcpServerKeys = null;
+    if (oldAgent && typeof oldAgent.close === "function") {
+      noteExpectedSdkAbort(this.id, cancelledRunEpoch);
+      try { await oldAgent.close(); }
+      catch (error) {
+        dbg("session auth exhausted-agent cleanup failed", "session=" + this.id,
+          (error && error.message) || String(error));
+      }
+    }
+    if (oldLease) {
+      try { await oldLease.release(); } catch {}
+    }
+    await recyclePlatformAndWait(platformScopeForSession(this));
+
+    this.done = true;
+    this.rejectAllPending(message, TerminalReason.RUN_ERROR);
+    this.sse({
+      type: "turn_end",
+      stop_reason: "error",
+      receipt: "session_auth_recovery_exhausted",
+      errorCode: SESSION_AUTH_RECOVERY_EXHAUSTED_CODE,
+      retryable: false,
+      retryMode: "none",
+      error: "The automatic Cursor session-auth recovery attempt also expired. Start a new conversation or rotate the Cursor credential.",
+    });
+    this.activeAuthRecovery = null;
+    this.activeClientMessageId = "";
+    this.activeClientMessageHash = "";
+    this.activeClientMessageGeneration = 1;
+    this.activeClientMessageKind = "";
+    this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE;
+    this.activeDeferredInputId = "";
+    this.clearTurnState();
+    this.settle();
+    lifecycleEvent("session_auth_recovery_exhausted", {
+      sessionId: this.id,
+      keyHash: keyHash(this.cursorKey),
+      authEpoch: this.authEpoch,
+    });
+  }
+
   async finalizeSessionAuthRecovery(context, message) {
     if (!context.requestHash || !/^[a-f0-9]{64}$/.test(context.requestHash)) {
       throw new Error("the accepted turn has no durable semantic request hash");
@@ -5092,7 +5378,33 @@ class Session {
       throw new Error("durable Cursor session auth epoch is exhausted");
     }
     const nextAuthEpoch = this.authEpoch + 1;
+    const recoveryPlatformIdentity = {
+      id: this.id,
+      cursorKey: this.cursorKey,
+      authEpoch: nextAuthEpoch,
+    };
+    if (!platformCapHasRoomForNew(this.cursorKey, recoveryPlatformIdentity)) {
+      throw new ToolRoundError(
+        "cursor_session_auth_recovery_unavailable",
+        "no isolated Cursor platform capacity is available for session-auth recovery",
+        503,
+      );
+    }
     const replacementAgentId = this.composeAgentId({ authEpoch: nextAuthEpoch });
+    const autoRecovery = sessionAuthAutoRecovery(
+      this.cursorKey,
+      this.id,
+      context.clientMessageId,
+      context.requestHash,
+      nextAuthEpoch,
+    );
+    const authRecoveryFence = {
+      ...autoRecovery,
+      requestHash: context.requestHash,
+      authEpoch: nextAuthEpoch,
+      state: "AUTHORIZED",
+      updatedAt: nowMs(),
+    };
     const pending = {
       version: 1,
       clientMessageId: context.clientMessageId || "",
@@ -5102,6 +5414,7 @@ class Session {
       generation: context.generation,
       sourceAgentId: context.sourceAgentId,
       replacementAgentId,
+      autoRecovery,
       clientLeaseToken: normalizeClientLeaseToken(context.clientLeaseToken),
       detectedAt: context.failedAt,
     };
@@ -5116,6 +5429,7 @@ class Session {
       reseedRequired: true,
       reseedReason: SESSION_AUTH_RESEED_REASON,
       pendingSessionAuthFailure: pending,
+      authRecoveryFence,
     };
     await withAliasStateLease(this.cursorKey, this.id, async () => {
       const current = readDurableAgentAlias(this.cursorKey, this.id);
@@ -5135,6 +5449,7 @@ class Session {
         this.reseedRequired = true;
         this.reseedReason = SESSION_AUTH_RESEED_REASON;
         this.pendingSessionAuthFailure = pending;
+        this.authRecoveryFence = authRecoveryFence;
         this.resetSeedState();
         lifecycleEvent("session_auth_alias_committed", {
           sessionId: this.id,
@@ -5145,6 +5460,7 @@ class Session {
         await writeSessionAuthFailureReceipt(this.cursorKey, this.id, {
           ...context,
           replacementAgentId,
+          autoRecovery,
         });
         lifecycleEvent("session_auth_failure_receipt_committed", {
           sessionId: this.id,
@@ -5214,6 +5530,14 @@ class Session {
           (error && error.message) || String(error));
       }
     }
+    if (nextAuthEpoch > 1) {
+      await recyclePlatformAndWait(platformScopeForSession(this));
+      lifecycleEvent("session_auth_platform_recycled", {
+        sessionId: this.id,
+        keyHash: keyHash(this.cursorKey),
+        authEpoch: this.authEpoch,
+      });
+    }
 
     this.done = true;
     this.rejectAllPending(message, TerminalReason.RUN_ERROR);
@@ -5223,8 +5547,9 @@ class Session {
       receipt: "session_auth_expired_rotated",
       errorCode: SESSION_AUTH_FAILURE_CODE,
       retryable: false,
-      retryMode: "reseed",
+      retryMode: "auto_recover",
       reseedRequired: true,
+      autoRecovery,
       error: "The Cursor session credential expired after this turn was accepted. Start a new turn with a new invocation identity and bounded history.",
     });
     this.activeClientMessageId = "";
@@ -5400,7 +5725,7 @@ class Session {
     // connection is healthy. Legacy no-id turns retain their historical
     // non-replayable behavior; every versioned turn must cross the commit.
     if (stopReason === "end_turn" && (!completedClientMessageId || completedReceiptPersisted)) {
-      closeBreaker(keyHash(this.cursorKey));
+      closeBreaker(platformScopeForSession(this));
     }
     if (completedReceiptPersisted && completedDeferredRound && completedDeferredInputId) {
       try {
@@ -6020,7 +6345,8 @@ async function ensureAgent(session, model) {
       id: `agent-init:${session.id}`,
     });
     try {
-    const platform = await getPlatform(session.cursorKey);
+    const platformScope = platformScopeForSession(session);
+    const platform = await getPlatform(session.cursorKey, session);
     const modelSel = composerModelSelection(model, { utilityOneShot: session.utilityOneShot });
     dbg("ensureAgent modelSelection", "session=" + session.id, "model=" + model, "selection=" + safeJson(modelSel));
     const opts = { model: modelSel, apiKey: session.cursorKey, local: { cwd: EMPTY_CWD } };
@@ -6044,13 +6370,13 @@ async function ensureAgent(session, model) {
     if (SDK_AGENT_GC_ENABLED && !session.agentUseLease) {
       let quarantine = { restored: false, missing: false };
       session.agentUseLease = await agentLeaseManager.acquireUse(
-        keyHash(session.cursorKey),
+        platformScope,
         agentId,
         {
           beforeAcquire: async () => {
             quarantine = await cancelSdkAgentQuarantine({
               platform,
-              scope: keyHash(session.cursorKey),
+              scope: platformScope,
               quarantineRoot: SDK_AGENT_GC_DIR,
               agentId,
               withAgentMutationLease: async (_context, restore) => restore(),
@@ -6164,7 +6490,7 @@ async function ensureAgent(session, model) {
       let priorMarker = null;
       let markerCorrupt = false;
       try {
-        priorMarker = readMarker(markerPath(SDK_AGENT_GC_DIR, keyHash(session.cursorKey), agentId));
+        priorMarker = readMarker(markerPath(SDK_AGENT_GC_DIR, platformScope, agentId));
       } catch (markerErr) {
         markerCorrupt = true;
         dbg("ensureAgent marker unreadable; treating as prior-life evidence", "session=" + session.id, (markerErr && markerErr.message) || String(markerErr));
@@ -7541,7 +7867,7 @@ function continuationTenantMismatch(round, cursorKey, strictKeyAffinity = strict
   return strictKeyAffinity && stored !== keyFingerprint(cursorKey);
 }
 
-async function preflightContinuationSessionAuth(cursorKey, sessionId, identity, requestHash) {
+async function preflightContinuationSessionAuth(cursorKey, sessionId, input, identity, requestHash) {
   const authRecoveryOwner = sessions.get(sessionId);
   if (authRecoveryOwner?.authRecoveryPromise) await authRecoveryOwner.authRecoveryPromise;
   if (authRecoveryOwner?.sessionAuthRecoveryUnavailable) {
@@ -7579,11 +7905,13 @@ async function preflightContinuationSessionAuth(cursorKey, sessionId, identity, 
       409,
       {
         retryable: false,
-        retryMode: "reseed",
+        retryMode: failure.autoRecovery ? "auto_recover" : "reseed",
         reseedRequired: true,
+        ...(failure.autoRecovery ? { autoRecovery: failure.autoRecovery } : {}),
       },
     );
   }
+  const authRecovery = validateSessionAuthRecoveryRequest(input, alias, identity, requestHash);
   if (alias?.reseedRequired === true && !versionedFreshReplayIdentity(identity)) {
     lifecycleEvent("session_auth_reseed_refused", {
       sessionId,
@@ -7603,7 +7931,7 @@ async function preflightContinuationSessionAuth(cursorKey, sessionId, identity, 
       },
     );
   }
-  return alias;
+  return { alias, authRecovery };
 }
 
 function legacyRecoveryKeyFor(sessionId, clientMessageId) {
@@ -7865,6 +8193,7 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
         await preflightContinuationSessionAuth(
           cursorKey,
           group.groupRound.sessionId,
+          { ...input, results: group.groupResults },
           continuationIdentity,
           completedTurnRequestHash({ ...input, results: group.groupResults }),
         );
@@ -7946,9 +8275,10 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
     if (continuationTenantMismatch(round, cursorKey)) {
       throw new ToolRoundError("tenant_mismatch", "the signed tool round belongs to a different Cursor credential", 403);
     }
-    await preflightContinuationSessionAuth(
+    const { authRecovery: continuationAuthRecovery } = await preflightContinuationSessionAuth(
       cursorKey,
       round.sessionId,
+      input,
       continuationIdentity,
       continuationClientMessageHash,
     );
@@ -8521,6 +8851,8 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
         dispositions: committed.dispositions,
         requestHash: continuationClientMessageHash,
         identityPolicy: continuationIdentity.policy,
+        authRecovery: continuationAuthRecovery,
+        authRecoveryInput: input,
       });
     }
 
@@ -8593,6 +8925,8 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
           committedIds,
           requestHash: continuationClientMessageHash,
           identityPolicy: continuationIdentity.policy,
+          authRecovery: continuationAuthRecovery,
+          authRecoveryInput: input,
         });
         return;
       }
@@ -8680,6 +9014,8 @@ async function handleContinueAdmitted(req, res, body, cursorKey, casAttempt = 0,
       dispositions: committed.dispositions,
       requestHash: continuationClientMessageHash,
       identityPolicy: continuationIdentity.policy,
+      authRecovery: continuationAuthRecovery,
+      authRecoveryInput: input,
     });
   } catch (error) {
     if (res.headersSent) {
@@ -8800,6 +9136,7 @@ async function handleTurn(req, res, body, cursorKey) {
     return;
   }
   const requestClientMessageId = requestIdentity.id;
+  let validatedAuthRecovery = null;
   try {
     const authRecoveryOwner = sessions.get(sessionId);
     if (authRecoveryOwner?.authRecoveryPromise) await authRecoveryOwner.authRecoveryPromise;
@@ -8810,6 +9147,13 @@ async function handleTurn(req, res, body, cursorKey) {
       return;
     }
     await reconcilePendingSessionAuthFailure(cursorKey, sessionId);
+    const authAlias = readDurableAgentAlias(cursorKey, sessionId);
+    validatedAuthRecovery = validateSessionAuthRecoveryRequest(
+      input,
+      authAlias,
+      requestIdentity,
+      requestClientMessageHash,
+    );
     const authFailure = readSessionAuthFailureReceipt(
       cursorKey,
       sessionId,
@@ -8824,12 +9168,22 @@ async function handleTurn(req, res, body, cursorKey) {
           code: SESSION_AUTH_FAILURE_CODE,
           message: "the accepted Cursor turn ended after its durable session credential expired; start a new invocation with bounded history",
           retryable: false,
-          retryMode: "reseed",
+          retryMode: authFailure.autoRecovery ? "auto_recover" : "reseed",
           reseedRequired: true,
+          ...(authFailure.autoRecovery ? { autoRecovery: authFailure.autoRecovery } : {}),
         });
       return;
     }
   } catch (error) {
+    if (error instanceof ToolRoundError) {
+      fail(error.status, error.message, error.code, {
+        code: error.code,
+        message: error.message,
+        retryable: false,
+        retryMode: "none",
+      });
+      return;
+    }
     fail(503, `durable session-auth continuity state is unavailable: ${(error && error.message) || String(error)}`,
       "cursor_session_auth_recovery_unavailable");
     return;
@@ -8955,9 +9309,11 @@ async function handleTurn(req, res, body, cursorKey) {
   // are NOT gated — they complete a paused run, and blocking one would strand it until the abandonment watchdog.
   // HALF-OPEN after the window: the next new-user turn probes and closeBreaker (onRunComplete) clears it on success.
   if (input.type !== "tool_results") {
-    const kh = keyHash(cursorKey);
-    if (breakerOpen(kh)) {
-      const waitS = Math.ceil(breakerRetryAfterMs(kh) / 1000);
+    const platformScope = sessions.has(sessionId)
+      ? platformScopeForSession(sessions.get(sessionId))
+      : keyHash(cursorKey);
+    if (breakerOpen(platformScope)) {
+      const waitS = Math.ceil(breakerRetryAfterMs(platformScope) / 1000);
       fail(429, `upstream is rate-limiting this account (Cursor HTTP/2 ENHANCE_YOUR_CALM); the proxy recycled the connection and is backing off — retry in ~${waitS}s and avoid rapid retries (they re-trip the limit)`, "upstream_account_rate_limit");
       return;
     }
@@ -9166,9 +9522,28 @@ async function handleTurn(req, res, body, cursorKey) {
   session.clientLeaseToken = normalizeClientLeaseToken(body.clientLeaseToken);
   try {
     refreshSessionFromBody(session, body, preparedToolRegistry, { ignoreToolInventory: !!inventoryWarning });
+    await startSessionAuthRecoveryAttempt(
+      session,
+      cursorKey,
+      input,
+      requestIdentity,
+      requestClientMessageHash,
+      validatedAuthRecovery,
+    );
   } catch (error) {
     releasePreReservedReceipt();
-    throw error;
+    if (error instanceof ToolRoundError) {
+      fail(error.status, error.message, error.code, {
+        code: error.code,
+        message: error.message,
+        retryable: false,
+        retryMode: "none",
+      });
+      return;
+    }
+    fail(503, `durable session-auth recovery could not be started: ${(error && error.message) || String(error)}`,
+      "cursor_session_auth_recovery_unavailable");
+    return;
   }
   // ADD-37 (extended by ADD-106): a plain NEW-USER turn that arrives while a run is still LIVE on this session
   // is an INTERRUPTION, not a concurrent generation — the user is steering, so the old run must yield to the
@@ -9496,6 +9871,17 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
   };
   let keepalive = null;
   try {
+    if (continuation) {
+      const authRecoveryInput = continuation.authRecoveryInput || input;
+      await startSessionAuthRecoveryAttempt(
+        session,
+        session.cursorKey,
+        authRecoveryInput,
+        turnInvocationIdentity(authRecoveryInput),
+        clientMessageHash,
+        continuation.authRecovery,
+      );
+    }
     try {
       session.beginReplaySegment(clientMessageId);
     } catch (error) {
@@ -10370,16 +10756,17 @@ const evictTimer = setInterval(() => {
       cancelSessionDetached(s, { terminalReason: TerminalReason.SESSION_EVICTED, detail: "idle session eviction" });
     }
   }
-  // Multi-tenant only: dispose idle per-user platforms. Single-tenant keeps its single platform resident
-  // (it is the common, hot path) — it is never evicted, matching the pre-pool behavior exactly.
-  if (MULTI_TENANT) {
-    const pcut = nowMs() - PLATFORM_TTL_MS;
-    for (const [h, entry] of platforms) {
-      if (entry.lastUsed < pcut && !platformHasSession(h)) {
-        platforms.delete(h);
-        upstreamBreaker.delete(h);
-        void disposePlatform(entry);
-      }
+  // Multi-tenant entries and per-session recovery entries are bounded by the same idle eviction. The original
+  // single-tenant base scope remains resident as the hot path; isolated recovery stores may be reclaimed once
+  // their session is gone.
+  const pcut = nowMs() - PLATFORM_TTL_MS;
+  for (const [scope, entry] of platforms) {
+    const isolatedRecoveryScope = scope.includes(":session:");
+    if ((MULTI_TENANT || isolatedRecoveryScope)
+        && entry.lastUsed < pcut && !platformHasSession(scope)) {
+      platforms.delete(scope);
+      upstreamBreaker.delete(scope);
+      void disposePlatform(entry);
     }
   }
   const now = nowMs();
@@ -10909,7 +11296,7 @@ if (RUN_AS_MAIN) {
 }
 
 export { runDurableMaintenance, runDurableFileMaintenance, runDurableMaintenanceInWorker, runSdkAgentMaintenance, sdkAgentGCRoots, sdkAgentGCCensus, readAuthoritativeSdkAgentRoots, continuationAdmissionPriority, lifecycleEvent, crashPoint, backfillTombstonesTick, reserveUnresolvedReceipt, resizeUnresolvedReceipt, releaseUnresolvedReceipt, reclaimTombstonedDurableFiles };
-export { CC_CASES, composerModelSelection, turnFailureMetadata, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, readSessionAuthFailureReceipt, validSessionAuthFailureReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, isCursorSessionAuthExpired, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
+export { CC_CASES, composerModelSelection, turnFailureMetadata, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, platformScopeForSession, platformStateRootForSession, validateSessionAuthRecoveryRequest, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, readSessionAuthFailureReceipt, validSessionAuthFailureReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, isCursorSessionAuthExpired, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
 export {
   TURN_RECEIPT_VERSION,
   ACCEPTANCE_PHASE,

@@ -98,6 +98,20 @@ var composerStreamCommitMaxBytes = func() int {
 	return value
 }()
 
+var composerAuthRecoveryOverlapMaxBytes = func() int {
+	const defaultMax = 8 << 20
+	raw := strings.TrimSpace(os.Getenv("CURSOR_COMPOSER_AUTH_RECOVERY_OVERLAP_MAX_BYTES"))
+	if raw == "" {
+		return defaultMax
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1<<20 {
+		log.Warnf("cursor composer: invalid CURSOR_COMPOSER_AUTH_RECOVERY_OVERLAP_MAX_BYTES=%q; using %d", raw, defaultMax)
+		return defaultMax
+	}
+	return value
+}()
+
 type composerAtomicCommitBudget struct {
 	mu   sync.Mutex
 	max  int
@@ -366,6 +380,7 @@ type composerBridgeStatusError struct {
 	requestedBytes *int64
 	availableBytes *int64
 	priority       *int
+	authRecovery   *composerAuthRecoveryDescriptor
 	// detail carries the bridge's own explanation for a repair-class conflict,
 	// where the remedy (e.g. "submit each round independently") IS the payload
 	// the caller needs. Only set for statuses whose message is client-actionable.
@@ -431,7 +446,7 @@ func (e *composerBridgeStatusError) RetryAfter() *time.Duration { return e.retry
 
 func (e *composerBridgeStatusError) RetryScope() cliproxyexecutor.RetryScope {
 	switch e.bridgeCode {
-	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch", "cursor_session_auth_expired", "cursor_session_auth_recovery_unavailable":
+	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch", "cursor_session_auth_expired", "cursor_session_auth_recovery_unavailable", "cursor_session_auth_recovery_diverged", "cursor_session_auth_recovery_exhausted":
 		return cliproxyexecutor.RetryScopeSelectedExecution
 	case "upstream_account_rate_limit":
 		return cliproxyexecutor.RetryScopeDefault
@@ -446,7 +461,7 @@ func (e *composerBridgeStatusError) RetryScope() cliproxyexecutor.RetryScope {
 
 func (e *composerBridgeStatusError) AuthAttributable() bool {
 	switch e.bridgeCode {
-	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch", "cursor_session_auth_expired", "cursor_session_auth_recovery_unavailable":
+	case "local_admission_capacity", "local_replay_capacity", "durable_state_capacity", "session_capacity", "platform_capacity", "session_queue_capacity", "tenant_mismatch", "cursor_session_auth_expired", "cursor_session_auth_recovery_unavailable", "cursor_session_auth_recovery_diverged", "cursor_session_auth_recovery_exhausted":
 		return false
 	case "upstream_account_rate_limit":
 		return true
@@ -660,6 +675,17 @@ func composerBridgeTurnFailure(responseID string, ev gjson.Result) error {
 			detail:      emsg,
 		}
 	}
+	if code := ev.Get("errorCode").String(); code == "cursor_session_auth_recovery_diverged" ||
+		code == "cursor_session_auth_recovery_exhausted" {
+		corr := composerCorrelationID()
+		log.Errorf("[composer %s] bridge SESSION-AUTH RECOVERY TERMINAL corr=%s code=%s (-> 409)", responseID, corr, code)
+		return &composerBridgeStatusError{
+			status:      http.StatusConflict,
+			correlation: corr,
+			bridgeCode:  code,
+			detail:      emsg,
+		}
+	}
 	// A non-retryable terminal that names a REPAIR-class retry mode is telling us
 	// the body must change ("repair"), be decomposed ("split"), or start a new
 	// invocation against a replacement agent ("reseed") before it can
@@ -671,7 +697,7 @@ func composerBridgeTurnFailure(responseID string, ev gjson.Result) error {
 	// (SelectedExecution, not auth-attributable) still blocks credential failover.
 	// ``none``/absent keeps ordinary terminal semantics.
 	switch ev.Get("retryMode").String() {
-	case "repair", "split", "reseed":
+	case "repair", "split", "reseed", "auto_recover":
 		corr := composerCorrelationID()
 		code := ev.Get("errorCode").String()
 		log.Errorf("[composer %s] bridge REPAIR-CLASS TERMINAL corr=%s code=%s mode=%s (-> 409)",
@@ -720,6 +746,106 @@ func composerEnvTruthy(v string) bool {
 // composerEnvTruthyRaw matches composerDebugEnabled's legacy check (no trim, no EqualFold).
 func composerEnvTruthyRaw(v string) bool {
 	return v == "1" || v == "true"
+}
+
+func composerAutoAuthRecoveryEnabledValue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return true
+	}
+}
+
+func composerAutoAuthRecoveryEnabled() bool {
+	return composerAutoAuthRecoveryEnabledValue(os.Getenv("CURSOR_COMPOSER_AUTO_AUTH_RECOVERY"))
+}
+
+type composerAuthRecoveryDescriptor struct {
+	recoveryOf   string
+	invocationID string
+	attempt      int64
+}
+
+func composerTurnInvocationIdentity(body []byte) string {
+	if id := strings.TrimSpace(gjson.GetBytes(body, "input.invocationId").String()); id != "" {
+		return id
+	}
+	return strings.TrimSpace(gjson.GetBytes(body, "input.clientMessageId").String())
+}
+
+func composerAuthRecoveryInputType(body []byte) bool {
+	inputType := gjson.GetBytes(body, "input.type").String()
+	return inputType == "user" || inputType == "tool_results"
+}
+
+func composerAuthRecoveryFromEvent(ev gjson.Result, body []byte) (composerAuthRecoveryDescriptor, bool) {
+	if ev.Get("errorCode").String() != "cursor_session_auth_expired" ||
+		ev.Get("retryMode").String() != "auto_recover" ||
+		!composerAuthRecoveryInputType(body) ||
+		gjson.GetBytes(body, "input.authRecoveryAttempt").Exists() {
+		return composerAuthRecoveryDescriptor{}, false
+	}
+	descriptor, ok := composerAuthRecoveryCandidate(ev)
+	if !ok {
+		return composerAuthRecoveryDescriptor{}, false
+	}
+	original := composerTurnInvocationIdentity(body)
+	if original == "" || descriptor.recoveryOf != original || descriptor.invocationID == original {
+		return composerAuthRecoveryDescriptor{}, false
+	}
+	return descriptor, true
+}
+
+func composerAuthRecoveryCandidate(ev gjson.Result) (composerAuthRecoveryDescriptor, bool) {
+	auto := ev.Get("autoRecovery")
+	descriptor := composerAuthRecoveryDescriptor{
+		recoveryOf:   strings.TrimSpace(auto.Get("recoveryOf").String()),
+		invocationID: strings.TrimSpace(auto.Get("invocationId").String()),
+		attempt:      auto.Get("attempt").Int(),
+	}
+	if auto.Get("version").Int() != 1 || descriptor.attempt != 1 ||
+		descriptor.recoveryOf == "" || !cliproxyexecutor.ValidInvocationID(descriptor.invocationID) {
+		return composerAuthRecoveryDescriptor{}, false
+	}
+	return descriptor, true
+}
+
+func composerAuthRecoveryBody(body []byte, descriptor composerAuthRecoveryDescriptor) ([]byte, error) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return nil, errors.New("automatic Cursor session-auth recovery body is invalid")
+	}
+	if !composerAuthRecoveryInputType(body) ||
+		gjson.GetBytes(body, "input.authRecoveryAttempt").Exists() ||
+		descriptor.attempt != 1 ||
+		descriptor.recoveryOf != composerTurnInvocationIdentity(body) ||
+		!cliproxyexecutor.ValidInvocationID(descriptor.invocationID) {
+		return nil, errors.New("automatic Cursor session-auth recovery descriptor does not match the original turn")
+	}
+	next, err := sjson.SetBytes(body, "input.invocationId", descriptor.invocationID)
+	if err != nil {
+		return nil, fmt.Errorf("set automatic recovery invocation: %w", err)
+	}
+	next, err = sjson.SetBytes(next, "input.authRecoveryOf", descriptor.recoveryOf)
+	if err != nil {
+		return nil, fmt.Errorf("link automatic recovery invocation: %w", err)
+	}
+	next, err = sjson.SetBytes(next, "input.authRecoveryAttempt", descriptor.attempt)
+	if err != nil {
+		return nil, fmt.Errorf("set automatic recovery attempt: %w", err)
+	}
+	return next, nil
+}
+
+func newComposerAuthRecoveryConflict(responseID, code, detail string) *composerBridgeStatusError {
+	corr := composerCorrelationID()
+	log.Errorf("[composer %s] automatic session-auth recovery failed closed corr=%s code=%s", responseID, corr, code)
+	return &composerBridgeStatusError{
+		status:      http.StatusConflict,
+		correlation: corr,
+		bridgeCode:  code,
+		detail:      detail,
+	}
 }
 
 // cursorDirectEnabled reports whether the gated, ToS-exposed direct Cursor path
@@ -4865,6 +4991,57 @@ func (e *CursorExecutor) composerAgentTurnDial(
 	return httpResp, nil
 }
 
+func composerAuthRecoveryFromError(err error, body []byte) (composerAuthRecoveryDescriptor, bool) {
+	var bridgeErr *composerBridgeStatusError
+	if !errors.As(err, &bridgeErr) || bridgeErr == nil || bridgeErr.authRecovery == nil ||
+		bridgeErr.bridgeCode != "cursor_session_auth_expired" ||
+		!composerAuthRecoveryInputType(body) ||
+		gjson.GetBytes(body, "input.authRecoveryAttempt").Exists() {
+		return composerAuthRecoveryDescriptor{}, false
+	}
+	descriptor := *bridgeErr.authRecovery
+	original := composerTurnInvocationIdentity(body)
+	if original == "" || descriptor.recoveryOf != original || descriptor.invocationID == original {
+		return composerAuthRecoveryDescriptor{}, false
+	}
+	return descriptor, true
+}
+
+func (e *CursorExecutor) dialComposerAuthRecovery(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	apiKey string,
+	body []byte,
+	descriptor composerAuthRecoveryDescriptor,
+	responseID string,
+	previous *http.Response,
+	stream bool,
+) (*http.Response, []byte, error) {
+	if previous != nil && previous.Body != nil {
+		if errClose := previous.Body.Close(); errClose != nil {
+			composerDebugf("[composer %s] close expired session response before recovery: %v", responseID, errClose)
+		}
+	}
+	recoveryBody, err := composerAuthRecoveryBody(body, descriptor)
+	if err != nil {
+		return nil, nil, &composerBridgeStatusError{
+			status:      http.StatusConflict,
+			correlation: composerCorrelationID(),
+			bridgeCode:  "cursor_session_auth_recovery_diverged",
+			detail:      err.Error(),
+		}
+	}
+	next, err := e.composerAgentTurnDial(ctx, auth, apiKey, recoveryBody)
+	if err != nil {
+		return nil, nil, newComposerBridgeUnavailableError(responseID, err)
+	}
+	if err = composerValidateAgentTurnPreStream(next, responseID, stream, stream); err != nil {
+		return nil, nil, err
+	}
+	log.Infof("[composer %s] automatic session-auth recovery started attempt=1", responseID)
+	return next, recoveryBody, nil
+}
+
 // reconnectComposerBridgeResponse closes one broken local bridge stream and
 // reissues the exact body with the same selected credential. The bridge's
 // durable invocation identity decides whether to hand off the live run or
@@ -4913,6 +5090,14 @@ func composerValidateAgentTurnPreStream(resp *http.Response, responseID string, 
 			log.Errorf("[composer %s] bridge NON-2xx corr=%s status=%d body=%s", responseID, corr, resp.StatusCode, sanitizeBridgeBody(errBody))
 		}
 		requestedBytes, availableBytes, priority := parseComposerCapacityMetadata(errBody)
+		var authRecovery *composerAuthRecoveryDescriptor
+		bridgeError := gjson.GetBytes(errBody, "error")
+		if bridgeError.Get("code").String() == "cursor_session_auth_expired" &&
+			bridgeError.Get("retryMode").String() == "auto_recover" {
+			if candidate, ok := composerAuthRecoveryCandidate(bridgeError); ok {
+				authRecovery = &candidate
+			}
+		}
 		return &composerBridgeStatusError{
 			status:         resp.StatusCode,
 			correlation:    corr,
@@ -4921,6 +5106,7 @@ func composerValidateAgentTurnPreStream(resp *http.Response, responseID string, 
 			requestedBytes: requestedBytes,
 			availableBytes: availableBytes,
 			priority:       priority,
+			authRecovery:   authRecovery,
 		}
 	}
 	if !composerResponseIsSSE(resp) {
@@ -4997,11 +5183,22 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		composerInflight.release(tenant, sessionID, leaseOwner)
 		return nil, unavailErr
 	}
-	if err := composerValidateAgentTurnPreStream(httpResp, responseID, true, true); err != nil {
-		reporter.PublishFailure(ctx, err)
-		reporter.EnsurePublished(ctx)
-		composerInflight.release(tenant, sessionID, leaseOwner)
-		return nil, err
+	authRecoveryAttempted := false
+	if validateErr := composerValidateAgentTurnPreStream(httpResp, responseID, true, true); validateErr != nil {
+		if descriptor, ok := composerAuthRecoveryFromError(validateErr, body); ok && composerAutoAuthRecoveryEnabled() {
+			httpResp, body, validateErr = e.dialComposerAuthRecovery(
+				ctx, auth, apiKey, body, descriptor, responseID, nil, true,
+			)
+			authRecoveryAttempted = validateErr == nil
+		}
+		if validateErr == nil {
+			// The replacement response continues below under the same logical request.
+		} else {
+			reporter.PublishFailure(ctx, validateErr)
+			reporter.EnsurePublished(ctx)
+			composerInflight.release(tenant, sessionID, leaseOwner)
+			return nil, validateErr
+		}
 	}
 	effectiveBinding, bindingErr := composerEffectiveContinuationBinding(
 		httpResp, turn.conversationBinding, continuation,
@@ -5146,6 +5343,10 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 		var param any
 		toolIdx := 0
 		lastLeaseTouch := time.Now()
+		authOverlap, _ := helps.NewExactEventPrefixMatcher(composerAuthRecoveryOverlapMaxBytes)
+		authOverlapComparing := false
+		var authOverlapRecordErr error
+		authRecoveryToolSeen := false
 		reconnectAllowed := composerBridgeEstablishedReconnectAllowed(auth, body)
 		reconnectMax := composerBridgeEstablishedReconnectMaxAttempts()
 		reconnectAttempts := 0
@@ -5190,13 +5391,69 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 				switch ev.Get("type").String() {
 				case "text":
 					txt := ev.Get("delta").String()
+					if liveStream && composerAutoAuthRecoveryEnabled() {
+						if authOverlapComparing {
+							var overlapErr error
+							txt, overlapErr = authOverlap.Consume("text", txt)
+							if overlapErr != nil {
+								turnErr := newComposerAuthRecoveryConflict(responseID,
+									"cursor_session_auth_recovery_diverged", overlapErr.Error())
+								reporter.PublishFailure(ctx, turnErr)
+								select {
+								case out <- cliproxyexecutor.StreamChunk{Err: turnErr}:
+								case <-ctx.Done():
+								}
+								return
+							}
+						} else if !authRecoveryAttempted && authOverlapRecordErr == nil {
+							authOverlapRecordErr = authOverlap.Record("text", txt)
+						}
+					}
+					if txt == "" {
+						continue
+					}
 					completionChars += len(txt) // ACCURATE ACCOUNTING: estimate completion tokens
 					choice = map[string]any{"index": 0, "delta": map[string]any{"content": txt}}
 				case "reasoning":
 					rzn := ev.Get("delta").String()
+					if liveStream && composerAutoAuthRecoveryEnabled() {
+						if authOverlapComparing {
+							var overlapErr error
+							rzn, overlapErr = authOverlap.Consume("reasoning", rzn)
+							if overlapErr != nil {
+								turnErr := newComposerAuthRecoveryConflict(responseID,
+									"cursor_session_auth_recovery_diverged", overlapErr.Error())
+								reporter.PublishFailure(ctx, turnErr)
+								select {
+								case out <- cliproxyexecutor.StreamChunk{Err: turnErr}:
+								case <-ctx.Done():
+								}
+								return
+							}
+						} else if !authRecoveryAttempted && authOverlapRecordErr == nil {
+							authOverlapRecordErr = authOverlap.Record("reasoning", rzn)
+						}
+					}
+					if rzn == "" {
+						continue
+					}
 					completionChars += len(rzn)
 					choice = map[string]any{"index": 0, "delta": map[string]any{"reasoning_content": rzn}}
 				case "tool_call":
+					if !authRecoveryAttempted {
+						authRecoveryToolSeen = true
+					}
+					if authOverlapComparing && !authOverlap.Complete() {
+						turnErr := newComposerAuthRecoveryConflict(responseID,
+							"cursor_session_auth_recovery_diverged",
+							"the recovery emitted a tool call before reproducing the exact prior output prefix")
+						reporter.PublishFailure(ctx, turnErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: turnErr}:
+						case <-ctx.Done():
+						}
+						return
+					}
 					rawName := ev.Get("name").String()
 					name, args := mapComposerToolCall(rawName, ev.Get("input"), defs, toolAliases)
 					completionChars += len(name) + len(args) // a tool call is generated output too
@@ -5211,6 +5468,67 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 						retryErr = composerBridgeTurnFailure(responseID, ev)
 						retryReason = "retryable_terminal"
 						break scanStream
+					}
+					if ev.Get("stop_reason").String() == "error" && !authRecoveryAttempted &&
+						composerAutoAuthRecoveryEnabled() {
+						if descriptor, ok := composerAuthRecoveryFromEvent(ev, body); ok {
+							if authRecoveryToolSeen || authOverlapRecordErr != nil {
+								detail := "the interrupted stream cannot be recovered after a client-visible tool call"
+								if authOverlapRecordErr != nil {
+									detail = authOverlapRecordErr.Error()
+								}
+								turnErr := newComposerAuthRecoveryConflict(responseID,
+									"cursor_session_auth_recovery_diverged", detail)
+								reporter.PublishFailure(ctx, turnErr)
+								select {
+								case out <- cliproxyexecutor.StreamChunk{Err: turnErr}:
+								case <-ctx.Done():
+								}
+								return
+							}
+							nextResp, recoveryBody, recoveryErr := e.dialComposerAuthRecovery(
+								ctx, auth, apiKey, body, descriptor, responseID, httpResp, true,
+							)
+							if recoveryErr != nil {
+								reporter.PublishFailure(ctx, recoveryErr)
+								select {
+								case out <- cliproxyexecutor.StreamChunk{Err: recoveryErr}:
+								case <-ctx.Done():
+								}
+								return
+							}
+							httpResp = nextResp
+							body = recoveryBody
+							authRecoveryAttempted = true
+							if liveStream {
+								authOverlap.StartRecovery()
+								authOverlapComparing = true
+							} else {
+								releaseCommitBuffer()
+								commitBufferErr = nil
+								param = nil
+								toolIdx = 0
+								completionChars = 0
+								lastLiveUsageChars = 0
+								realUsage = false
+							}
+							reconnectAllowed = composerBridgeEstablishedReconnectAllowed(auth, body)
+							reconnectAttempts = 0
+							lastLeaseTouch = time.Now()
+							leaseStop = ""
+							continue bridgeStream
+						}
+					}
+					if authOverlapComparing && !authOverlap.Complete() {
+						turnErr := newComposerAuthRecoveryConflict(responseID,
+							"cursor_session_auth_recovery_diverged",
+							"the recovery ended before reproducing the exact prior output prefix")
+						reporter.PublishFailure(ctx, turnErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: turnErr}:
+						case <-ctx.Done():
+						}
+						return
 					}
 					// ADD-88/96 (RBT-012): a turn_end is the bridge's terminal frame. Observing one (even an error)
 					// means the stream ended deliberately, not by a truncated/empty body — record it so a clean EOF
@@ -5450,11 +5768,20 @@ func (e *CursorExecutor) executeComposer(ctx context.Context, auth *cliproxyauth
 			log.Errorf("cursor composer: close bridge response body error: %v", errClose)
 		}
 	}()
-	if err := composerValidateAgentTurnPreStream(httpResp, responseID, false, false); err != nil {
-		reporter.PublishFailure(ctx, err)
-		reporter.EnsurePublished(ctx)
-		composerInflight.release(tenant, sessionID, leaseOwner)
-		return cliproxyexecutor.Response{}, err
+	authRecoveryAttempted := false
+	if validateErr := composerValidateAgentTurnPreStream(httpResp, responseID, false, false); validateErr != nil {
+		if descriptor, ok := composerAuthRecoveryFromError(validateErr, body); ok && composerAutoAuthRecoveryEnabled() {
+			httpResp, body, validateErr = e.dialComposerAuthRecovery(
+				ctx, auth, apiKey, body, descriptor, responseID, httpResp, false,
+			)
+			authRecoveryAttempted = validateErr == nil
+		}
+		if validateErr != nil {
+			reporter.PublishFailure(ctx, validateErr)
+			reporter.EnsurePublished(ctx)
+			composerInflight.release(tenant, sessionID, leaseOwner)
+			return cliproxyexecutor.Response{}, validateErr
+		}
 	}
 	effectiveBinding, bindingErr := composerEffectiveContinuationBinding(
 		httpResp, turn.conversationBinding, continuation,
@@ -5558,6 +5885,39 @@ bridgeResponse:
 					retryErr = composerBridgeTurnFailure(responseID, ev)
 					retryReason = "retryable_terminal"
 					break scanResponse
+				}
+				if ev.Get("stop_reason").String() == "error" && !authRecoveryAttempted &&
+					composerAutoAuthRecoveryEnabled() {
+					if descriptor, ok := composerAuthRecoveryFromEvent(ev, body); ok {
+						if len(toolCalls) > 0 {
+							turnErr := newComposerAuthRecoveryConflict(responseID,
+								"cursor_session_auth_recovery_diverged",
+								"the interrupted response emitted a tool call before session-auth recovery")
+							reporter.PublishFailure(ctx, turnErr)
+							return cliproxyexecutor.Response{}, turnErr
+						}
+						nextResp, recoveryBody, recoveryErr := e.dialComposerAuthRecovery(
+							ctx, auth, apiKey, body, descriptor, responseID, httpResp, false,
+						)
+						if recoveryErr != nil {
+							reporter.PublishFailure(ctx, recoveryErr)
+							return cliproxyexecutor.Response{}, recoveryErr
+						}
+						httpResp = nextResp
+						body = recoveryBody
+						authRecoveryAttempted = true
+						text.Reset()
+						reasoning.Reset()
+						toolCalls = toolCalls[:0]
+						responseBytes = 0
+						finish = "stop"
+						usageRaw = ""
+						reconnectAllowed = composerBridgeEstablishedReconnectAllowed(auth, body)
+						reconnectAttempts = 0
+						lastLeaseTouch = time.Now()
+						leaseStop = ""
+						continue bridgeResponse
+					}
 				}
 				sawTerminal = true // ADD-88/96 (RBT-012): terminal observed — EOF below is a clean end, not truncation
 				// ISOLATION: record the terminal stop_reason for the deferred lease handler (tool_use pause -> touch;

@@ -858,6 +858,222 @@ func TestExecuteComposerEstablishedResponseReconnectsWithoutDuplicateContent(t *
 	}
 }
 
+func TestExecuteComposerAutoAuthRecoveryContinuesLiveStreamWithoutDuplicatePrefix(t *testing.T) {
+	t.Setenv("CURSOR_COMPOSER_AUTO_AUTH_RECOVERY", "1")
+	const originalInvocation = "invocation-live-auth-recovery-0001"
+	const recoveryInvocation = "car1_live-auth-recovery-0001"
+	var mu sync.Mutex
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, append([]byte(nil), raw...))
+		call := len(bodies)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		write := func(payload string) { _, _ = io.WriteString(w, "data: "+payload+"\n\n") }
+		if call == 1 {
+			write(`{"type":"reasoning","delta":"think"}`)
+			write(`{"type":"text","delta":"hello "}`)
+			write(`{"type":"turn_end","stop_reason":"error","errorCode":"cursor_session_auth_expired","retryable":false,"retryMode":"auto_recover","autoRecovery":{"version":1,"recoveryOf":"` + originalInvocation + `","invocationId":"` + recoveryInvocation + `","attempt":1},"error":"session expired"}`)
+			write("[DONE]")
+			return
+		}
+		write(`{"type":"reasoning","delta":"th"}`)
+		write(`{"type":"reasoning","delta":"ink"}`)
+		write(`{"type":"text","delta":"hello"}`)
+		write(`{"type":"text","delta":" world"}`)
+		write(`{"type":"turn_end","stop_reason":"end_turn"}`)
+		write("[DONE]")
+	}))
+	defer srv.Close()
+
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "live-auth-recovery", Attributes: map[string]string{
+		"api_key":                          "same-key",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	opts := composerExecOpts("openai", "live-auth-recovery")
+	opts.Headers.Set(cliproxyexecutor.HeaderIdempotencyKey, originalInvocation)
+	opts.Headers.Set(cliproxyexecutor.HeaderCLIProxyCapabilities, cliproxyexecutor.CapabilityStreamResumeV1)
+	stream, err := e.executeComposerStream(context.Background(), auth, "same-key",
+		cliproxyexecutor.Request{Model: "composer-2.5", Payload: toolTurn("recover seamlessly")}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire strings.Builder
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("automatic live recovery failed: %v", chunk.Err)
+		}
+		wire.Write(chunk.Payload)
+	}
+	got := wire.String()
+	if strings.Count(got, `"reasoning_content":"think"`) != 1 ||
+		strings.Count(got, `"content":"hello "`) != 1 ||
+		strings.Count(got, `"content":"world"`) != 1 {
+		t.Fatalf("live recovery duplicated or lost the exact prefix: %s", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("bridge calls = %d, want exactly 2", len(bodies))
+	}
+	if got := gjson.GetBytes(bodies[1], "input.invocationId").String(); got != recoveryInvocation {
+		t.Fatalf("recovery invocation = %q", got)
+	}
+	if got := gjson.GetBytes(bodies[1], "input.authRecoveryOf").String(); got != originalInvocation {
+		t.Fatalf("recovery linkage = %q", got)
+	}
+	if got := gjson.GetBytes(bodies[1], "input.authRecoveryAttempt").Int(); got != 1 {
+		t.Fatalf("recovery attempt = %d", got)
+	}
+	if gjson.GetBytes(bodies[0], "input.text").String() != gjson.GetBytes(bodies[1], "input.text").String() {
+		t.Fatal("automatic recovery changed the semantic user input")
+	}
+}
+
+func TestExecuteComposerAutoAuthRecoveryDiscardsUncommittedNonStreamAttempt(t *testing.T) {
+	t.Setenv("CURSOR_COMPOSER_AUTO_AUTH_RECOVERY", "1")
+	const originalInvocation = "invocation-response-auth-recovery-0001"
+	const recoveryInvocation = "car1_response-auth-recovery-0001"
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		write := func(payload string) { _, _ = io.WriteString(w, "data: "+payload+"\n\n") }
+		if call == 1 {
+			write(`{"type":"text","delta":"stale partial"}`)
+			write(`{"type":"turn_end","stop_reason":"error","errorCode":"cursor_session_auth_expired","retryable":false,"retryMode":"auto_recover","autoRecovery":{"version":1,"recoveryOf":"` + originalInvocation + `","invocationId":"` + recoveryInvocation + `","attempt":1},"error":"session expired"}`)
+			return
+		}
+		write(`{"type":"text","delta":"fresh complete"}`)
+		write(`{"type":"turn_end","stop_reason":"end_turn"}`)
+		write("[DONE]")
+	}))
+	defer srv.Close()
+
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "response-auth-recovery", Attributes: map[string]string{
+		"api_key":                          "same-key",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	opts := composerExecOpts("openai", "response-auth-recovery")
+	opts.Headers.Set(cliproxyexecutor.HeaderIdempotencyKey, originalInvocation)
+	resp, err := e.executeComposer(context.Background(), auth, "same-key",
+		cliproxyexecutor.Request{Model: "composer-2.5", Payload: toolTurn("recover response")}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "fresh complete" {
+		t.Fatalf("recovered content = %q, want only the recovery response", got)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("bridge calls = %d, want exactly 2", calls.Load())
+	}
+}
+
+func TestExecuteComposerAutoAuthRecoveryHandlesPreStream409Continuation(t *testing.T) {
+	t.Setenv("CURSOR_COMPOSER_AUTO_AUTH_RECOVERY", "1")
+	const originalInvocation = "invocation-prestream-auth-recovery-0001"
+	const recoveryInvocation = "car1_prestream-auth-recovery-0001"
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if r.URL.Path != composerAgentContinuePath {
+			t.Errorf("automatic continuation recovery path = %q, want %q", r.URL.Path, composerAgentContinuePath)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		if got := gjson.GetBytes(raw, "input.type").String(); got != "tool_results" {
+			t.Errorf("automatic continuation recovery input type = %q", got)
+		}
+		if call == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"error":{"code":"cursor_session_auth_expired","message":"session expired","retryable":false,"retryMode":"auto_recover","autoRecovery":{"version":1,"recoveryOf":"`+originalInvocation+`","invocationId":"`+recoveryInvocation+`","attempt":1}}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"type\":\"text\",\"delta\":\"recovered from 409\"}\n\n")
+		_, _ = io.WriteString(w, "data: {\"type\":\"turn_end\",\"stop_reason\":\"end_turn\"}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "prestream-auth-recovery", Attributes: map[string]string{
+		"api_key":                          "same-key",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	opts := composerExecOpts("openai", "prestream-auth-recovery")
+	opts.Headers.Set(cliproxyexecutor.HeaderIdempotencyKey, originalInvocation)
+	payload := []byte(`{"messages":[
+		{"role":"user","content":"read the file"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"cct1_auth_recovery_route_0_signature","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"cct1_auth_recovery_route_0_signature","content":"exact tool result"}
+	]}`)
+	resp, err := e.executeComposer(context.Background(), auth, "same-key",
+		cliproxyexecutor.Request{Model: "composer-2.5", Payload: payload}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "recovered from 409" {
+		t.Fatalf("recovered content = %q", got)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("bridge calls = %d, want exactly 2", calls.Load())
+	}
+}
+
+func TestExecuteComposerAutoAuthRecoveryStopsAfterOneAttempt(t *testing.T) {
+	t.Setenv("CURSOR_COMPOSER_AUTO_AUTH_RECOVERY", "1")
+	const originalInvocation = "invocation-exhausted-auth-recovery-0001"
+	const recoveryInvocation = "car1_exhausted-auth-recovery-0001"
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if call == 1 {
+			_, _ = io.WriteString(w, `data: {"type":"turn_end","stop_reason":"error","errorCode":"cursor_session_auth_expired","retryable":false,"retryMode":"auto_recover","autoRecovery":{"version":1,"recoveryOf":"`+originalInvocation+`","invocationId":"`+recoveryInvocation+`","attempt":1},"error":"session expired"}`+"\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"type\":\"turn_end\",\"stop_reason\":\"error\",\"errorCode\":\"cursor_session_auth_recovery_exhausted\",\"retryable\":false,\"retryMode\":\"none\",\"error\":\"recovery also expired\"}\n\n")
+	}))
+	defer srv.Close()
+
+	e := NewCursorExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{ID: "exhausted-auth-recovery", Attributes: map[string]string{
+		"api_key":                          "same-key",
+		"composer_client_tools_bridge_url": srv.URL,
+	}}
+	opts := composerExecOpts("openai", "exhausted-auth-recovery")
+	opts.Headers.Set(cliproxyexecutor.HeaderIdempotencyKey, originalInvocation)
+	stream, err := e.executeComposerStream(context.Background(), auth, "same-key",
+		cliproxyexecutor.Request{Model: "composer-2.5", Payload: toolTurn("recover once")}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotErr error
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+		}
+	}
+	var statusErr *composerBridgeStatusError
+	if !errors.As(gotErr, &statusErr) || statusErr.status != http.StatusConflict ||
+		statusErr.bridgeCode != "cursor_session_auth_recovery_exhausted" {
+		t.Fatalf("second auth failure = %T %v, want typed exhausted 409", gotErr, gotErr)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("bridge calls = %d, one-shot recovery must stop at 2", calls.Load())
+	}
+}
+
 // RC4: re-translating an already-OpenAI payload through the source(claude)->openai translator CORRUPTS it
 // (the gated CURSOR_DIRECT path's double-translation bug — here it drops the tool name). The fix reuses the
 // single-translation result instead of re-translating; this test pins the hazard.
@@ -1053,6 +1269,113 @@ func TestComposerSessionAuthTerminalsPreserveReseedAndUnavailableSemantics(t *te
 	if body := string(bridgeErr.APIErrorBody()); !strings.Contains(body, `"type":"server_error"`) ||
 		!strings.Contains(body, `"code":"cursor_session_auth_recovery_unavailable"`) {
 		t.Fatalf("session-auth unavailable API body lost its typed contract: %s", body)
+	}
+}
+
+func TestComposerAutoAuthRecoveryDefaultAndKillSwitch(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"", true},
+		{"1", true},
+		{"true", true},
+		{"0", false},
+		{"false", false},
+		{"off", false},
+		{"no", false},
+	} {
+		if got := composerAutoAuthRecoveryEnabledValue(tc.value); got != tc.want {
+			t.Fatalf("composerAutoAuthRecoveryEnabledValue(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
+func TestComposerAuthRecoveryDescriptorBuildsOneLinkedSemanticRetry(t *testing.T) {
+	original := composerTurnBody(
+		"sess_auth_recovery_test",
+		"cursor-grok-4.6",
+		map[string]any{
+			"type":            "user",
+			"text":            "continue the exact turn",
+			"history":         "bounded history",
+			"clientMessageId": "ccm2_semantic_message",
+			"invocationId":    "invocation-original-auth-0001",
+		},
+		nil,
+		"",
+		nil,
+		nil,
+		0,
+	)
+	event := gjson.Parse(`{
+		"type":"turn_end",
+		"stop_reason":"error",
+		"errorCode":"cursor_session_auth_expired",
+		"retryMode":"auto_recover",
+		"autoRecovery":{
+			"version":1,
+			"recoveryOf":"invocation-original-auth-0001",
+			"invocationId":"car1_authorized-recovery-0001",
+			"attempt":1
+		}
+	}`)
+
+	descriptor, ok := composerAuthRecoveryFromEvent(event, original)
+	if !ok {
+		t.Fatal("valid automatic recovery descriptor was rejected")
+	}
+	recovery, err := composerAuthRecoveryBody(original, descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(recovery, "input.invocationId").String(); got != descriptor.invocationID {
+		t.Fatalf("recovery invocationId = %q", got)
+	}
+	if got := gjson.GetBytes(recovery, "input.authRecoveryOf").String(); got != descriptor.recoveryOf {
+		t.Fatalf("authRecoveryOf = %q", got)
+	}
+	if got := gjson.GetBytes(recovery, "input.authRecoveryAttempt").Int(); got != 1 {
+		t.Fatalf("authRecoveryAttempt = %d", got)
+	}
+	if got := gjson.GetBytes(recovery, "input.text").String(); got != "continue the exact turn" {
+		t.Fatalf("semantic input changed: %q", got)
+	}
+	if got := gjson.GetBytes(recovery, "input.clientMessageId").String(); got != "ccm2_semantic_message" {
+		t.Fatalf("semantic clientMessageId changed: %q", got)
+	}
+
+	bad := gjson.Parse(strings.ReplaceAll(event.Raw,
+		"invocation-original-auth-0001", "invocation-different-auth-0001"))
+	if _, ok := composerAuthRecoveryFromEvent(bad, original); ok {
+		t.Fatal("descriptor linked to a different original invocation was accepted")
+	}
+
+	continuation := composerTurnBody(
+		"sess_auth_recovery_test",
+		"cursor-grok-4.6",
+		map[string]any{
+			"type":         "tool_results",
+			"results":      []any{map[string]any{"toolCallId": "cct1_signed", "content": "exact result"}},
+			"history":      "bounded history",
+			"invocationId": "invocation-original-auth-0001",
+		},
+		nil,
+		"",
+		nil,
+		nil,
+		0,
+	)
+	continuationDescriptor, ok := composerAuthRecoveryFromEvent(event, continuation)
+	if !ok {
+		t.Fatal("valid automatic recovery descriptor for a tool-results continuation was rejected")
+	}
+	continuationRecovery, err := composerAuthRecoveryBody(continuation, continuationDescriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(continuationRecovery, "input.results.0.content").String(); got != "exact result" {
+		t.Fatalf("continuation tool result changed: %q", got)
 	}
 }
 

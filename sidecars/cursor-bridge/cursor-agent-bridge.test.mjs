@@ -110,6 +110,8 @@ const {
   nativeToolBlockedByChoice,
   parseShellContent,
   platforms,
+  platformScopeForSession,
+  platformStateRootForSession,
   prepareAdvertisedToolRegistry,
   readinessBody,
   replayMemoryBudget,
@@ -141,10 +143,44 @@ const {
   truncateLiveToolResult,
   typedUnavailableResult,
   validateBindHost,
+  validateSessionAuthRecoveryRequest,
   wrapToolInput,
   writeFreshDeliveryReceipt,
   transitionFreshAttemptState,
 } = bridge;
+
+test("session-auth recovery uses one stable isolated platform scope without moving same-key siblings", (t) => {
+  const cursorKey = `session-platform-scope-key-${Date.now()}`;
+  const base = new Session(`session-platform-base-${Date.now()}`, cursorKey);
+  const recovered = new Session(`session-platform-recovered-${Date.now()}`, cursorKey);
+  recovered.authEpoch = 1;
+  const secondEpoch = new Session(recovered.id, cursorKey);
+  secondEpoch.authEpoch = 2;
+
+  const baseScope = platformScopeForSession(base);
+  const recoveredScope = platformScopeForSession(recovered);
+  assert.equal(baseScope, keyHash(cursorKey));
+  assert.notEqual(recoveredScope, baseScope);
+  assert.equal(platformScopeForSession(secondEpoch), recoveredScope,
+    "later auth epochs must recycle the same per-session scope instead of leaking platforms");
+
+  const baseRoot = platformStateRootForSession(base);
+  const recoveredRoot = platformStateRootForSession(recovered);
+  assert.notEqual(recoveredRoot, baseRoot);
+  assert.equal(platformStateRootForSession(secondEpoch), recoveredRoot,
+    "the isolated durable store must remain stable across auth epochs");
+  assert.equal(recoveredRoot.includes(cursorKey), false, "platform roots must never expose credentials");
+  assert.equal(recoveredRoot.includes(recovered.id), false, "platform roots must not expose raw session ids");
+
+  sessions.set(base.id, base);
+  sessions.set(recovered.id, recovered);
+  t.after(() => {
+    sessions.delete(base.id);
+    sessions.delete(recovered.id);
+  });
+  assert.equal(bridge.platformHasSession(baseScope), true);
+  assert.equal(bridge.platformHasSession(recoveredScope), true);
+});
 
 // P3.4: a corrupt alias no longer wedges all root discovery (fail-closed-throw) nor silently
 // unprotects the agent (fail-open-skip): the file is quarantined aside and any extractable
@@ -4494,8 +4530,19 @@ test("an accepted Cursor session auth failure rotates durably and rejects the ex
 
   assert.match(first.text(), /"errorCode":"cursor_session_auth_expired"/);
   assert.match(first.text(), /"receipt":"session_auth_expired_rotated"/);
-  assert.match(first.text(), /"retryMode":"reseed"/);
+  assert.match(first.text(), /"retryMode":"auto_recover"/);
   assert.equal([...first.text().matchAll(/"type":"turn_end"/g)].length, 1);
+  const terminal = first.text().split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)))
+    .find((event) => event.type === "turn_end");
+  assert.deepEqual(terminal.autoRecovery, {
+    version: 1,
+    recoveryOf: input.invocationId,
+    invocationId: terminal.autoRecovery.invocationId,
+    attempt: 1,
+  });
+  assert.match(terminal.autoRecovery.invocationId, /^car1_[A-Za-z0-9_-]{20,}$/);
   assert.equal(session.authEpoch, 1);
   assert.notEqual(session.agentId, oldAgentId);
   assert.match(session.agentId, /_a1$/);
@@ -4529,6 +4576,273 @@ test("an accepted Cursor session auth failure rotates durably and rejects the ex
   }), cursorKey);
   assert.equal(exactRetry.status, 409);
   assert.equal(exactRetry.json().error.code, "cursor_session_auth_expired");
+  assert.deepEqual(exactRetry.json().error.autoRecovery, terminal.autoRecovery);
+});
+
+test("an auth error during the internal recovery attempt is exhausted without rotating again", async (t) => {
+  const cursorKey = `session-auth-exhausted-key-${Date.now()}`;
+  const sessionId = `session-auth-exhausted-${Date.now()}`;
+  const session = new Session(sessionId, cursorKey);
+  session.authEpoch = 1;
+  session.agentId = session.composeAgentId();
+  session.activeClientMessageId = "car1_internal-recovery-attempt-0001";
+  session.activeClientMessageHash = completedTurnRequestHash({
+    type: "user",
+    text: "same semantic request",
+    invocationId: session.activeClientMessageId,
+  });
+  session.activeClientMessageGeneration = 1;
+  session.activeClientMessageKind = "fresh";
+  session.activeIdentityPolicy = "invocation-v1";
+  session.activeAuthRecovery = {
+    version: 1,
+    recoveryOf: "invocation-original-auth-failure-0001",
+    invocationId: session.activeClientMessageId,
+    attempt: 1,
+  };
+  session.agent = { async close() {} };
+  await session.persistDurableAlias();
+  sessions.set(sessionId, session);
+  t.after(() => sessions.delete(sessionId));
+  const response = new MockResponse();
+  session.beginResponse(response);
+
+  session.onRunError(new Error(
+    "Authentication error If you are logged in, try logging out and back in.",
+  ));
+  await waitFor(() => response.text().includes('"type":"turn_end"'),
+    "session auth recovery exhaustion terminal");
+
+  assert.match(response.text(), /"errorCode":"cursor_session_auth_recovery_exhausted"/);
+  assert.equal(session.authEpoch, 1, "the one-shot recovery must never mint a second replacement");
+});
+
+test("session-auth recovery admission accepts only the authorized semantic request", () => {
+  const original = {
+    type: "user",
+    text: "recover this exact turn",
+    history: "bounded history",
+    invocationId: "invocation-auth-original-0001",
+  };
+  const requestHash = completedTurnRequestHash(original);
+  const autoRecovery = {
+    version: 1,
+    recoveryOf: original.invocationId,
+    invocationId: "car1_authorized-internal-recovery-0001",
+    attempt: 1,
+  };
+  const alias = {
+    authRecoveryFence: {
+      ...autoRecovery,
+      requestHash,
+      authEpoch: 1,
+      state: "AUTHORIZED",
+      updatedAt: Date.now(),
+    },
+  };
+  const recoveryInput = {
+    ...original,
+    invocationId: autoRecovery.invocationId,
+    authRecoveryOf: autoRecovery.recoveryOf,
+    authRecoveryAttempt: 1,
+  };
+
+  assert.deepEqual(validateSessionAuthRecoveryRequest(
+    recoveryInput,
+    alias,
+    turnInvocationIdentity(recoveryInput),
+    completedTurnRequestHash(recoveryInput),
+  ), autoRecovery);
+  assert.throws(() => validateSessionAuthRecoveryRequest(
+    { ...recoveryInput, text: "mutated semantic request" },
+    alias,
+    turnInvocationIdentity(recoveryInput),
+    completedTurnRequestHash({ ...recoveryInput, text: "mutated semantic request" }),
+  ), (error) => error instanceof ToolRoundError
+    && error.code === "cursor_session_auth_recovery_diverged" && error.status === 409);
+  assert.throws(() => validateSessionAuthRecoveryRequest(
+    recoveryInput,
+    { authRecoveryFence: { ...alias.authRecoveryFence, state: "EXHAUSTED" } },
+    turnInvocationIdentity(recoveryInput),
+    completedTurnRequestHash(recoveryInput),
+  ), (error) => error instanceof ToolRoundError
+    && error.code === "cursor_session_auth_recovery_exhausted" && error.status === 409);
+});
+
+test("a completed auth recovery fence cannot execute a second SDK attempt without its receipt", async (t) => {
+  const cursorKey = `session-auth-completed-fence-key-${Date.now()}`;
+  const sessionId = `session-auth-completed-fence-${Date.now()}`;
+  const original = {
+    type: "user",
+    text: "recover this accepted turn once",
+    history: "bounded history",
+    invocationId: "invocation-completed-auth-original-0001",
+  };
+  const autoRecovery = {
+    version: 1,
+    recoveryOf: original.invocationId,
+    invocationId: "car1_completed-auth-recovery-0001",
+    attempt: 1,
+  };
+  const primed = new Session(sessionId, cursorKey);
+  primed.authEpoch = 1;
+  primed.agentId = primed.composeAgentId();
+  primed.authRecoveryFence = {
+    ...autoRecovery,
+    requestHash: completedTurnRequestHash(original),
+    authEpoch: 1,
+    state: "COMPLETED",
+    updatedAt: Date.now(),
+  };
+  await primed.persistDurableAlias();
+  const isolatedScope = platformScopeForSession(primed);
+  let sends = 0;
+  platforms.set(isolatedScope, {
+    promise: Promise.resolve({
+      async resumeAgent() {
+        return {
+          async send() {
+            sends++;
+            return {
+              async wait() { return { status: "finished", result: "must not rerun", usage: {} }; },
+              async cancel() {},
+            };
+          },
+          async close() {},
+        };
+      },
+      async getAgentMessages() { return [{ role: "user" }]; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  t.after(() => {
+    sessions.delete(sessionId);
+    platforms.delete(isolatedScope);
+  });
+
+  const response = new MockResponse();
+  await handleTurn(request(), response, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input: {
+      ...original,
+      invocationId: autoRecovery.invocationId,
+      authRecoveryOf: autoRecovery.recoveryOf,
+      authRecoveryAttempt: autoRecovery.attempt,
+    },
+  }), cursorKey);
+
+  assert.equal(response.status, 409);
+  assert.equal(response.json().error.code, "cursor_session_auth_recovery_exhausted");
+  assert.equal(sends, 0, "a completed one-shot recovery must never execute again");
+});
+
+test("authorized session-auth recovery runs on the isolated platform and leaves the base sibling live", async (t) => {
+  const cursorKey = `session-auth-isolated-run-key-${Date.now()}`;
+  const sessionId = `session-auth-isolated-run-${Date.now()}`;
+  const original = {
+    type: "user",
+    text: "recover this exact accepted turn",
+    history: "bounded history for the replacement",
+    invocationId: "invocation-isolated-auth-original-0001",
+  };
+  const requestHash = completedTurnRequestHash(original);
+  const autoRecovery = {
+    version: 1,
+    recoveryOf: original.invocationId,
+    invocationId: "car1_isolated-auth-recovery-0001",
+    attempt: 1,
+  };
+  const primed = new Session(sessionId, cursorKey);
+  primed.authEpoch = 1;
+  primed.agentId = primed.composeAgentId();
+  primed.reseedRequired = true;
+  primed.reseedReason = "session_auth_expired";
+  primed.authRecoveryFence = {
+    ...autoRecovery,
+    requestHash,
+    authEpoch: 1,
+    state: "AUTHORIZED",
+    updatedAt: Date.now(),
+  };
+  await primed.persistDurableAlias();
+
+  const sibling = new Session(`session-auth-isolated-sibling-${Date.now()}`, cursorKey);
+  const baseScope = platformScopeForSession(sibling);
+  const recoveredScope = platformScopeForSession(primed);
+  const baseEntry = {
+    promise: Promise.resolve({}),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  };
+  let recoveredCreates = 0;
+  const recoveredEntry = {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() {
+        recoveredCreates++;
+        return {
+          async send() {
+            return { async wait() { return { status: "finished", result: "recovered answer", usage: {} }; } };
+          },
+          async close() {},
+        };
+      },
+    }),
+    stateRoot: platformStateRootForSession(primed),
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  };
+  platforms.set(baseScope, baseEntry);
+  platforms.set(recoveredScope, recoveredEntry);
+  sessions.set(sibling.id, sibling);
+  sessions.delete(sessionId);
+  t.after(() => {
+    sessions.delete(sessionId);
+    sessions.delete(sibling.id);
+    platforms.delete(baseScope);
+    platforms.delete(recoveredScope);
+  });
+
+  const response = new MockResponse();
+  await handleTurn(request(), response, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input: {
+      ...original,
+      invocationId: autoRecovery.invocationId,
+      authRecoveryOf: autoRecovery.recoveryOf,
+      authRecoveryAttempt: 1,
+    },
+  }), cursorKey);
+  await waitFor(() => response.text().includes('"type":"turn_end"'),
+    "isolated session-auth recovery terminal");
+
+  assert.equal(response.status, 200);
+  assert.match(response.text(), /recovered answer/);
+  assert.equal(recoveredCreates, 1);
+  assert.equal(platforms.get(baseScope), baseEntry, "the same-key sibling platform must remain untouched");
+  const recovered = sessions.get(sessionId);
+  assert.deepEqual(recovered.activeAuthRecovery, autoRecovery);
+  assert.equal(platformScopeForSession(recovered), recoveredScope);
+
+  const replay = new MockResponse();
+  await handleTurn(request(), replay, neutralBody({
+    sessionId,
+    model: "cursor-grok-4.6",
+    input: {
+      ...original,
+      invocationId: autoRecovery.invocationId,
+      authRecoveryOf: autoRecovery.recoveryOf,
+      authRecoveryAttempt: 1,
+    },
+  }), cursorKey);
+  assert.equal(replay.status, 200);
+  assert.match(replay.text(), /recovered answer/);
+  assert.equal(recoveredCreates, 1, "an exact completed retry must replay its receipt without another SDK send");
 });
 
 test("ingress idempotently reconciles a crash after auth alias publication", async (t) => {
@@ -4720,7 +5034,7 @@ test("a new invocation seeds the auth replacement once and durably clears reseed
   sessions.set(sessionId, session);
   t.after(() => {
     sessions.delete(sessionId);
-    platforms.delete(keyHash(cursorKey));
+    platforms.delete(replacementPlatformScope);
   });
   const failed = new MockResponse();
   session.beginResponse(failed);
@@ -4732,8 +5046,9 @@ test("a new invocation seeds the auth replacement once and durably clears reseed
     "durable auth rotation");
 
   const replacementAgentId = session.agentId;
+  const replacementPlatformScope = platformScopeForSession(session);
   const sent = [];
-  platforms.set(keyHash(cursorKey), {
+  platforms.set(replacementPlatformScope, {
     promise: Promise.resolve({
       async resumeAgent(agentId) {
         assert.equal(agentId, replacementAgentId);
@@ -4794,7 +5109,8 @@ test("an unseeded auth replacement refuses a history-less turn before any SDK ca
 
   let resumes = 0;
   let sends = 0;
-  platforms.set(keyHash(cursorKey), {
+  const replacementPlatformScope = platformScopeForSession(primed);
+  platforms.set(replacementPlatformScope, {
     promise: Promise.resolve({
       async resumeAgent() {
         resumes++;
@@ -4813,7 +5129,7 @@ test("an unseeded auth replacement refuses a history-less turn before any SDK ca
   });
   t.after(() => {
     sessions.delete(sessionId);
-    platforms.delete(keyHash(cursorKey));
+    platforms.delete(replacementPlatformScope);
   });
 
   const response = new MockResponse();
@@ -5043,10 +5359,11 @@ test("a new signed continuation recovers on the durable auth replacement instead
   await waitFor(() => session.authRecoveryPromise === null && session.reseedRequired,
     "continuation auth rotation");
   const replacementAgentId = session.agentId;
+  const replacementPlatformScope = platformScopeForSession(session);
   const resumed = [];
   const created = [];
   const sent = [];
-  platforms.set(keyHash(cursorKey), {
+  platforms.set(replacementPlatformScope, {
     promise: Promise.resolve({
       async resumeAgent(agentId) {
         resumed.push(agentId);
@@ -5073,7 +5390,7 @@ test("a new signed continuation recovers on the durable auth replacement instead
   });
   t.after(() => {
     sessions.delete(session.id);
-    platforms.delete(keyHash(cursorKey));
+    platforms.delete(replacementPlatformScope);
   });
 
   const recovery = new MockResponse();
@@ -5094,6 +5411,80 @@ test("a new signed continuation recovers on the durable auth replacement instead
   assert.match(String(sent[0]), /complete bounded history for the continuation replacement/);
   assert.equal(session.agentId, replacementAgentId);
   assert.equal(session.reseedRequired, false);
+});
+
+test("an authorized continuation auth recovery is attempted once and then exhausts", async (t) => {
+  const cursorKey = `session-auth-continuation-exhausted-key-${Date.now()}`;
+  const { session } = seedSession(`session-auth-continuation-exhausted-${Date.now()}`, cursorKey);
+  const opened = await openTool(session);
+  const failedInput = {
+    type: "tool_results",
+    results: [{ toolCallId: opened.call.wireId, content: "exact accepted result" }],
+    history: "complete bounded history for one automatic continuation recovery",
+    invocationId: "invocation-session-auth-continuation-exhausted-0001",
+  };
+  session.activeClientMessageId = failedInput.invocationId;
+  session.activeClientMessageHash = completedTurnRequestHash(failedInput);
+  session.activeClientMessageGeneration = 1;
+  session.activeClientMessageKind = "continuation";
+  session.activeIdentityPolicy = "invocation-v1";
+  session.agent = { async close() {} };
+  await session.persistDurableAlias();
+
+  session.onRunComplete({
+    status: "error",
+    error: { message: "Authentication error If you are logged in, try logging out and back in." },
+  });
+  await waitFor(() => session.authRecoveryPromise === null && session.reseedRequired,
+    "continuation auth rotation");
+  const autoRecovery = session.authRecoveryFence;
+  const replacementPlatformScope = platformScopeForSession(session);
+  platforms.set(replacementPlatformScope, {
+    promise: Promise.resolve({
+      async resumeAgent() { throw new Error("agent not found"); },
+      async createAgent() {
+        return {
+          async send() {
+            return {
+              async wait() {
+                return {
+                  status: "error",
+                  error: { message: "Authentication error If you are logged in, try logging out and back in." },
+                };
+              },
+              async cancel() {},
+            };
+          },
+          async close() {},
+        };
+      },
+      async getAgentMessages() { return []; },
+    }),
+    stateRoot: TEST_STATE_ROOT,
+    lastUsed: Date.now(),
+    fp: keyFingerprint(cursorKey),
+  });
+  t.after(() => {
+    sessions.delete(session.id);
+    platforms.delete(replacementPlatformScope);
+  });
+
+  const recovery = new MockResponse();
+  await handleContinue(request(), recovery, continuationBody(
+    failedInput.results,
+    {
+      history: failedInput.history,
+      invocationId: autoRecovery.invocationId,
+      authRecoveryOf: autoRecovery.recoveryOf,
+      authRecoveryAttempt: autoRecovery.attempt,
+    },
+    { model: "cursor-grok-4.6" },
+  ), cursorKey);
+  await waitFor(() => recovery.text().includes('"errorCode":"cursor_session_auth_recovery_exhausted"'),
+    "continuation automatic auth recovery exhaustion");
+
+  assert.equal(session.authEpoch, 1, "the single automatic recovery must not rotate a second time");
+  assert.equal(session.authRecoveryFence.state, "EXHAUSTED");
 });
 
 test("a post-acceptance fresh run failure retains one frozen generation across retry", async () => {
