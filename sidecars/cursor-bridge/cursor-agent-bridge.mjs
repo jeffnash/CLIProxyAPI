@@ -10018,6 +10018,12 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     reasoningEffort: constraints.reasoningEffort,
   });
   const modelSelectionIdentity = safeJson(modelSelection);
+  // Sessions created before selection fingerprints stored a raw model id. Normalize that legacy form for
+  // comparison only: a request for the same effective default must keep its warm agent, while a requested
+  // effort that changes the selection still forces the required reseed.
+  const persistedModelSelectionIdentity = typeof session.model === "string" && !session.model.startsWith("{")
+    ? safeJson(composerModelSelection(session.model, { utilityOneShot: session.utilityOneShot }))
+    : session.model;
 
 
   // driveUserSend performs a model-visible user send on the EXISTING no-timeout agent: it seeds (prepends
@@ -10475,8 +10481,8 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     // (A bare resume-only continuation with run===null but a changed model also rotates — correct: the old
     // agent is the wrong model.) `forceModelReseed` then routes through the re-seed path below.
     let forceModelReseed = false;
-    if (session.run === null && session.model && session.model !== modelSelectionIdentity) {
-      dbg("runTurn MODEL SELECTION CHANGED (no live run) -> rotate durable agent + re-seed", "session=" + session.id, "from=" + session.model, "to=" + modelSelectionIdentity);
+    if (session.run === null && persistedModelSelectionIdentity && persistedModelSelectionIdentity !== modelSelectionIdentity) {
+      dbg("runTurn MODEL SELECTION CHANGED (no live run) -> rotate durable agent + re-seed", "session=" + session.id, "from=" + persistedModelSelectionIdentity, "to=" + modelSelectionIdentity);
       // Rotation cancellation belongs to the old durable agent, not to this
       // newly-opened HTTP turn. Detach the current settle callback while the
       // old handle closes; otherwise cancel() settles this response before the
