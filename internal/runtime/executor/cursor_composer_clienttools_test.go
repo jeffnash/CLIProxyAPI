@@ -4100,31 +4100,23 @@ func TestADD79_KeyFingerprintFoldedIntoSession(t *testing.T) {
 	}
 }
 
-// ADD-83/87 (exec half): reasoning_effort is surfaced SOLELY via unsupportedHardGuarantees (the SDK has no
-// reasoning-effort knob and the bridge does not read a reasoningEffort key, so a dedicated body field would be
-// dead). The failure path asserted here is the dead-key regression: a reasoningEffort field must NOT be set.
-func TestADD83_ReasoningEffortFlaggedNotCarriedAsDeadKey(t *testing.T) {
-	c := composerConstraints([]byte(`{"reasoning_effort":"high"}`))
-	// Regression guard: the bridge's constraints allowlist never reads reasoningEffort, so writing it back
-	// would be a dead wire field. It must be absent — the signal lives only in unsupportedHardGuarantees.
-	if _, ok := c["reasoningEffort"]; ok {
-		t.Fatalf("ADD-87: reasoningEffort must NOT be carried as a dedicated (dead) body field, got %#v", c["reasoningEffort"])
+func TestComposerConstraintsCarriesReasoningEffortToBridge(t *testing.T) {
+	c := composerConstraints([]byte(`{"reasoning_effort":"xhigh"}`))
+	if got := c["reasoningEffort"]; got != "xhigh" {
+		t.Fatalf("reasoning effort must reach the bridge selection path, got %#v", got)
 	}
 	notes, _ := c["unsupportedHardGuarantees"].([]string)
-	if !strings.Contains(strings.Join(notes, " | "), "reasoning_effort=high") {
-		t.Fatalf("ADD-87: reasoning_effort must be flagged unsupported, got %#v", notes)
+	if strings.Contains(strings.Join(notes, " | "), "reasoning_effort=") {
+		t.Fatalf("reasoning effort is bridge-supported and must not be reported unsupported, got %#v", notes)
 	}
-	// Absent reasoning_effort => no note at all.
-	if _, ok := composerConstraints([]byte(`{}`))["unsupportedHardGuarantees"]; ok {
-		t.Fatalf("ADD-87: no reasoning_effort must not add an unsupported note")
+	if _, ok := composerConstraints([]byte(`{}`))["reasoningEffort"]; ok {
+		t.Fatal("absent reasoning effort must not override the model default")
 	}
 }
 
 // ADD-83 (exec half): a tool_results CONTINUATION turn must carry the bridge-CONSUMED constraints
-// (responseFormat/stop/maxTokens) plus system to the bridge body (composerInputHinted attaches system;
-// composerTurnBody spreads constraints) so the bridge can apply them on the resume. reasoning_effort is NOT a
-// bridge-consumed field — it is surfaced only via unsupportedHardGuarantees — so it must NOT appear as a dead
-// reasoningEffort body key (the dead-key regression guard below).
+// (responseFormat/stop/maxTokens/reasoningEffort) plus system to the bridge body (composerInputHinted attaches
+// system; composerTurnBody spreads constraints) so the bridge can apply them on the resume.
 func TestADD83_ContinuationBodyCarriesConstraintsAndSystem(t *testing.T) {
 	oai := []byte(`{
 		"response_format":{"type":"json_object"},
@@ -4153,14 +4145,8 @@ func TestADD83_ContinuationBodyCarriesConstraintsAndSystem(t *testing.T) {
 	if gjson.GetBytes(body, "stop.0").String() != "STOP" || gjson.GetBytes(body, "maxTokens").Int() != 256 {
 		t.Fatalf("ADD-83: continuation body must carry stop/maxTokens, got %s", body)
 	}
-	// Dead-key regression guard: reasoning_effort is bridge-advisory only (unsupportedHardGuarantees), so the
-	// continuation body must NOT carry a reasoningEffort field the bridge would never read.
-	if gjson.GetBytes(body, "reasoningEffort").Exists() {
-		t.Fatalf("ADD-83: continuation body must NOT carry a dead reasoningEffort field, got %s", body)
-	}
-	// The advisory note for reasoning_effort must still reach the bridge (so the model is told it is best-effort).
-	if !strings.Contains(gjson.GetBytes(body, "unsupportedHardGuarantees").Raw, "reasoning_effort=medium") {
-		t.Fatalf("ADD-83: continuation body must carry the reasoning_effort advisory in unsupportedHardGuarantees, got %s", body)
+	if gjson.GetBytes(body, "reasoningEffort").String() != "medium" {
+		t.Fatalf("continuation body must carry bridge-consumed reasoning effort, got %s", body)
 	}
 }
 

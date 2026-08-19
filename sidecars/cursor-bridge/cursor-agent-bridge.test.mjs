@@ -6988,6 +6988,27 @@ test("Grok 4.6 model aliases preserve native xhigh and map the fast tier", () =>
   assert.deepEqual(composerModelSelection("grok-4.6-fast-medium"), { id: "grok-4.6", params: [{ id: "fast", value: "true" }, { id: "effort", value: "medium" }] });
 });
 
+test("requested reasoning effort selects Cursor Grok tiers when the model has no explicit suffix", () => {
+  assert.deepEqual(composerModelSelection("composer-2.5", { reasoningEffort: "xhigh" }), {
+    id: "composer-2.5", params: [{ id: "fast", value: "false" }, { id: "thinking", value: "xhigh" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.6", { reasoningEffort: "low" }), {
+    id: "grok-4.6", params: [{ id: "fast", value: "false" }, { id: "effort", value: "low" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.6", { reasoningEffort: "medium" }), {
+    id: "grok-4.6", params: [{ id: "fast", value: "false" }, { id: "effort", value: "medium" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.6", { reasoningEffort: "high" }), {
+    id: "grok-4.6", params: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.6", { reasoningEffort: "xhigh" }), {
+    id: "grok-4.6", params: [{ id: "fast", value: "false" }, { id: "effort", value: "xhigh" }],
+  });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.6-high", { reasoningEffort: "low" }), {
+    id: "grok-4.6", params: [{ id: "fast", value: "false" }, { id: "effort", value: "high" }],
+  });
+});
+
 test("utility one-shots lower reasoning without enabling the costly fast tier", () => {
   assert.deepEqual(composerModelSelection("composer-2.5", { utilityOneShot: true }), {
     id: "composer-2.5",

@@ -3466,14 +3466,11 @@ func composerConstraints(oai []byte) map[string]any {
 		c["maxTokens"] = mt
 		unsupported = append(unsupported, "max_tokens hard cap (best-effort prompt only; output length is not capped server-side)")
 	}
-	// ADD-83/87: the Claude/Gemini/Responses request translators normalize a requested thinking budget /
-	// reasoning.effort into reasoning_effort, but the composer path cannot honor it: the @cursor/sdk agent.send
-	// takes no reasoning-effort knob. The signal is surfaced SOLELY via unsupportedHardGuarantees (rendered by
-	// the bridge's constraintInstructions) — NOT as a dedicated body field. The bridge's constraints allowlist
-	// (cursor-agent-bridge.mjs handleTurn) does not read a reasoningEffort key, so carrying one would be a dead
-	// wire field; this matches the honest-degrade contract (best-effort advisory only, never an enforced control).
+	// All inbound translators normalize a requested effort into reasoning_effort. The bridge consumes this
+	// selection input for Cursor models that expose an effort parameter; explicit model suffixes remain
+	// authoritative there. Keep it separate from prompt-only constraints because it changes SDK selection.
 	if re := strings.TrimSpace(gjson.GetBytes(oai, "reasoning_effort").String()); re != "" {
-		unsupported = append(unsupported, fmt.Sprintf("reasoning_effort=%s best-effort; Cursor composer does not accept a reasoning-effort param", re))
+		c["reasoningEffort"] = re
 	}
 	// H20: parallel_tool_calls:false is a documented zero-or-one-tool-per-turn limit. We cannot hard-cap
 	// Cursor's emission and the bridge does not read a parallelToolCalls key, so the signal is surfaced SOLELY

@@ -6312,7 +6312,7 @@ function mapGrokEffort(level, modelId) {
   if (l === "minimal" || l === "none") return "low";
   return null;
 }
-function composerModelSelection(model, { utilityOneShot = false } = {}) {
+function composerModelSelection(model, { utilityOneShot = false, reasoningEffort = null } = {}) {
   const raw = String(model || "");
   let id = raw;
   // Disambiguate from xAI: client-facing Cursor Grok ids carry cursor-. Strip it only for supported SDK ids.
@@ -6328,9 +6328,16 @@ function composerModelSelection(model, { utilityOneShot = false } = {}) {
     id = id.slice(0, d);
   }
   if (/-fast$/.test(id)) { fast = "true"; id = id.slice(0, id.length - "-fast".length); }
+  // Keep the request value protocol-level. Individual backends decide which
+  // values they support; that avoids encoding one provider's capability matrix
+  // into callers or synthetic model names.
+  const requestedThinking = String(reasoningEffort || "").toLowerCase();
+  const normalizedRequestedThinking = COMPOSER_THINKING_LEVELS.has(requestedThinking)
+    ? requestedThinking
+    : null;
   if (id === "composer-2.5" || id === "composer-2") {
     const params = [{ id: "fast", value: fast }];
-    const effectiveThinking = thinking || (utilityOneShot ? "low" : null);
+    const effectiveThinking = thinking || normalizedRequestedThinking || (utilityOneShot ? "low" : null);
     if (effectiveThinking) params.push({ id: "thinking", value: effectiveThinking });
     return { id, params };
   }
@@ -6340,7 +6347,7 @@ function composerModelSelection(model, { utilityOneShot = false } = {}) {
     // Utility one-shots default to low, but an explicit model suffix always wins.
     // Always set fast explicitly so we never silently inherit Cursor's costly fast=true default.
     // SDK id stays bare regardless of the client-facing cursor- prefix.
-    const effort = mapGrokEffort(thinking, id) || (utilityOneShot ? "low" : COMPOSER_GROK_EFFORT_DEFAULT);
+    const effort = mapGrokEffort(thinking, id) || mapGrokEffort(normalizedRequestedThinking, id) || (utilityOneShot ? "low" : COMPOSER_GROK_EFFORT_DEFAULT);
     return { id, params: [{ id: "fast", value: fast }, { id: "effort", value: effort }] };
   }
   return { id: raw }; // non-recognized: pass the original id through (Cursor resolves its default)
@@ -6363,7 +6370,7 @@ function turnFailureMetadata(error) {
   };
 }
 
-async function ensureAgent(session, model) {
+async function ensureAgent(session, modelSelection) {
   if (session.agent && !SDK_AGENT_GC_ENABLED) return session.agent;
   if (session.agentPromise) return session.agentPromise;          // guard TOCTOU
   session.agentPromise = (async () => {
@@ -6375,9 +6382,8 @@ async function ensureAgent(session, model) {
     try {
     const platformScope = platformScopeForSession(session);
     const platform = await getPlatform(session.cursorKey, session);
-    const modelSel = composerModelSelection(model, { utilityOneShot: session.utilityOneShot });
-    dbg("ensureAgent modelSelection", "session=" + session.id, "model=" + model, "selection=" + safeJson(modelSel));
-    const opts = { model: modelSel, apiKey: session.cursorKey, local: { cwd: EMPTY_CWD } };
+    dbg("ensureAgent modelSelection", "session=" + session.id, "selection=" + safeJson(modelSelection));
+    const opts = { model: modelSelection, apiKey: session.cursorKey, local: { cwd: EMPTY_CWD } };
     // MCP shim registration (additive, never substitutive): attach the session's MCP server map so the SDK's
     // local runtime dials our in-bridge /mcp/<id> endpoint and surfaces the advertised tools to the model.
     // Wrapped so any throw degrades to today's native-only behavior — the working read/shell path MUST survive
@@ -6451,7 +6457,7 @@ async function ensureAgent(session, model) {
         session.agent = await platform.createAgent({ agentId, ...opts });
         return session.agent;
       }
-      dbg("ensureAgent resumeAgent", "session=" + session.id, "agentId=" + agentId, "model=" + model, "mcpServers=" + (opts.mcpServers ? Object.keys(opts.mcpServers).length : 0));
+      dbg("ensureAgent resumeAgent", "session=" + session.id, "agentId=" + agentId, "selection=" + safeJson(modelSelection), "mcpServers=" + (opts.mcpServers ? Object.keys(opts.mcpServers).length : 0));
       session.agent = await platform.resumeAgent(agentId, opts);          // cold / restart: resume by our durable agentId
       // BR-DS / H11 / H12 / ADD-73: a SUCCESSFUL resume means this durable agentId EXISTS in the SDK store —
       // which only happens after a prior createAgent + at least one send (the seed); the create-on-not-found
@@ -9352,7 +9358,7 @@ async function handleTurn(req, res, body, cursorKey) {
   // ADD-72/ADD-84) is the executor's advisory list of constraints the composer path cannot hard-enforce; it is
   // threaded through here so BOTH the send path (driveUserSend) AND the ADD-77/ADD-83 resume-injection surface
   // it to the model identically (never a claim of hard enforcement).
-  const constraints = { toolChoice: body.toolChoice || "", responseFormat: body.responseFormat, stop: body.stop, maxTokens: body.maxTokens, unsupportedHardGuarantees: body.unsupportedHardGuarantees };
+  const constraints = { toolChoice: body.toolChoice || "", responseFormat: body.responseFormat, stop: body.stop, maxTokens: body.maxTokens, reasoningEffort: body.reasoningEffort, unsupportedHardGuarantees: body.unsupportedHardGuarantees };
 
   if (input.type === "tool_results") {
     fail(400, "tool results must be submitted to /agent/continue using their signed tool-call ids");
@@ -10004,6 +10010,15 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     }, SSE_KEEPALIVE_MS);
     if (keepalive.unref) keepalive.unref();
 
+  // Selection is a protocol-level value, not a model-name convention. Its stable fingerprint
+  // drives durable-agent rotation, so every backend mapper can add capabilities without callers
+  // inventing synthetic model aliases.
+  const modelSelection = composerModelSelection(model, {
+    utilityOneShot: session.utilityOneShot,
+    reasoningEffort: constraints.reasoningEffort,
+  });
+  const modelSelectionIdentity = safeJson(modelSelection);
+
 
   // driveUserSend performs a model-visible user send on the EXISTING no-timeout agent: it seeds (prepends
   // system + prior history on the FIRST send for the session), applies the enforced constraint instructions,
@@ -10037,7 +10052,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     session.reseedAllowed = typeof input.history === "string" && input.history.trim().length > 0;
     let agent;
     try {
-      agent = await ensureAgent(session, model);
+      agent = await ensureAgent(session, modelSelection);
     } catch (error) {
       releaseInputDeliveryAdmission(input);
       if (frozenDelivery) session.advertise = advertiseBeforeFrozenRetry;
@@ -10062,7 +10077,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
           );
         }
         await session.rotateForSystemReplacement(contextPlan.ids || []);
-        agent = await ensureAgent(session, model);
+        agent = await ensureAgent(session, modelSelection);
         if (settled) {
           releaseInputDeliveryAdmission(input);
           return;
@@ -10406,7 +10421,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       }
       // ADD-62: the send under `model` landed and this run owns the session -> record the model the durable
       // agent is now running. A later turn requesting a DIFFERENT model rotates the durable agent (above).
-      session.model = model;
+      session.model = modelSelectionIdentity;
       // Bind completion to THIS run's epoch, not the session: a cancelled/superseded run's late settlement
       // must not tear down a freshly-promoted queued turn that now owns session.run/activeRes/pending.
       session.run.wait()
@@ -10460,15 +10475,15 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     // (A bare resume-only continuation with run===null but a changed model also rotates — correct: the old
     // agent is the wrong model.) `forceModelReseed` then routes through the re-seed path below.
     let forceModelReseed = false;
-    if (session.run === null && session.model && session.model !== model) {
-      dbg("runTurn MODEL CHANGED (no live run) -> rotate durable agent + re-seed", "session=" + session.id, "from=" + session.model, "to=" + model);
+    if (session.run === null && session.model && session.model !== modelSelectionIdentity) {
+      dbg("runTurn MODEL SELECTION CHANGED (no live run) -> rotate durable agent + re-seed", "session=" + session.id, "from=" + session.model, "to=" + modelSelectionIdentity);
       // Rotation cancellation belongs to the old durable agent, not to this
       // newly-opened HTTP turn. Detach the current settle callback while the
       // old handle closes; otherwise cancel() settles this response before the
       // fallback send starts and driveUserSend correctly refuses to create an
       // orphan, yielding a session frame plus empty [DONE].
       session.settleTurn = null;
-      try { await session.rotateForModelChange(model); }
+      try { await session.rotateForModelChange(modelSelectionIdentity); }
       finally { session.settleTurn = settleOnce; }
       if (clientMessageId) {
         session.activeClientMessageId = clientMessageId;
