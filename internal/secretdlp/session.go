@@ -639,7 +639,7 @@ func (s *Session) RestoreStreamJSONChunkWithResolverStats(chunk []byte, resolver
 }
 
 func (s *Session) restoreChatCompletionContentDeltaLocked(body []byte, resolver PlaceholderResolver) ([]byte, int, bool) {
-	content, root, ok := chatCompletionDeltaContent(body)
+	content, root, framed, ok := chatCompletionDeltaContent(body)
 	if !ok {
 		return nil, 0, false
 	}
@@ -652,12 +652,12 @@ func (s *Session) restoreChatCompletionContentDeltaLocked(body []byte, resolver 
 	s.streamContentFrame = nil
 	restoredContent, restored := s.restoreRawJSONLocked([]byte(combined), resolver)
 	if restored > 0 {
-		return marshalChatCompletionDelta(root, string(restoredContent)), restored, true
+		return marshalChatCompletionDelta(root, string(restoredContent), framed), restored, true
 	}
 
 	hold := placeholderHoldbackLen([]byte(combined), s.maxPlaceholderLen+1)
 	if hold == 0 {
-		return marshalChatCompletionDelta(root, combined), 0, true
+		return marshalChatCompletionDelta(root, combined, framed), 0, true
 	}
 
 	safe := combined[:len(combined)-hold]
@@ -666,39 +666,40 @@ func (s *Session) restoreChatCompletionContentDeltaLocked(body []byte, resolver 
 	if safe == "" {
 		return nil, 0, true
 	}
-	return marshalChatCompletionDelta(root, safe), 0, true
+	return marshalChatCompletionDelta(root, safe, framed), 0, true
 }
 
-func chatCompletionDeltaContent(body []byte) (string, map[string]any, bool) {
+func chatCompletionDeltaContent(body []byte) (string, map[string]any, bool, bool) {
 	trimmed := bytes.TrimSpace(body)
-	if !bytes.HasPrefix(trimmed, []byte("data:")) {
-		return "", nil, false
+	framed := bytes.HasPrefix(trimmed, []byte("data:"))
+	payload := trimmed
+	if framed {
+		payload = bytes.TrimSpace(trimmed[len("data:"):])
 	}
-	payload := bytes.TrimSpace(trimmed[len("data:"):])
 	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
-		return "", nil, false
+		return "", nil, false, false
 	}
 	var root map[string]any
 	if err := json.Unmarshal(payload, &root); err != nil {
-		return "", nil, false
+		return "", nil, false, false
 	}
 	choices, ok := root["choices"].([]any)
 	if !ok || len(choices) == 0 {
-		return "", nil, false
+		return "", nil, false, false
 	}
 	choice, ok := choices[0].(map[string]any)
 	if !ok {
-		return "", nil, false
+		return "", nil, false, false
 	}
 	delta, ok := choice["delta"].(map[string]any)
 	if !ok {
-		return "", nil, false
+		return "", nil, false, false
 	}
 	content, ok := delta["content"].(string)
-	return content, root, ok
+	return content, root, framed, ok
 }
 
-func marshalChatCompletionDelta(root map[string]any, content string) []byte {
+func marshalChatCompletionDelta(root map[string]any, content string, framed bool) []byte {
 	choices := root["choices"].([]any)
 	choice := choices[0].(map[string]any)
 	delta := choice["delta"].(map[string]any)
@@ -706,6 +707,9 @@ func marshalChatCompletionDelta(root map[string]any, content string) []byte {
 	payload, err := json.Marshal(root)
 	if err != nil {
 		return nil
+	}
+	if !framed {
+		return payload
 	}
 	out := append([]byte("data: "), payload...)
 	return append(out, '\n', '\n')
@@ -773,11 +777,11 @@ func (s *Session) FlushStreamJSONTailWithResolverStats(resolver PlaceholderResol
 	var out []byte
 	restored := 0
 	if s.streamContentTail != "" {
-		content, root, ok := chatCompletionDeltaContent(s.streamContentFrame)
+		content, root, framed, ok := chatCompletionDeltaContent(s.streamContentFrame)
 		if ok {
 			_ = content
 			restoredContent, count := s.restoreRawJSONLocked([]byte(s.streamContentTail), resolver)
-			out = append(out, marshalChatCompletionDelta(root, string(restoredContent))...)
+			out = append(out, marshalChatCompletionDelta(root, string(restoredContent), framed)...)
 			restored += count
 		} else {
 			out = append(out, s.streamContentTail...)

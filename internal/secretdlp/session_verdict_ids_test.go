@@ -74,7 +74,7 @@ func TestServiceRestoresVerdictPlaceholderAcrossChatCompletionContentDeltas(t *t
 	fragments := []string{"VERDICT ", placeholder[:2], placeholder[2:9], placeholder[9:24], placeholder[24:], " approve: live restore probe"}
 	var restored []byte
 	for _, fragment := range fragments {
-		chunk := fmt.Sprintf("data: {\"id\":\"chatcmpl-judge\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", fragment)
+		chunk := fmt.Sprintf("{\"id\":\"chatcmpl-judge\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":%q}}]}", fragment)
 		restored = append(restored, svc.RestoreStreamChunk(ctx, []byte(chunk))...)
 	}
 	restored = append(restored, svc.FlushStream(ctx)...)

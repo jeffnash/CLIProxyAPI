@@ -76,6 +76,45 @@ func TestExecuteStreamWithAuthManagerRestoresSecretDLPStream(t *testing.T) {
 	}
 }
 
+func TestExecuteStreamWithAuthManagerCarriesAfterAuthSecretDLPSessionToResponse(t *testing.T) {
+	const model = "secret-dlp-after-auth-stream-model"
+	const artifactID = "sk-testdlpfixture0000000000000000000000000000"
+
+	executor := &modelExecutionCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			placeholder := extractSecretDLPPlaceholder(t, string(req.Payload))
+			fragments := []string{placeholder[:2], placeholder[2:11], placeholder[11:]}
+			chunks := make(chan coreexecutor.StreamChunk, len(fragments))
+			for _, fragment := range fragments {
+				chunks <- coreexecutor.StreamChunk{Payload: []byte(fmt.Sprintf("data: {\"id\":\"chatcmpl-judge\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", fragment))}
+			}
+			close(chunks)
+			return &coreexecutor.StreamResult{Chunks: chunks}, nil
+		},
+	}
+	handler := newModelExecutionHandler(t, model, executor, &sdkconfig.SDKConfig{})
+	handler.SetSecretDLP(newSecretDLPTestService(t))
+	ctx := newSecretDLPGinContext(t, "/v1/chat/completions")
+	request := []byte(fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"Judge %s"}]}`, model, artifactID))
+
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", model, request, "")
+	var body []byte
+	for chunk := range dataChan {
+		body = append(body, chunk...)
+	}
+	for errMsg := range errChan {
+		if errMsg != nil {
+			t.Fatalf("ExecuteStreamWithAuthManager() error = %+v", errMsg)
+		}
+	}
+	if bytes.Contains(body, []byte("__CPA_DLP_v1_")) {
+		t.Fatalf("stream body still contains after-auth placeholder: %s", body)
+	}
+	if !bytes.Contains(body, []byte(artifactID)) {
+		t.Fatalf("stream body = %q, want restored artifact id %q", body, artifactID)
+	}
+}
+
 func TestApplySecretDLPAfterAuthHonorsProviderPolicy(t *testing.T) {
 	const secret = "sk-testdlpfixture0000000000000000000000000000"
 
