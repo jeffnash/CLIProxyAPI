@@ -86,6 +86,8 @@ type Session struct {
 	secretToPlaceholder map[string]string
 	placeholderToSecret map[string][]byte
 	streamTail          []byte
+	streamContentTail   string
+	streamContentFrame  []byte
 	maxPlaceholderLen   int
 }
 
@@ -613,6 +615,10 @@ func (s *Session) RestoreStreamJSONChunkWithResolverStats(chunk []byte, resolver
 	defer s.mu.Unlock()
 
 	combined := append(bytes.Clone(s.streamTail), chunk...)
+	if out, restored, handled := s.restoreChatCompletionContentDeltaLocked(combined, resolver); handled {
+		s.streamTail = nil
+		return out, restored
+	}
 	out, restored := s.restoreStreamJSONLocked(combined, resolver)
 	hold := placeholderHoldbackLen(out, s.maxPlaceholderLen)
 	if hold > 0 && len(out) <= hold {
@@ -630,6 +636,79 @@ func (s *Session) RestoreStreamJSONChunkWithResolverStats(chunk []byte, resolver
 	}
 
 	return bytes.Clone(safe), restored
+}
+
+func (s *Session) restoreChatCompletionContentDeltaLocked(body []byte, resolver PlaceholderResolver) ([]byte, int, bool) {
+	content, root, ok := chatCompletionDeltaContent(body)
+	if !ok {
+		return nil, 0, false
+	}
+	if s.streamContentTail == "" && placeholderHoldbackLen([]byte(content), s.maxPlaceholderLen+1) == 0 {
+		return nil, 0, false
+	}
+
+	combined := s.streamContentTail + content
+	s.streamContentTail = ""
+	s.streamContentFrame = nil
+	restoredContent, restored := s.restoreRawJSONLocked([]byte(combined), resolver)
+	if restored > 0 {
+		return marshalChatCompletionDelta(root, string(restoredContent)), restored, true
+	}
+
+	hold := placeholderHoldbackLen([]byte(combined), s.maxPlaceholderLen+1)
+	if hold == 0 {
+		return marshalChatCompletionDelta(root, combined), 0, true
+	}
+
+	safe := combined[:len(combined)-hold]
+	s.streamContentTail = combined[len(combined)-hold:]
+	s.streamContentFrame = bytes.Clone(body)
+	if safe == "" {
+		return nil, 0, true
+	}
+	return marshalChatCompletionDelta(root, safe), 0, true
+}
+
+func chatCompletionDeltaContent(body []byte) (string, map[string]any, bool) {
+	trimmed := bytes.TrimSpace(body)
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return "", nil, false
+	}
+	payload := bytes.TrimSpace(trimmed[len("data:"):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return "", nil, false
+	}
+	var root map[string]any
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return "", nil, false
+	}
+	choices, ok := root["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return "", nil, false
+	}
+	choice, ok := choices[0].(map[string]any)
+	if !ok {
+		return "", nil, false
+	}
+	delta, ok := choice["delta"].(map[string]any)
+	if !ok {
+		return "", nil, false
+	}
+	content, ok := delta["content"].(string)
+	return content, root, ok
+}
+
+func marshalChatCompletionDelta(root map[string]any, content string) []byte {
+	choices := root["choices"].([]any)
+	choice := choices[0].(map[string]any)
+	delta := choice["delta"].(map[string]any)
+	delta["content"] = content
+	payload, err := json.Marshal(root)
+	if err != nil {
+		return nil
+	}
+	out := append([]byte("data: "), payload...)
+	return append(out, '\n', '\n')
 }
 
 func placeholderHoldbackLen(body []byte, maxPlaceholderLen int) int {
@@ -687,11 +766,28 @@ func (s *Session) FlushStreamJSONTailWithResolverStats(resolver PlaceholderResol
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.streamTail) == 0 {
+	if len(s.streamTail) == 0 && s.streamContentTail == "" {
 		return nil, 0
 	}
 
-	out, restored := s.restoreStreamJSONLocked(s.streamTail, resolver)
+	var out []byte
+	restored := 0
+	if s.streamContentTail != "" {
+		content, root, ok := chatCompletionDeltaContent(s.streamContentFrame)
+		if ok {
+			_ = content
+			restoredContent, count := s.restoreRawJSONLocked([]byte(s.streamContentTail), resolver)
+			out = append(out, marshalChatCompletionDelta(root, string(restoredContent))...)
+			restored += count
+		} else {
+			out = append(out, s.streamContentTail...)
+		}
+		s.streamContentTail = ""
+		s.streamContentFrame = nil
+	}
+	rawOut, rawRestored := s.restoreStreamJSONLocked(s.streamTail, resolver)
+	out = append(out, rawOut...)
+	restored += rawRestored
 	s.streamTail = nil
 	return out, restored
 }

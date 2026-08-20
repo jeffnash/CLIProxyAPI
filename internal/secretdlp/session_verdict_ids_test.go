@@ -2,6 +2,7 @@ package secretdlp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -53,5 +54,35 @@ func TestSessionRestoresModelMutatedVerdictPlaceholderAcrossStreamChunks(t *test
 	untrusted := svc.RestoreResponse(WithSession(context.Background(), otherClient), []byte(`{"content":"VERDICT `+mutated+` approve"}`))
 	if strings.Contains(string(untrusted), artifactID) {
 		t.Fatalf("other-client response restored authenticated artifact id: %s", untrusted)
+	}
+}
+
+func TestServiceRestoresVerdictPlaceholderAcrossChatCompletionContentDeltas(t *testing.T) {
+	const artifactID = "ra_79704d89709f47a897bc71f151b60c05"
+
+	session := NewSession([]byte("master-key"), "client-key", time.Minute, ModeRestore)
+	redacted := redactRawForTest(t, session, []byte(artifactID), []Finding{{Secret: artifactID, RuleID: "test", Source: "test"}})
+	placeholder := extractPlaceholderForTest(t, string(redacted))
+	svc := newSegmentPolicyTestService(t)
+	defer func() {
+		if err := svc.Close(); err != nil {
+			t.Fatalf("Close(): %v", err)
+		}
+	}()
+	ctx := WithSession(context.Background(), session)
+
+	fragments := []string{"VERDICT ", placeholder[:2], placeholder[2:9], placeholder[9:24], placeholder[24:], " approve: live restore probe"}
+	var restored []byte
+	for _, fragment := range fragments {
+		chunk := fmt.Sprintf("data: {\"id\":\"chatcmpl-judge\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", fragment)
+		restored = append(restored, svc.RestoreStreamChunk(ctx, []byte(chunk))...)
+	}
+	restored = append(restored, svc.FlushStream(ctx)...)
+
+	if strings.Contains(string(restored), placeholderPrefix) {
+		t.Fatalf("semantic content deltas still contain DLP placeholder: %s", restored)
+	}
+	if !strings.Contains(string(restored), artifactID) {
+		t.Fatalf("semantic content deltas = %q, want restored artifact id %q", restored, artifactID)
 	}
 }
