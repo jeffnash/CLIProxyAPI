@@ -22,6 +22,9 @@ const (
 )
 
 var placeholderPattern = regexp.MustCompile(`__CPA_DLP_v1_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{16}_\d{3,}_[A-Za-z0-9_-]{11}__`)
+var restorablePlaceholderPattern = regexp.MustCompile(`__CPA_DLP_v1_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{16}_\d{3,}_{1,2}[A-Za-z0-9_-]{11}__`)
+var placeholderPartsPattern = regexp.MustCompile(`^(__CPA_DLP_v1_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{16}_\d{3,})_([A-Za-z0-9_-]{11}__)$`)
+var mutatedPlaceholderPartsPattern = regexp.MustCompile(`^(__CPA_DLP_v1_[A-Za-z0-9_-]{12}_[A-Za-z0-9_-]{16}_\d{3,})__([A-Za-z0-9_-]{11}__)$`)
 
 var (
 	secretDLPExcludedTopLevelJSONPathKeys = map[string]bool{
@@ -415,12 +418,14 @@ func (s *Session) restoreJSONStringLocked(value string, path []string, resolver 
 		var count int
 		out, count = replaceAllStringCount(out, placeholder, string(secret))
 		restored += count
+		out, count = replaceAllStringCount(out, mutatedPlaceholderAlias(placeholder), string(secret))
+		restored += count
 	}
 	if resolver == nil {
 		return out, restored
 	}
 
-	matches := placeholderPattern.FindAllString(out, -1)
+	matches := restorablePlaceholderPattern.FindAllString(out, -1)
 	seen := make(map[string]struct{}, len(matches))
 	for _, placeholder := range matches {
 		if _, ok := seen[placeholder]; ok {
@@ -430,12 +435,13 @@ func (s *Session) restoreJSONStringLocked(value string, path []string, resolver 
 		if _, ok := s.placeholderToSecret[placeholder]; ok {
 			continue
 		}
-		secret, ok := resolver(placeholder)
+		canonical := canonicalPlaceholder(placeholder)
+		secret, ok := resolver(canonical)
 		if !ok || len(secret) == 0 {
 			continue
 		}
 		secret = cloneBytes(secret)
-		s.placeholderToSecret[placeholder] = secret
+		s.placeholderToSecret[canonical] = secret
 		if len(placeholder) > s.maxPlaceholderLen {
 			s.maxPlaceholderLen = len(placeholder)
 		}
@@ -444,6 +450,20 @@ func (s *Session) restoreJSONStringLocked(value string, path []string, resolver 
 		restored += count
 	}
 	return out, restored
+}
+
+func mutatedPlaceholderAlias(placeholder string) string {
+	if !placeholderPartsPattern.MatchString(placeholder) {
+		return ""
+	}
+	return placeholderPartsPattern.ReplaceAllString(placeholder, `${1}__${2}`)
+}
+
+func canonicalPlaceholder(placeholder string) string {
+	if mutatedPlaceholderPartsPattern.MatchString(placeholder) {
+		return mutatedPlaceholderPartsPattern.ReplaceAllString(placeholder, `${1}_${2}`)
+	}
+	return placeholder
 }
 
 func replaceAllStringCount(s, old, new string) (string, int) {
@@ -497,12 +517,14 @@ func (s *Session) restoreRawJSONLocked(body []byte, resolver PlaceholderResolver
 		var count int
 		out, count = replaceAllCount(out, []byte(placeholder), replacement)
 		restored += count
+		out, count = replaceAllCount(out, []byte(mutatedPlaceholderAlias(placeholder)), replacement)
+		restored += count
 	}
 	if resolver == nil {
 		return out, restored
 	}
 
-	matches := placeholderPattern.FindAll(out, -1)
+	matches := restorablePlaceholderPattern.FindAll(out, -1)
 	seen := make(map[string]struct{}, len(matches))
 	for _, match := range matches {
 		placeholder := string(match)
@@ -513,12 +535,13 @@ func (s *Session) restoreRawJSONLocked(body []byte, resolver PlaceholderResolver
 		if _, ok := s.placeholderToSecret[placeholder]; ok {
 			continue
 		}
-		secret, ok := resolver(placeholder)
+		canonical := canonicalPlaceholder(placeholder)
+		secret, ok := resolver(canonical)
 		if !ok || len(secret) == 0 {
 			continue
 		}
 		secret = cloneBytes(secret)
-		s.placeholderToSecret[placeholder] = secret
+		s.placeholderToSecret[canonical] = secret
 		if len(placeholder) > s.maxPlaceholderLen {
 			s.maxPlaceholderLen = len(placeholder)
 		}
