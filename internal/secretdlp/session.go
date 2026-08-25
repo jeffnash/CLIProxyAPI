@@ -615,7 +615,7 @@ func (s *Session) RestoreStreamJSONChunkWithResolverStats(chunk []byte, resolver
 	defer s.mu.Unlock()
 
 	combined := append(bytes.Clone(s.streamTail), chunk...)
-	if out, restored, handled := s.restoreChatCompletionContentDeltaLocked(combined, resolver); handled {
+	if out, restored, handled := s.restoreTextDeltaLocked(combined, resolver); handled {
 		s.streamTail = nil
 		return out, restored
 	}
@@ -638,8 +638,8 @@ func (s *Session) RestoreStreamJSONChunkWithResolverStats(chunk []byte, resolver
 	return bytes.Clone(safe), restored
 }
 
-func (s *Session) restoreChatCompletionContentDeltaLocked(body []byte, resolver PlaceholderResolver) ([]byte, int, bool) {
-	content, root, framed, ok := chatCompletionDeltaContent(body)
+func (s *Session) restoreTextDeltaLocked(body []byte, resolver PlaceholderResolver) ([]byte, int, bool) {
+	content, root, framed, kind, ok := textDeltaContent(body)
 	if !ok {
 		return nil, 0, false
 	}
@@ -652,12 +652,12 @@ func (s *Session) restoreChatCompletionContentDeltaLocked(body []byte, resolver 
 	s.streamContentFrame = nil
 	restoredContent, restored := s.restoreRawJSONLocked([]byte(combined), resolver)
 	if restored > 0 {
-		return marshalChatCompletionDelta(root, string(restoredContent), framed), restored, true
+		return marshalTextDelta(root, string(restoredContent), framed, kind), restored, true
 	}
 
 	hold := placeholderHoldbackLen([]byte(combined), s.maxPlaceholderLen+1)
 	if hold == 0 {
-		return marshalChatCompletionDelta(root, combined, framed), 0, true
+		return marshalTextDelta(root, combined, framed, kind), 0, true
 	}
 
 	safe := combined[:len(combined)-hold]
@@ -666,50 +666,64 @@ func (s *Session) restoreChatCompletionContentDeltaLocked(body []byte, resolver 
 	if safe == "" {
 		return nil, 0, true
 	}
-	return marshalChatCompletionDelta(root, safe, framed), 0, true
+	return marshalTextDelta(root, safe, framed, kind), 0, true
 }
 
-func chatCompletionDeltaContent(body []byte) (string, map[string]any, bool, bool) {
+func textDeltaContent(body []byte) (string, map[string]any, bool, string, bool) {
 	trimmed := bytes.TrimSpace(body)
-	framed := bytes.HasPrefix(trimmed, []byte("data:"))
+	framed := bytes.HasPrefix(trimmed, []byte("data:")) || bytes.HasPrefix(trimmed, []byte("event:"))
 	payload := trimmed
-	if framed {
+	if bytes.HasPrefix(trimmed, []byte("event:")) {
+		dataAt := bytes.Index(trimmed, []byte("\ndata:"))
+		if dataAt < 0 {
+			return "", nil, false, "", false
+		}
+		payload = bytes.TrimSpace(trimmed[dataAt+len("\ndata:"):])
+	} else if framed {
 		payload = bytes.TrimSpace(trimmed[len("data:"):])
 	}
 	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
-		return "", nil, false, false
+		return "", nil, false, "", false
 	}
 	var root map[string]any
 	if err := json.Unmarshal(payload, &root); err != nil {
-		return "", nil, false, false
+		return "", nil, false, "", false
 	}
 	choices, ok := root["choices"].([]any)
-	if !ok || len(choices) == 0 {
-		return "", nil, false, false
+	if ok && len(choices) > 0 {
+		choice, choiceOK := choices[0].(map[string]any)
+		delta, deltaOK := choice["delta"].(map[string]any)
+		content, contentOK := delta["content"].(string)
+		if choiceOK && deltaOK && contentOK {
+			return content, root, framed, "openai", true
+		}
 	}
-	choice, ok := choices[0].(map[string]any)
-	if !ok {
-		return "", nil, false, false
+	delta, ok := root["delta"].(map[string]any)
+	if !ok || root["type"] != "content_block_delta" || delta["type"] != "text_delta" {
+		return "", nil, false, "", false
 	}
-	delta, ok := choice["delta"].(map[string]any)
-	if !ok {
-		return "", nil, false, false
-	}
-	content, ok := delta["content"].(string)
-	return content, root, framed, ok
+	content, ok := delta["text"].(string)
+	return content, root, framed, "claude", ok
 }
 
-func marshalChatCompletionDelta(root map[string]any, content string, framed bool) []byte {
-	choices := root["choices"].([]any)
-	choice := choices[0].(map[string]any)
-	delta := choice["delta"].(map[string]any)
-	delta["content"] = content
+func marshalTextDelta(root map[string]any, content string, framed bool, kind string) []byte {
+	if kind == "claude" {
+		root["delta"].(map[string]any)["text"] = content
+	} else {
+		choices := root["choices"].([]any)
+		choice := choices[0].(map[string]any)
+		choice["delta"].(map[string]any)["content"] = content
+	}
 	payload, err := json.Marshal(root)
 	if err != nil {
 		return nil
 	}
 	if !framed {
 		return payload
+	}
+	if kind == "claude" {
+		out := append([]byte("event: content_block_delta\ndata: "), payload...)
+		return append(out, '\n', '\n')
 	}
 	out := append([]byte("data: "), payload...)
 	return append(out, '\n', '\n')
@@ -777,11 +791,11 @@ func (s *Session) FlushStreamJSONTailWithResolverStats(resolver PlaceholderResol
 	var out []byte
 	restored := 0
 	if s.streamContentTail != "" {
-		content, root, framed, ok := chatCompletionDeltaContent(s.streamContentFrame)
+		content, root, framed, kind, ok := textDeltaContent(s.streamContentFrame)
 		if ok {
 			_ = content
 			restoredContent, count := s.restoreRawJSONLocked([]byte(s.streamContentTail), resolver)
-			out = append(out, marshalChatCompletionDelta(root, string(restoredContent), framed)...)
+			out = append(out, marshalTextDelta(root, string(restoredContent), framed, kind)...)
 			restored += count
 		} else {
 			out = append(out, s.streamContentTail...)

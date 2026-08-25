@@ -86,3 +86,40 @@ func TestServiceRestoresVerdictPlaceholderAcrossChatCompletionContentDeltas(t *t
 		t.Fatalf("semantic content deltas = %q, want restored artifact id %q", restored, artifactID)
 	}
 }
+
+func TestServiceRestoresVerdictPlaceholderAcrossClaudeTextDeltas(t *testing.T) {
+	const artifactID = "ra_79704d89709f47a897bc71f151b60c05"
+
+	session := NewSession([]byte("master-key"), "client-key", time.Minute, ModeRestore)
+	redacted := redactRawForTest(t, session, []byte(artifactID), []Finding{{Secret: artifactID, RuleID: "test", Source: "test"}})
+	placeholder := extractPlaceholderForTest(t, string(redacted))
+	svc := newSegmentPolicyTestService(t)
+	defer func() {
+		if err := svc.Close(); err != nil {
+			t.Fatalf("Close(): %v", err)
+		}
+	}()
+	ctx := WithSession(context.Background(), session)
+
+	fragments := []string{"VERDICT ", placeholder[:12], placeholder[12:31], placeholder[31:], " approve: live restore probe"}
+	var restored []byte
+	for _, fragment := range fragments {
+		chunk := fmt.Sprintf("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":%q}}\n\n", fragment)
+		restored = append(restored, svc.RestoreStreamChunk(ctx, []byte(chunk))...)
+	}
+	restored = append(restored, svc.FlushStream(ctx)...)
+
+	if strings.Contains(string(restored), placeholderPrefix) {
+		t.Fatalf("Claude text deltas still contain DLP placeholder: %s", restored)
+	}
+	var restoredText strings.Builder
+	for _, event := range strings.Split(string(restored), "\n\n") {
+		_, root, _, kind, ok := textDeltaContent([]byte(event))
+		if ok && kind == "claude" {
+			restoredText.WriteString(root["delta"].(map[string]any)["text"].(string))
+		}
+	}
+	if !strings.Contains(restoredText.String(), "VERDICT "+artifactID+" approve:") {
+		t.Fatalf("Claude text deltas = %q, want restored artifact id %q", restored, artifactID)
+	}
+}
