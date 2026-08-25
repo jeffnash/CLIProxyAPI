@@ -62,6 +62,7 @@ const {
   bindHostIsLoopback,
   blockedNativeResult,
   blockedSyntheticNativeExecIfNeeded,
+  breakerOpen,
   buildMcpServers,
   buildReadSuccess,
   buildRestartRecoveryInput,
@@ -134,6 +135,7 @@ const {
   toolManifestRule,
   toolResultRecoveryPlan,
   terminalizePoisonedPlatformSessions,
+  upstreamBreaker,
   consumeExpectedSdkAbort,
   consumeExpectedSdkLifecycleClosure,
   isClosedInputStreamError,
@@ -4410,6 +4412,31 @@ test("onRunError rotates only the affected durable agent and leaves same-key sib
   assert.equal(session.authEpoch, 1);
   assert.equal(sibling.done, false);
   assert.equal(platforms.get(keyHash(cursorKey)), platformEntry);
+});
+
+test("normal SDK resource_exhausted completion recycles the poisoned platform", (t) => {
+  const cursorKey = `resource-exhausted-key-${Date.now()}`;
+  const session = new Session(`resource-exhausted-${Date.now()}`, cursorKey);
+  const scope = platformScopeForSession(session);
+  platforms.set(scope, { promise: Promise.resolve({}), lastUsed: Date.now() });
+  sessions.set(session.id, session);
+  t.after(() => {
+    sessions.delete(session.id);
+    platforms.delete(scope);
+    upstreamBreaker.delete(scope);
+  });
+
+  const response = new MockResponse();
+  session.beginResponse(response);
+  session.onRunComplete({
+    status: "error",
+    error: { code: "resource_exhausted", message: "[resource_exhausted] Error" },
+    usage: {},
+  });
+
+  assert.equal(platforms.has(scope), false);
+  assert.equal(breakerOpen(scope), true);
+  assert.match(response.text(), /resource_exhausted/);
 });
 
 test("a later session-auth expiry advances the auth epoch without consuming another rotation budget", async (t) => {

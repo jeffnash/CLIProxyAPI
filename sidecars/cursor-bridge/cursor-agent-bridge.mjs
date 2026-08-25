@@ -5638,6 +5638,12 @@ class Session {
       return;
     }
     this.done = true; this.run = null; this.sendPending = false;
+    if (res && res.status !== "finished" && isUpstreamRateLimit(runError)) {
+      const scope = platformScopeForSession(this);
+      terminalizePoisonedPlatformSessions(scope, runError);
+      recyclePlatform(scope);
+      tripBreaker(scope);
+    }
     // BR2: a non-"finished" terminal means the upstream run failed; remember it so a tool_results turn that
     // finds nothing to resume surfaces the real error instead of a false-success empty turn.
     if (res && res.status !== "finished") this.lastRunError = runError || "run did not finish";
