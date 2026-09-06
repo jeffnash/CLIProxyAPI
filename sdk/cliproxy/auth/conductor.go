@@ -3930,9 +3930,6 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if err == nil {
 		return 0, false
 	}
-	if maxWait <= 0 {
-		return 0, false
-	}
 	status := statusCodeFromError(err)
 	if status == http.StatusOK {
 		return 0, false
@@ -3959,11 +3956,14 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 				state := auth.ModelStates[m.selectionModelForAuth(auth, model)]
 				if state != nil && statusCodeFromResult(state.LastError) == http.StatusNotFound {
 					m.mu.RUnlock()
-					return min(time.Second, maxWait), true
+					return max(0, min(time.Second, maxWait)), true
 				}
 			}
 		}
 		m.mu.RUnlock()
+	}
+	if maxWait <= 0 {
+		return 0, false
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
 	if found {
