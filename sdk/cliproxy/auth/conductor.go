@@ -992,7 +992,6 @@ func (m *Manager) ClearCooldown(ctx context.Context, provider, model string) ([]
 	return authIDs, models, nil
 }
 
-
 func modelsForRegisteredAuth(authID string) []string {
 	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(authID)
 	models := make([]string, 0, len(supportedModels))
@@ -3940,6 +3939,31 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	}
 	if isRequestInvalidError(err) {
 		return 0, false
+	}
+	// Explicit no-cooldown routes can retry transient model-not-found responses.
+	// Without a cooldown deadline, closestCooldownWait cannot schedule a retry.
+	if status == http.StatusNotFound {
+		m.mu.RLock()
+		for _, auth := range m.auths {
+			if auth == nil || auth.Disabled {
+				continue
+			}
+			retries, explicit := auth.RequestRetryOverride()
+			if !explicit || attempt >= retries || !(m.cooldownDisabledForAuth(auth) || modelSuspendDisabledForAuth(auth)) {
+				continue
+			}
+			for _, provider := range providers {
+				if !strings.EqualFold(strings.TrimSpace(provider), executorKeyFromAuth(auth)) {
+					continue
+				}
+				state := auth.ModelStates[m.selectionModelForAuth(auth, model)]
+				if state != nil && statusCodeFromResult(state.LastError) == http.StatusNotFound {
+					m.mu.RUnlock()
+					return min(time.Second, maxWait), true
+				}
+			}
+		}
+		m.mu.RUnlock()
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
 	if found {
