@@ -6,16 +6,15 @@
 package gemini
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"math/big"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -48,37 +47,37 @@ var (
 func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream bool) []byte {
 	rawJSON := inputRawJSON
 
-	if account == "" {
-		u, _ := uuid.NewRandom()
-		account = u.String()
+	userID := translatorcommon.DeriveClaudeUserID(rawJSON)
+	if userID == "" {
+		if account == "" {
+			u, _ := uuid.NewRandom()
+			account = u.String()
+		}
+		if session == "" {
+			u, _ := uuid.NewRandom()
+			session = u.String()
+		}
+		if user == "" {
+			sum := sha256.Sum256([]byte(account + session))
+			user = hex.EncodeToString(sum[:])
+		}
+		userID = fmt.Sprintf("user_%s_account_%s_session_%s", user, account, session)
 	}
-	if session == "" {
-		u, _ := uuid.NewRandom()
-		session = u.String()
-	}
-	if user == "" {
-		sum := sha256.Sum256([]byte(account + session))
-		user = hex.EncodeToString(sum[:])
-	}
-	userID := fmt.Sprintf("user_%s_account_%s_session_%s", user, account, session)
 
 	// Base Claude message payload
-	out := []byte(fmt.Sprintf(`{"model":"","max_tokens":32000,"messages":[],"metadata":{"user_id":"%s"}}`, userID))
+	out := []byte(`{"model":"","max_tokens":32000,"messages":[],"metadata":{}}`)
+	out, _ = sjson.SetBytes(out, "metadata.user_id", userID)
 
 	root := gjson.ParseBytes(rawJSON)
 
-	// Helper for generating tool call IDs in the form: toolu_<alphanum>
-	// This ensures unique identifiers for tool calls in the Claude Code format
+	toolCallCounter := 0
+	// Generated IDs stay deterministic across conversions so repeated
+	// translations of one request pair tool calls with their results.
 	genToolCallID := func() string {
-		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-		var b strings.Builder
-		// 24 chars random suffix for uniqueness
-		for i := 0; i < 24; i++ {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(letters))))
-			b.WriteByte(letters[n.Int64()])
-		}
-		return "toolu_" + b.String()
+		toolCallCounter++
+		return fmt.Sprintf("toolu_gemini_%016d", toolCallCounter)
 	}
+	messageAccumulator := translatorcommon.NewClaudeMessageAccumulator(int(root.Get("contents.#").Int()) + 1)
 
 	getGeminiToolID := func(value gjson.Result) string {
 		if toolID := strings.TrimSpace(value.Get("id").String()); toolID != "" {
@@ -215,11 +214,12 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 							out, _ = sjson.SetBytes(out, "thinking.budget_tokens", budget)
 						}
 					}
-				} else if includeThoughts := thinkingConfig.Get("includeThoughts"); includeThoughts.Exists() && includeThoughts.Type == gjson.True {
-					out, _ = sjson.SetBytes(out, "thinking.type", "enabled")
-				} else if includeThoughts := thinkingConfig.Get("include_thoughts"); includeThoughts.Exists() && includeThoughts.Type == gjson.True {
-					out, _ = sjson.SetBytes(out, "thinking.type", "enabled")
 				}
+				// Amount and summary visibility are independent: a bare
+				// includeThoughts flag carries no thinking amount, so it must not
+				// invent a thinking block here. The thinking pipeline activates a
+				// valid mode for enabled summaries (adaptive for level-models,
+				// Min-budget enabled otherwise) and applies display=summarized.
 			}
 		}
 	}
@@ -229,6 +229,9 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		if parts := sysInstr.Get("parts"); parts.Exists() && parts.IsArray() {
 			var systemText strings.Builder
 			parts.ForEach(func(_, part gjson.Result) bool {
+				if translatorcommon.IsGeminiThoughtPart(part) {
+					return true
+				}
 				if text := part.Get("text"); text.Exists() {
 					if systemText.Len() > 0 {
 						systemText.WriteString("\n")
@@ -238,10 +241,11 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 				return true
 			})
 			if systemText.Len() > 0 {
-				// Create system message in Claude Code format
+				// Create system message in Claude Code format.
 				systemMessage := []byte(`{"role":"user","content":[{"type":"text","text":""}]}`)
 				systemMessage, _ = sjson.SetBytes(systemMessage, "content.0.text", systemText.String())
-				out, _ = sjson.SetRawBytes(out, "messages.-1", systemMessage)
+				messageAccumulator.Append(systemMessage)
+				messageAccumulator.Flush()
 			}
 		}
 	}
@@ -263,17 +267,18 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 				role = "user"
 			}
 
-			// Create message structure in Claude Code format
-			msg := []byte(`{"role":"","content":[]}`)
-			msg, _ = sjson.SetBytes(msg, "role", role)
-
+			contentItems := make([][]byte, 0, 4)
 			if parts := content.Get("parts"); parts.Exists() && parts.IsArray() {
 				parts.ForEach(func(_, part gjson.Result) bool {
+					if translatorcommon.IsGeminiThoughtPart(part) {
+						return true
+					}
+
 					// Text content conversion
 					if text := part.Get("text"); text.Exists() {
 						textContent := []byte(`{"type":"text","text":""}`)
 						textContent, _ = sjson.SetBytes(textContent, "text", text.String())
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", textContent)
+						contentItems = append(contentItems, textContent)
 						return true
 					}
 
@@ -295,7 +300,7 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						if args := fc.Get("args"); args.Exists() && args.IsObject() {
 							toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(args.Raw))
 						}
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", toolUse)
+						contentItems = append(contentItems, toolUse)
 						return true
 					}
 
@@ -325,14 +330,14 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						} else if response := fr.Get("response"); response.Exists() {
 							toolResult, _ = sjson.SetBytes(toolResult, "content", response.Raw)
 						}
-						msg, _ = sjson.SetRawBytes(msg, "content.-1", toolResult)
+						contentItems = append(contentItems, toolResult)
 						return true
 					}
 
 					// Inline data conversion to Claude Code content format
 					if inlineData := geminiClaudeInlineData(part); inlineData.Exists() {
 						if contentPart, ok := claudeContentPartFromGeminiInlineData(inlineData); ok {
-							msg, _ = sjson.SetRawBytes(msg, "content.-1", contentPart)
+							contentItems = append(contentItems, contentPart)
 						}
 						return true
 					}
@@ -340,7 +345,7 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					// File data conversion to Claude Code content format
 					if fileData := geminiClaudeFileData(part); fileData.Exists() {
 						if contentPart, ok := claudeContentPartFromGeminiFileData(fileData); ok {
-							msg, _ = sjson.SetRawBytes(msg, "content.-1", contentPart)
+							contentItems = append(contentItems, contentPart)
 						}
 						return true
 					}
@@ -349,14 +354,18 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 				})
 			}
 
-			// Only add message if it has content
-			if contentArray := gjson.GetBytes(msg, "content"); contentArray.Exists() && len(contentArray.Array()) > 0 {
-				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+			// Only add message if it has content.
+			if len(contentItems) > 0 {
+				msg := []byte(`{"role":"","content":[]}`)
+				msg, _ = sjson.SetBytes(msg, "role", role)
+				msg, _ = sjson.SetRawBytes(msg, "content", translatorcommon.JoinRawArray(contentItems))
+				messageAccumulator.Append(msg)
 			}
 
 			return true
 		})
 	}
+	out = translatorcommon.SetRawArrayItems(out, "messages", messageAccumulator.Messages())
 
 	// Tools mapping: Gemini functionDeclarations -> Claude Code tools
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
@@ -374,19 +383,14 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 						anthropicTool, _ = sjson.SetBytes(anthropicTool, "description", desc.String())
 					}
 					if params := funcDecl.Get("parameters"); params.Exists() {
-						// Clean up the parameters schema for Claude Code compatibility
-						cleaned := []byte(params.Raw)
-						cleaned, _ = sjson.SetBytes(cleaned, "additionalProperties", false)
-						cleaned, _ = sjson.SetBytes(cleaned, "$schema", "http://json-schema.org/draft-07/schema#")
+						cleaned := normalizeClaudeToolSchema(params)
 						anthropicTool, _ = sjson.SetRawBytes(anthropicTool, "input_schema", cleaned)
 					} else if params = funcDecl.Get("parametersJsonSchema"); params.Exists() {
-						// Clean up the parameters schema for Claude Code compatibility
-						cleaned := []byte(params.Raw)
-						cleaned, _ = sjson.SetBytes(cleaned, "additionalProperties", false)
-						cleaned, _ = sjson.SetBytes(cleaned, "$schema", "http://json-schema.org/draft-07/schema#")
+						cleaned := normalizeClaudeToolSchema(params)
 						anthropicTool, _ = sjson.SetRawBytes(anthropicTool, "input_schema", cleaned)
 					}
 
+					anthropicTool = lowercaseClaudeToolSchemaTypes(anthropicTool)
 					anthropicTools = append(anthropicTools, gjson.ParseBytes(anthropicTool).Value())
 					return true
 				})
@@ -409,16 +413,34 @@ func ConvertGeminiRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	// Stream setting configuration
 	out, _ = sjson.SetBytes(out, "stream", stream)
 
-	// Convert tool parameter types to lowercase for Claude Code compatibility
-	var pathsToLower []string
-	toolsResult := gjson.GetBytes(out, "tools")
-	util.Walk(toolsResult, "", "type", &pathsToLower)
-	for _, p := range pathsToLower {
-		fullPath := fmt.Sprintf("tools.%s", p)
-		out, _ = sjson.SetBytes(out, fullPath, strings.ToLower(gjson.GetBytes(out, fullPath).String()))
-	}
-
 	return out
+}
+
+func normalizeClaudeToolSchema(parameters gjson.Result) []byte {
+	cleaned := []byte(parameters.Raw)
+	if parameters.Get("additionalProperties").Type != gjson.False {
+		cleaned, _ = sjson.SetBytes(cleaned, "additionalProperties", false)
+	}
+	const schema = "http://json-schema.org/draft-07/schema#"
+	currentSchema := parameters.Get("$schema")
+	if currentSchema.Type != gjson.String || currentSchema.String() != schema {
+		cleaned, _ = sjson.SetBytes(cleaned, "$schema", schema)
+	}
+	return cleaned
+}
+
+func lowercaseClaudeToolSchemaTypes(tool []byte) []byte {
+	var pathsToLower []string
+	util.Walk(gjson.ParseBytes(tool), "", "type", &pathsToLower)
+	for _, path := range pathsToLower {
+		typeValue := gjson.GetBytes(tool, path)
+		normalizedType := strings.ToLower(typeValue.String())
+		if typeValue.Type == gjson.String && normalizedType == typeValue.String() {
+			continue
+		}
+		tool, _ = sjson.SetBytes(tool, path, normalizedType)
+	}
+	return tool
 }
 
 func setClaudeToolChoiceFromGeminiToolConfig(out []byte, funcCalling gjson.Result) []byte {
@@ -439,9 +461,10 @@ func setClaudeToolChoiceFromGeminiToolConfig(out []byte, funcCalling gjson.Resul
 		if !allowedNames.Exists() {
 			allowedNames = funcCalling.Get("allowed_function_names")
 		}
-		if allowedNames.IsArray() && len(allowedNames.Array()) == 1 {
+		allowedNameItems := allowedNames.Array()
+		if allowedNames.IsArray() && len(allowedNameItems) == 1 {
 			choice := []byte(`{"type":"tool","name":""}`)
-			choice, _ = sjson.SetBytes(choice, "name", allowedNames.Array()[0].String())
+			choice, _ = sjson.SetBytes(choice, "name", allowedNameItems[0].String())
 			out, _ = sjson.SetRawBytes(out, "tool_choice", choice)
 		} else {
 			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"any"}`))

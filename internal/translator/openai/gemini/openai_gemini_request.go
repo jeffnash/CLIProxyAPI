@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -23,29 +24,6 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	out := []byte(`{"model":"","messages":[]}`)
 
 	root := gjson.ParseBytes(rawJSON)
-
-	// Deterministic tool-call id minter from a function name + call ordinal.
-	// Used only when the client truly sends NO id. Because a call and its matching
-	// response derive the SAME id from the same (name, index) pair, the ids agree
-	// and tool-use continuations round-trip even when ids are not preserved upstream.
-	sanitizeToolName := func(name string) string {
-		var b strings.Builder
-		for _, r := range name {
-			switch {
-			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
-				b.WriteRune(r)
-			default:
-				b.WriteByte('_')
-			}
-		}
-		if b.Len() == 0 {
-			return "fn"
-		}
-		return b.String()
-	}
-	mintDeterministicToolCallID := func(name string, index int) string {
-		return fmt.Sprintf("call_%s_%d", sanitizeToolName(name), index)
-	}
 
 	// Model mapping
 	out, _ = sjson.SetBytes(out, "model", modelName)
@@ -171,14 +149,34 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 		out, _ = sjson.SetBytes(out, "service_tier", serviceTier.String())
 	}
 
-	// Process contents (Gemini messages) -> OpenAI messages.
-	// Track the tool-call ids we DERIVE (or minted) per function name, in call order,
-	// so a functionResponse with no id of its own can pair with its functionCall by
-	// name+position. mintedByName[name] is a FIFO of ids waiting to be matched by a
-	// response; mintedCountByName[name] counts how many calls we have seen for that
-	// name so the deterministic id ordinal stays consistent across both branches.
-	mintedByName := make(map[string][]string)
+	// Process contents (Gemini messages) -> OpenAI messages
+	messageCapacity := root.Get("contents.#").Int()
+	if root.Get("systemInstruction").Exists() || root.Get("system_instruction").Exists() {
+		messageCapacity++
+	}
+	messageItems := translatorcommon.NewRawArrayItems(messageCapacity)
+	toolCallIDsByName := make(map[string][]string) // Track tool call IDs per function name for matching
+	// Deterministic tool-call id minter from a function name + call ordinal,
+	// used only when the client truly sends NO id. Because a call and its
+	// matching response derive the SAME id from the same (name, index) pair
+	// (responses consume the minted FIFO first), continuations round-trip even
+	// when ids are not preserved upstream.
 	mintedCountByName := make(map[string]int)
+	sanitizeMintedToolName := func(name string) string {
+		var b strings.Builder
+		for _, r := range name {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+				b.WriteRune(r)
+			default:
+				b.WriteByte('_')
+			}
+		}
+		return b.String()
+	}
+	mintDeterministicToolCallID := func(name string, index int) string {
+		return fmt.Sprintf("call_%s_%d", sanitizeMintedToolName(name), index)
+	}
 
 	// System instruction -> OpenAI system message
 	// Gemini may provide `systemInstruction` or `system_instruction`; support both keys.
@@ -188,42 +186,41 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 	if systemInstruction.Exists() {
 		parts := systemInstruction.Get("parts")
-		msg := []byte(`{"role":"system","content":[]}`)
-		hasContent := false
+		contentItems := make([][]byte, 0, 2)
 
 		if parts.Exists() && parts.IsArray() {
 			parts.ForEach(func(_, part gjson.Result) bool {
+				if translatorcommon.IsGeminiThoughtPart(part) {
+					return true
+				}
+
 				// Handle text parts
 				if text := part.Get("text"); text.Exists() {
 					contentPart := []byte(`{"type":"text","text":""}`)
 					contentPart, _ = sjson.SetBytes(contentPart, "text", text.String())
-					msg, _ = sjson.SetRawBytes(msg, "content.-1", contentPart)
-					hasContent = true
+					contentItems = append(contentItems, contentPart)
 				}
 
 				// Handle inline data (e.g., images)
 				if contentPart, ok := openAIContentPartFromGeminiInlineData(part); ok {
-					msg, _ = sjson.SetRawBytes(msg, "content.-1", contentPart)
-					hasContent = true
+					contentItems = append(contentItems, contentPart)
 				}
-
-				// ADD-54: handle fileData (URI-referenced media) in the system instruction
-				// too. Mirrors the contents-loop branch: never silently drop the part.
-				var ignoreOnlyText bool
-				if cp, ok := geminiFileDataPart(part, &ignoreOnlyText); ok {
-					msg, _ = sjson.SetRawBytes(msg, "content.-1", cp)
-					hasContent = true
+				if contentPart, ok := openAIContentPartFromGeminiFileData(part); ok {
+					contentItems = append(contentItems, contentPart)
 				}
 				return true
 			})
 		}
 
-		if hasContent {
-			out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+		if len(contentItems) > 0 {
+			msg := []byte(`{"role":"system","content":[]}`)
+			msg, _ = sjson.SetRawBytes(msg, "content", translatorcommon.JoinRawArray(contentItems))
+			messageItems = append(messageItems, msg)
 		}
 	}
 
 	if contents := root.Get("contents"); contents.Exists() && contents.IsArray() {
+		msgIdx := 0
 		contents.ForEach(func(_, content gjson.Result) bool {
 			role := strings.TrimSpace(content.Get("role").String())
 			parts := content.Get("parts")
@@ -254,101 +251,75 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 			msg, _ = sjson.SetBytes(msg, "role", role)
 
 			var textBuilder strings.Builder
-			contentWrapper := []byte(`{"arr":[]}`)
-			contentPartsCount := 0
+			contentItems := make([][]byte, 0, 4)
 			onlyTextContent := true
-			toolCallsWrapper := []byte(`{"arr":[]}`)
-			toolCallsCount := 0
+			toolCallItems := make([][]byte, 0, 2)
+			droppedThought := false
 
 			if parts.Exists() && parts.IsArray() {
 				parts.ForEach(func(_, part gjson.Result) bool {
+
+					if translatorcommon.IsGeminiThoughtPart(part) {
+						droppedThought = true
+						return true
+					}
+
 					// Handle text parts
 					if text := part.Get("text"); text.Exists() {
 						formattedText := text.String()
-						// ADD-86: preserve the boundary between successive text parts in the
-						// flattened-string fast path. Without a delimiter [{text:"a"},{text:"b"}]
-						// became "ab", erasing the semantic boundary (commands/paths/code lines
-						// could fuse). Insert a "\n" between two flattened text parts. The
-						// structured content array path (contentWrapper) is untouched — each text
-						// part stays a distinct array element there.
 						if textBuilder.Len() > 0 {
 							textBuilder.WriteString("\n")
 						}
 						textBuilder.WriteString(formattedText)
 						contentPart := []byte(`{"type":"text","text":""}`)
 						contentPart, _ = sjson.SetBytes(contentPart, "text", formattedText)
-						contentWrapper, _ = sjson.SetRawBytes(contentWrapper, "arr.-1", contentPart)
-						contentPartsCount++
+						contentItems = append(contentItems, contentPart)
 					}
 
 					// Handle inline data (e.g., images)
 					if contentPart, ok := openAIContentPartFromGeminiInlineData(part); ok {
 						onlyTextContent = false
-						contentWrapper, _ = sjson.SetRawBytes(contentWrapper, "arr.-1", contentPart)
-						contentPartsCount++
+						contentItems = append(contentItems, contentPart)
 					}
-
-					// ADD-54: handle fileData (a media part referenced by URI instead of
-					// inline base64). Without this branch the part was silently dropped, so
-					// a Gemini turn that attaches an image/file by URI reached Composer with
-					// the attachment missing. Image MIME types become an OpenAI image_url
-					// (the URI is a fetchable reference); any other / missing MIME degrades
-					// to a visible text marker so the attachment is NEVER silently dropped.
-					if cp, ok := geminiFileDataPart(part, &onlyTextContent); ok {
-						contentWrapper, _ = sjson.SetRawBytes(contentWrapper, "arr.-1", cp)
-						contentPartsCount++
+					if contentPart, ok := openAIContentPartFromGeminiFileData(part); ok {
+						onlyTextContent = false
+						contentItems = append(contentItems, contentPart)
 					}
 
 					// Handle function calls (Gemini) -> tool calls (OpenAI)
 					if functionCall := part.Get("functionCall"); functionCall.Exists() {
-						fnName := functionCall.Get("name").String()
-
-						// Prefer the client-provided id so the id round-trips: the
-						// matching functionResponse can carry the SAME id and the
-						// upstream bridge sees the exact id it emitted. Only mint a
-						// DETERMINISTIC id (name + ordinal) when the client sent none,
-						// minting it identically here and in the response branch so a
-						// call and its response always agree.
-						var toolCallID string
-						if id := functionCall.Get("id").String(); id != "" {
-							toolCallID = id
-						} else if callID := functionCall.Get("call_id").String(); callID != "" {
-							toolCallID = callID
-						} else {
-							toolCallID = mintDeterministicToolCallID(fnName, mintedCountByName[fnName])
-							mintedCountByName[fnName]++
+						funcName := functionCall.Get("name").String()
+						argsRaw := ""
+						if args := functionCall.Get("args"); args.Exists() {
+							argsRaw = args.Raw
 						}
-						// Remember it (FIFO per name) for a later id-less response to pair with.
-						mintedByName[fnName] = append(mintedByName[fnName], toolCallID)
+						toolCallID := explicitGeminiToolID(functionCall)
+						if toolCallID == "" {
+							toolCallID = mintDeterministicToolCallID(funcName, mintedCountByName[funcName])
+							mintedCountByName[funcName]++
+						}
+						toolCallIDsByName[funcName] = append(toolCallIDsByName[funcName], toolCallID)
 
 						toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 						toolCall, _ = sjson.SetBytes(toolCall, "id", toolCallID)
-						toolCall, _ = sjson.SetBytes(toolCall, "function.name", fnName)
+						toolCall, _ = sjson.SetBytes(toolCall, "function.name", funcName)
 
 						// Convert args to arguments JSON string
-						if args := functionCall.Get("args"); args.Exists() {
-							toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", args.Raw)
+						if argsRaw != "" {
+							toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", argsRaw)
 						} else {
 							toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", "{}")
 						}
 
-						toolCallsWrapper, _ = sjson.SetRawBytes(toolCallsWrapper, "arr.-1", toolCall)
-						toolCallsCount++
+						toolCallItems = append(toolCallItems, toolCall)
 					}
 
 					// Handle function responses (Gemini) -> tool role messages (OpenAI)
 					if functionResponse := part.Get("functionResponse"); functionResponse.Exists() {
+						funcName := functionResponse.Get("name").String()
 						// Create tool message for function response
 						toolMsg := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
-
-						// Convert response.content to the tool message content (ADD-85).
-						// Branch on the gjson type: a STRING value must be set with its
-						// decoded value (contentField.String()) so the tool content is the
-						// bare text "hello" — not the double-encoded JSON-string "\"hello\"".
-						// Object/array/number/bool keep .Raw so structured JSON survives
-						// verbatim. The `else` branch (no content field, fall back to the
-						// whole response) gets the same care so a string response is also
-						// emitted unquoted.
+						// Convert response.content to JSON string
 						if response := functionResponse.Get("response"); response.Exists() {
 							if contentField := response.Get("content"); contentField.Exists() {
 								if contentField.Type == gjson.String {
@@ -356,39 +327,39 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 								} else {
 									toolMsg, _ = sjson.SetBytes(toolMsg, "content", contentField.Raw)
 								}
-							} else if response.Type == gjson.String {
-								toolMsg, _ = sjson.SetBytes(toolMsg, "content", response.String())
 							} else {
-								toolMsg, _ = sjson.SetBytes(toolMsg, "content", response.Raw)
+								if response.Type == gjson.String {
+									toolMsg, _ = sjson.SetBytes(toolMsg, "content", response.String())
+								} else {
+									toolMsg, _ = sjson.SetBytes(toolMsg, "content", response.Raw)
+								}
 							}
 						}
 
-						// Resolve the tool_call_id so it ROUND-TRIPS with the call.
-						// Priority:
-						//   1. The response's own id (client preserved it) -> use verbatim;
-						//      the bridge sees the exact id it emitted.
-						//   2. The deterministic id we minted for this function name in the
-						//      call branch (FIFO match by name+position) -> a call and its
-						//      id-less response always agree.
-						//   3. A deterministic id from the response name + position, so even an
-						//      orphan response is stable (never the positional last-id heuristic
-						//      that misfired when calls/responses interleave).
-						respName := functionResponse.Get("name").String()
-						var toolCallID string
-						if id := functionResponse.Get("id").String(); id != "" {
-							toolCallID = id
-						} else if callID := functionResponse.Get("call_id").String(); callID != "" {
-							toolCallID = callID
-						} else if q := mintedByName[respName]; len(q) > 0 {
-							toolCallID = q[0]
-							mintedByName[respName] = q[1:]
+						if toolCallID := explicitGeminiToolID(functionResponse); toolCallID != "" {
+							toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", toolCallID)
+							if queue := toolCallIDsByName[funcName]; len(queue) > 0 {
+								for i, id := range queue {
+									if id == toolCallID {
+										toolCallIDsByName[funcName] = append(queue[:i], queue[i+1:]...)
+										break
+									}
+								}
+							}
+						} else if queue := toolCallIDsByName[funcName]; len(queue) > 0 {
+							toolCallID := queue[0]
+							toolCallIDsByName[funcName] = queue[1:]
+							toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", toolCallID)
 						} else {
-							toolCallID = mintDeterministicToolCallID(respName, mintedCountByName[respName])
-							mintedCountByName[respName]++
+							// Orphan response: deterministic id from the response
+							// name + position, so it stays stable (never the
+							// positional last-id heuristic).
+							fallbackID := mintDeterministicToolCallID(funcName, mintedCountByName[funcName])
+							mintedCountByName[funcName]++
+							toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", fallbackID)
 						}
-						toolMsg, _ = sjson.SetBytes(toolMsg, "tool_call_id", toolCallID)
 
-						out, _ = sjson.SetRawBytes(out, "messages.-1", toolMsg)
+						messageItems = append(messageItems, toolMsg)
 					}
 
 					return true
@@ -396,47 +367,41 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 			}
 
 			// Set content
-			if contentPartsCount > 0 {
+			if len(contentItems) > 0 {
 				if onlyTextContent {
 					msg, _ = sjson.SetBytes(msg, "content", textBuilder.String())
 				} else {
-					msg, _ = sjson.SetRawBytes(msg, "content", []byte(gjson.GetBytes(contentWrapper, "arr").Raw))
+					msg, _ = sjson.SetRawBytes(msg, "content", translatorcommon.JoinRawArray(contentItems))
 				}
 			}
 
-			// Set tool calls if any
-			if toolCallsCount > 0 {
-				msg, _ = sjson.SetRawBytes(msg, "tool_calls", []byte(gjson.GetBytes(toolCallsWrapper, "arr").Raw))
+			// Set tool calls if any.
+			if len(toolCallItems) > 0 {
+				msg, _ = sjson.SetRawBytes(msg, "tool_calls", translatorcommon.JoinRawArray(toolCallItems))
 			}
 
-			// H14: a function-response-ONLY continuation (only functionResponse parts,
-			// no text/image/functionCall) must NOT emit a trailing empty user/assistant
-			// message. The functionResponse parts were already appended directly as
-			// role:"tool" messages above, so the outer msg carries nothing. Emitting an
-			// empty role:"user" here would make the translated history end on an empty
-			// user turn, which the executor's continuation detector reads as a fresh
-			// (empty) user turn instead of a tool_results continuation — the paused run
-			// would never receive the tool output. Append the outer msg only when it has
-			// real content (text/image parts) or tool calls.
-			if contentPartsCount == 0 && toolCallsCount == 0 {
+			if droppedThought && len(contentItems) == 0 && len(toolCallItems) == 0 {
+				msgIdx++
 				return true
 			}
 
-			out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+			// A function-response-only continuation carries no outer content, so skip
+			// the empty outer message instead of ending history on an empty turn.
+			if len(contentItems) == 0 && len(toolCallItems) == 0 {
+				msgIdx++
+				return true
+			}
+
+			messageItems = append(messageItems, msg)
+			msgIdx++
 			return true
 		})
 	}
+	out = translatorcommon.SetRawArrayItems(out, "messages", messageItems)
 
-	// Tools mapping: Gemini tools -> OpenAI tools.
-	//
-	// ADD-99 (gemini half): unlike OpenAI's function tools, a Gemini functionDeclaration
-	// has NO per-tool strict-schema flag in the standard schema — there is no
-	// `function.strict` equivalent to preserve, so nothing is dropped here on the Gemini
-	// side (the strict-flag concern is OpenAI-only). We still pass the schema through
-	// verbatim: `parameters` is the standard field, `parametersJsonSchema` is the
-	// JSON-Schema variant some SDKs send. If a future Gemini revision adds a
-	// strict-equivalent hint, forward it here; until then this is a no-op by design.
+	// Tools mapping: Gemini tools -> OpenAI tools
 	if tools := root.Get("tools"); tools.Exists() && tools.IsArray() {
+		var toolItems [][]byte
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			if functionDeclarations := tool.Get("functionDeclarations"); functionDeclarations.Exists() && functionDeclarations.IsArray() {
 				functionDeclarations.ForEach(func(_, funcDecl gjson.Result) bool {
@@ -451,14 +416,16 @@ func ConvertGeminiRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 						openAITool, _ = sjson.SetRawBytes(openAITool, "function.parameters", []byte(parameters.Raw))
 					}
 
-					out, _ = sjson.SetRawBytes(out, "tools.-1", openAITool)
+					toolItems = append(toolItems, openAITool)
 					return true
 				})
 			}
 			return true
 		})
+		if len(toolItems) > 0 {
+			out, _ = sjson.SetRawBytes(out, "tools", translatorcommon.JoinRawArray(toolItems))
+		}
 	}
-
 	// Tool choice mapping. Gemini's functionCallingConfig.mode maps to OpenAI tool_choice;
 	// allowedFunctionNames (H15) further restricts WHICH tools may be called. Gemini and
 	// OpenAI default to AUTO when the mode is unset, so an allowedFunctionNames restriction
@@ -611,6 +578,16 @@ func setOpenAIAllowedTools(out []byte, names []string) []byte {
 	return out
 }
 
+func explicitGeminiToolID(node gjson.Result) string {
+	if id := strings.TrimSpace(node.Get("id").String()); id != "" {
+		return id
+	}
+	if callID := strings.TrimSpace(node.Get("call_id").String()); callID != "" {
+		return callID
+	}
+	return strings.TrimSpace(node.Get("callId").String())
+}
+
 func openAIContentPartFromGeminiInlineData(part gjson.Result) ([]byte, bool) {
 	inlineData := part.Get("inlineData")
 	if !inlineData.Exists() {
@@ -666,36 +643,40 @@ func openAIContentPartFromGeminiFileData(part gjson.Result) ([]byte, bool) {
 	if fileURI == "" {
 		fileURI = fileData.Get("file_uri").String()
 	}
-	if fileURI == "" {
-		return nil, false
-	}
+	// A missing URI still yields a marker below (never a silent drop); only a
+	// wholly absent fileData/file_data object means "not a file part".
 	mimeType := fileData.Get("mimeType").String()
 	if mimeType == "" {
 		mimeType = fileData.Get("mime_type").String()
 	}
 	lowerMimeType := strings.ToLower(mimeType)
-	if strings.HasPrefix(lowerMimeType, "image/") {
+	// Only a present URI can back a URL part: without one the branches below
+	// would emit an empty url, so fall through to the visible marker instead.
+	if fileURI != "" && strings.HasPrefix(lowerMimeType, "image/") {
 		contentPart := []byte(`{"type":"image_url","image_url":{"url":""}}`)
 		contentPart, _ = sjson.SetBytes(contentPart, "image_url.url", fileURI)
 		return contentPart, true
 	}
-	if strings.HasPrefix(lowerMimeType, "video/") {
+	if fileURI != "" && strings.HasPrefix(lowerMimeType, "video/") {
 		contentPart := []byte(`{"type":"video_url","video_url":{"url":""}}`)
 		contentPart, _ = sjson.SetBytes(contentPart, "video_url.url", fileURI)
 		return contentPart, true
 	}
-	if strings.HasPrefix(lowerMimeType, "application/") || strings.HasPrefix(lowerMimeType, "text/") {
-		contentPart := []byte(`{"type":"file","file":{"filename":"","file_url":""}}`)
-		contentPart, _ = sjson.SetBytes(contentPart, "file.filename", openAIFileNameFromMIME(mimeType))
-		contentPart, _ = sjson.SetBytes(contentPart, "file.file_url", fileURI)
-		return contentPart, true
+	// Any other URI attachment (documents, audio, missing URI) degrades to a
+	// model-visible text marker rather than a `file` part the downstream
+	// consumer cannot resolve: never silently drop the attachment.
+	mimeLabel := mimeType
+	if mimeLabel == "" {
+		mimeLabel = "unknown type"
 	}
-	fileInfo := "File: " + fileURI
-	if mimeType != "" {
-		fileInfo += " (Type: " + mimeType + ")"
+	var marker string
+	if fileURI != "" {
+		marker = fmt.Sprintf("[unsupported file attachment: %s (%s) — this media type cannot be forwarded and was omitted]", fileURI, mimeLabel)
+	} else {
+		marker = fmt.Sprintf("[unsupported file attachment (%s) — missing file URI; the attachment was omitted]", mimeLabel)
 	}
-	contentPart := []byte(`{"type":"text","text":""}}`)
-	contentPart, _ = sjson.SetBytes(contentPart, "text", fileInfo)
+	contentPart := []byte(`{"type":"text","text":""}`)
+	contentPart, _ = sjson.SetBytes(contentPart, "text", marker)
 	return contentPart, true
 }
 

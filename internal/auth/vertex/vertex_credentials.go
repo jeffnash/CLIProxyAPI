@@ -5,9 +5,11 @@ package vertex
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	log "github.com/sirupsen/logrus"
 )
 
 // VertexCredentialStorage stores the service account JSON for Vertex AI access.
@@ -32,11 +34,18 @@ type VertexCredentialStorage struct {
 	// Prefix optionally namespaces models for this credential (e.g., "teamA").
 	// This results in model names like "teamA/gemini-2.0-flash".
 	Prefix string `json:"prefix,omitempty"`
+
+	// Metadata holds arbitrary key-value pairs injected via hooks.
+	Metadata map[string]any `json:"-"`
+}
+
+// SetMetadata allows external callers to inject metadata into the storage before saving.
+func (s *VertexCredentialStorage) SetMetadata(meta map[string]any) {
+	s.Metadata = meta
 }
 
 // SaveTokenToFile writes the credential payload to the given file path in JSON format.
 // It ensures the parent directory exists and logs the operation for transparency.
-// Uses atomic write to prevent race conditions with file watchers.
 func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	if s == nil {
@@ -48,17 +57,28 @@ func (s *VertexCredentialStorage) SaveTokenToFile(authFilePath string) error {
 	// Ensure we tag the file with the provider type.
 	s.Type = "vertex"
 
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return fmt.Errorf("vertex credential: marshal failed: %w", err)
+	if err := os.MkdirAll(filepath.Dir(authFilePath), 0o700); err != nil {
+		return fmt.Errorf("vertex credential: create directory failed: %w", err)
 	}
 
-	// Append newline for consistency with encoder behavior
-	data = append(data, '\n')
+	data, errMerge := misc.MergeMetadata(s, s.Metadata)
+	if errMerge != nil {
+		return fmt.Errorf("vertex credential: merge metadata failed: %w", errMerge)
+	}
 
-	// Use atomic write to prevent race conditions with file watcher
-	if err = util.AtomicWriteFile(authFilePath, data, 0o600); err != nil {
-		return fmt.Errorf("vertex credential: write file failed: %w", err)
+	f, err := os.OpenFile(authFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("vertex credential: create file failed: %w", err)
+	}
+	defer func() {
+		if errClose := f.Close(); errClose != nil {
+			log.Errorf("vertex credential: failed to close file: %v", errClose)
+		}
+	}()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err = enc.Encode(data); err != nil {
+		return fmt.Errorf("vertex credential: encode failed: %w", err)
 	}
 	return nil
 }

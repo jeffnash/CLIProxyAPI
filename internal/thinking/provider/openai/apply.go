@@ -6,40 +6,11 @@
 package openai
 
 import (
-	"strings"
-
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
-
-// validReasoningEffortLevels contains values accepted by CLIProxyAPI's OpenAI-compatible
-// surfaces, including extended effort levels used by upstream/provider variants.
-var validReasoningEffortLevels = map[string]struct{}{
-	"none":    {},
-	"low":     {},
-	"medium":  {},
-	"high":    {},
-	"xhigh":   {},
-	"minimal": {},
-	"auto":    {},
-}
-
-// clampReasoningEffort normalizes and validates effort values for OpenAI-compatible
-// request bodies. Unknown values fall back to "medium".
-func clampReasoningEffort(level string) string {
-	level = strings.TrimSpace(strings.ToLower(level))
-	if _, ok := validReasoningEffortLevels[level]; ok {
-		return level
-	}
-	log.WithFields(log.Fields{
-		"original": level,
-		"clamped":  string(thinking.LevelMedium),
-	}).Debug("openai: reasoning_effort clamped to default value")
-	return string(thinking.LevelMedium)
-}
 
 // Applier implements thinking.ProviderApplier for OpenAI models.
 //
@@ -85,7 +56,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	}
 
 	if config.Mode == thinking.ModeLevel {
-		result, _ := sjson.SetBytes(body, "reasoning_effort", clampReasoningEffort(string(config.Level)))
+		result, _ := sjson.SetBytes(body, "reasoning_effort", string(config.Level))
 		return result, nil
 	}
 
@@ -106,7 +77,7 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	result, _ := sjson.SetBytes(body, "reasoning_effort", clampReasoningEffort(effort))
+	result, _ := sjson.SetBytes(body, "reasoning_effort", effort)
 	return result, nil
 }
 

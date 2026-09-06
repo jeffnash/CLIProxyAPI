@@ -188,15 +188,16 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		cachedClient, ok := httpClientCache[cacheKey]
 		httpClientCacheMutex.RUnlock()
 		if ok {
-			// Return a wrapper with the requested timeout but shared transport.
-			// Cached clients are stored with Timeout=0 to avoid leaking timeouts across requests.
-			if timeout > 0 {
-				return &http.Client{
-					Transport: cachedClient.Transport,
-					Timeout:   timeout,
-				}
+			// Always return a wrapper with the requested timeout but shared
+			// transport. Cached clients are stored with Timeout=0 to avoid
+			// leaking timeouts across requests, and the wrapper keeps callers
+			// from mutating the cached entry: several executors assign
+			// Transport on the returned client (e.g. credential-scoped pools),
+			// which must stay per-caller.
+			return &http.Client{
+				Transport: cachedClient.Transport,
+				Timeout:   timeout,
 			}
-			return cachedClient
 		}
 	} else {
 		// Request-scoped test transports and SDK-provided transports must not
@@ -222,10 +223,9 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 				proxySource,
 				noProxyRaw,
 			)
-			if timeout > 0 {
-				return &http.Client{Transport: transport, Timeout: timeout}
-			}
-			return httpClient
+			// Return a wrapper so caller-side Transport/Timeout assignment never
+			// mutates the cached entry.
+			return &http.Client{Transport: transport, Timeout: timeout}
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
 		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyutil.Redact(proxyURL))
@@ -244,10 +244,9 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		httpClientCacheMutex.Unlock()
 	}
 
-	if timeout > 0 {
-		return &http.Client{Transport: httpClient.Transport, Timeout: timeout}
-	}
-	return httpClient
+	// Return a wrapper so caller-side Transport/Timeout assignment never
+	// mutates the cached entry.
+	return &http.Client{Transport: httpClient.Transport, Timeout: timeout}
 }
 
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.

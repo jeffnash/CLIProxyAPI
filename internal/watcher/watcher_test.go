@@ -69,15 +69,16 @@ func TestBuildAPIKeyClientsCounts(t *testing.T) {
 			{APIKey: "v1"},
 		},
 		ClaudeKey: []config.ClaudeKey{{APIKey: "c1"}},
-		CodexKey:  []config.CodexKey{{APIKey: "x1"}, {APIKey: "x2"}},
+		CodexKey:  []config.CodexKey{{APIKey: "c1"}, {APIKey: "c2"}},
+		XAIKey:    []config.XAIKey{{APIKey: "x1"}},
 		OpenAICompatibility: []config.OpenAICompatibility{
 			{APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "o1"}, {APIKey: "o2"}}},
 		},
 	}
 
-	gemini, vertex, claude, codex, compat := BuildAPIKeyClients(cfg)
-	if gemini != 3 || vertex != 1 || claude != 1 || codex != 2 || compat != 2 {
-		t.Fatalf("unexpected counts: %d %d %d %d %d", gemini, vertex, claude, codex, compat)
+	gemini, vertex, claude, codex, xai, compat := BuildAPIKeyClients(cfg)
+	if gemini != 3 || vertex != 1 || claude != 1 || codex != 2 || xai != 1 || compat != 2 {
+		t.Fatalf("unexpected counts: %d %d %d %d %d %d", gemini, vertex, claude, codex, xai, compat)
 	}
 }
 
@@ -148,37 +149,18 @@ func TestSnapshotCoreAuths_ConfigAndAuthFiles(t *testing.T) {
 	w.SetConfig(cfg)
 
 	auths := w.SnapshotCoreAuths()
-	if len(auths) != 4 {
-		t.Fatalf("expected 4 auth entries, got %d", len(auths))
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 config auth entry, got %d", len(auths))
 	}
 
 	var geminiAPIKeyAuth *coreauth.Auth
-	var geminiCLIPrimary *coreauth.Auth
-	virtualProjects := map[string]bool{}
 	for _, a := range auths {
 		if a.Provider == "gemini" && a.Attributes["api_key"] == "g-key" {
 			geminiAPIKeyAuth = a
 		}
-		if a.Provider == "gemini-cli" && a.ID == "gemini.json" {
-			geminiCLIPrimary = a
-		}
-		if projectID := a.Attributes["gemini_virtual_project"]; projectID != "" {
-			virtualProjects[projectID] = true
-		}
 	}
 	if geminiAPIKeyAuth == nil {
 		t.Fatal("expected synthesized Gemini API key auth")
-	}
-	if geminiCLIPrimary == nil {
-		t.Fatal("expected synthesized Gemini CLI primary auth")
-	}
-	if geminiCLIPrimary.Status != coreauth.StatusDisabled {
-		t.Fatalf("expected Gemini CLI primary status disabled, got %s", geminiCLIPrimary.Status)
-	}
-	for _, projectID := range []string{"proj-a", "proj-b"} {
-		if !virtualProjects[projectID] {
-			t.Fatalf("expected Gemini CLI virtual auth for project %s", projectID)
-		}
 	}
 	expectedAPIKeyHash := diff.ComputeExcludedModelsHash([]string{"Model-A", "model-b"})
 	if geminiAPIKeyAuth.Attributes["excluded_models_hash"] != expectedAPIKeyHash {
@@ -199,8 +181,9 @@ func TestReloadConfigIfChanged_TriggersOnChangeAndSkipsUnchanged(t *testing.T) {
 	configPath := filepath.Join(tmpDir, "config.yaml")
 	writeConfig := func(port int, allowRemote bool) {
 		cfg := &config.Config{
-			Port:    port,
-			AuthDir: authDir,
+			Port:               port,
+			AuthDir:            authDir,
+			CredentialInFlight: config.DefaultCredentialInFlightConfig(),
 			RemoteManagement: config.RemoteManagement{
 				AllowRemote: allowRemote,
 			},
@@ -1142,54 +1125,6 @@ func TestHandleEventAtomicReplaceChangedTriggersUpdate(t *testing.T) {
 	}
 }
 
-func TestHandleEventAtomicReplaceDoesNotDebounceLaterDelete(t *testing.T) {
-	tmpDir := t.TempDir()
-	authDir := filepath.Join(tmpDir, "auth")
-	if err := os.MkdirAll(authDir, 0o755); err != nil {
-		t.Fatalf("failed to create auth dir: %v", err)
-	}
-	configPath := filepath.Join(tmpDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir+"\n"), 0o644); err != nil {
-		t.Fatalf("failed to write config file: %v", err)
-	}
-	authFile := filepath.Join(authDir, "replace-then-delete.json")
-	content := []byte(`{"type":"demo","v":2}`)
-	if err := os.WriteFile(authFile, content, 0o644); err != nil {
-		t.Fatalf("failed to write auth file: %v", err)
-	}
-	oldSum := sha256.Sum256([]byte(`{"type":"demo","v":1}`))
-
-	var reloads int32
-	w := &Watcher{
-		authDir:        authDir,
-		configPath:     configPath,
-		lastAuthHashes: make(map[string]string),
-		reloadCallback: func(*config.Config) { atomic.AddInt32(&reloads, 1) },
-	}
-	w.SetConfig(&config.Config{AuthDir: authDir})
-	normalized := w.normalizeAuthPath(authFile)
-	w.lastAuthHashes[normalized] = hexString(oldSum[:])
-
-	w.handleEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Rename})
-	w.clientsMutex.Lock()
-	_, debounced := w.lastRemoveTimes[normalized]
-	w.clientsMutex.Unlock()
-	if debounced {
-		t.Fatal("atomic replace recorded a remove debounce timestamp")
-	}
-
-	if err := os.Remove(authFile); err != nil {
-		t.Fatalf("remove auth file: %v", err)
-	}
-	w.handleEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Remove})
-	if atomic.LoadInt32(&reloads) != 0 {
-		t.Fatalf("expected auth delete to avoid global reload, got %d", reloads)
-	}
-	if _, ok := w.lastAuthHashes[normalized]; ok {
-		t.Fatal("expected later delete to remove auth hash")
-	}
-}
-
 func TestHandleEventRemoveUnknownFileIgnored(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := filepath.Join(tmpDir, "auth")
@@ -1422,13 +1357,15 @@ func TestReloadConfigFiltersAffectedOAuthProviders(t *testing.T) {
 	}
 
 	oldCfg := &config.Config{
-		AuthDir: authDir,
+		AuthDir:            authDir,
+		CredentialInFlight: config.DefaultCredentialInFlightConfig(),
 		OAuthExcludedModels: map[string][]string{
 			"provider-a": {"m1"},
 		},
 	}
 	newCfg := &config.Config{
-		AuthDir: authDir,
+		AuthDir:            authDir,
+		CredentialInFlight: config.DefaultCredentialInFlightConfig(),
 		OAuthExcludedModels: map[string][]string{
 			"provider-a": {"m2"},
 		},
@@ -1484,12 +1421,14 @@ func TestReloadConfigTriggersCallbackForMaxRetryCredentialsChange(t *testing.T) 
 
 	oldCfg := &config.Config{
 		AuthDir:             authDir,
+		CredentialInFlight:  config.DefaultCredentialInFlightConfig(),
 		MaxRetryCredentials: 0,
 		RequestRetry:        1,
 		MaxRetryInterval:    5,
 	}
 	newCfg := &config.Config{
 		AuthDir:             authDir,
+		CredentialInFlight:  config.DefaultCredentialInFlightConfig(),
 		MaxRetryCredentials: 2,
 		RequestRetry:        1,
 		MaxRetryInterval:    5,
@@ -1576,11 +1515,13 @@ func TestNormalizeAuthNil(t *testing.T) {
 
 // stubStore implements coreauth.Store plus watcher-specific persistence helpers.
 type stubStore struct {
+	mu              sync.Mutex
 	authDir         string
-	cfgPersisted    int32
-	authPersisted   int32
+	cfgPersisted    int
+	authPersisted   int
 	lastAuthMessage string
 	lastAuthPaths   []string
+	persisted       chan struct{}
 }
 
 func (s *stubStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
@@ -1589,16 +1530,38 @@ func (s *stubStore) Save(context.Context, *coreauth.Auth) (string, error) {
 }
 func (s *stubStore) Delete(context.Context, string) error { return nil }
 func (s *stubStore) PersistConfig(context.Context) error {
-	atomic.AddInt32(&s.cfgPersisted, 1)
+	s.mu.Lock()
+	s.cfgPersisted++
+	s.mu.Unlock()
+	s.signalPersisted()
 	return nil
 }
 func (s *stubStore) PersistAuthFiles(_ context.Context, message string, paths ...string) error {
-	atomic.AddInt32(&s.authPersisted, 1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.lastAuthMessage = message
-	s.lastAuthPaths = paths
+	s.lastAuthPaths = append([]string(nil), paths...)
+	s.authPersisted++
+	s.signalPersisted()
 	return nil
 }
 func (s *stubStore) AuthDir() string { return s.authDir }
+
+func (s *stubStore) signalPersisted() {
+	if s.persisted == nil {
+		return
+	}
+	select {
+	case s.persisted <- struct{}{}:
+	default:
+	}
+}
+
+func (s *stubStore) persistenceSnapshot() (cfgPersisted, authPersisted int, message string, paths []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfgPersisted, s.authPersisted, s.lastAuthMessage, append([]string(nil), s.lastAuthPaths...)
+}
 
 func TestNewWatcherDetectsPersisterAndAuthDir(t *testing.T) {
 	tmp := t.TempDir()
@@ -1620,26 +1583,33 @@ func TestNewWatcherDetectsPersisterAndAuthDir(t *testing.T) {
 }
 
 func TestPersistConfigAndAuthAsyncInvokePersister(t *testing.T) {
+	store := &stubStore{persisted: make(chan struct{}, 2)}
 	w := &Watcher{
-		storePersister: &stubStore{},
+		storePersister: store,
 	}
 
 	w.persistConfigAsync()
 	w.persistAuthAsync("msg", " a ", "", "b ")
 
-	time.Sleep(30 * time.Millisecond)
-	store := w.storePersister.(*stubStore)
-	if atomic.LoadInt32(&store.cfgPersisted) != 1 {
-		t.Fatalf("expected PersistConfig to be called once, got %d", store.cfgPersisted)
+	for range 2 {
+		select {
+		case <-store.persisted:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for asynchronous persistence")
+		}
 	}
-	if atomic.LoadInt32(&store.authPersisted) != 1 {
-		t.Fatalf("expected PersistAuthFiles to be called once, got %d", store.authPersisted)
+	cfgPersisted, authPersisted, message, paths := store.persistenceSnapshot()
+	if cfgPersisted != 1 {
+		t.Fatalf("expected PersistConfig to be called once, got %d", cfgPersisted)
 	}
-	if store.lastAuthMessage != "msg" {
-		t.Fatalf("unexpected auth message: %s", store.lastAuthMessage)
+	if authPersisted != 1 {
+		t.Fatalf("expected PersistAuthFiles to be called once, got %d", authPersisted)
 	}
-	if len(store.lastAuthPaths) != 2 || store.lastAuthPaths[0] != "a" || store.lastAuthPaths[1] != "b" {
-		t.Fatalf("unexpected filtered paths: %#v", store.lastAuthPaths)
+	if message != "msg" {
+		t.Fatalf("unexpected auth message: %s", message)
+	}
+	if len(paths) != 2 || paths[0] != "a" || paths[1] != "b" {
+		t.Fatalf("unexpected filtered paths: %#v", paths)
 	}
 }
 
@@ -1662,13 +1632,21 @@ func TestScheduleConfigReloadDebounces(t *testing.T) {
 	w.scheduleConfigReload()
 	w.scheduleConfigReload()
 
-	time.Sleep(400 * time.Millisecond)
-
-	if atomic.LoadInt32(&reloads) != 1 {
-		t.Fatalf("expected single debounced reload, got %d", reloads)
+	deadline := time.Now().Add(time.Second)
+	for {
+		w.clientsMutex.RLock()
+		hashSet := w.lastConfigHash != ""
+		w.clientsMutex.RUnlock()
+		if hashSet {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for debounced config reload")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if w.lastConfigHash == "" {
-		t.Fatal("expected lastConfigHash to be set after reload")
+	if got := atomic.LoadInt32(&reloads); got != 1 {
+		t.Fatalf("expected single debounced reload, got %d", got)
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
@@ -13,8 +12,6 @@ import (
 
 // zeroWidthSpace is the Unicode zero-width space character used for obfuscation.
 const zeroWidthSpace = "\u200B"
-
-var sensitiveWordMatcherCache sync.Map // map[string]*SensitiveWordMatcher
 
 // SensitiveWordMatcher holds the compiled regex for matching sensitive words.
 type SensitiveWordMatcher struct {
@@ -53,22 +50,12 @@ func BuildSensitiveWordMatcher(words []string) *SensitiveWordMatcher {
 	}
 
 	pattern := "(?i)" + strings.Join(escaped, "|")
-	if cached, ok := sensitiveWordMatcherCache.Load(pattern); ok {
-		if matcher, ok := cached.(*SensitiveWordMatcher); ok {
-			return matcher
-		}
-	}
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil
 	}
 
-	matcher := &SensitiveWordMatcher{regex: re}
-	actual, _ := sensitiveWordMatcherCache.LoadOrStore(pattern, matcher)
-	if cached, ok := actual.(*SensitiveWordMatcher); ok {
-		return cached
-	}
-	return matcher
+	return &SensitiveWordMatcher{regex: re}
 }
 
 // obfuscateWord inserts a zero-width space after the first grapheme.
@@ -110,6 +97,44 @@ func ObfuscateSensitiveWords(payload []byte, matcher *SensitiveWordMatcher) []by
 	return payload
 }
 
+// ObfuscateSensitiveWordsInSystemInstruction obfuscates sensitive words in an Antigravity system instruction.
+func ObfuscateSensitiveWordsInSystemInstruction(payload []byte, matcher *SensitiveWordMatcher) []byte {
+	if matcher == nil || matcher.regex == nil {
+		return payload
+	}
+
+	for _, path := range []string{"request.systemInstruction", "request.system_instruction"} {
+		instruction := gjson.GetBytes(payload, path)
+		if !instruction.Exists() {
+			continue
+		}
+		if instruction.Type == gjson.String {
+			text := instruction.String()
+			if obfuscated := matcher.obfuscateText(text); obfuscated != text {
+				payload, _ = sjson.SetBytes(payload, path, obfuscated)
+			}
+			continue
+		}
+
+		parts := instruction.Get("parts")
+		if !parts.IsArray() {
+			continue
+		}
+		parts.ForEach(func(key, part gjson.Result) bool {
+			if part.Get("text").Type != gjson.String {
+				return true
+			}
+			text := part.Get("text").String()
+			if obfuscated := matcher.obfuscateText(text); obfuscated != text {
+				payload, _ = sjson.SetBytes(payload, path+".parts."+key.String()+".text", obfuscated)
+			}
+			return true
+		})
+	}
+
+	return payload
+}
+
 // obfuscateSystemBlocks obfuscates sensitive words in system blocks.
 func obfuscateSystemBlocks(payload []byte, matcher *SensitiveWordMatcher) []byte {
 	system := gjson.GetBytes(payload, "system")
@@ -122,6 +147,9 @@ func obfuscateSystemBlocks(payload []byte, matcher *SensitiveWordMatcher) []byte
 		system.ForEach(func(key, value gjson.Result) bool {
 			if value.Get("type").String() == "text" {
 				text := value.Get("text").String()
+				if strings.HasPrefix(text, "x-anthropic-billing-header:") {
+					return true
+				}
 				obfuscated := matcher.obfuscateText(text)
 				if obfuscated != text {
 					path := "system." + key.String() + ".text"
@@ -136,9 +164,11 @@ func obfuscateSystemBlocks(payload []byte, matcher *SensitiveWordMatcher) []byte
 		}
 	} else if system.Type == gjson.String {
 		text := system.String()
-		obfuscated := matcher.obfuscateText(text)
-		if obfuscated != text {
-			payload, _ = sjson.SetBytes(payload, "system", obfuscated)
+		if !strings.HasPrefix(text, "x-anthropic-billing-header:") {
+			obfuscated := matcher.obfuscateText(text)
+			if obfuscated != text {
+				payload, _ = sjson.SetBytes(payload, "system", obfuscated)
+			}
 		}
 	}
 

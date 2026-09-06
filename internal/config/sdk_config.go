@@ -53,6 +53,15 @@ type SDKConfig struct {
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 
+	// CodexOptimizeMultiAgentV2 mirrors the provider-wide runtime setting for API handlers.
+	CodexOptimizeMultiAgentV2 bool `yaml:"-" json:"-"`
+
+	// CodexOrphanDelegationCompatibility mirrors the provider-wide runtime setting for API handlers.
+	CodexOrphanDelegationCompatibility bool `yaml:"-" json:"-"`
+
+	// ClaudeCode configures Claude Code compatibility behavior.
+	ClaudeCode ClaudeCodeConfig `yaml:"claude-code" json:"claude-code"`
+
 	// APIKeys is a list of keys for authenticating clients to this proxy server.
 	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 
@@ -72,6 +81,12 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// ClaudeCodeConfig configures Claude Code compatibility behavior.
+type ClaudeCodeConfig struct {
+	// DisableCloakingModelList disables model ID cloaking in Anthropic model list responses.
+	DisableCloakingModelList bool `yaml:"disable-cloaking-model-list" json:"disable-cloaking-model-list"`
 }
 
 // ProxyEnabledFor reports whether the global ProxyURL should be applied for the given service name.
@@ -101,7 +116,8 @@ func (c *SDKConfig) ProxyEnabledFor(service string) bool {
 
 // StreamingConfig holds server streaming behavior configuration.
 type StreamingConfig struct {
-	// KeepAliveSeconds controls how often the server emits SSE heartbeats (": keep-alive\n\n").
+	// KeepAliveSeconds controls how often the server emits SSE heartbeats (": keep-alive\n\n")
+	// or WebSocket Ping control frames.
 	// <= 0 disables keep-alives. Default is 0.
 	KeepAliveSeconds int `yaml:"keepalive-seconds,omitempty" json:"keepalive-seconds,omitempty"`
 

@@ -252,7 +252,7 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				if errMsg, okPendingErr := handlers.PendingStreamError(errChan); okPendingErr {
+				if errMsg, hasPendingError := handlers.PendingStreamError(errChan); hasPendingError {
 					h.WriteErrorResponse(c, errMsg)
 					if errMsg != nil {
 						cliCancel(errMsg.Error)

@@ -92,16 +92,50 @@ func (h *OpenAIAPIHandler) Models() []map[string]any {
 // and specifications in OpenAI-compatible format.
 func (h *OpenAIAPIHandler) OpenAIModels(c *gin.Context) {
 	if _, ok := c.Request.URL.Query()["client_version"]; ok {
-		c.JSON(http.StatusOK, h.codexClientModelsResponse())
+		clientVersion := c.Query("client_version")
+		c.JSON(http.StatusOK, h.codexClientModelsResponse(clientVersion))
 		return
 	}
 
 	// Get all available models
 	allModels := h.Models()
 
+	// Filter to the base OpenAI fields (id, object, created, owned_by) plus
+	// token-limit metadata (context_length, max_completion_tokens and their
+	// provider-native sources/aliases) so clients can size requests.
+	filteredModels := make([]map[string]any, len(allModels))
+	for i, model := range allModels {
+		filteredModel := map[string]any{
+			"id":     model["id"],
+			"object": model["object"],
+		}
+
+		// Add created field if it exists
+		if created, exists := model["created"]; exists {
+			filteredModel["created"] = created
+		}
+
+		// Add owned_by field if it exists
+		if ownedBy, exists := model["owned_by"]; exists {
+			filteredModel["owned_by"] = ownedBy
+		}
+
+		for _, key := range []string{
+			"context_length", "context_window",
+			"max_completion_tokens", "max_tokens",
+			"inputTokenLimit", "outputTokenLimit",
+		} {
+			if value, exists := model[key]; exists {
+				filteredModel[key] = value
+			}
+		}
+
+		filteredModels[i] = filteredModel
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
-		"data":   allModels,
+		"data":   filteredModels,
 	})
 }
 
@@ -447,7 +481,9 @@ func (h *OpenAIAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
+	stopKeepAlive()
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
@@ -514,7 +550,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				if errMsg, okPendingErr := handlers.PendingStreamError(errChan); okPendingErr {
+				if errMsg, hasPendingError := handlers.PendingStreamError(errChan); hasPendingError {
 					h.WriteErrorResponse(c, errMsg)
 					if errMsg != nil {
 						cliCancel(errMsg.Error)
@@ -637,7 +673,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			return
 		case chunk, ok := <-dataChan:
 			if !ok {
-				if errMsg, okPendingErr := handlers.PendingStreamError(errChan); okPendingErr {
+				if errMsg, hasPendingError := handlers.PendingStreamError(errChan); hasPendingError {
 					h.WriteErrorResponse(c, errMsg)
 					if errMsg != nil {
 						cliCancel(errMsg.Error)

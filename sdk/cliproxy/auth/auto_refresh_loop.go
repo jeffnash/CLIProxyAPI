@@ -339,7 +339,7 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 	if auth == nil {
 		return time.Time{}, false
 	}
-	if hasTerminalRefreshFailure(auth) {
+	if hasTerminalRefreshFailure(auth) || hasUnauthorizedAuthFailure(auth) {
 		return time.Time{}, false
 	}
 

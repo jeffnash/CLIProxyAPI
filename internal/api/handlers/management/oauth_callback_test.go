@@ -117,6 +117,7 @@ func TestGetOAuthCallbackDoesNotAliasPluginProvider(t *testing.T) {
 }
 
 func TestWriteOAuthCallbackFileForPendingSessionCreatesMissingAuthDirForCallbackProviders(t *testing.T) {
+	// Branch retains callback-file support for xAI alongside the device-code flow.
 	providers := []string{"anthropic", "codex", "gemini", "antigravity", "xai"}
 	for _, provider := range providers {
 		t.Run(provider, func(t *testing.T) {

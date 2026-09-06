@@ -73,6 +73,28 @@ func TestFetchProjectIDFallsBackToDailyOnboardUser(t *testing.T) {
 	}
 }
 
+func TestFetchProjectIDUpstreamForbiddenReturnsStatus403(t *testing.T) {
+	auth := NewAntigravityAuth(nil, &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":403,"message":"The caller does not have permission"}}`)),
+		}, nil
+	})})
+
+	_, err := auth.FetchProjectID(context.Background(), "access-token")
+	if err == nil {
+		t.Fatalf("expected error from 403 response")
+	}
+	type statusCoder interface {
+		StatusCode() int
+	}
+	sc, ok := err.(statusCoder)
+	if !ok || sc.StatusCode() != http.StatusForbidden {
+		t.Fatalf("expected status code %d, got %T (%v)", http.StatusForbidden, err, err)
+	}
+}
+
 func assertLoadCodeAssistHeaders(t *testing.T, req *http.Request) {
 	t.Helper()
 	if got := req.Header.Get("Authorization"); got != "Bearer access-token" {
@@ -84,8 +106,12 @@ func assertLoadCodeAssistHeaders(t *testing.T, req *http.Request) {
 	if got := req.Header.Get("X-Goog-Api-Client"); got != "" {
 		t.Fatalf("X-Goog-Api-Client = %q, want empty", got)
 	}
-	if got := req.Header.Get("User-Agent"); strings.Contains(got, "google-api-nodejs-client/") {
-		t.Fatalf("User-Agent = %q", got)
+	userAgent := req.Header.Get("User-Agent")
+	if !strings.HasPrefix(userAgent, "antigravity/hub/") {
+		t.Fatalf("User-Agent = %q", userAgent)
+	}
+	if strings.Contains(userAgent, "google-api-nodejs-client/") {
+		t.Fatalf("User-Agent = %q", userAgent)
 	}
 }
 
@@ -100,8 +126,12 @@ func assertOnboardUserHeaders(t *testing.T, req *http.Request) {
 	if got := req.Header.Get("X-Goog-Api-Client"); got != "gl-node/22.21.1" {
 		t.Fatalf("X-Goog-Api-Client = %q", got)
 	}
-	if got := req.Header.Get("User-Agent"); !strings.Contains(got, "google-api-nodejs-client/10.3.0") {
-		t.Fatalf("User-Agent = %q", got)
+	userAgent := req.Header.Get("User-Agent")
+	if !strings.HasPrefix(userAgent, "antigravity/hub/") {
+		t.Fatalf("User-Agent = %q", userAgent)
+	}
+	if !strings.Contains(userAgent, "google-api-nodejs-client/10.3.0") {
+		t.Fatalf("User-Agent = %q", userAgent)
 	}
 }
 

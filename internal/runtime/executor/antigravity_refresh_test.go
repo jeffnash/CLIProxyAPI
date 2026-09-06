@@ -2,7 +2,9 @@ package executor
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +20,80 @@ import (
 
 func resetAntigravityRefreshGroupForTest() {
 	antigravityRefreshGroup = singleflight.Group{}
+}
+
+func useAntigravityRefreshTestTransport(t *testing.T, targetHost string) {
+	t.Helper()
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := net.Dialer{}
+			return dialer.DialContext(ctx, network, targetHost)
+		},
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		ForceAttemptHTTP2: false,
+	}
+	originalBase := antigravityBaseTransport
+	antigravityBaseTransport = transport
+	antigravityTransports.Purge()
+	t.Cleanup(func() {
+		antigravityBaseTransport = originalBase
+		antigravityTransports.Purge()
+	})
+}
+
+func TestAntigravityEnsureAccessTokenUsesFiveMinuteSafetyWindow(t *testing.T) {
+	t.Parallel()
+
+	executor := &AntigravityExecutor{}
+	now := time.Now()
+
+	t.Run("uses token outside safety window", func(t *testing.T) {
+		auth := &cliproxyauth.Auth{Metadata: map[string]any{
+			"access_token": "still-valid-access",
+			"expired":      now.Add(antigravityRequestTokenSafetyWindow + time.Minute).Format(time.RFC3339),
+		}}
+
+		token, updated, errToken := executor.ensureAccessToken(context.Background(), auth)
+		if errToken != nil {
+			t.Fatalf("ensureAccessToken() error = %v", errToken)
+		}
+		if token != "still-valid-access" || updated != nil {
+			t.Fatalf("ensureAccessToken() = %q, %#v, want existing token and nil update", token, updated)
+		}
+	})
+
+	t.Run("uses relative expiry with issued_at seconds", func(t *testing.T) {
+		issuedAt := now.Add(-10 * time.Minute).Truncate(time.Second)
+		auth := &cliproxyauth.Auth{Metadata: map[string]any{
+			"access_token": "relative-expiry-access",
+			"expires_in":   3600,
+			"issued_at":    issuedAt.Unix(),
+		}}
+
+		token, updated, errToken := executor.ensureAccessToken(context.Background(), auth)
+		if errToken != nil {
+			t.Fatalf("ensureAccessToken() error = %v", errToken)
+		}
+		if token != "relative-expiry-access" || updated != nil {
+			t.Fatalf("ensureAccessToken() = %q, %#v, want existing token and nil update", token, updated)
+		}
+	})
+
+	t.Run("refreshes token inside safety window", func(t *testing.T) {
+		auth := &cliproxyauth.Auth{Metadata: map[string]any{
+			"access_token": "expiring-access",
+			"expired":      now.Add(antigravityRequestTokenSafetyWindow - time.Minute).Format(time.RFC3339),
+		}}
+
+		token, updated, errToken := executor.ensureAccessToken(context.Background(), auth)
+		if errToken == nil || !strings.Contains(errToken.Error(), "missing refresh token") {
+			t.Fatalf("ensureAccessToken() error = %v, want refresh attempt", errToken)
+		}
+		if token != "" || updated != nil {
+			t.Fatalf("ensureAccessToken() = %q, %#v, want empty result after failed refresh", token, updated)
+		}
+	})
 }
 
 func TestAntigravityRefresh_DeduplicatesConcurrentRefresh(t *testing.T) {
@@ -58,13 +134,7 @@ func TestAntigravityRefresh_DeduplicatesConcurrentRefresh(t *testing.T) {
 	if errParse != nil {
 		t.Fatalf("parse test server URL: %v", errParse)
 	}
-	testTransport := server.Client().Transport
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		cloned := req.Clone(req.Context())
-		cloned.URL = cloneURLForAntigravityRefreshTest(req.URL, serverURL)
-		cloned.Host = serverURL.Host
-		return testTransport.RoundTrip(cloned)
-	}))
+	useAntigravityRefreshTestTransport(t, serverURL.Host)
 
 	executor := &AntigravityExecutor{}
 	authA := &cliproxyauth.Auth{
@@ -84,17 +154,15 @@ func TestAntigravityRefresh_DeduplicatesConcurrentRefresh(t *testing.T) {
 		},
 	}
 
-	type refreshResult struct {
-		auth *cliproxyauth.Auth
-		err  error
-	}
-	results := make(chan refreshResult, 2)
+	results := make(chan *cliproxyauth.Auth, 2)
+	errs := make(chan error, 2)
 	runRefresh := func(auth *cliproxyauth.Auth, launched chan<- struct{}) {
 		if launched != nil {
 			close(launched)
 		}
-		updated, errRefresh := executor.Refresh(ctx, auth)
-		results <- refreshResult{auth: updated, err: errRefresh}
+		updated, errRefresh := executor.Refresh(context.Background(), auth)
+		results <- updated
+		errs <- errRefresh
 	}
 
 	go runRefresh(authA, nil)
@@ -110,11 +178,10 @@ func TestAntigravityRefresh_DeduplicatesConcurrentRefresh(t *testing.T) {
 	close(release)
 
 	for i := 0; i < 2; i++ {
-		result := <-results
-		if result.err != nil {
-			t.Fatalf("expected refresh to succeed, got %v", result.err)
+		if errRefresh := <-errs; errRefresh != nil {
+			t.Fatalf("expected refresh to succeed, got %v", errRefresh)
 		}
-		updated := result.auth
+		updated := <-results
 		if updated == nil {
 			t.Fatal("expected refreshed auth, got nil")
 		}
@@ -131,11 +198,4 @@ func TestAntigravityRefresh_DeduplicatesConcurrentRefresh(t *testing.T) {
 	if got := atomic.LoadInt32(&tokenCalls); got != 1 {
 		t.Fatalf("expected both refresh callers to share a single upstream token call, got %d", got)
 	}
-}
-
-func cloneURLForAntigravityRefreshTest(original *url.URL, serverURL *url.URL) *url.URL {
-	cloned := *original
-	cloned.Scheme = serverURL.Scheme
-	cloned.Host = serverURL.Host
-	return &cloned
 }

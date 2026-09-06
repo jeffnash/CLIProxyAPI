@@ -10,25 +10,45 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// DefaultServiceTier is used when a request does not specify service_tier.
+// DefaultServiceTier is retained for direct SDK and non-OpenAI usage callers.
 const DefaultServiceTier = "default"
+
+// AutoServiceTier is the OpenAI request semantics when service_tier is omitted.
+// OpenAI HTTP handlers set it explicitly, without changing other providers'
+// historical direct-SDK default.
+const AutoServiceTier = "auto"
 
 // Record contains the usage statistics captured for a single provider request.
 type Record struct {
 	Provider string
 	// ExecutorType stores the concrete executor type that handled the request.
-	ExecutorType string
-	Model        string
-	Alias        string
-	APIKey       string
-	AuthID       string
-	AuthIndex    string
-	AuthType     string
-	Source       string
+	ExecutorType    string
+	Model           string
+	Alias           string
+	APIKey          string
+	SessionID       string
+	ParentSessionID string
+	AuthID          string
+	AuthIndex       string
+	// AccessTokenSHA256 identifies the OAuth token version without exposing the token.
+	AccessTokenSHA256 string
+	AuthType          string
+	Source            string
 	// ReasoningEffort stores the translated upstream thinking level for request event logs.
 	ReasoningEffort string
-	// ServiceTier stores the client-requested service tier for request event logs.
+	// ServiceTier stores the client-requested service tier.
 	ServiceTier string
+	// RequestServiceTier is a deprecated input-only alias retained for existing
+	// plugin callers. It is normalized into ServiceTier and never emitted.
+	RequestServiceTier string
+	// ResponseServiceTier stores the final tier reported by the upstream response.
+	ResponseServiceTier string
+	// Generate reports whether the client requested actual generation.
+	// nil or true means generation is enabled; only an explicit false disables generation.
+	// Use GenerateFlag to set the value and GenerateEnabled to read it with the default.
+	Generate *bool
+	// Stream reports whether the request was executed in streaming mode.
+	Stream      bool
 	RequestedAt time.Time
 	Latency     time.Duration
 	TTFT        time.Duration
@@ -57,12 +77,16 @@ type Detail struct {
 	// Estimated marks a token breakdown APPROXIMATED by the proxy (e.g. the Cursor Composer path, whose
 	// @cursor/sdk exposes no real usage) rather than reported by the upstream provider. It is adequate for UX/
 	// display but is NOT billing-grade; usage sinks should classify or exclude it from authoritative metering.
-	Estimated bool
+	Estimated           bool
+	TokenBreakdown      TokenBreakdown
+	ResponseServiceTier string
 }
 
 type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
+type generateContextKey struct{}
+type streamContextKey struct{}
 
 // WithRequestedModelAlias stores the client-requested model name for usage sinks.
 func WithRequestedModelAlias(ctx context.Context, alias string) context.Context {
@@ -154,6 +178,67 @@ func ServiceTierFromContext(ctx context.Context) string {
 	default:
 		return DefaultServiceTier
 	}
+}
+
+// WithGenerate stores whether the client requested actual generation for usage sinks.
+// Missing context values default to true; only an explicit false disables generation.
+func WithGenerate(ctx context.Context, generate bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, generateContextKey{}, generate)
+}
+
+// GenerateFromContext returns whether the client requested actual generation.
+// Missing values default to true.
+func GenerateFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return true
+	}
+	raw := ctx.Value(generateContextKey{})
+	switch value := raw.(type) {
+	case bool:
+		return value
+	default:
+		return true
+	}
+}
+
+// WithStream stores whether the request was executed in streaming mode for usage sinks.
+func WithStream(ctx context.Context, stream bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, streamContextKey{}, stream)
+}
+
+// StreamFromContext returns whether the request was executed in streaming mode.
+// Missing values default to false.
+func StreamFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	raw := ctx.Value(streamContextKey{})
+	switch value := raw.(type) {
+	case bool:
+		return value
+	default:
+		return false
+	}
+}
+
+// GenerateFlag returns a pointer suitable for Record.Generate.
+func GenerateFlag(generate bool) *bool {
+	return &generate
+}
+
+// GenerateEnabled reports whether generation is enabled for the record field.
+// A nil value defaults to true so legacy callers that omit Generate keep the historical behavior.
+func GenerateEnabled(generate *bool) bool {
+	if generate == nil {
+		return true
+	}
+	return *generate
 }
 
 // Plugin consumes usage records emitted by the proxy runtime.

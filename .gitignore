@@ -10,6 +10,7 @@ config.yaml
 # Generated content
 bin/*
 logs/*
+/logs
 conv/*
 temp/*
 refs/*
@@ -27,6 +28,7 @@ debug/*
 coverage.out
 .cache/
 .meta-harness/
+
 # Authentication data
 auths/*
 /auths
@@ -38,6 +40,7 @@ docs/*
 AGENTS.md
 CLAUDE.md
 GEMINI.md
+AGENTS.override.md
 
 # Tooling metadata
 .vscode/*
@@ -49,6 +52,8 @@ GEMINI.md
 .serena/*
 .agent/*
 .agents
+.pi
+.pi/
 .agents/*
 .opencode/*
 .idea/*
@@ -57,6 +62,7 @@ GEMINI.md
 _bmad/*
 _bmad-output/*
 .mcp/cache/
+.gitnexus/
 
 # macOS
 .DS_Store
@@ -65,9 +71,14 @@ _bmad-output/*
 # Go
 .gocache/
 
+# docker
+docker-compose.override.yml
+
+# Local LLM Wiki vault
+.llm-wiki
+
 # Local dev artifacts
 .gomodcache/
-.pi/
 .letta/
 .codex/
 sidecars/cursor-bridge/node_modules/

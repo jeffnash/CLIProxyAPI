@@ -21,6 +21,10 @@ var (
 	dataTag = []byte("data:")
 )
 
+// codexThinkingSummaryPartSeparator joins consecutive reasoning summary parts inside
+// the single thinking block that represents one Codex reasoning item.
+const codexThinkingSummaryPartSeparator = "\n\n"
+
 // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
 type ConvertCodexResponseToClaudeParams struct {
 	HasToolCall                bool
@@ -49,6 +53,11 @@ type ConvertCodexResponseToClaudeParams struct {
 	HasCurrentToolBlock        bool
 	MessageStarted             bool
 	MessageStopped             bool
+	FunctionCalls              map[string]*codexFunctionCallStream
+	FunctionCallQueue          []*codexFunctionCallStream
+	ActiveFunctionCall         *codexFunctionCallStream
+	LastFunctionCall           *codexFunctionCallStream
+	DeferredStreamEvents       [][]byte
 }
 
 type pendingCodexFunctionCall struct {
@@ -57,6 +66,19 @@ type pendingCodexFunctionCall struct {
 	Arguments                 string
 	HasReceivedArgumentsDelta bool
 	StartEmitted              bool
+}
+
+type codexFunctionCallStream struct {
+	CallID                    string
+	Name                      string
+	BlockIndex                int
+	Arguments                 string
+	EmittedArgumentsLength    int
+	HasReceivedArgumentsDelta bool
+	EmitInitialEmptyDelta     bool
+	Started                   bool
+	Done                      bool
+	Closed                    bool
 }
 
 // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
@@ -85,40 +107,36 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 	if !bytes.HasPrefix(rawJSON, dataTag) {
 		return [][]byte{}
 	}
+	streamEventRawJSON := bytes.Clone(rawJSON)
 	rawJSON = bytes.TrimSpace(rawJSON[5:])
 
 	output := make([]byte, 0, 512)
 	rootResult := gjson.ParseBytes(rawJSON)
 	params := (*param).(*ConvertCodexResponseToClaudeParams)
 	cacheScope := codexClaudeToolCallScope(originalRequestRawJSON)
-	tolerateGrokComposerStream := isGrokComposerClaudeStreamRepairModel(modelName)
-
-	// Once the Claude message has been stopped, nothing further is valid: a late content block,
-	// a duplicate message_stop, or a second response.completed would all reference a closed message
-	// and surface as "Content block not found" / a stream error. Drop any trailing events. This is
-	// a no-op for well-behaved streams, which emit nothing after response.completed.
+	// Once the Claude message has been stopped, nothing further is valid: a late
+	// content block, a duplicate message_stop, or a second response.completed
+	// would all reference a closed message. Drop any trailing events. This is a
+	// no-op for well-behaved streams, which emit nothing after completed.
 	if params.MessageStopped {
 		return [][]byte{}
 	}
 
-	if params.ThinkingBlockOpen && params.ThinkingStopPending {
-		switch rootResult.Get("type").String() {
-		case "response.content_part.added", "response.completed", "response.incomplete":
-			output = append(output, finalizeCodexThinkingBlock(params)...)
-		}
-	}
-
 	typeResult := rootResult.Get("type")
 	typeStr := typeResult.String()
+	if params.ActiveFunctionCall != nil && shouldDeferCodexStreamEvent(typeStr, rootResult) {
+		params.DeferredStreamEvents = append(params.DeferredStreamEvents, streamEventRawJSON)
+		return [][]byte{}
+	}
 	var template []byte
 
 	switch typeStr {
 	case "error":
 		output = append(output, codexStreamErrorToClaudeError(rootResult)...)
 	case "response.created":
-		// Emit message_start once per stream. A second response.created would reset the client's
-		// content-block tracking while our block index keeps climbing, turning every later block
-		// into a "Content block not found". One HTTP stream maps to one Claude message.
+		// Emit message_start once per stream: a second response.created would
+		// reset the client's content-block tracking while our block index keeps
+		// climbing. One HTTP stream maps to one Claude message.
 		if !params.MessageStarted {
 			template = []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"claude-opus-4-1-20250805","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`)
 			template, _ = sjson.SetBytes(template, "message.model", rootResult.Get("response.model").String())
@@ -128,82 +146,66 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 			output = translatorcommon.AppendSSEEventBytes(output, "message_start", template, 2)
 		}
 	case "response.reasoning_summary_part.added":
-		if params.ThinkingBlockOpen && params.ThinkingStopPending {
-			output = append(output, finalizeCodexThinkingBlock(params)...)
+		output = append(output, stopCodexTextBlock(params)...)
+		// Codex splits a single reasoning item into several summary parts, but only
+		// output_item.done carries that item's final encrypted_content. Keep one
+		// thinking block open for the whole item and separate the parts with a blank
+		// line, so the only signature ever emitted is the final one.
+		if params.ThinkingBlockOpen {
+			output = append(output, appendCodexThinkingDelta(params, codexThinkingSummaryPartSeparator)...)
+		} else {
+			output = append(output, startCodexThinkingBlock(params)...)
 		}
-		// Close any open text block before opening a thinking block so they cannot share an index.
-		output = append(output, finalizeCodexTextBlock(params)...)
 		params.ThinkingSummarySeen = true
-		output = append(output, startCodexThinkingBlock(params)...)
 	case "response.reasoning_summary_text.delta":
-		// Defensively open a thinking block if one is not already open (grok-composer can emit a
-		// summary delta without a preceding summary_part.added). No-op when already open.
+		output = append(output, stopCodexTextBlock(params)...)
 		output = append(output, startCodexThinkingBlock(params)...)
-		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
-		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
-		template, _ = sjson.SetBytes(template, "delta.thinking", rootResult.Get("delta").String())
-
-		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
+		output = append(output, appendCodexThinkingDelta(params, rootResult.Get("delta").String())...)
 	case "response.reasoning_summary_part.done":
-		params.ThinkingStopPending = true
+		// Intentionally does not close the thinking block: it stays open until
+		// output_item.done delivers the reasoning item's final encrypted_content.
 	case "response.content_part.added":
-		// Open a text block only when one is not already open. grok-composer can emit
-		// response.content_part.added more than once before any delta; reopening would emit a
-		// duplicate content_block_start at the same index. Compliant Codex streams send a single
-		// added per part (separated by a done), so this is a no-op for them.
-		partType := rootResult.Get("part.type").String()
-		if partType == "" || partType == "output_text" {
-			output = append(output, ensureCodexTextBlockOpen(params)...)
+		output = append(output, finalizeCodexThinkingBlock(params)...)
+		if rootResult.Get("part.type").String() == "output_text" {
+			output = append(output, startCodexTextBlock(params)...)
 		}
 	case "response.output_text.delta":
-		// Ensure a text block is open before the delta. Normally content_part.added already opened
-		// it; this also covers grok-composer emitting a text delta without a preceding added.
-		output = append(output, ensureCodexTextBlockOpen(params)...)
 		params.HasTextDelta = true
+		output = append(output, finalizeCodexThinkingBlock(params)...)
+		output = append(output, startCodexTextBlock(params)...)
 		template = []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`)
 		template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
 		template, _ = sjson.SetBytes(template, "delta.text", rootResult.Get("delta").String())
 
 		output = translatorcommon.AppendSSEEventBytes(output, "content_block_delta", template, 2)
 	case "response.content_part.done":
-		// Close the text block only when it is actually open. grok-composer can deliver
-		// response.content_part.done late - after function_call items have advanced BlockIndex,
-		// and after a tool start already closed the text block — in which case emitting a stop at
-		// the current BlockIndex targets a block that was never opened. When TextBlockOpen is true
-		// no tool/thinking block has advanced BlockIndex since the text opened, so BlockIndex still
-		// points at the text block. Compliant Codex streams always have it open here (no-op guard).
-		partType := rootResult.Get("part.type").String()
-		if partType == "" || partType == "output_text" {
-			output = append(output, finalizeCodexTextBlock(params)...)
+		if rootResult.Get("part.type").String() == "output_text" {
+			output = append(output, stopCodexTextBlock(params)...)
 		}
 	case "response.web_search_call.searching", "response.web_search_call.completed", "response.web_search_call.in_progress":
 		// Wait for populated web_search_call items on output_item.done.
 	case "response.completed", "response.incomplete":
-		if tolerateGrokComposerStream {
-			// Close every block grok-composer may have left open (it can skip the matching
-			// thinking/text/tool *.done events) so the message ends with all content blocks stopped.
-			output = append(output, finalizeCodexThinkingBlock(params)...)
-			output = append(output, finalizeCodexTextBlock(params)...)
-			output = append(output, finalizeOpenCodexToolBlocks(params)...)
-		}
 		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
 		responseData := rootResult.Get("response")
-		output = hydrateOpenCodexFunctionCallFromTerminal(output, params, responseData)
-		output = append(output, finalizeCodexOpenContentBlocks(params)...)
-		output = appendPendingCodexFunctionCallsFromTerminal(output, params, originalRequestRawJSON, responseData)
-		// stop_reason uses HasEmittedToolUse (not bare HasToolCall):
-		// - FORK intent (stop_reason=tool_use when tools were shown to Claude) preserved.
-		// - Upstream deferred-start: an unresolved unnamed pending must NOT force tool_use
-		//   (StreamUnresolvedPendingFunctionCallDoesNotForceToolUseStopReason).
-		// - Named starts / resolved pending set HasEmittedToolUse when the tool_use block
-		//   is actually emitted (Tool_call_wins_over_stop).
+		output = append(output, finalizeCodexThinkingBlock(params)...)
+		output = append(output, stopCodexTextBlock(params)...)
+		// Only grok-composer streams force-close tool blocks left open at
+		// completion (they can skip the matching *.done events). Other models
+		// must not invent a stop for an incomplete block.
+		output = appendCodexFunctionCallsFromTerminal(output, params, originalRequestRawJSON, responseData, isGrokComposerClaudeStreamRepairModel(modelName))
+		output = appendDeferredCodexStreamEvents(output, originalRequestRawJSON, param)
+		output = append(output, finalizeCodexThinkingBlock(params)...)
+		output = append(output, stopCodexTextBlock(params)...)
 		template, _ = sjson.SetBytes(template, "delta.stop_reason", mapCodexStopReasonToClaude(codexStopReason(responseData), params.HasEmittedToolUse))
 		template = setClaudeStopSequence(template, "delta.stop_sequence", responseData)
-		inputTokens, outputTokens, cachedTokens := extractResponsesUsage(responseData.Get("usage"))
+		inputTokens, outputTokens, cachedTokens, cacheWriteTokens := extractResponsesUsage(responseData.Get("usage"))
 		template, _ = sjson.SetBytes(template, "usage.input_tokens", inputTokens)
 		template, _ = sjson.SetBytes(template, "usage.output_tokens", outputTokens)
 		if cachedTokens > 0 {
 			template, _ = sjson.SetBytes(template, "usage.cache_read_input_tokens", cachedTokens)
+		}
+		if cacheWriteTokens > 0 {
+			template, _ = sjson.SetBytes(template, "usage.cache_creation_input_tokens", cacheWriteTokens)
 		}
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_delta", template, 2)
@@ -215,38 +217,26 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 		switch itemType {
 		case "function_call":
 			output = append(output, finalizeCodexThinkingBlock(params)...)
-			// grok-composer can open a leading text content part and jump straight to
-			// function_call items without a response.content_part.done. Close the open text
-			// block first so the tool block does not reuse its (still-open) content index.
-			output = append(output, finalizeCodexTextBlock(params)...)
-			params.HasToolCall = true
-			params.HasReceivedArgumentsDelta = false
-			callID := shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(itemResult.Get("call_id").String()))
-			rememberCodexClaudeToolCall(cacheScope, callID, itemResult)
+			output = append(output, stopCodexTextBlock(params)...)
 
-			name := itemResult.Get("name").String()
-			if name == "" {
-				recordPendingCodexFunctionCall(params, rootResult, itemResult)
-				break
-			}
+			// Remember the call under its Claude-visible (shortened) ID so a
+			// later request can repair an orphan tool result referencing it.
+			rememberCodexClaudeToolCall(cacheScope, shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(itemResult.Get("call_id").String())), itemResult)
 
-			key := codexFunctionCallKey(rootResult, itemResult)
-			if params.PendingFunctionCalls != nil {
-				delete(params.PendingFunctionCalls, key)
+			call := recordCodexFunctionCall(params, rootResult, itemResult)
+			updateCodexFunctionCallIdentity(params, call, rootResult, itemResult)
+			if call.Name != "" {
+				call.EmitInitialEmptyDelta = true
 			}
-			blockIndex := params.startCodexToolBlock(rootResult, itemResult)
-			output = appendCodexFunctionCallStart(output, originalRequestRawJSON, callID, name, blockIndex)
-			output = appendCodexFunctionCallArgumentDelta(output, "", blockIndex)
-			// Mark tool_use for stop_reason mapping. FunctionCallBlock* tracks the *current*
-			// open tool so response.completed can hydrate missing arguments; cleared when the
-			// tool block is finished (done path / appendCodexOpenFunctionCallStop).
-			params.HasEmittedToolUse = true
-			params.FunctionCallBlockOpen = true
-			params.FunctionCallBlockCallID = callID
-			params.FunctionCallBlockIndex = blockIndex
-			params.HasReceivedArgumentsDelta = false
+			output = appendCodexFunctionCallQueue(output, params, originalRequestRawJSON)
 		case "reasoning":
+			output = append(output, stopCodexTextBlock(params)...)
+			// A previous reasoning item that never reported output_item.done must not
+			// leak its still-open block into this one.
+			output = append(output, finalizeCodexThinkingBlock(params)...)
 			params.ThinkingSummarySeen = false
+			// Kept only as a fallback for streams whose output_item.done omits
+			// encrypted_content; it is a pre-content snapshot, never the final value.
 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
 		case "web_search_call":
 			// Defer server_tool_use until output_item.done carries action/query.
@@ -289,66 +279,21 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 			output = append(output, stopCodexTextBlock(params)...)
 			params.HasTextDelta = true
 		case "function_call":
-			if pending, pendingKeys := pendingCodexFunctionCallForDone(params, rootResult, itemResult); pending != nil && !pending.StartEmitted && len(pendingKeys) > 0 {
-				pendingKey := pendingKeys[0]
-				name := itemResult.Get("name").String()
-				if name == "" {
-					return [][]byte{output}
-				}
-				callID := pending.CallID
-				if callID == "" {
-					callID = codexFunctionCallID(itemResult)
-				}
-				// Assign Claude content-block index at emit time.
-				// Fork originally reserved BlockIndex when recording pending (1ab4d8b8 /
-				// defer-until-name). Upstream later added
-				// StreamDeferredUnnamedFunctionCallDoesNotReserveBlockIndex (text after an
-				// unnamed tool must still open at index 0). Emitting here keeps multi-pending
-				// slots stable when names arrive (KeepsPendingSlots → [0,1]) without starving
-				// intervening text of index 0.
-				blockIndex := params.BlockIndex
-				params.BlockIndex++
-				pending.BlockIndex = blockIndex
-				output = appendCodexFunctionCallStart(output, originalRequestRawJSON, callID, name, blockIndex)
-				params.HasEmittedToolUse = true
-				pending.StartEmitted = true
-
-				args := pending.Arguments
-				if args == "" {
-					args = itemResult.Get("arguments").String()
-				}
-				if args != "" {
-					output = appendCodexFunctionCallArgumentDelta(output, args, blockIndex)
-				}
-				output = appendCodexFunctionCallStop(output, blockIndex)
-
-				delete(params.PendingFunctionCalls, pendingKey)
-				if params.LastPendingFunctionCallKey == pendingKey {
-					params.LastPendingFunctionCallKey = ""
-				}
-			} else {
-				callID := shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(itemResult.Get("call_id").String()))
-				rememberCodexClaudeToolCall(cacheScope, callID, itemResult)
-				var blockIndex int
-				if tolerateGrokComposerStream {
-					var ok bool
-					blockIndex, ok = params.codexOpenToolBlockIndex(rootResult, itemResult)
-					if !ok {
-						return [][]byte{output}
-					}
-				} else {
-					blockIndex = params.codexToolBlockIndex(rootResult, itemResult)
-				}
-				if !params.codexToolArgumentsDeltaSeen(blockIndex) {
-					if args := codexFunctionArgumentsString(itemResult); args != "" {
-						output = appendCodexFunctionCallArgumentDelta(output, args, blockIndex)
-						params.markCodexToolArgumentsDelta(blockIndex)
-					}
-				}
-				output = appendCodexFunctionCallStop(output, blockIndex)
-				params.finishCodexToolBlock(rootResult, itemResult, blockIndex, tolerateGrokComposerStream)
+			output = append(output, finalizeCodexThinkingBlock(params)...)
+			output = append(output, stopCodexTextBlock(params)...)
+			call := codexFunctionCallForEvent(params, rootResult, itemResult)
+			if call == nil {
+				call = recordCodexFunctionCall(params, rootResult, itemResult)
 			}
+			updateCodexFunctionCallIdentity(params, call, rootResult, itemResult)
+			updateCodexFunctionCallArguments(call, itemResult.Get("arguments").String(), false)
+			call.Done = true
+			// The done item carries the final arguments: refresh the cached
+			// call so orphan repair restores the complete version.
+			rememberCodexClaudeToolCall(cacheScope, shortenCodexCallIDIfNeeded(util.SanitizeClaudeToolID(itemResult.Get("call_id").String())), itemResult)
+			output = appendCodexFunctionCallQueue(output, params, originalRequestRawJSON)
 		case "reasoning":
+			output = append(output, stopCodexTextBlock(params)...)
 			if signature := itemResult.Get("encrypted_content").String(); signature != "" {
 				params.ThinkingSignature = signature
 			}
@@ -363,242 +308,56 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 			output = appendCodexWebSearchToolResult(output, params, rootResult, itemResult)
 		}
 	case "response.function_call_arguments.delta":
-		delta := rootResult.Get("delta").String()
-		key := codexArgumentsFunctionCallKey(params, rootResult)
-		if pending, _ := pendingCodexFunctionCallForKey(params, key); pending != nil && !pending.StartEmitted {
-			pending.HasReceivedArgumentsDelta = true
-			pending.Arguments += delta
-			break
+		call := codexFunctionCallForEvent(params, rootResult, gjson.Result{})
+		if call == nil {
+			call = recordCodexFunctionCall(params, rootResult, gjson.Result{})
 		}
-
-		var blockIndex int
-		if tolerateGrokComposerStream {
-			var ok bool
-			blockIndex, ok = params.codexOpenToolBlockIndex(rootResult, gjson.Result{})
-			if !ok {
-				return [][]byte{output}
-			}
-		} else {
-			blockIndex = params.codexToolBlockIndex(rootResult, gjson.Result{})
-		}
-		params.markCodexToolArgumentsDelta(blockIndex)
-
-		params.HasReceivedArgumentsDelta = true
-		output = appendCodexFunctionCallArgumentDelta(output, delta, blockIndex)
+		updateCodexFunctionCallArguments(call, rootResult.Get("delta").String(), true)
+		output = appendCodexFunctionCallBufferedArguments(output, params, call)
 	case "response.function_call_arguments.done":
-		key := codexArgumentsFunctionCallKey(params, rootResult)
-		if pending, _ := pendingCodexFunctionCallForKey(params, key); pending != nil && !pending.StartEmitted {
-			if !pending.HasReceivedArgumentsDelta {
-				pending.Arguments = rootResult.Get("arguments").String()
-			}
-			break
+		call := codexFunctionCallForEvent(params, rootResult, gjson.Result{})
+		if call == nil {
+			call = recordCodexFunctionCall(params, rootResult, gjson.Result{})
 		}
-
-		var blockIndex int
-		if tolerateGrokComposerStream {
-			var ok bool
-			blockIndex, ok = params.codexOpenToolBlockIndex(rootResult, gjson.Result{})
-			if !ok {
-				return [][]byte{output}
-			}
-		} else {
-			blockIndex = params.codexToolBlockIndex(rootResult, gjson.Result{})
-		}
-		if !params.codexToolArgumentsDeltaSeen(blockIndex) {
-			if args := rootResult.Get("arguments").String(); args != "" {
-				output = appendCodexFunctionCallArgumentDelta(output, args, blockIndex)
-				params.markCodexToolArgumentsDelta(blockIndex)
-			}
-		}
+		updateCodexFunctionCallArguments(call, rootResult.Get("arguments").String(), false)
+		output = appendCodexFunctionCallBufferedArguments(output, params, call)
 	}
 
+	if len(params.FunctionCallQueue) == 0 {
+		output = appendDeferredCodexStreamEvents(output, originalRequestRawJSON, param)
+	}
 	return [][]byte{output}
 }
 
-func (params *ConvertCodexResponseToClaudeParams) startCodexToolBlock(rootResult, itemResult gjson.Result) int {
-	params.ensureCodexToolBlockState()
-	blockIndex := params.BlockIndex
-	params.BlockIndex++
-	params.CurrentToolBlockIndex = blockIndex
-	params.HasCurrentToolBlock = true
-	params.ToolBlockOpen[blockIndex] = true
-	params.ToolBlockOrder = append(params.ToolBlockOrder, blockIndex)
-	for _, key := range codexToolStreamKeys(rootResult, itemResult) {
-		params.ToolBlockIndexes[key] = blockIndex
-	}
-	return blockIndex
-}
-
-func (params *ConvertCodexResponseToClaudeParams) codexToolBlockIndex(rootResult, itemResult gjson.Result) int {
-	params.ensureCodexToolBlockState()
-	for _, key := range codexToolStreamKeys(rootResult, itemResult) {
-		if blockIndex, ok := params.ToolBlockIndexes[key]; ok {
-			return blockIndex
-		}
-	}
-	if params.HasCurrentToolBlock {
-		return params.CurrentToolBlockIndex
-	}
-	return params.BlockIndex
-}
-
-func (params *ConvertCodexResponseToClaudeParams) codexOpenToolBlockIndex(rootResult, itemResult gjson.Result) (int, bool) {
-	params.ensureCodexToolBlockState()
-	keys := codexToolStreamKeys(rootResult, itemResult)
-	for _, key := range keys {
-		if blockIndex, ok := params.ToolBlockIndexes[key]; ok {
-			return blockIndex, params.ToolBlockOpen[blockIndex]
-		}
-	}
-	if params.HasCurrentToolBlock && params.ToolBlockOpen[params.CurrentToolBlockIndex] {
-		return params.CurrentToolBlockIndex, true
-	}
-	if len(keys) == 0 {
-		openIndex := -1
-		openCount := 0
-		for blockIndex, open := range params.ToolBlockOpen {
-			if open {
-				openIndex = blockIndex
-				openCount++
-			}
-		}
-		if openCount == 1 {
-			return openIndex, true
-		}
-	}
-	return 0, false
-}
-
-func (params *ConvertCodexResponseToClaudeParams) markCodexToolArgumentsDelta(blockIndex int) {
-	params.ensureCodexToolBlockState()
-	params.ToolArgumentDeltaSeen[blockIndex] = true
-}
-
-func (params *ConvertCodexResponseToClaudeParams) codexToolArgumentsDeltaSeen(blockIndex int) bool {
-	params.ensureCodexToolBlockState()
-	return params.ToolArgumentDeltaSeen[blockIndex]
-}
-
-func (params *ConvertCodexResponseToClaudeParams) finishCodexToolBlock(rootResult, itemResult gjson.Result, blockIndex int, keepFinishedMapping bool) {
-	params.ensureCodexToolBlockState()
-	for _, key := range codexToolStreamKeys(rootResult, itemResult) {
-		if keepFinishedMapping {
-			params.ToolBlockIndexes[key] = blockIndex
-		} else {
-			delete(params.ToolBlockIndexes, key)
-		}
-	}
-	params.ToolBlockOpen[blockIndex] = false
-	delete(params.ToolArgumentDeltaSeen, blockIndex)
-	if params.HasCurrentToolBlock && params.CurrentToolBlockIndex == blockIndex {
-		if keepFinishedMapping {
-			params.refreshCurrentToolBlock()
-		} else {
-			params.HasCurrentToolBlock = false
-		}
-	}
-	// Clear legacy single-open-tool tracking so response.completed does not emit a
-	// second content_block_stop for a tool that was already closed on output_item.done.
-	if params.FunctionCallBlockOpen && params.FunctionCallBlockIndex == blockIndex {
-		params.FunctionCallBlockOpen = false
-		params.FunctionCallBlockCallID = ""
-		params.FunctionCallBlockIndex = 0
+func shouldDeferCodexStreamEvent(typeStr string, rootResult gjson.Result) bool {
+	switch typeStr {
+	case "error", "response.completed", "response.incomplete", "response.function_call_arguments.delta", "response.function_call_arguments.done":
+		return false
+	case "response.output_item.added", "response.output_item.done":
+		return rootResult.Get("item.type").String() != "function_call"
+	default:
+		return true
 	}
 }
 
-func (params *ConvertCodexResponseToClaudeParams) ensureCodexToolBlockState() {
-	if params.ToolBlockIndexes == nil {
-		params.ToolBlockIndexes = make(map[string]int)
+func appendDeferredCodexStreamEvents(output []byte, originalRequestRawJSON []byte, param *any) []byte {
+	if param == nil || *param == nil {
+		return output
 	}
-	if params.ToolBlockOpen == nil {
-		params.ToolBlockOpen = make(map[int]bool)
+	params := (*param).(*ConvertCodexResponseToClaudeParams)
+	if len(params.DeferredStreamEvents) == 0 {
+		return output
 	}
-	if params.ToolArgumentDeltaSeen == nil {
-		params.ToolArgumentDeltaSeen = make(map[int]bool)
-	}
-}
 
-func (params *ConvertCodexResponseToClaudeParams) refreshCurrentToolBlock() {
-	params.HasCurrentToolBlock = false
-	for i := len(params.ToolBlockOrder) - 1; i >= 0; i-- {
-		blockIndex := params.ToolBlockOrder[i]
-		if params.ToolBlockOpen[blockIndex] {
-			params.CurrentToolBlockIndex = blockIndex
-			params.HasCurrentToolBlock = true
-			return
+	events := params.DeferredStreamEvents
+	params.DeferredStreamEvents = nil
+	for _, event := range events {
+		translated := ConvertCodexResponseToClaude(context.Background(), "", originalRequestRawJSON, nil, event, param)
+		for _, chunk := range translated {
+			output = append(output, chunk...)
 		}
 	}
-}
-
-// finalizeOpenCodexToolBlocks closes tool content blocks left open when the stream ends.
-// FORK (09e422f2): only called for grok-composer models (tolerateGrokComposerStream) —
-// other Codex models intentionally leave incomplete tools open so non-grok streams
-// match prior behavior (GrokComposerFinalizesOpenToolBlocksOnlyForScopedModel).
-func finalizeOpenCodexToolBlocks(params *ConvertCodexResponseToClaudeParams) []byte {
-	params.ensureCodexToolBlockState()
-	output := make([]byte, 0, 128)
-	for _, blockIndex := range params.ToolBlockOrder {
-		if !params.ToolBlockOpen[blockIndex] {
-			continue
-		}
-		template := []byte(`{"type":"content_block_stop","index":0}`)
-		template, _ = sjson.SetBytes(template, "index", blockIndex)
-		output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
-		params.ToolBlockOpen[blockIndex] = false
-		delete(params.ToolArgumentDeltaSeen, blockIndex)
-		// Clear upstream FunctionCallBlockOpen if it points at a block we just closed,
-		// so finalizeCodexOpenContentBlocks does not emit a second stop.
-		if params.FunctionCallBlockOpen && params.FunctionCallBlockIndex == blockIndex {
-			params.FunctionCallBlockOpen = false
-			params.FunctionCallBlockCallID = ""
-			params.FunctionCallBlockIndex = 0
-		}
-	}
-	params.refreshCurrentToolBlock()
 	return output
-}
-
-func codexFunctionArgumentsString(itemResult gjson.Result) string {
-	argsResult := itemResult.Get("arguments")
-	if !argsResult.Exists() {
-		return ""
-	}
-	if argsResult.Type == gjson.String {
-		return argsResult.String()
-	}
-	return argsResult.Raw
-}
-
-func isGrokComposerClaudeStreamRepairModel(modelName string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(modelName))
-	return normalized == "grok-composer-2.5-fast" ||
-		strings.HasPrefix(normalized, "grok-composer-2.5-fast-") ||
-		strings.HasPrefix(normalized, "grok-composer-2.5-fast[")
-}
-
-func codexToolStreamKeys(rootResult, itemResult gjson.Result) []string {
-	seen := make(map[string]struct{})
-	keys := make([]string, 0, 4)
-	addKey := func(prefix, value string) {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			return
-		}
-		key := prefix + ":" + value
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		keys = append(keys, key)
-	}
-
-	addKey("item_id", rootResult.Get("item_id").String())
-	addKey("item_id", itemResult.Get("id").String())
-	addKey("call_id", itemResult.Get("call_id").String())
-	if outputIndex := rootResult.Get("output_index"); outputIndex.Exists() {
-		addKey("output_index", outputIndex.Raw)
-	}
-	return keys
 }
 
 func codexStreamErrorToClaudeError(rootResult gjson.Result) []byte {
@@ -655,15 +414,19 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
 	out, _ = sjson.SetBytes(out, "id", responseData.Get("id").String())
 	out, _ = sjson.SetBytes(out, "model", responseData.Get("model").String())
-	inputTokens, outputTokens, cachedTokens := extractResponsesUsage(responseData.Get("usage"))
+	inputTokens, outputTokens, cachedTokens, cacheWriteTokens := extractResponsesUsage(responseData.Get("usage"))
 	out, _ = sjson.SetBytes(out, "usage.input_tokens", inputTokens)
 	out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
 	if cachedTokens > 0 {
 		out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
 	}
+	if cacheWriteTokens > 0 {
+		out, _ = sjson.SetBytes(out, "usage.cache_creation_input_tokens", cacheWriteTokens)
+	}
 
 	hasToolCall := false
 	webSearchSeen := make(map[string]struct{})
+	var contentBlocks [][]byte
 
 	if output := responseData.Get("output"); output.Exists() && output.IsArray() {
 		output.ForEach(func(_, item gjson.Result) bool {
@@ -707,7 +470,7 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 					if signature != "" {
 						block, _ = sjson.SetBytes(block, "signature", signature)
 					}
-					out, _ = sjson.SetRawBytes(out, "content.-1", block)
+					contentBlocks = append(contentBlocks, block)
 				}
 			case "message":
 				if content := item.Get("content"); content.Exists() {
@@ -718,7 +481,7 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 								if text != "" {
 									block := []byte(`{"type":"text","text":""}`)
 									block, _ = sjson.SetBytes(block, "text", text)
-									out, _ = sjson.SetRawBytes(out, "content.-1", block)
+									contentBlocks = append(contentBlocks, block)
 								}
 							}
 							return true
@@ -728,12 +491,12 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 						if text != "" {
 							block := []byte(`{"type":"text","text":""}`)
 							block, _ = sjson.SetBytes(block, "text", text)
-							out, _ = sjson.SetRawBytes(out, "content.-1", block)
+							contentBlocks = append(contentBlocks, block)
 						}
 					}
 				}
 			case "web_search_call":
-				out = appendCodexWebSearchNonStreamContent(out, item, webSearchSeen)
+				contentBlocks = appendCodexWebSearchNonStreamBlocks(contentBlocks, item, webSearchSeen)
 			case "function_call":
 				hasToolCall = true
 				name := item.Get("name").String()
@@ -754,10 +517,14 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 					}
 				}
 				toolBlock, _ = sjson.SetRawBytes(toolBlock, "input", []byte(inputRaw))
-				out, _ = sjson.SetRawBytes(out, "content.-1", toolBlock)
+				contentBlocks = append(contentBlocks, toolBlock)
 			}
 			return true
 		})
+	}
+
+	if len(contentBlocks) > 0 {
+		out = translatorcommon.SetRawArrayItems(out, "content", contentBlocks)
 	}
 
 	out, _ = sjson.SetBytes(out, "stop_reason", mapCodexStopReasonToClaude(codexStopReason(responseData), hasToolCall))
@@ -891,6 +658,26 @@ func pendingCodexFunctionCallForDone(params *ConvertCodexResponseToClaudeParams,
 	return nil, nil
 }
 
+func codexFunctionCallKeys(rootResult, itemResult gjson.Result) []string {
+	keys := make([]string, 0, 5)
+	if outputIndex := rootResult.Get("output_index"); outputIndex.Exists() {
+		keys = appendUniqueCodexFunctionCallKey(keys, "output:"+outputIndex.Raw)
+	}
+	if callID := codexFunctionCallID(itemResult); callID != "" {
+		keys = appendUniqueCodexFunctionCallKey(keys, "call:"+callID)
+	}
+	if callID := rootResult.Get("call_id").String(); callID != "" {
+		keys = appendUniqueCodexFunctionCallKey(keys, "call:"+callID)
+	}
+	if itemID := itemResult.Get("id").String(); itemID != "" {
+		keys = appendUniqueCodexFunctionCallKey(keys, "item:"+itemID)
+	}
+	if itemID := rootResult.Get("item_id").String(); itemID != "" {
+		keys = appendUniqueCodexFunctionCallKey(keys, "item:"+itemID)
+	}
+	return keys
+}
+
 func appendUniqueCodexFunctionCallKey(keys []string, key string) []string {
 	if key == "" {
 		return keys
@@ -929,6 +716,84 @@ func deletePendingCodexFunctionCallAliases(params *ConvertCodexResponseToClaudeP
 	}
 }
 
+func codexFunctionCallForKeys(params *ConvertCodexResponseToClaudeParams, keys []string) *codexFunctionCallStream {
+	if params == nil || params.FunctionCalls == nil {
+		return nil
+	}
+	for _, key := range keys {
+		if call := params.FunctionCalls[key]; call != nil {
+			return call
+		}
+	}
+	return nil
+}
+
+func codexFunctionCallForEvent(params *ConvertCodexResponseToClaudeParams, rootResult, itemResult gjson.Result) *codexFunctionCallStream {
+	keys := codexFunctionCallKeys(rootResult, itemResult)
+	if len(keys) > 0 {
+		return codexFunctionCallForKeys(params, keys)
+	}
+	if params == nil {
+		return nil
+	}
+	return params.LastFunctionCall
+}
+
+func recordCodexFunctionCall(params *ConvertCodexResponseToClaudeParams, rootResult, itemResult gjson.Result) *codexFunctionCallStream {
+	keys := codexFunctionCallKeys(rootResult, itemResult)
+	call := codexFunctionCallForKeys(params, keys)
+	if call == nil {
+		call = &codexFunctionCallStream{BlockIndex: -1}
+		params.FunctionCallQueue = append(params.FunctionCallQueue, call)
+	}
+	addCodexFunctionCallAliases(params, call, keys)
+	params.LastFunctionCall = call
+	return call
+}
+
+func addCodexFunctionCallAliases(params *ConvertCodexResponseToClaudeParams, call *codexFunctionCallStream, keys []string) {
+	if params == nil || call == nil {
+		return
+	}
+	if params.FunctionCalls == nil {
+		params.FunctionCalls = map[string]*codexFunctionCallStream{}
+	}
+	for _, key := range keys {
+		params.FunctionCalls[key] = call
+	}
+}
+
+func updateCodexFunctionCallIdentity(params *ConvertCodexResponseToClaudeParams, call *codexFunctionCallStream, rootResult, itemResult gjson.Result) {
+	if call == nil {
+		return
+	}
+	if callID := codexFunctionCallID(itemResult); callID != "" {
+		call.CallID = callID
+	}
+	if name := itemResult.Get("name").String(); name != "" {
+		call.Name = name
+	}
+	addCodexFunctionCallAliases(params, call, codexFunctionCallKeys(rootResult, itemResult))
+}
+
+func updateCodexFunctionCallArguments(call *codexFunctionCallStream, arguments string, delta bool) {
+	if call == nil || arguments == "" {
+		return
+	}
+	if delta {
+		call.Arguments += arguments
+		call.HasReceivedArgumentsDelta = true
+		return
+	}
+	if !call.HasReceivedArgumentsDelta {
+		call.Arguments = arguments
+		return
+	}
+	if strings.HasPrefix(arguments, call.Arguments) {
+		call.Arguments = arguments
+	}
+}
+
 func appendCodexFunctionCallStart(output []byte, originalRequestRawJSON []byte, callID, name string, blockIndex int) []byte {
 	template := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
 	template, _ = sjson.SetBytes(template, "index", blockIndex)
@@ -950,42 +815,78 @@ func appendCodexFunctionCallStop(output []byte, blockIndex int) []byte {
 	return translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
 }
 
-func appendCodexOpenFunctionCallStop(output []byte, params *ConvertCodexResponseToClaudeParams) []byte {
-	if params == nil || !params.FunctionCallBlockOpen {
+func appendCodexFunctionCallBufferedArguments(output []byte, params *ConvertCodexResponseToClaudeParams, call *codexFunctionCallStream) []byte {
+	if params == nil || call == nil || params.ActiveFunctionCall != call || !call.Started || call.Closed {
+		return output
+	}
+	if call.EmittedArgumentsLength >= len(call.Arguments) {
 		return output
 	}
 
-	blockIndex := params.FunctionCallBlockIndex
-	output = appendCodexFunctionCallStop(output, blockIndex)
-	if params.BlockIndex <= blockIndex {
-		params.BlockIndex = blockIndex + 1
-	}
-	params.FunctionCallBlockOpen = false
-	params.FunctionCallBlockCallID = ""
-	params.FunctionCallBlockIndex = 0
+	output = appendCodexFunctionCallArgumentDelta(output, call.Arguments[call.EmittedArgumentsLength:], call.BlockIndex)
+	call.EmittedArgumentsLength = len(call.Arguments)
 	return output
 }
 
-func hydrateOpenCodexFunctionCallFromTerminal(output []byte, params *ConvertCodexResponseToClaudeParams, responseData gjson.Result) []byte {
-	if params == nil || !params.FunctionCallBlockOpen || params.HasReceivedArgumentsDelta {
+func appendCodexFunctionCallQueue(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte) []byte {
+	if params == nil {
 		return output
 	}
 
-	responseData.Get("output").ForEach(func(_, item gjson.Result) bool {
-		if item.Get("type").String() != "function_call" || codexFunctionCallID(item) != params.FunctionCallBlockCallID {
-			return true
+	for {
+		if active := params.ActiveFunctionCall; active != nil {
+			output = appendCodexFunctionCallBufferedArguments(output, params, active)
+			if !active.Done {
+				return output
+			}
+			output = appendCodexFunctionCallStop(output, active.BlockIndex)
+			if params.BlockIndex <= active.BlockIndex {
+				params.BlockIndex = active.BlockIndex + 1
+			}
+			active.Closed = true
+			params.ActiveFunctionCall = nil
+			removeCodexFunctionCallFromQueue(params, active)
 		}
-		if args := item.Get("arguments").String(); args != "" {
-			output = appendCodexFunctionCallArgumentDelta(output, args, params.FunctionCallBlockIndex)
-			params.HasReceivedArgumentsDelta = true
+
+		for len(params.FunctionCallQueue) > 0 && params.FunctionCallQueue[0].Closed {
+			params.FunctionCallQueue = params.FunctionCallQueue[1:]
 		}
-		return false
-	})
-	return output
+		if len(params.FunctionCallQueue) == 0 {
+			return output
+		}
+
+		call := params.FunctionCallQueue[0]
+		if call.Name == "" {
+			return output
+		}
+
+		call.BlockIndex = params.BlockIndex
+		output = appendCodexFunctionCallStart(output, originalRequestRawJSON, call.CallID, call.Name, call.BlockIndex)
+		if call.EmitInitialEmptyDelta {
+			output = appendCodexFunctionCallArgumentDelta(output, "", call.BlockIndex)
+		}
+		call.Started = true
+		params.ActiveFunctionCall = call
+		params.HasEmittedToolUse = true
+		output = appendCodexFunctionCallBufferedArguments(output, params, call)
+	}
 }
 
-func appendPendingCodexFunctionCallsFromTerminal(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte, responseData gjson.Result) []byte {
-	if params == nil || len(params.PendingFunctionCalls) == 0 {
+func removeCodexFunctionCallFromQueue(params *ConvertCodexResponseToClaudeParams, call *codexFunctionCallStream) {
+	if params == nil || call == nil {
+		return
+	}
+	for index, queued := range params.FunctionCallQueue {
+		if queued != call {
+			continue
+		}
+		params.FunctionCallQueue = append(params.FunctionCallQueue[:index], params.FunctionCallQueue[index+1:]...)
+		return
+	}
+}
+
+func appendCodexFunctionCallsFromTerminal(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte, responseData gjson.Result, forceCloseOpenCalls bool) []byte {
+	if params == nil {
 		return output
 	}
 
@@ -994,96 +895,59 @@ func appendPendingCodexFunctionCallsFromTerminal(output []byte, params *ConvertC
 			return true
 		}
 
-		pending, pendingKeys := pendingCodexFunctionCallForTerminalItem(params, index, item)
-		if pending == nil {
-			return true
+		keys := codexFunctionCallKeys(gjson.Result{}, item)
+		if itemOutputIndex := item.Get("output_index"); itemOutputIndex.Exists() {
+			keys = appendUniqueCodexFunctionCallKey(keys, "output:"+itemOutputIndex.Raw)
 		}
-		if pending.StartEmitted {
-			deletePendingCodexFunctionCallAliases(params, pendingKeys)
-			return true
+		if index.Exists() {
+			keys = appendUniqueCodexFunctionCallKey(keys, "output:"+index.String())
 		}
-
-		name := item.Get("name").String()
-		if name == "" {
-			deletePendingCodexFunctionCallAliases(params, pendingKeys)
-			return true
+		call := codexFunctionCallForKeys(params, keys)
+		if call == nil {
+			call = &codexFunctionCallStream{BlockIndex: -1}
+			params.FunctionCallQueue = append(params.FunctionCallQueue, call)
 		}
-		callID := pending.CallID
-		if callID == "" {
-			callID = codexFunctionCallID(item)
-		}
-
-		blockIndex := params.BlockIndex
-		output = appendCodexFunctionCallStart(output, originalRequestRawJSON, callID, name, blockIndex)
-		params.HasEmittedToolUse = true
-		pending.StartEmitted = true
-
-		args := item.Get("arguments").String()
-		if args == "" {
-			args = pending.Arguments
-		}
-		if args != "" {
-			output = appendCodexFunctionCallArgumentDelta(output, args, blockIndex)
-		}
-		output = appendCodexFunctionCallStop(output, blockIndex)
-		params.BlockIndex++
-
-		deletePendingCodexFunctionCallAliases(params, pendingKeys)
+		addCodexFunctionCallAliases(params, call, keys)
+		updateCodexFunctionCallIdentity(params, call, gjson.Result{}, item)
+		updateCodexFunctionCallArguments(call, item.Get("arguments").String(), false)
+		call.Done = true
 		return true
 	})
 
-	clearPendingCodexFunctionCalls(params)
+	queuedCalls := params.FunctionCallQueue[:0]
+	for _, call := range params.FunctionCallQueue {
+		if call.Closed {
+			continue
+		}
+		if call.Name == "" {
+			call.Closed = true
+			continue
+		}
+		if !call.Done && !forceCloseOpenCalls && strings.TrimSpace(call.Arguments) == "" {
+			// Leave argument-less open blocks unclosed outside the
+			// grok-composer repair scope: never invent a stop for an
+			// incomplete block. The stream is over, so the dropped queue
+			// entry is released by clearCodexFunctionCalls below.
+			continue
+		}
+		call.Done = true
+		queuedCalls = append(queuedCalls, call)
+	}
+	params.FunctionCallQueue = queuedCalls
+	output = appendCodexFunctionCallQueue(output, params, originalRequestRawJSON)
+
+	clearCodexFunctionCalls(params)
 	return output
 }
 
-func pendingCodexFunctionCallForTerminalItem(params *ConvertCodexResponseToClaudeParams, outputIndex, item gjson.Result) (*pendingCodexFunctionCall, []string) {
-	if params == nil || params.PendingFunctionCalls == nil {
-		return nil, nil
-	}
-
-	keys := make([]string, 0, 3)
-	if callID := codexFunctionCallID(item); callID != "" {
-		keys = appendUniqueCodexFunctionCallKey(keys, codexFunctionCallIDKey(callID))
-	}
-	if itemOutputIndex := item.Get("output_index"); itemOutputIndex.Exists() {
-		keys = appendUniqueCodexFunctionCallKey(keys, "output:"+itemOutputIndex.Raw)
-	}
-	if outputIndex.Exists() {
-		keys = appendUniqueCodexFunctionCallKey(keys, "output:"+outputIndex.Raw)
-	}
-
-	for _, key := range keys {
-		if pending, ok := params.PendingFunctionCalls[key]; ok {
-			return pending, keysForPendingCodexFunctionCall(params, pending)
-		}
-	}
-	return nil, nil
-}
-
-func clearPendingCodexFunctionCalls(params *ConvertCodexResponseToClaudeParams) {
-	if params == nil || params.PendingFunctionCalls == nil {
+func clearCodexFunctionCalls(params *ConvertCodexResponseToClaudeParams) {
+	if params == nil {
 		return
 	}
-	for key := range params.PendingFunctionCalls {
-		delete(params.PendingFunctionCalls, key)
-	}
-	params.LastPendingFunctionCallKey = ""
-}
-
-// finalizeCodexOpenContentBlocks closes thinking/text and, when safe, an open tool.
-// Upstream added FunctionCallBlockOpen + terminal hydration; the FORK keeps
-// finalizeOpenCodexToolBlocks as the only forced tool-close path for grok-composer
-// (scoped by model). For other models we only close FunctionCallBlockOpen when
-// arguments were actually received/hydrated — never invent a stop for an incomplete
-// non-grok stream (preserves GrokComposerFinalizesOpenToolBlocksOnlyForScopedModel).
-func finalizeCodexOpenContentBlocks(params *ConvertCodexResponseToClaudeParams) []byte {
-	output := make([]byte, 0, 256)
-	output = append(output, finalizeCodexThinkingBlock(params)...)
-	output = append(output, stopCodexTextBlock(params)...)
-	if params != nil && params.FunctionCallBlockOpen && params.HasReceivedArgumentsDelta {
-		output = appendCodexOpenFunctionCallStop(output, params)
-	}
-	return output
+	clear(params.FunctionCalls)
+	params.FunctionCallQueue = nil
+	params.ActiveFunctionCall = nil
+	params.LastFunctionCall = nil
 }
 
 func resolveCodexClaudeToolUseName(originalRequestRawJSON []byte, name string) string {
@@ -1094,14 +958,18 @@ func resolveCodexClaudeToolUseName(originalRequestRawJSON []byte, name string) s
 	return name
 }
 
-func extractResponsesUsage(usage gjson.Result) (int64, int64, int64) {
+func extractResponsesUsage(usage gjson.Result) (int64, int64, int64, int64) {
 	if !usage.Exists() || usage.Type == gjson.Null {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 
 	inputTokens := usage.Get("input_tokens").Int()
 	outputTokens := usage.Get("output_tokens").Int()
 	cachedTokens := usage.Get("input_tokens_details.cached_tokens").Int()
+	cacheWriteTokens := usage.Get("input_tokens_details.cache_write_tokens").Int()
+	if cacheWriteTokens == 0 {
+		cacheWriteTokens = usage.Get("input_tokens_details.cache_creation_tokens").Int()
+	}
 
 	if cachedTokens > 0 {
 		if inputTokens >= cachedTokens {
@@ -1111,7 +979,7 @@ func extractResponsesUsage(usage gjson.Result) (int64, int64, int64) {
 		}
 	}
 
-	return inputTokens, outputTokens, cachedTokens
+	return inputTokens, outputTokens, cachedTokens, cacheWriteTokens
 }
 
 // buildReverseMapFromClaudeOriginalShortToOriginal builds a map[short]original from original Claude request tools.
@@ -1180,6 +1048,19 @@ func startCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams) []byte 
 	return translatorcommon.AppendSSEEventBytes(nil, "content_block_start", template, 2)
 }
 
+// appendCodexThinkingDelta emits a thinking_delta for the currently open thinking block.
+func appendCodexThinkingDelta(params *ConvertCodexResponseToClaudeParams, text string) []byte {
+	if text == "" {
+		return nil
+	}
+
+	template := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`)
+	template, _ = sjson.SetBytes(template, "index", params.BlockIndex)
+	template, _ = sjson.SetBytes(template, "delta.thinking", text)
+
+	return translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", template, 2)
+}
+
 func finalizeCodexSignatureOnlyThinkingBlock(params *ConvertCodexResponseToClaudeParams) []byte {
 	if params.ThinkingSignature == "" {
 		return nil
@@ -1246,5 +1127,304 @@ func finalizeCodexThinkingBlock(params *ConvertCodexResponseToClaudeParams) []by
 	params.ThinkingBlockOpen = false
 	params.ThinkingStopPending = false
 
+	return output
+}
+
+// Branch-preserved stream-repair helpers for non-conforming Codex streams
+// (e.g. grok-composer) and cached orphan tool-output repair. They are kept
+// alongside the upstream queue-based machinery; the live conversion path
+// above does not call them.
+func (params *ConvertCodexResponseToClaudeParams) startCodexToolBlock(rootResult, itemResult gjson.Result) int {
+	params.ensureCodexToolBlockState()
+	blockIndex := params.BlockIndex
+	params.BlockIndex++
+	params.CurrentToolBlockIndex = blockIndex
+	params.HasCurrentToolBlock = true
+	params.ToolBlockOpen[blockIndex] = true
+	params.ToolBlockOrder = append(params.ToolBlockOrder, blockIndex)
+	for _, key := range codexToolStreamKeys(rootResult, itemResult) {
+		params.ToolBlockIndexes[key] = blockIndex
+	}
+	return blockIndex
+}
+func (params *ConvertCodexResponseToClaudeParams) codexToolBlockIndex(rootResult, itemResult gjson.Result) int {
+	params.ensureCodexToolBlockState()
+	for _, key := range codexToolStreamKeys(rootResult, itemResult) {
+		if blockIndex, ok := params.ToolBlockIndexes[key]; ok {
+			return blockIndex
+		}
+	}
+	if params.HasCurrentToolBlock {
+		return params.CurrentToolBlockIndex
+	}
+	return params.BlockIndex
+}
+func (params *ConvertCodexResponseToClaudeParams) codexOpenToolBlockIndex(rootResult, itemResult gjson.Result) (int, bool) {
+	params.ensureCodexToolBlockState()
+	keys := codexToolStreamKeys(rootResult, itemResult)
+	for _, key := range keys {
+		if blockIndex, ok := params.ToolBlockIndexes[key]; ok {
+			return blockIndex, params.ToolBlockOpen[blockIndex]
+		}
+	}
+	if params.HasCurrentToolBlock && params.ToolBlockOpen[params.CurrentToolBlockIndex] {
+		return params.CurrentToolBlockIndex, true
+	}
+	if len(keys) == 0 {
+		openIndex := -1
+		openCount := 0
+		for blockIndex, open := range params.ToolBlockOpen {
+			if open {
+				openIndex = blockIndex
+				openCount++
+			}
+		}
+		if openCount == 1 {
+			return openIndex, true
+		}
+	}
+	return 0, false
+}
+func (params *ConvertCodexResponseToClaudeParams) markCodexToolArgumentsDelta(blockIndex int) {
+	params.ensureCodexToolBlockState()
+	params.ToolArgumentDeltaSeen[blockIndex] = true
+}
+func (params *ConvertCodexResponseToClaudeParams) codexToolArgumentsDeltaSeen(blockIndex int) bool {
+	params.ensureCodexToolBlockState()
+	return params.ToolArgumentDeltaSeen[blockIndex]
+}
+func (params *ConvertCodexResponseToClaudeParams) finishCodexToolBlock(rootResult, itemResult gjson.Result, blockIndex int, keepFinishedMapping bool) {
+	params.ensureCodexToolBlockState()
+	for _, key := range codexToolStreamKeys(rootResult, itemResult) {
+		if keepFinishedMapping {
+			params.ToolBlockIndexes[key] = blockIndex
+		} else {
+			delete(params.ToolBlockIndexes, key)
+		}
+	}
+	params.ToolBlockOpen[blockIndex] = false
+	delete(params.ToolArgumentDeltaSeen, blockIndex)
+	if params.HasCurrentToolBlock && params.CurrentToolBlockIndex == blockIndex {
+		if keepFinishedMapping {
+			params.refreshCurrentToolBlock()
+		} else {
+			params.HasCurrentToolBlock = false
+		}
+	}
+	// Clear legacy single-open-tool tracking so response.completed does not emit a
+	// second content_block_stop for a tool that was already closed on output_item.done.
+	if params.FunctionCallBlockOpen && params.FunctionCallBlockIndex == blockIndex {
+		params.FunctionCallBlockOpen = false
+		params.FunctionCallBlockCallID = ""
+		params.FunctionCallBlockIndex = 0
+	}
+}
+func (params *ConvertCodexResponseToClaudeParams) ensureCodexToolBlockState() {
+	if params.ToolBlockIndexes == nil {
+		params.ToolBlockIndexes = make(map[string]int)
+	}
+	if params.ToolBlockOpen == nil {
+		params.ToolBlockOpen = make(map[int]bool)
+	}
+	if params.ToolArgumentDeltaSeen == nil {
+		params.ToolArgumentDeltaSeen = make(map[int]bool)
+	}
+}
+func (params *ConvertCodexResponseToClaudeParams) refreshCurrentToolBlock() {
+	params.HasCurrentToolBlock = false
+	for i := len(params.ToolBlockOrder) - 1; i >= 0; i-- {
+		blockIndex := params.ToolBlockOrder[i]
+		if params.ToolBlockOpen[blockIndex] {
+			params.CurrentToolBlockIndex = blockIndex
+			params.HasCurrentToolBlock = true
+			return
+		}
+	}
+}
+func finalizeOpenCodexToolBlocks(params *ConvertCodexResponseToClaudeParams) []byte {
+	params.ensureCodexToolBlockState()
+	output := make([]byte, 0, 128)
+	for _, blockIndex := range params.ToolBlockOrder {
+		if !params.ToolBlockOpen[blockIndex] {
+			continue
+		}
+		template := []byte(`{"type":"content_block_stop","index":0}`)
+		template, _ = sjson.SetBytes(template, "index", blockIndex)
+		output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
+		params.ToolBlockOpen[blockIndex] = false
+		delete(params.ToolArgumentDeltaSeen, blockIndex)
+		// Clear upstream FunctionCallBlockOpen if it points at a block we just closed,
+		// so finalizeCodexOpenContentBlocks does not emit a second stop.
+		if params.FunctionCallBlockOpen && params.FunctionCallBlockIndex == blockIndex {
+			params.FunctionCallBlockOpen = false
+			params.FunctionCallBlockCallID = ""
+			params.FunctionCallBlockIndex = 0
+		}
+	}
+	params.refreshCurrentToolBlock()
+	return output
+}
+func codexFunctionArgumentsString(itemResult gjson.Result) string {
+	argsResult := itemResult.Get("arguments")
+	if !argsResult.Exists() {
+		return ""
+	}
+	if argsResult.Type == gjson.String {
+		return argsResult.String()
+	}
+	return argsResult.Raw
+}
+func isGrokComposerClaudeStreamRepairModel(modelName string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(modelName))
+	return normalized == "grok-composer-2.5-fast" ||
+		strings.HasPrefix(normalized, "grok-composer-2.5-fast-") ||
+		strings.HasPrefix(normalized, "grok-composer-2.5-fast[")
+}
+func codexToolStreamKeys(rootResult, itemResult gjson.Result) []string {
+	seen := make(map[string]struct{})
+	keys := make([]string, 0, 4)
+	addKey := func(prefix, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		key := prefix + ":" + value
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+
+	addKey("item_id", rootResult.Get("item_id").String())
+	addKey("item_id", itemResult.Get("id").String())
+	addKey("call_id", itemResult.Get("call_id").String())
+	if outputIndex := rootResult.Get("output_index"); outputIndex.Exists() {
+		addKey("output_index", outputIndex.Raw)
+	}
+	return keys
+}
+func appendCodexOpenFunctionCallStop(output []byte, params *ConvertCodexResponseToClaudeParams) []byte {
+	if params == nil || !params.FunctionCallBlockOpen {
+		return output
+	}
+
+	blockIndex := params.FunctionCallBlockIndex
+	output = appendCodexFunctionCallStop(output, blockIndex)
+	if params.BlockIndex <= blockIndex {
+		params.BlockIndex = blockIndex + 1
+	}
+	params.FunctionCallBlockOpen = false
+	params.FunctionCallBlockCallID = ""
+	params.FunctionCallBlockIndex = 0
+	return output
+}
+func hydrateOpenCodexFunctionCallFromTerminal(output []byte, params *ConvertCodexResponseToClaudeParams, responseData gjson.Result) []byte {
+	if params == nil || !params.FunctionCallBlockOpen || params.HasReceivedArgumentsDelta {
+		return output
+	}
+
+	responseData.Get("output").ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").String() != "function_call" || codexFunctionCallID(item) != params.FunctionCallBlockCallID {
+			return true
+		}
+		if args := item.Get("arguments").String(); args != "" {
+			output = appendCodexFunctionCallArgumentDelta(output, args, params.FunctionCallBlockIndex)
+			params.HasReceivedArgumentsDelta = true
+		}
+		return false
+	})
+	return output
+}
+func appendPendingCodexFunctionCallsFromTerminal(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte, responseData gjson.Result) []byte {
+	if params == nil || len(params.PendingFunctionCalls) == 0 {
+		return output
+	}
+
+	responseData.Get("output").ForEach(func(index, item gjson.Result) bool {
+		if item.Get("type").String() != "function_call" {
+			return true
+		}
+
+		pending, pendingKeys := pendingCodexFunctionCallForTerminalItem(params, index, item)
+		if pending == nil {
+			return true
+		}
+		if pending.StartEmitted {
+			deletePendingCodexFunctionCallAliases(params, pendingKeys)
+			return true
+		}
+
+		name := item.Get("name").String()
+		if name == "" {
+			deletePendingCodexFunctionCallAliases(params, pendingKeys)
+			return true
+		}
+		callID := pending.CallID
+		if callID == "" {
+			callID = codexFunctionCallID(item)
+		}
+
+		blockIndex := params.BlockIndex
+		output = appendCodexFunctionCallStart(output, originalRequestRawJSON, callID, name, blockIndex)
+		params.HasEmittedToolUse = true
+		pending.StartEmitted = true
+
+		args := item.Get("arguments").String()
+		if args == "" {
+			args = pending.Arguments
+		}
+		if args != "" {
+			output = appendCodexFunctionCallArgumentDelta(output, args, blockIndex)
+		}
+		output = appendCodexFunctionCallStop(output, blockIndex)
+		params.BlockIndex++
+
+		deletePendingCodexFunctionCallAliases(params, pendingKeys)
+		return true
+	})
+
+	clearPendingCodexFunctionCalls(params)
+	return output
+}
+func pendingCodexFunctionCallForTerminalItem(params *ConvertCodexResponseToClaudeParams, outputIndex, item gjson.Result) (*pendingCodexFunctionCall, []string) {
+	if params == nil || params.PendingFunctionCalls == nil {
+		return nil, nil
+	}
+
+	keys := make([]string, 0, 3)
+	if callID := codexFunctionCallID(item); callID != "" {
+		keys = appendUniqueCodexFunctionCallKey(keys, codexFunctionCallIDKey(callID))
+	}
+	if itemOutputIndex := item.Get("output_index"); itemOutputIndex.Exists() {
+		keys = appendUniqueCodexFunctionCallKey(keys, "output:"+itemOutputIndex.Raw)
+	}
+	if outputIndex.Exists() {
+		keys = appendUniqueCodexFunctionCallKey(keys, "output:"+outputIndex.Raw)
+	}
+
+	for _, key := range keys {
+		if pending, ok := params.PendingFunctionCalls[key]; ok {
+			return pending, keysForPendingCodexFunctionCall(params, pending)
+		}
+	}
+	return nil, nil
+}
+func clearPendingCodexFunctionCalls(params *ConvertCodexResponseToClaudeParams) {
+	if params == nil || params.PendingFunctionCalls == nil {
+		return
+	}
+	for key := range params.PendingFunctionCalls {
+		delete(params.PendingFunctionCalls, key)
+	}
+	params.LastPendingFunctionCallKey = ""
+}
+func finalizeCodexOpenContentBlocks(params *ConvertCodexResponseToClaudeParams) []byte {
+	output := make([]byte, 0, 256)
+	output = append(output, finalizeCodexThinkingBlock(params)...)
+	output = append(output, stopCodexTextBlock(params)...)
+	if params != nil && params.FunctionCallBlockOpen && params.HasReceivedArgumentsDelta {
+		output = appendCodexOpenFunctionCallStop(output, params)
+	}
 	return output
 }

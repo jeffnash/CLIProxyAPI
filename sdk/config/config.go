@@ -11,6 +11,7 @@ type SDKConfig = internalconfig.SDKConfig
 type Config = internalconfig.Config
 
 type StreamingConfig = internalconfig.StreamingConfig
+type ClaudeCodeConfig = internalconfig.ClaudeCodeConfig
 type TLSConfig = internalconfig.TLSConfig
 type RemoteManagement = internalconfig.RemoteManagement
 type OAuthModelAlias = internalconfig.OAuthModelAlias
@@ -24,6 +25,8 @@ type ManagedProviderRouteHealthConfig = internalconfig.ManagedProviderRouteHealt
 
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
+type XAIKey = internalconfig.XAIKey
+type XAIModel = internalconfig.XAIModel
 type ClaudeKey = internalconfig.ClaudeKey
 type CursorKey = internalconfig.CursorKey
 type CursorModel = internalconfig.CursorModel
@@ -58,7 +61,6 @@ func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []stri
 func NormalizeCommentIndentation(data []byte) []byte {
 	return internalconfig.NormalizeCommentIndentation(data)
 }
-
 func ManagedProviderName(provider ManagedProviderConfig) string {
 	return internalconfig.ManagedProviderName(provider)
 }

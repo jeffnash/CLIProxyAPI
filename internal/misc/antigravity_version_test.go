@@ -2,6 +2,7 @@ package misc
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -9,8 +10,21 @@ import (
 	"time"
 )
 
-func overrideAntigravityVersionURLsForTest(t *testing.T, updaterBaseURL string, cliLatestURL string, cliListURL string) func() {
+func overrideAntigravityVersionURLsForTest(t *testing.T, hubManifestURL string) func() {
 	t.Helper()
+
+	oldHubManifest := antigravityHubLatestManifestURL
+	antigravityHubLatestManifestURL = hubManifestURL
+
+	return func() {
+		antigravityHubLatestManifestURL = oldHubManifest
+	}
+}
+
+func overrideAntigravityVersionCLIURLsForTest(t *testing.T, hubManifestURL string, updaterBaseURL string, cliLatestURL string, cliListURL string) func() {
+	t.Helper()
+
+	restoreHub := overrideAntigravityVersionURLsForTest(t, hubManifestURL)
 
 	oldUpdater := antigravityCLIUpdaterBaseURL
 	oldCLILatest := antigravityCLILatestURL
@@ -23,6 +37,7 @@ func overrideAntigravityVersionURLsForTest(t *testing.T, updaterBaseURL string, 
 		antigravityCLIUpdaterBaseURL = oldUpdater
 		antigravityCLILatestURL = oldCLILatest
 		antigravityCLIGCSListURL = oldCLIList
+		restoreHub()
 	}
 }
 
@@ -44,21 +59,35 @@ func overrideAntigravityVersionCacheForTest(t *testing.T, version string, expiry
 	}
 }
 
-func TestAntigravityLatestVersionUsesCurrentCLIFallback(t *testing.T) {
+func TestAntigravityLatestVersionUsesCurrentHubFallback(t *testing.T) {
 	restore := overrideAntigravityVersionCacheForTest(t, "", time.Time{})
 	defer restore()
 
 	version := AntigravityLatestVersion()
-	if version != "1.0.13" {
-		t.Fatalf("AntigravityLatestVersion() = %q, want %q", version, "1.0.13")
+	if version != antigravityFallbackVersion {
+		t.Fatalf("AntigravityLatestVersion() = %q, want %q", version, antigravityFallbackVersion)
 	}
 }
 
-func TestAntigravityUserAgentUsesCLIFamily(t *testing.T) {
-	restore := overrideAntigravityVersionCacheForTest(t, "1.0.8", time.Now().Add(time.Hour))
+// Cloud Code resolves newer models only for clients reporting at least 2.9.0;
+// older versions get 404 Requested entity was not found.
+func TestAntigravityFallbackVersionMeetsBackendFloor(t *testing.T) {
+	const floorMajor, floorMinor = 2, 9
+
+	var major, minor, patch int
+	if _, err := fmt.Sscanf(antigravityFallbackVersion, "%d.%d.%d", &major, &minor, &patch); err != nil {
+		t.Fatalf("antigravityFallbackVersion = %q is not a dotted version: %v", antigravityFallbackVersion, err)
+	}
+	if major < floorMajor || (major == floorMajor && minor < floorMinor) {
+		t.Fatalf("antigravityFallbackVersion = %q, want at least %d.%d.0", antigravityFallbackVersion, floorMajor, floorMinor)
+	}
+}
+
+func TestAntigravityUserAgentUsesHubFamily(t *testing.T) {
+	restore := overrideAntigravityVersionCacheForTest(t, "2.2.1", time.Now().Add(time.Hour))
 	defer restore()
 
-	want := "antigravity/cli/1.0.8 (aidev_client; os_type=darwin; arch=arm64)"
+	want := "antigravity/hub/2.2.1 darwin/arm64"
 	if got := AntigravityUserAgent(); got != want {
 		t.Fatalf("AntigravityUserAgent() = %q, want %q", got, want)
 	}
@@ -77,11 +106,23 @@ func TestAntigravityVersionFromUserAgentParsesAidevClientSuffix(t *testing.T) {
 	}
 }
 
+func TestAntigravityVersionFromUserAgentParsesHubFamily(t *testing.T) {
+	if got := AntigravityVersionFromUserAgent("antigravity/hub/2.2.1 darwin/arm64"); got != "2.2.1" {
+		t.Fatalf("AntigravityVersionFromUserAgent() = %q, want %q", got, "2.2.1")
+	}
+}
+
+func TestAntigravityVersionFromUserAgentParsesLegacyFamily(t *testing.T) {
+	if got := AntigravityVersionFromUserAgent("antigravity/1.23.2 windows/amd64"); got != "1.23.2" {
+		t.Fatalf("AntigravityVersionFromUserAgent() = %q, want %q", got, "1.23.2")
+	}
+}
+
 func TestAntigravityLoadCodeAssistUserAgentUsesShortUA(t *testing.T) {
-	restore := overrideAntigravityVersionCacheForTest(t, "1.0.13", time.Now().Add(time.Hour))
+	restore := overrideAntigravityVersionCacheForTest(t, "2.2.1", time.Now().Add(time.Hour))
 	defer restore()
 
-	want := "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)"
+	want := "antigravity/hub/2.2.1 darwin/arm64"
 	if got := AntigravityLoadCodeAssistUserAgent(""); got != want {
 		t.Fatalf("AntigravityLoadCodeAssistUserAgent() = %q, want %q", got, want)
 	}
@@ -117,7 +158,7 @@ func TestFetchAntigravityLatestVersionPrefersDarwinManifest(t *testing.T) {
 	}))
 	defer server.Close()
 
-	restore := overrideAntigravityVersionURLsForTest(t, server.URL+"/manifests", server.URL+"/cli-latest", server.URL+"/cli-list")
+	restore := overrideAntigravityVersionCLIURLsForTest(t, server.URL+"/hub/latest-arm64-mac.yml", server.URL+"/manifests", server.URL+"/cli-latest", server.URL+"/cli-list")
 	defer restore()
 
 	version, errFetch := fetchAntigravityLatestVersion(context.Background())
@@ -135,6 +176,46 @@ func TestFetchAntigravityLatestVersionPrefersDarwinManifest(t *testing.T) {
 	}
 }
 
+func TestAntigravityOnboardUserUserAgentUsesLongUA(t *testing.T) {
+	restore := overrideAntigravityVersionCacheForTest(t, "2.2.1", time.Now().Add(time.Hour))
+	defer restore()
+
+	want := "antigravity/hub/2.2.1 darwin/arm64 google-api-nodejs-client/10.3.0"
+	if got := AntigravityOnboardUserUserAgent(""); got != want {
+		t.Fatalf("AntigravityOnboardUserUserAgent() = %q, want %q", got, want)
+	}
+}
+
+func TestFetchAntigravityLatestVersionUsesHubManifest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/hub/latest-arm64-mac.yml":
+			if got := r.Header.Get("User-Agent"); got != "electron-builder" {
+				t.Errorf("hub manifest User-Agent = %q, want %q", got, "electron-builder")
+			}
+			if got := r.Header.Get("Cache-Control"); got != "no-cache" {
+				t.Errorf("hub manifest Cache-Control = %q, want %q", got, "no-cache")
+			}
+			w.Header().Set("Content-Type", "application/yaml")
+			_, _ = w.Write([]byte("version: 2.2.1\npath: Antigravity-arm64-mac.zip\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	restore := overrideAntigravityVersionURLsForTest(t, server.URL+"/hub/latest-arm64-mac.yml")
+	defer restore()
+
+	version, errFetch := fetchAntigravityLatestVersion(context.Background())
+	if errFetch != nil {
+		t.Fatalf("fetchAntigravityLatestVersion() error = %v", errFetch)
+	}
+	if version != "2.2.1" {
+		t.Fatalf("fetchAntigravityLatestVersion() = %q, want %q", version, "2.2.1")
+	}
+}
+
 func TestFetchAntigravityLatestVersionFallsBackToCLILatest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -148,7 +229,7 @@ func TestFetchAntigravityLatestVersionFallsBackToCLILatest(t *testing.T) {
 	}))
 	defer server.Close()
 
-	restore := overrideAntigravityVersionURLsForTest(t, server.URL+"/manifests", server.URL+"/cli-latest", server.URL+"/cli-list")
+	restore := overrideAntigravityVersionCLIURLsForTest(t, server.URL+"/hub/latest-arm64-mac.yml", server.URL+"/manifests", server.URL+"/cli-latest", server.URL+"/cli-list")
 	defer restore()
 
 	version, errFetch := fetchAntigravityLatestVersion(context.Background())
@@ -181,7 +262,7 @@ func TestFetchAntigravityLatestVersionFallsBackToCLIGCSList(t *testing.T) {
 	}))
 	defer server.Close()
 
-	restore := overrideAntigravityVersionURLsForTest(t, server.URL+"/manifests", server.URL+"/cli-latest", server.URL+"/cli-list")
+	restore := overrideAntigravityVersionCLIURLsForTest(t, server.URL+"/hub/latest-arm64-mac.yml", server.URL+"/manifests", server.URL+"/cli-latest", server.URL+"/cli-list")
 	defer restore()
 
 	version, errFetch := fetchAntigravityLatestVersion(context.Background())
@@ -207,5 +288,21 @@ func TestLatestAntigravityCLIVersionFromPrefixesSortsByNumericSemver(t *testing.
 	}
 	if version != "1.0.8" {
 		t.Fatalf("latestAntigravityCLIVersionFromPrefixes() = %q, want %q", version, "1.0.8")
+	}
+}
+
+func TestFetchAntigravityLatestVersionReturnsHubManifestError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "temporary outage", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	restore := overrideAntigravityVersionURLsForTest(t, server.URL+"/hub/latest-arm64-mac.yml")
+	defer restore()
+	defer overrideAntigravityVersionCLIURLsForTest(t, server.URL+"/hub/latest-arm64-mac.yml", server.URL+"/cli-manifests", server.URL+"/cli-latest", server.URL+"/cli-list")()
+
+	_, errFetch := fetchAntigravityLatestVersion(context.Background())
+	if errFetch == nil {
+		t.Fatal("fetchAntigravityLatestVersion() error = nil, want error")
 	}
 }

@@ -62,40 +62,30 @@ func TokenizerForModel(model string) (tokenizer.Codec, error) {
 		return &TokenizerWrapper{Codec: enc, AdjustmentFactor: 1.1}, nil
 	}
 
-	var enc tokenizer.Codec
-	var err error
-
 	switch {
 	case sanitized == "":
-		enc, err = tokenizer.Get(tokenizer.Cl100kBase)
-	case strings.HasPrefix(sanitized, "gpt-5.2"):
-		enc, err = tokenizer.ForModel(tokenizer.GPT5)
-	case strings.HasPrefix(sanitized, "gpt-5.1"):
-		enc, err = tokenizer.ForModel(tokenizer.GPT5)
+		return tokenizer.Get(tokenizer.Cl100kBase)
 	case strings.HasPrefix(sanitized, "gpt-5"):
-		enc, err = tokenizer.ForModel(tokenizer.GPT5)
+		return tokenizer.ForModel(tokenizer.GPT5)
+	case strings.HasPrefix(sanitized, "gpt-5.1"):
+		return tokenizer.ForModel(tokenizer.GPT5)
 	case strings.HasPrefix(sanitized, "gpt-4.1"):
-		enc, err = tokenizer.ForModel(tokenizer.GPT41)
+		return tokenizer.ForModel(tokenizer.GPT41)
 	case strings.HasPrefix(sanitized, "gpt-4o"):
-		enc, err = tokenizer.ForModel(tokenizer.GPT4o)
+		return tokenizer.ForModel(tokenizer.GPT4o)
 	case strings.HasPrefix(sanitized, "gpt-4"):
-		enc, err = tokenizer.ForModel(tokenizer.GPT4)
+		return tokenizer.ForModel(tokenizer.GPT4)
 	case strings.HasPrefix(sanitized, "gpt-3.5"), strings.HasPrefix(sanitized, "gpt-3"):
-		enc, err = tokenizer.ForModel(tokenizer.GPT35Turbo)
+		return tokenizer.ForModel(tokenizer.GPT35Turbo)
 	case strings.HasPrefix(sanitized, "o1"):
-		enc, err = tokenizer.ForModel(tokenizer.O1)
+		return tokenizer.ForModel(tokenizer.O1)
 	case strings.HasPrefix(sanitized, "o3"):
-		enc, err = tokenizer.ForModel(tokenizer.O3)
+		return tokenizer.ForModel(tokenizer.O3)
 	case strings.HasPrefix(sanitized, "o4"):
-		enc, err = tokenizer.ForModel(tokenizer.O4Mini)
+		return tokenizer.ForModel(tokenizer.O4Mini)
 	default:
-		enc, err = tokenizer.Get(tokenizer.O200kBase)
+		return tokenizer.Get(tokenizer.O200kBase)
 	}
-
-	if err != nil {
-		return nil, err
-	}
-	return &TokenizerWrapper{Codec: enc, AdjustmentFactor: 1.0}, nil
 }
 
 // CountOpenAIChatTokens approximates prompt tokens for OpenAI chat completions payloads.
@@ -123,21 +113,13 @@ func CountOpenAIChatTokens(enc tokenizer.Codec, payload []byte) (int64, error) {
 		return 0, nil
 	}
 
-	// Count text tokens
 	count, err := enc.Count(joined)
 	if err != nil {
 		return 0, err
 	}
-
-	// Extract and add image tokens from placeholders
-	imageTokens := extractImageTokens(joined)
-
-	return int64(count) + int64(imageTokens), nil
+	return int64(count), nil
 }
 
-// countClaudeChatTokens approximates prompt tokens for Claude API chat completions payloads.
-// This handles Claude's message format with system, messages, and tools.
-// Image tokens are estimated based on image dimensions when available.
 func countClaudeChatTokens(enc *TokenizerWrapper, payload []byte) (int64, error) {
 	if enc == nil {
 		return 0, fmt.Errorf("encoder is nil")

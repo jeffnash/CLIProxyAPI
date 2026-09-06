@@ -50,6 +50,9 @@ func ToOpenAIModelMap(info *ModelInfo) map[string]any {
 		// Alias for letta-server compatibility.
 		result["context_window"] = contextLength
 	}
+	if info.MaxContextLength > 0 {
+		result["max_context_length"] = info.MaxContextLength
+	}
 
 	maxCompletionTokens := info.MaxCompletionTokens
 	if maxCompletionTokens <= 0 && info.OutputTokenLimit > 0 {

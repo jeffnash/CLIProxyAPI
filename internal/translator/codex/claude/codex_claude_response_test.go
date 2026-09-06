@@ -3,6 +3,7 @@ package claude
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -171,54 +172,83 @@ func TestConvertCodexResponseToClaude_StreamThinkingWithoutReasoningItemStillInc
 	}
 }
 
-func TestConvertCodexResponseToClaude_StreamThinkingFinalizesPendingBlockBeforeNextSummaryPart(t *testing.T) {
+// codexThinkingStreamDigest collects the thinking-related events produced by a Codex
+// stream so tests can assert block/signature counts and the reassembled thinking text.
+type codexThinkingStreamDigest struct {
+	Starts     int
+	Stops      int
+	Signatures []string
+	Thinking   string
+	Raw        string
+}
+
+func digestCodexThinkingStream(t *testing.T, chunks [][]byte) codexThinkingStreamDigest {
+	t.Helper()
+
 	ctx := context.Background()
 	originalRequest := []byte(`{"messages":[]}`)
 	var param any
-
-	chunks := [][]byte{
-		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
-		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"First part\"}"),
-		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
-		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
-	}
 
 	var outputs [][]byte
 	for _, chunk := range chunks {
 		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
 	}
 
-	startCount := 0
-	stopCount := 0
+	var digest codexThinkingStreamDigest
+	var thinking strings.Builder
+	var raw strings.Builder
 	for _, out := range outputs {
+		raw.Write(out)
 		for _, line := range strings.Split(string(out), "\n") {
 			if !strings.HasPrefix(line, "data: ") {
 				continue
 			}
 			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
-			if data.Get("type").String() == "content_block_start" && data.Get("content_block.type").String() == "thinking" {
-				startCount++
-			}
-			if data.Get("type").String() == "content_block_stop" {
-				stopCount++
+			switch data.Get("type").String() {
+			case "content_block_start":
+				if data.Get("content_block.type").String() == "thinking" {
+					digest.Starts++
+				}
+			case "content_block_delta":
+				switch data.Get("delta.type").String() {
+				case "thinking_delta":
+					thinking.WriteString(data.Get("delta.thinking").String())
+				case "signature_delta":
+					digest.Signatures = append(digest.Signatures, data.Get("delta.signature").String())
+				}
+			case "content_block_stop":
+				digest.Stops++
 			}
 		}
 	}
+	digest.Thinking = thinking.String()
+	digest.Raw = raw.String()
 
-	if startCount != 2 {
-		t.Fatalf("expected 2 thinking block starts, got %d", startCount)
+	return digest
+}
+
+func TestConvertCodexResponseToClaude_StreamThinkingKeepsSingleBlockAcrossSummaryParts(t *testing.T) {
+	digest := digestCodexThinkingStream(t, [][]byte{
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"First part\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Second part\"}"),
+	})
+
+	if digest.Starts != 1 {
+		t.Fatalf("expected a single thinking block start for one reasoning item, got %d", digest.Starts)
 	}
-	if stopCount != 1 {
-		t.Fatalf("expected pending thinking block to be finalized before second start, got %d stops", stopCount)
+	if digest.Stops != 0 {
+		t.Fatalf("expected the thinking block to stay open until output_item.done, got %d stops", digest.Stops)
+	}
+	if want := "First part\n\nSecond part"; digest.Thinking != want {
+		t.Fatalf("thinking text = %q, want %q", digest.Thinking, want)
 	}
 }
 
-func TestConvertCodexResponseToClaude_StreamThinkingRetainsSignatureAcrossMultipartReasoning(t *testing.T) {
-	ctx := context.Background()
-	originalRequest := []byte(`{"messages":[]}`)
-	var param any
-
-	chunks := [][]byte{
+func TestConvertCodexResponseToClaude_StreamThinkingEmitsSingleSignatureAcrossMultipartReasoning(t *testing.T) {
+	digest := digestCodexThinkingStream(t, [][]byte{
 		[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig_multipart\"}}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"First part\"}"),
@@ -227,31 +257,80 @@ func TestConvertCodexResponseToClaude_StreamThinkingRetainsSignatureAcrossMultip
 		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Second part\"}"),
 		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
 		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}"),
-	}
+	})
 
-	var outputs [][]byte
-	for _, chunk := range chunks {
-		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+	if digest.Starts != 1 || digest.Stops != 1 {
+		t.Fatalf("expected exactly one thinking block, got %d starts and %d stops", digest.Starts, digest.Stops)
 	}
-
-	signatureDeltaCount := 0
-	for _, out := range outputs {
-		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.HasPrefix(line, "data: ") {
-				continue
-			}
-			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
-			if data.Get("type").String() == "content_block_delta" && data.Get("delta.type").String() == "signature_delta" {
-				signatureDeltaCount++
-				if got := data.Get("delta.signature").String(); got != "enc_sig_multipart" {
-					t.Fatalf("unexpected signature delta: %q", got)
-				}
-			}
-		}
+	if len(digest.Signatures) != 1 {
+		t.Fatalf("expected one signature_delta for one reasoning item, got %d: %v", len(digest.Signatures), digest.Signatures)
 	}
+	// output_item.done omitted encrypted_content here, so the pre-content fallback is expected.
+	if digest.Signatures[0] != "enc_sig_multipart" {
+		t.Fatalf("unexpected signature delta: %q", digest.Signatures[0])
+	}
+	if want := "First part\n\nSecond part"; digest.Thinking != want {
+		t.Fatalf("thinking text = %q, want %q", digest.Thinking, want)
+	}
+}
 
-	if signatureDeltaCount != 2 {
-		t.Fatalf("expected signature_delta for both multipart thinking blocks, got %d", signatureDeltaCount)
+// TestConvertCodexResponseToClaude_StreamThinkingNeverEmitsPreContentEncryptedContent guards the
+// real-world shape earlier tests missed: output_item.added carries a fixed-size pre-content
+// snapshot of encrypted_content that always differs from the final value on output_item.done.
+// Emitting that snapshot makes the client replay bogus reasoning items for the rest of the session.
+func TestConvertCodexResponseToClaude_StreamThinkingNeverEmitsPreContentEncryptedContent(t *testing.T) {
+	digest := digestCodexThinkingStream(t, [][]byte{
+		[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig_pre_content_snapshot\"}}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Part A\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Part B\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Part C\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_sig_final\"}}"),
+	})
+
+	if digest.Starts != 1 || digest.Stops != 1 {
+		t.Fatalf("expected one thinking block for one reasoning item with three summary parts, got %d starts and %d stops", digest.Starts, digest.Stops)
+	}
+	if len(digest.Signatures) != 1 || digest.Signatures[0] != "enc_sig_final" {
+		t.Fatalf("expected exactly one signature_delta carrying the final encrypted_content, got %v", digest.Signatures)
+	}
+	if strings.Contains(digest.Raw, "enc_sig_pre_content_snapshot") {
+		t.Fatal("pre-content encrypted_content snapshot leaked into the Claude stream")
+	}
+	if want := "Part A\n\nPart B\n\nPart C"; digest.Thinking != want {
+		t.Fatalf("thinking text = %q, want %q", digest.Thinking, want)
+	}
+}
+
+// TestConvertCodexResponseToClaude_StreamThinkingEmitsOneBlockPerReasoningItem checks that two
+// consecutive reasoning items stay separate blocks, each signed with its own final value.
+func TestConvertCodexResponseToClaude_StreamThinkingEmitsOneBlockPerReasoningItem(t *testing.T) {
+	digest := digestCodexThinkingStream(t, [][]byte{
+		[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_pre_1\"}}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"First item\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_final_1\"}}"),
+		[]byte("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_pre_2\"}}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.added\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Second item\"}"),
+		[]byte("data: {\"type\":\"response.reasoning_summary_part.done\"}"),
+		[]byte("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"enc_final_2\"}}"),
+	})
+
+	if digest.Starts != 2 || digest.Stops != 2 {
+		t.Fatalf("expected two thinking blocks for two reasoning items, got %d starts and %d stops", digest.Starts, digest.Stops)
+	}
+	if len(digest.Signatures) != 2 || digest.Signatures[0] != "enc_final_1" || digest.Signatures[1] != "enc_final_2" {
+		t.Fatalf("expected each block signed with its own final encrypted_content, got %v", digest.Signatures)
+	}
+	if strings.Contains(digest.Raw, "enc_pre_1") || strings.Contains(digest.Raw, "enc_pre_2") {
+		t.Fatal("pre-content encrypted_content snapshot leaked into the Claude stream")
 	}
 }
 
@@ -801,7 +880,8 @@ func TestConvertCodexResponseToClaude_StreamUnresolvedPendingFunctionCallDoesNot
 		t.Fatalf("stop_reason = %q, want end_turn. Outputs=%q", gotReason, outputs)
 	}
 	params, ok := param.(*ConvertCodexResponseToClaudeParams)
-	if !ok || len(params.PendingFunctionCalls) != 0 || params.LastPendingFunctionCallKey != "" {
+	if !ok || len(params.FunctionCalls) != 0 || len(params.FunctionCallQueue) != 0 || params.LastFunctionCall != nil ||
+		len(params.PendingFunctionCalls) != 0 || params.LastPendingFunctionCallKey != "" {
 		t.Fatalf("pending function calls were not cleared: %#v", param)
 	}
 }
@@ -1712,5 +1792,198 @@ func assertClaudeStreamContentBlocksWellFormed(t *testing.T, outputs [][]byte) {
 			}
 			messageStopped = true
 		}
+	}
+}
+
+func TestConvertCodexResponseToClaude_StreamPreservesCacheWriteUsage(t *testing.T) {
+	tests := []struct {
+		name                 string
+		terminalUsageJSON    string
+		wantInputTokens      int64
+		wantOutputTokens     int64
+		wantCacheReadTokens  int64
+		wantCacheWriteTokens int64
+	}{
+		{
+			name:                 "cache_write_tokens field",
+			terminalUsageJSON:    `{"input_tokens":1000,"output_tokens":200,"input_tokens_details":{"cached_tokens":800,"cache_write_tokens":150}}`,
+			wantInputTokens:      200,
+			wantOutputTokens:     200,
+			wantCacheReadTokens:  800,
+			wantCacheWriteTokens: 150,
+		},
+		{
+			name:                 "cache_creation_tokens field alias",
+			terminalUsageJSON:    `{"input_tokens":1000,"output_tokens":200,"input_tokens_details":{"cached_tokens":800,"cache_creation_tokens":150}}`,
+			wantInputTokens:      200,
+			wantOutputTokens:     200,
+			wantCacheReadTokens:  800,
+			wantCacheWriteTokens: 150,
+		},
+		{
+			name:                 "cached_tokens greater than input_tokens clamps input_tokens to zero",
+			terminalUsageJSON:    `{"input_tokens":500,"output_tokens":100,"input_tokens_details":{"cached_tokens":800,"cache_write_tokens":50}}`,
+			wantInputTokens:      0,
+			wantOutputTokens:     100,
+			wantCacheReadTokens:  800,
+			wantCacheWriteTokens: 50,
+		},
+		{
+			name:                 "zero cache_write_tokens does not emit cache_creation_input_tokens",
+			terminalUsageJSON:    `{"input_tokens":1000,"output_tokens":200,"input_tokens_details":{"cached_tokens":800,"cache_write_tokens":0}}`,
+			wantInputTokens:      200,
+			wantOutputTokens:     200,
+			wantCacheReadTokens:  800,
+			wantCacheWriteTokens: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			originalRequest := []byte(`{"messages":[]}`)
+			var param any
+
+			chunks := [][]byte{
+				[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}`),
+				[]byte(`data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}`),
+				[]byte(fmt.Sprintf(`data: {"type":"response.completed","response":{"stop_reason":"stop","usage":%s}}`, tt.terminalUsageJSON)),
+			}
+
+			var outputs [][]byte
+			for _, chunk := range chunks {
+				outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
+			}
+
+			delta, ok := findClaudeStreamMessageDelta(outputs)
+			if !ok {
+				t.Fatalf("missing message_delta event; outputs=%q", outputs)
+			}
+
+			usage := delta.Get("usage")
+			if got := usage.Get("input_tokens").Int(); got != tt.wantInputTokens {
+				t.Fatalf("input_tokens = %d, want %d", got, tt.wantInputTokens)
+			}
+			if got := usage.Get("output_tokens").Int(); got != tt.wantOutputTokens {
+				t.Fatalf("output_tokens = %d, want %d", got, tt.wantOutputTokens)
+			}
+			if got := usage.Get("cache_read_input_tokens").Int(); got != tt.wantCacheReadTokens {
+				t.Fatalf("cache_read_input_tokens = %d, want %d", got, tt.wantCacheReadTokens)
+			}
+			if tt.wantCacheWriteTokens == 0 {
+				if usage.Get("cache_creation_input_tokens").Exists() {
+					t.Fatalf("cache_creation_input_tokens should not be emitted when zero; got %v", usage.Get("cache_creation_input_tokens").Raw)
+				}
+			} else if got := usage.Get("cache_creation_input_tokens").Int(); got != tt.wantCacheWriteTokens {
+				t.Fatalf("cache_creation_input_tokens = %d, want %d", got, tt.wantCacheWriteTokens)
+			}
+		})
+	}
+}
+
+func TestConvertCodexResponseToClaudeNonStream_PreservesCacheWriteUsage(t *testing.T) {
+	tests := []struct {
+		name                 string
+		responseJSON         string
+		wantInputTokens      int64
+		wantOutputTokens     int64
+		wantCacheReadTokens  int64
+		wantCacheWriteTokens int64
+	}{
+		{
+			name: "cache_write_tokens field",
+			responseJSON: `{
+				"type":"response.completed",
+				"response":{
+					"id":"resp_1",
+					"model":"gpt-5",
+					"stop_reason":"stop",
+					"usage":{"input_tokens":1000,"output_tokens":200,"input_tokens_details":{"cached_tokens":800,"cache_write_tokens":150}},
+					"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]
+				}
+			}`,
+			wantInputTokens:      200,
+			wantOutputTokens:     200,
+			wantCacheReadTokens:  800,
+			wantCacheWriteTokens: 150,
+		},
+		{
+			name: "cache_creation_tokens alias",
+			responseJSON: `{
+				"type":"response.completed",
+				"response":{
+					"id":"resp_1",
+					"model":"gpt-5",
+					"stop_reason":"stop",
+					"usage":{"input_tokens":1000,"output_tokens":200,"input_tokens_details":{"cached_tokens":800,"cache_creation_tokens":150}},
+					"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]
+				}
+			}`,
+			wantInputTokens:      200,
+			wantOutputTokens:     200,
+			wantCacheReadTokens:  800,
+			wantCacheWriteTokens: 150,
+		},
+		{
+			name: "cached_tokens greater than input_tokens clamps input_tokens to zero",
+			responseJSON: `{
+				"type":"response.completed",
+				"response":{
+					"id":"resp_1",
+					"model":"gpt-5",
+					"stop_reason":"stop",
+					"usage":{"input_tokens":500,"output_tokens":100,"input_tokens_details":{"cached_tokens":800,"cache_write_tokens":50}},
+					"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]
+				}
+			}`,
+			wantInputTokens:      0,
+			wantOutputTokens:     100,
+			wantCacheReadTokens:  800,
+			wantCacheWriteTokens: 50,
+		},
+		{
+			name: "zero cache_write_tokens does not emit cache_creation_input_tokens",
+			responseJSON: `{
+				"type":"response.completed",
+				"response":{
+					"id":"resp_1",
+					"model":"gpt-5",
+					"stop_reason":"stop",
+					"usage":{"input_tokens":1000,"output_tokens":200,"input_tokens_details":{"cached_tokens":800,"cache_write_tokens":0}},
+					"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]
+				}
+			}`,
+			wantInputTokens:      200,
+			wantOutputTokens:     200,
+			wantCacheReadTokens:  800,
+			wantCacheWriteTokens: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			originalRequest := []byte(`{"messages":[]}`)
+			out := ConvertCodexResponseToClaudeNonStream(ctx, "", originalRequest, nil, []byte(tt.responseJSON), nil)
+			parsed := gjson.ParseBytes(out)
+
+			usage := parsed.Get("usage")
+			if got := usage.Get("input_tokens").Int(); got != tt.wantInputTokens {
+				t.Fatalf("input_tokens = %d, want %d", got, tt.wantInputTokens)
+			}
+			if got := usage.Get("output_tokens").Int(); got != tt.wantOutputTokens {
+				t.Fatalf("output_tokens = %d, want %d", got, tt.wantOutputTokens)
+			}
+			if got := usage.Get("cache_read_input_tokens").Int(); got != tt.wantCacheReadTokens {
+				t.Fatalf("cache_read_input_tokens = %d, want %d", got, tt.wantCacheReadTokens)
+			}
+			if tt.wantCacheWriteTokens == 0 {
+				if usage.Get("cache_creation_input_tokens").Exists() {
+					t.Fatalf("cache_creation_input_tokens should not be emitted when zero; got %v", usage.Get("cache_creation_input_tokens").Raw)
+				}
+			} else if got := usage.Get("cache_creation_input_tokens").Int(); got != tt.wantCacheWriteTokens {
+				t.Fatalf("cache_creation_input_tokens = %d, want %d", got, tt.wantCacheWriteTokens)
+			}
+		})
 	}
 }

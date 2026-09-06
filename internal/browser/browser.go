@@ -11,6 +11,7 @@ import (
 
 	pkgbrowser "github.com/pkg/browser"
 	log "github.com/sirupsen/logrus"
+	"github.com/skratchdot/open-golang/open"
 )
 
 // incognitoMode controls whether to open URLs in incognito/private mode.
@@ -49,6 +50,8 @@ func CloseBrowser() error {
 // It uses the pkg/browser library which provides robust cross-platform support
 // for Windows, macOS, and Linux.
 // If incognito mode is enabled, it will open in a private/incognito window.
+// It first attempts platform-agnostic libraries and falls back to
+// platform-specific commands if those fail.
 //
 // Parameters:
 //   - url: The URL to open.
@@ -65,13 +68,20 @@ func OpenURL(url string) error {
 	}
 
 	// Use pkg/browser for cross-platform support
-	err := pkgbrowser.OpenURL(url)
-	if err == nil {
+	if err := pkgbrowser.OpenURL(url); err == nil {
 		log.Debug("Successfully opened URL using pkg/browser library")
 		return nil
+	} else {
+		log.Debugf("pkg/browser failed: %v, trying open-golang library", err)
 	}
 
-	log.Debugf("pkg/browser failed: %v, trying platform-specific commands", err)
+	// Try using the open-golang library
+	if err := open.Run(url); err == nil {
+		log.Debug("Successfully opened URL using open-golang library")
+		return nil
+	} else {
+		log.Debugf("open-golang failed: %v, trying platform-specific commands", err)
+	}
 
 	// Fallback to platform-specific commands
 	return openURLPlatformSpecific(url)
@@ -492,6 +502,12 @@ func tryFallbackBrowsersLinuxChain(url string) *exec.Cmd {
 // Returns:
 //   - true if a browser can be opened, false otherwise.
 func IsAvailable() bool {
+	// First check if open-golang can work
+	testErr := open.Run("about:blank")
+	if testErr == nil {
+		return true
+	}
+
 	// Check platform-specific commands
 	switch runtime.GOOS {
 	case "darwin":

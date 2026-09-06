@@ -293,11 +293,17 @@ func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministicForStructuredSession(
 	if cacheKey1 == "" {
 		t.Fatalf("expected prompt_cache_key to be set: %s", string(body1))
 	}
-	if got := httpReq1.Header.Get("Session_id"); got != cacheKey1 {
-		t.Fatalf("Session_id header = %q, want %q", got, cacheKey1)
+	// The legacy Session_id spelling was normalized to canonical Session-Id
+	// upstream (fix(codex): normalize request session header); Conversation_id
+	// is not sent on the HTTP path (it travels on the websocket path instead).
+	if got := httpReq1.Header.Get("Session-Id"); got != cacheKey1 {
+		t.Fatalf("Session-Id header = %q, want %q", got, cacheKey1)
 	}
-	if got := httpReq1.Header.Get("Conversation_id"); got != cacheKey1 {
-		t.Fatalf("Conversation_id header = %q, want %q", got, cacheKey1)
+	if got := httpReq1.Header.Get("Session_id"); got != "" {
+		t.Fatalf("legacy Session_id header = %q, want empty", got)
+	}
+	if got := httpReq1.Header.Get("Conversation_id"); got != "" {
+		t.Fatalf("Conversation_id header = %q, want empty on the HTTP path", got)
 	}
 
 	// Simulate a cache miss (e.g., restart/eviction) and ensure the ID is still stable.

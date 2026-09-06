@@ -3,11 +3,13 @@ package xai
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	log "github.com/sirupsen/logrus"
 )
 
 // TokenStorage stores xAI OAuth credentials on disk.
@@ -40,18 +42,29 @@ func (ts *TokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "xai"
 	ts.AuthKind = "oauth"
+	if errMkdirAll := os.MkdirAll(filepath.Dir(authFilePath), 0o700); errMkdirAll != nil {
+		return fmt.Errorf("xai token storage: create directory: %w", errMkdirAll)
+	}
 
 	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
 	if errMerge != nil {
 		return fmt.Errorf("xai token storage: merge metadata: %w", errMerge)
 	}
-	encoded, errMarshal := json.MarshalIndent(data, "", "  ")
-	if errMarshal != nil {
-		return fmt.Errorf("xai token storage: marshal token file: %w", errMarshal)
+
+	file, err := os.OpenFile(authFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("xai token storage: create token file: %w", err)
 	}
-	encoded = append(encoded, '\n')
-	if errWrite := util.AtomicWriteFile(authFilePath, encoded, 0o600); errWrite != nil {
-		return fmt.Errorf("xai token storage: write token file: %w", errWrite)
+	defer func() {
+		if errClose := file.Close(); errClose != nil {
+			log.Errorf("xai token storage: close token file error: %v", errClose)
+		}
+	}()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err = encoder.Encode(data); err != nil {
+		return fmt.Errorf("xai token storage: write token file: %w", err)
 	}
 	return nil
 }

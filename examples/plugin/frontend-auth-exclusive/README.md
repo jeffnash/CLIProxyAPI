@@ -16,3 +16,4 @@ Build:
 cd examples/plugin/frontend-auth-exclusive/go
 go build -buildmode=c-shared -o /tmp/cliproxy-frontend-auth-exclusive.dylib .
 ```
+

@@ -143,6 +143,8 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 				chunkOutputs = append(chunkOutputs, contentTemplate)
 			}
 
+			// A chunk may combine content with tool calls and a finish reason:
+			// emit the content frame but keep processing the rest below.
 			if len(chunkOutputs) > 0 {
 				results = append(results, chunkOutputs...)
 			}
@@ -196,11 +198,14 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 					return true
 				})
 
-				// Don't output anything for tool call deltas - wait for completion
+				// Tool call deltas only accumulate here; a combined chunk falls
+				// through to the finish/usage handling below, while a pure
+				// tool-delta chunk appends nothing and yields no frame.
 			}
 
-			// Handle finish reason
-			if finishReason := choice.Get("finish_reason"); finishReason.Exists() && finishReason.Type != gjson.Null && finishReason.String() != "" {
+			// Handle finish reason. An explicit null is "not finished": it must
+			// not synthesize a STOP frame (gjson reports null as existing).
+			if finishReason := choice.Get("finish_reason"); finishReason.Exists() && finishReason.Type != gjson.Null {
 				geminiFinishReason := mapOpenAIFinishReasonToGemini(finishReason.String())
 				template, _ = sjson.SetBytes(template, "candidates.0.finishReason", geminiFinishReason)
 
@@ -568,6 +573,8 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 		out, _ = sjson.SetBytes(out, "model", model.String())
 	}
 
+	var allParts [][]byte
+
 	// Process choices
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() {
 		choices.ForEach(func(choiceIndex, choice gjson.Result) bool {
@@ -582,6 +589,12 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 			}
 
 			partIndex := 0
+			ensurePart := func(idx int) []byte {
+				for len(allParts) <= idx {
+					allParts = append(allParts, []byte(`{}`))
+				}
+				return allParts[idx]
+			}
 
 			// Handle reasoning content before visible text
 			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
@@ -589,22 +602,23 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 					if reasoningText == "" {
 						continue
 					}
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.thought", partIndex), true)
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.text", partIndex), reasoningText)
+					part := ensurePart(partIndex)
+					part, _ = sjson.SetBytes(part, "thought", true)
+					part, _ = sjson.SetBytes(part, "text", reasoningText)
+					allParts[partIndex] = part
 					partIndex++
 				}
 			}
 
 			// Handle content first
 			if content := message.Get("content"); content.Exists() && content.String() != "" {
-				out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.text", partIndex), content.String())
+				part := ensurePart(partIndex)
+				part, _ = sjson.SetBytes(part, "text", content.String())
+				allParts[partIndex] = part
 				partIndex++
 			}
 
-			// Handle tool calls. ADD-69: the non-stream path iterates the OpenAI
-			// tool_calls JSON ARRAY in order (gjson ForEach preserves array order),
-			// so parts are already emitted deterministically here — unlike the
-			// streaming path, this side never accumulates into a Go map.
+			// Handle tool calls
 			if toolCalls := message.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 				toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 					if toolCall.Get("type").String() == "function" {
@@ -613,21 +627,13 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 						functionArgs := function.Get("arguments").String()
 						functionID := toolCall.Get("id").String()
 
-						idPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.id", partIndex)
-						namePath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.name", partIndex)
-						argsPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.args", partIndex)
+						part := ensurePart(partIndex)
 						if functionID != "" {
-							out, _ = sjson.SetBytes(out, idPath, functionID)
+							part, _ = sjson.SetBytes(part, "functionCall.id", functionID)
 						}
-						out, _ = sjson.SetBytes(out, namePath, functionName)
-						out, _ = sjson.SetRawBytes(out, argsPath, []byte(parseArgsToObjectRaw(functionArgs)))
-						// Mirror the streaming path: surface the OpenAI tool-call id as
-						// functionCall.id so the Gemini client echoes it as functionResponse.id
-						// and the id round-trips exactly. Only when non-empty. Contract C-GEMID.
-						if toolID := toolCall.Get("id").String(); toolID != "" {
-							idPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.id", partIndex)
-							out, _ = sjson.SetBytes(out, idPath, toolID)
-						}
+						part, _ = sjson.SetBytes(part, "functionCall.name", functionName)
+						part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(parseArgsToObjectRaw(functionArgs)))
+						allParts[partIndex] = part
 						partIndex++
 					}
 					return true
@@ -645,6 +651,10 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 
 			return true
 		})
+
+		if len(allParts) > 0 {
+			out, _ = sjson.SetRawBytes(out, "candidates.0.content.parts", translatorcommon.JoinRawArray(allParts))
+		}
 	}
 
 	// Handle usage information
