@@ -14,8 +14,8 @@ const maxStatelessPromptCacheSignalBytes = 4096
 // StatelessPromptCacheKey derives a deterministic prompt_cache_key for
 // stateless clients that send neither prompt_cache_key nor session identity
 // (e.g. OMP openai-responses turns, which re-send the full history every
-// turn). Stability across append-only turns is what lets upstream prefix
-// caches (Meta Muse Spark, OpenAI) engage.
+// turn). Stability across append-only turns gives the key routing affinity
+// (Meta) or a stable cache scope (OpenAI).
 //
 // identity must identify the downstream credential (APIKeyFromContext). An
 // empty identity yields "" so anonymous payloads never gain a cache scope.
