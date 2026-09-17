@@ -80,6 +80,19 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			out, _ = sjson.SetBytes(out, "previous_response_id", v)
 		}
 	}
+	// Carry explicit prompt-cache directives so upstream prefix caches (Meta
+	// Muse Spark, OpenAI) engage on the translated body. Blank values stay
+	// omitted so executor fallback derivation can still apply.
+	if cacheKey := root.Get("prompt_cache_key"); cacheKey.Exists() && cacheKey.Type == gjson.String {
+		if v := strings.TrimSpace(cacheKey.String()); v != "" {
+			out, _ = sjson.SetBytes(out, "prompt_cache_key", v)
+		}
+	}
+	if retention := root.Get("prompt_cache_retention"); retention.Exists() && retention.Type == gjson.String {
+		if v := strings.TrimSpace(retention.String()); v != "" {
+			out, _ = sjson.SetBytes(out, "prompt_cache_retention", v)
+		}
+	}
 	if convID := responsesConversationID(root); convID != "" {
 		out, _ = sjson.SetBytes(out, "conversation_id", convID)
 	}

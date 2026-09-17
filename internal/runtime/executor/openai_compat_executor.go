@@ -909,13 +909,16 @@ func (e *OpenAICompatExecutor) applyPromptCacheKey(ctx context.Context, auth *cl
 		}
 	}
 
-	sessionID := helps.ProviderSessionUUID(e.provider, opts.Metadata, req.Metadata)
-	if sessionID == "" {
-		return translated, nil
-	}
 	provider := strings.TrimSpace(e.provider)
 	if provider == "" {
 		provider = strings.TrimSpace(compat.Name)
+	}
+	sessionID := helps.ProviderSessionUUID(e.provider, opts.Metadata, req.Metadata)
+	if sessionID == "" {
+		if fallback := helps.StatelessPromptCacheKey(provider, modelName, from.String(), req.Payload, helps.APIKeyFromContext(ctx)); fallback != "" {
+			return helps.SetStringIfDifferent(translated, "prompt_cache_key", fallback), nil
+		}
+		return translated, nil
 	}
 	identity := strings.Join([]string{
 		"cli-proxy-api:openai-compat:prompt-cache",

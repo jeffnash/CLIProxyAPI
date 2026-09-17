@@ -120,6 +120,11 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		if promptCacheKey.Exists() {
 			cache.ID = promptCacheKey.String()
 		}
+		if cache.ID == "" {
+			if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+				cache.ID = helps.StatelessPromptCacheKey("codex", thinking.ParseSuffix(req.Model).ModelName, from.String(), req.Payload, apiKey)
+			}
+		}
 	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
 		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
 			cache.ID = strings.TrimSpace(promptCacheKey.String())

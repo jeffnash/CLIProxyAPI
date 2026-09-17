@@ -392,3 +392,64 @@ func TestCodexExecutorCacheHelper_ClaudeAgentScopeUsesResolvedModelAcrossHTTPAnd
 		t.Fatalf("HTTP/WebSocket prompt keys differ: http=%q websocket=%q", childKey, websocketKey)
 	}
 }
+
+func TestCodexExecutorCacheHelper_OpenAIResponses_StatelessFallbackStableAcrossTurns(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Set("userApiKey", "downstream-caller")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	executor := &CodexExecutor{}
+	url := "https://example.com/responses"
+	// Append-only stateless resend without prompt_cache_key or
+	// previous_response_id, as OMP openai-responses clients behave.
+	turns := [][]byte{
+		[]byte(`{"model":"muse-spark-1.3-contributor","instructions":"be concise","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`),
+		[]byte(`{"model":"muse-spark-1.3-contributor","instructions":"be concise","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}`),
+	}
+
+	keys := make([]string, 0, len(turns))
+	for _, payload := range turns {
+		req := cliproxyexecutor.Request{Model: "muse-spark-1.3-contributor", Payload: payload}
+		rawJSON := []byte(`{"model":"muse-spark-1.3-contributor","stream":true}`)
+		httpReq, _, _, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, nil, req, req.Payload, rawJSON)
+		if err != nil {
+			t.Fatalf("cacheHelper error: %v", err)
+		}
+		body, errRead := io.ReadAll(httpReq.Body)
+		if errRead != nil {
+			t.Fatalf("read request body: %v", errRead)
+		}
+		keys = append(keys, gjson.GetBytes(body, "prompt_cache_key").String())
+	}
+	if keys[0] == "" {
+		t.Fatalf("stateless responses turn produced no prompt_cache_key")
+	}
+	if keys[0] != keys[1] {
+		t.Fatalf("stateless prompt_cache_key unstable across turns: %q vs %q", keys[0], keys[1])
+	}
+	if _, errParse := uuid.Parse(keys[0]); errParse != nil {
+		t.Fatalf("stateless prompt_cache_key %q is not a UUID: %v", keys[0], errParse)
+	}
+}
+
+func TestCodexExecutorCacheHelper_OpenAIResponses_NoFallbackWithoutIdentity(t *testing.T) {
+	executor := &CodexExecutor{}
+	payload := []byte(`{"model":"muse-spark-1.3-contributor","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
+	req := cliproxyexecutor.Request{Model: "muse-spark-1.3-contributor", Payload: payload}
+
+	httpReq, _, _, err := executor.cacheHelper(context.Background(), sdktranslator.FromString("openai-response"), "https://example.com/responses", nil, req, req.Payload, []byte(`{"model":"muse-spark-1.3-contributor","stream":true}`))
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+	body, errRead := io.ReadAll(httpReq.Body)
+	if errRead != nil {
+		t.Fatalf("read request body: %v", errRead)
+	}
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "" {
+		t.Fatalf("identity-less request must not gain a prompt_cache_key, got %q", got)
+	}
+	if got := httpReq.Header["Session-Id"]; len(got) != 0 {
+		t.Fatalf("identity-less request must not gain Session-Id, got %#v", got)
+	}
+}

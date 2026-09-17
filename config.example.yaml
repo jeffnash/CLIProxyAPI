@@ -755,7 +755,10 @@ nonstream-keepalive-interval: 0
 #     disabled: false # optional: set to true to disable this provider without removing it
 #     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
-#     support-prompt-cache-key: false # optional: derive prompt_cache_key for requests from all input protocols
+#     support-prompt-cache-key: false # optional: derive prompt_cache_key for requests from all input protocols.
+#     # Set true for upstreams that require an explicit key for prefix caching (Meta Muse Spark, OpenAI):
+#     # caller keys pass through untouched, and stateless clients (no key/session) get a stable
+#     # per-credential + conversation-prefix fallback so append-only turns can hit the cache.
 #     disable-cooling: false # optional provider override: true disables cooling, false enables it; omit to inherit global
 #     request-retry: 3 # optional per-provider override; 0 disables additional rounds; omit or set < 0 to inherit global
 #     request-scoped-errors: # optional: custom rules to classify upstream errors by status and body patterns

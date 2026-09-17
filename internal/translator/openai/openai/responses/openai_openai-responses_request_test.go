@@ -1779,3 +1779,38 @@ func TestResponsesCustomToolNames_OnlyReportsMergedTools(t *testing.T) {
 		}
 	}
 }
+
+func TestConvertOpenAIResponsesRequest_PreservesPromptCacheDirectives(t *testing.T) {
+	raw := []byte(`{
+		"model": "muse-spark-1.3-contributor",
+		"prompt_cache_key": "session-abc",
+		"prompt_cache_retention": "in_memory",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("muse-spark-1.3-contributor", raw, false)
+
+	if got := gjson.GetBytes(out, "prompt_cache_key").String(); got != "session-abc" {
+		t.Fatalf("prompt_cache_key = %q, want session-abc; out=%s", got, prettyJSONForTest(out))
+	}
+	if got := gjson.GetBytes(out, "prompt_cache_retention").String(); got != "in_memory" {
+		t.Fatalf("prompt_cache_retention = %q, want in_memory; out=%s", got, prettyJSONForTest(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequest_OmitsBlankPromptCacheDirectives(t *testing.T) {
+	raw := []byte(`{
+		"model": "muse-spark-1.3-contributor",
+		"prompt_cache_key": "   ",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("muse-spark-1.3-contributor", raw, false)
+
+	if got := gjson.GetBytes(out, "prompt_cache_key"); got.Exists() {
+		t.Fatalf("blank prompt_cache_key must be omitted, got %q; out=%s", got.String(), prettyJSONForTest(out))
+	}
+	if got := gjson.GetBytes(out, "prompt_cache_retention"); got.Exists() {
+		t.Fatalf("missing prompt_cache_retention must stay omitted, got %q; out=%s", got.String(), prettyJSONForTest(out))
+	}
+}
