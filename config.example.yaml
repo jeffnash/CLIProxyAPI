@@ -1058,11 +1058,6 @@ nonstream-keepalive-interval: 0
 #     # requests (e.g., unsupported input formats like images for text-only models)
 #     # but the model remains available for other requests.
 #     lenient: true
-#     # Stable breakpoints: place prompt-cache breakpoints only on system/tools.
-#     # Required for Claude-protocol upstreams (e.g. api.meta.ai) whose cache only
-#     # reuses a byte-stable breakpointed prefix; the default rolling breakpoint on
-#     # the latest message would bust the cache on every turn.
-#     stable-cache-breakpoints: true
 #     # Alternatively, use explicit rate-limit settings for more granular control:
 #     # rate-limit:
 #     #   request-retry: 3

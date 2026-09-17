@@ -1479,25 +1479,6 @@ func ensureCacheControl(payload []byte) []byte {
 	return payload
 }
 
-// claudeStableCacheBreakpoints reports whether the credential opts into
-// stable breakpoint placement (passthru stable-cache-breakpoints). Such
-// upstreams only reuse a breakpointed prefix that is byte-stable across
-// turns, so the rolling latest-message breakpoint must stay off.
-func claudeStableCacheBreakpoints(auth *cliproxyauth.Auth) bool {
-	return auth != nil && auth.Attributes["stable_cache_breakpoints"] == "true"
-}
-
-// ensureStableCacheControl injects cache_control breakpoints only on
-// conversation-stable sections: the last system block and the last eligible
-// tool. Unlike ensureCacheControl it never adds the rolling latest-message
-// breakpoint, which would bust prefix caches (e.g. api.meta.ai) on every
-// turn. Caller-supplied markers are still respected by each injector.
-func ensureStableCacheControl(payload []byte) []byte {
-	payload = injectSystemCacheControl(payload)
-	payload = injectToolsCacheControl(payload)
-	return payload
-}
-
 // claudePayloadHasCacheableSystem reports whether the payload has a system prompt
 // that injectSystemCacheControl can actually host a breakpoint on. An absent key, an
 // empty array and an empty string all leave the tools prefix uncovered.

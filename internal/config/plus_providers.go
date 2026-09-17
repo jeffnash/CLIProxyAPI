@@ -47,13 +47,6 @@ type PassthruRoute struct {
 	// before forwarding to the upstream, and restored on the response. Required for strict upstreams
 	// like api.meta.ai that enforce a 64-char limit (e.g., chrome-devtools-mcp tools).
 	TruncateTools bool `yaml:"truncate-tools,omitempty" json:"truncate-tools,omitempty"`
-	// StableCacheBreakpoints places prompt-cache breakpoints only on
-	// conversation-stable sections (system prompt, tool definitions) and skips
-	// the rolling latest-message breakpoint. Required for upstreams such as
-	// api.meta.ai whose cache only reuses a breakpointed prefix that is
-	// byte-stable across turns; the Anthropic-style rolling breakpoint would
-	// bust the cache on every turn.
-	StableCacheBreakpoints bool `yaml:"stable-cache-breakpoints,omitempty" json:"stable-cache-breakpoints,omitempty"`
 }
 
 // PassthruPayload defines route-scoped payload parameter rules.
