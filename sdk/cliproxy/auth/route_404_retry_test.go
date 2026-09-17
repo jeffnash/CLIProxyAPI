@@ -39,6 +39,10 @@ func TestExplicitRoute404Retry(t *testing.T) {
 			if got != tc.want || wait != 0 {
 				t.Fatalf("zero cooldown wait: got retry=%v wait=%v, want retry=%v", got, wait, tc.want)
 			}
+			wait, got = m.shouldRetryAfterError(&Error{HTTPStatus: http.StatusNotFound, Message: tc.message}, tc.attempt, []string{tc.provider}, tc.model, -time.Second)
+			if got != tc.want || wait != 0 {
+				t.Fatalf("negative cooldown wait: got retry=%v wait=%v, want retry=%v", got, wait, tc.want)
+			}
 		})
 	}
 }

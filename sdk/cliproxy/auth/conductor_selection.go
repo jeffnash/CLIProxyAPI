@@ -1213,7 +1213,7 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 				state := auth.ModelStates[m.selectionModelForAuth(auth, model)]
 				if state != nil && statusCodeFromResult(state.LastError) == http.StatusNotFound {
 					m.mu.RUnlock()
-					return min(time.Second, maxWait), true
+					return max(0, min(time.Second, maxWait)), true
 				}
 			}
 		}
