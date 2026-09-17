@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/durablestate"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -115,6 +117,10 @@ func (s *Service) Run(ctx context.Context) error {
 		redisqueue.SetEnabled(true)
 	}
 
+	if err := s.startDurableRuntime(ctx); err != nil {
+		return err
+	}
+
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
 	s.syncPluginRuntimeConfig(ctx)
@@ -213,6 +219,31 @@ func (s *Service) Run(ctx context.Context) error {
 	case errServer := <-s.serverErr:
 		return errServer
 	}
+}
+
+// startDurableRuntime boots the optional Go-owned durable-state coordinator
+// (Unix socket + writer lease) when CLIPROXY_STATE_SOCKET is configured.
+// Deployments with a Cursor bridge block /readyz on this socket, so a missing
+// startup silently wedges the boot.
+func (s *Service) startDurableRuntime(ctx context.Context) error {
+	rtCfg := durablestate.LoadRuntimeConfigFromEnv()
+	if !durablestate.ShouldStartRuntime(rtCfg) {
+		return nil
+	}
+	rt, errRT := durablestate.OpenRuntime(ctx, rtCfg)
+	if errRT != nil {
+		return fmt.Errorf("cliproxy: durable state runtime: %w", errRT)
+	}
+	s.durableRuntime = rt
+	log.Infof("durable-state coordinator listening on %s (backend=%s epoch=%d)", rt.Socket, runtimeBackendKind(rtCfg), rt.Epoch)
+	return nil
+}
+
+func runtimeBackendKind(cfg durablestate.RuntimeConfig) string {
+	if strings.TrimSpace(cfg.PostgresDSN) != "" {
+		return "postgres"
+	}
+	return "sqlite"
 }
 
 // Shutdown gracefully stops background workers and the HTTP server.
@@ -325,6 +356,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 					shutdownErr = err
 				}
 			}
+		}
+
+		if s.durableRuntime != nil {
+			if err := s.durableRuntime.Close(ctx); err != nil {
+				log.Errorf("error stopping durable-state runtime: %v", err)
+				if shutdownErr == nil {
+					shutdownErr = err
+				}
+			}
+			s.durableRuntime = nil
 		}
 
 		if s.pluginHost != nil {
