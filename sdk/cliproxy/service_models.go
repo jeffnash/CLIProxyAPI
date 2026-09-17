@@ -2,13 +2,16 @@ package cliproxy
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
 
+	grokauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/grok"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
@@ -17,6 +20,92 @@ import (
 // registerModelsForAuth (re)binds provider models in the global registry using the core auth ID as client identifier.
 func (s *Service) registerModelsForAuth(ctx context.Context, a *coreauth.Auth) {
 	s.registerModelsForAuthWithCache(ctx, a, nil)
+}
+
+// registerPassthruModelsForAuth registers a passthru route's routing name as
+// a model ID so clients can request it directly; the executor forwards the
+// upstream model to the remote API.
+func (s *Service) registerPassthruModelsForAuth(a *coreauth.Auth) {
+	routingName := strings.TrimSpace(a.Attributes["passthru_routing_name"])
+	if routingName == "" {
+		routingName = strings.TrimSpace(a.Attributes["passthru_model"])
+	}
+	if routingName == "" {
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(a.Provider))
+	if provider == "" {
+		provider = "openai-compatibility"
+	}
+	// Parse context window and max tokens from attributes, use defaults if not set
+	contextWindow := 128000
+	maxTokens := 32000
+	if v := strings.TrimSpace(a.Attributes["context_window"]); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			contextWindow = parsed
+		}
+	}
+	if v := strings.TrimSpace(a.Attributes["max_tokens"]); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			maxTokens = parsed
+		}
+	}
+	models := []*ModelInfo{{
+		ID:                  routingName,
+		Object:              "model",
+		Created:             time.Now().Unix(),
+		OwnedBy:             "passthru",
+		Type:                provider,
+		DisplayName:         routingName,
+		ContextLength:       contextWindow,
+		MaxCompletionTokens: maxTokens,
+		UserDefined:         true,
+	}}
+
+	// Resolve model capabilities. Priority:
+	// 1. Explicit model-override from passthru JSON → highest priority
+	// 2. Static model definitions (by upstream model name) → fallback
+	// 3. UserDefined=true → thinking config passed through to upstream without validation
+	upstreamModel := strings.TrimSpace(a.Attributes["upstream_model"])
+	if upstreamModel == "" {
+		upstreamModel = strings.TrimSpace(a.Attributes["passthru_model"])
+	}
+	// Try static resolution first
+	if upstreamModel != "" {
+		if static := registry.LookupStaticModelInfo(upstreamModel); static != nil {
+			if static.Thinking != nil {
+				models[0].Thinking = static.Thinking
+			}
+			if static.MaxCompletionTokens > 0 && models[0].MaxCompletionTokens == 32000 {
+				models[0].MaxCompletionTokens = static.MaxCompletionTokens
+			}
+			if static.ContextLength > 0 && models[0].ContextLength == 128000 {
+				models[0].ContextLength = static.ContextLength
+			}
+		}
+	}
+	// Apply explicit model-override (overrides static resolution)
+	if overrideJSON := strings.TrimSpace(a.Attributes["model_override"]); overrideJSON != "" {
+		var override registry.ModelInfo
+		if err := json.Unmarshal([]byte(overrideJSON), &override); err == nil {
+			if override.Thinking != nil {
+				models[0].Thinking = override.Thinking
+			}
+			if override.MaxCompletionTokens > 0 {
+				models[0].MaxCompletionTokens = override.MaxCompletionTokens
+			}
+			if override.ContextLength > 0 {
+				models[0].ContextLength = override.ContextLength
+			}
+		} else {
+			short := overrideJSON
+			if len(short) > 200 {
+				short = short[:200] + "..."
+			}
+			log.Warnf("passthru %s: failed to parse model_override JSON: %v | override=%s", a.ID, err, short)
+		}
+	}
+	GlobalModelRegistry().RegisterClient(a.ID, provider, models)
 }
 
 func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreauth.Auth, compatCache *openAICompatibilityRegistrationCache) {
@@ -32,6 +121,19 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	if a.Disabled {
 		GlobalModelRegistry().UnregisterClient(a.ID)
 		return
+	}
+	if a.Attributes != nil {
+		if v := strings.TrimSpace(a.Attributes["gemini_virtual_primary"]); strings.EqualFold(v, "true") {
+			GlobalModelRegistry().UnregisterClient(a.ID)
+			return
+		}
+		// Handle passthru routes: register the routing name as a model ID.
+		// This allows clients to request model: "zai-glm-4.7" which routes to the passthru
+		// provider and forwards the upstream model (e.g., glm-4.7) to the remote API.
+		if strings.EqualFold(strings.TrimSpace(a.Attributes["passthru"]), "true") {
+			s.registerPassthruModelsForAuth(a)
+			return
+		}
 	}
 	authKind := a.AuthKind()
 	// Unregister legacy client ID (if present) to avoid double counting
@@ -142,6 +244,37 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 			models = registry.GetCodexProModels()
 		}
 		models = applyExcludedModels(models, excluded)
+	case "copilot":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		var fetchErr error
+		models, fetchErr = executor.NewCopilotExecutor(s.cfg).FetchModels(ctx, a, s.cfg)
+		cancel()
+		if fetchErr != nil {
+			log.Warnf("copilot: dynamic model fetch failed for auth %s: %v", a.ID, fetchErr)
+		}
+		if len(models) == 0 {
+			log.Warnf("copilot: using static fallback models for auth %s", a.ID)
+			models = registry.GetCopilotModels()
+		}
+	case "qwen":
+		models = registry.GetQwenModels()
+		models = applyExcludedModels(models, excluded)
+	case "iflow":
+		models = registry.GetIFlowModels()
+	case "kiro":
+		models = registry.GetKiroModels()
+		models = applyExcludedModels(models, excluded)
+	case "grok":
+		models = grokauth.GetGrokModels()
+		models = applyExcludedModels(models, excluded)
+	case "chutes":
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		models = executor.NewChutesExecutor(s.cfg).FetchModels(ctx, a, s.cfg)
+		cancel()
+		if len(models) == 0 {
+			log.Warnf("chutes: using static fallback models for auth %s", a.ID)
+			models = registry.GetChutesModels()
+		}
 	case "kimi":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
@@ -156,7 +289,28 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 			}
 		}
 		models = applyExcludedModels(models, excluded)
+	case "cursor":
+		models = registry.GetCursorModels()
+		if entry := s.resolveConfigCursorKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildCursorConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
+		log.Debugf("cursor: registerModelsForAuth provider=%s authID=%s models=%d excluded=%v", provider, a.ID, len(models), excluded)
 	default:
+		if s.isManagedProvider(provider) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			models = executor.NewManagedProviderExecutor(provider, s.cfg).FetchModels(ctx, a, s.cfg)
+			cancel()
+			if len(models) == 0 {
+				log.Warnf("%s: no dynamic or fallback managed-provider models for auth %s", provider, a.ID)
+			}
+			break
+		}
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
 			providerKey := provider
