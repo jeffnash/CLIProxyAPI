@@ -392,3 +392,49 @@ func TestLoadConfigOptional_PassthruModelsJSON_ApiKeyAndApiKeys_Combined(t *test
 		t.Fatalf("expected api-keys[0] to be sk-backup-1, got %q", r.APIKeys[0])
 	}
 }
+
+func TestLoadConfigOptional_PassthruModelsJSON_StableCacheBreakpoints(t *testing.T) {
+	old := os.Getenv("PASSTHRU_MODELS_JSON")
+	t.Cleanup(func() {
+		_ = os.Setenv("PASSTHRU_MODELS_JSON", old)
+	})
+
+	tmp := t.TempDir()
+	path := tmp + "/config.yaml"
+	if err := os.WriteFile(path, []byte("port: 8317\n"), 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	jsonValue := `[
+  {
+    "model": "muse-spark-1.3-contributor",
+    "protocol": "claude",
+    "base-url": "https://api.meta.ai",
+    "api-key": "meta-key",
+    "stable-cache-breakpoints": true
+  },
+  {
+    "model": "glm-4.7",
+    "protocol": "claude",
+    "base-url": "https://api.z.ai/api/anthropic",
+    "api-key": "za-123"
+  }
+]`
+	if err := os.Setenv("PASSTHRU_MODELS_JSON", jsonValue); err != nil {
+		t.Fatalf("failed to set env: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(path, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Passthru) != 2 {
+		t.Fatalf("expected 2 passthru routes, got %d", len(cfg.Passthru))
+	}
+	if !cfg.Passthru[0].StableCacheBreakpoints {
+		t.Fatalf("expected stable-cache-breakpoints true for route 0")
+	}
+	if cfg.Passthru[1].StableCacheBreakpoints {
+		t.Fatalf("expected stable-cache-breakpoints false by default for route 1")
+	}
+}

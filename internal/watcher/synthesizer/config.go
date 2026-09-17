@@ -168,6 +168,9 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 			if r.TruncateTools {
 				attrs["truncate_tools"] = "true"
 			}
+			if r.StableCacheBreakpoints {
+				attrs["stable_cache_breakpoints"] = "true"
+			}
 			if r.SupportsDeveloperRole != nil {
 				attrs["supports_developer_role"] = strconv.FormatBool(*r.SupportsDeveloperRole)
 			}

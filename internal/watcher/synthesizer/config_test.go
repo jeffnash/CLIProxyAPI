@@ -215,6 +215,45 @@ func TestConfigSynthesizer_PassthruRoutes_UsesRoutingNameForModelID(t *testing.T
 	}
 }
 
+func TestConfigSynthesizer_PassthruRoutes_StableCacheBreakpoints(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			Passthru: []config.PassthruRoute{
+				{
+					Model:                  "muse-spark-1.3-contributor",
+					Protocol:               "claude",
+					BaseURL:                "https://api.meta.ai",
+					APIKey:                 "meta-key",
+					StableCacheBreakpoints: true,
+				},
+				{
+					Model:    "zai-glm-4.7",
+					Protocol: "claude",
+					BaseURL:  "https://api.z.ai/api/anthropic",
+					APIKey:   "za-123",
+				},
+			},
+		},
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("expected 2 auths, got %d", len(auths))
+	}
+	if got := auths[0].Attributes["stable_cache_breakpoints"]; got != "true" {
+		t.Fatalf("opted-in route attr = %q, want true", got)
+	}
+	if got, ok := auths[1].Attributes["stable_cache_breakpoints"]; ok {
+		t.Fatalf("default route must not set the attr, got %q", got)
+	}
+}
+
 // TestConfigSynthesizer_PassthruRoutes_AutoUpstreamModel verifies that when ModelRoutingName
 // differs from Model and UpstreamModel is not explicitly set, upstream_model is automatically
 // set to Model so executors know which model to send upstream.

@@ -221,7 +221,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// forces Cloak off for a confirmed native client.
 	cpaOwnsCacheControl := shouldEnsureCacheControl(body, cloaked, confirmedClaudeCode)
 	if cpaOwnsCacheControl {
-		body = ensureCacheControl(body)
+		if claudeStableCacheBreakpoints(auth) {
+			body = ensureStableCacheControl(body)
+		} else {
+			body = ensureCacheControl(body)
+		}
 	}
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).

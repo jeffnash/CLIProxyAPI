@@ -698,3 +698,50 @@ func TestClaudeExecutorCloakedRollingCacheBreakpointAdvances(t *testing.T) {
 		t.Fatalf("cache_control count = %d, want at most 4: %s", total, longBody)
 	}
 }
+
+func TestEnsureStableCacheControl(t *testing.T) {
+	input := []byte(`{"model":"m","system":[{"type":"text","text":"sys1"},{"type":"text","text":"sys2"}],"tools":[{"name":"a"},{"name":"b"}],"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},{"role":"assistant","content":[{"type":"text","text":"hi"}]},{"role":"user","content":[{"type":"text","text":"next"}]}]}`)
+
+	output := ensureStableCacheControl(input)
+
+	if got := gjson.GetBytes(output, "system.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("system.1.cache_control.type = %q, want ephemeral: %s", got, output)
+	}
+	if gjson.GetBytes(output, "system.0.cache_control").Exists() {
+		t.Fatalf("system.0 must not carry a breakpoint: %s", output)
+	}
+	if got := gjson.GetBytes(output, "tools.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("tools.1.cache_control.type = %q, want ephemeral: %s", got, output)
+	}
+	if gjson.GetBytes(output, "tools.0.cache_control").Exists() {
+		t.Fatalf("tools.0 must not carry a breakpoint: %s", output)
+	}
+	for _, path := range []string{"messages.0.content.0.cache_control", "messages.1.content.0.cache_control", "messages.2.content.0.cache_control"} {
+		if gjson.GetBytes(output, path).Exists() {
+			t.Fatalf("stable placement must not stamp %s: %s", path, output)
+		}
+	}
+}
+
+func TestEnsureStableCacheControl_RespectsCallerMarkers(t *testing.T) {
+	input := []byte(`{"model":"m","system":[{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"a","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	output := ensureStableCacheControl(input)
+
+	if total := countCacheControls(output); total != 2 {
+		t.Fatalf("cache_control count = %d, want 2 (caller markers only): %s", total, output)
+	}
+}
+
+func TestEnsureStableCacheControl_WithoutTools(t *testing.T) {
+	input := []byte(`{"model":"m","system":"sys prompt","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	output := ensureStableCacheControl(input)
+
+	if got := gjson.GetBytes(output, "system.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("system.0.cache_control.type = %q, want ephemeral: %s", got, output)
+	}
+	if gjson.GetBytes(output, "messages.0.content.0.cache_control").Exists() {
+		t.Fatalf("stable placement must not stamp messages: %s", output)
+	}
+}
