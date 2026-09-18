@@ -157,7 +157,7 @@ func TestRetryPolicyDelayWindowAndMatching(t *testing.T) {
 	a, _ := m.GetByID("policy-auth")
 	m.retryPolicyAuth(ctx, a, "policy-model")
 	for attempt, want := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 15 * time.Second} {
-		wait, yes, matched := m.policyRetryDecision(ctx, &Error{HTTPStatus: 404, Message: "Model not found"}, attempt, 30*time.Second)
+		wait, yes, matched := m.policyRetryDecision(ctx, &Error{HTTPStatus: 404, Message: "Model not found"}, attempt)
 		if !yes || !matched || wait < want || wait > want+cooldownWaitJitterCap {
 			t.Fatalf("attempt=%d wait=%v yes=%v matched=%v", attempt, wait, yes, matched)
 		}
@@ -167,7 +167,7 @@ func TestRetryPolicyDelayWindowAndMatching(t *testing.T) {
 	if _, excluded := m.policyRoundExclusions(ctx, 1, 0, "policy-model")["policy-auth"]; !excluded {
 		t.Fatal("expired window permits another dispatch")
 	}
-	if _, yes, _ := m.policyRetryDecision(ctx, &Error{HTTPStatus: 404, Message: "Model not found"}, 0, 30*time.Second); yes {
+	if _, yes, _ := m.policyRetryDecision(ctx, &Error{HTTPStatus: 404, Message: "Model not found"}, 0); yes {
 		t.Fatal("retried expired window")
 	}
 	if m.retryPolicyFor(a, "other") != nil {
@@ -191,5 +191,17 @@ func TestRetryPolicyDelayWindowAndMatching(t *testing.T) {
 		if retryPolicyMatches(&p, err) {
 			t.Fatalf("unsafe retry: %v", err)
 		}
+	}
+}
+
+func TestRetryPolicyDelayOverridesGlobalZeroInterval(t *testing.T) {
+	p := testPolicy()
+	p.DelaysSeconds = []float64{0.001}
+	e := &policyExecutor{failures: 1, err: &Error{HTTPStatus: 404, Message: "Model not found"}}
+	m := newPolicyManager(t, p, e)
+	m.SetRetryConfig(0, 0, 0)
+	_, err := m.Execute(t.Context(), []string{"policy-provider"}, ex.Request{Model: "policy-model"}, ex.Options{})
+	if err != nil || len(e.calls) != 2 {
+		t.Fatalf("calls=%d err=%v", len(e.calls), err)
 	}
 }

@@ -1191,7 +1191,7 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	if isRequestInvalidError(err) || isRequestStopError(err) {
 		return 0, false
 	}
-	if wait, retry, configured := m.policyRetryDecision(ctx, err, attempt, maxWait); configured {
+	if wait, retry, configured := m.policyRetryDecision(ctx, err, attempt); configured {
 		return wait, retry
 	}
 	// Explicit no-cooldown routes can retry transient model-not-found responses.

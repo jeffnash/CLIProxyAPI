@@ -103,7 +103,7 @@ func retryPolicyMatches(p *config.RetryPolicy, err error) bool {
 	return false
 }
 
-func (m *Manager) policyRetryDecision(ctx context.Context, err error, attempt int, maxWait time.Duration) (time.Duration, bool, bool) {
+func (m *Manager) policyRetryDecision(ctx context.Context, err error, attempt int) (time.Duration, bool, bool) {
 	state, _ := ctx.Value(retryPolicyContextKey{}).(*retryPolicyState)
 	if state == nil {
 		return 0, false, false
@@ -121,10 +121,7 @@ func (m *Manager) policyRetryDecision(ctx context.Context, err error, attempt in
 	if after := retryAfterFromError(err); after != nil && *after > delay {
 		delay = *after
 	}
-	if delay > 0 && (maxWait <= 0 || delay > maxWait) {
-		return 0, false, true
-	}
-	delay = jitteredCooldownWait(delay, maxWait)
+	delay = jitteredCooldownWait(delay, 0)
 	if p.WindowSeconds > 0 && time.Since(state.started)+delay >= time.Duration(p.WindowSeconds*float64(time.Second)) {
 		return 0, false, true
 	}

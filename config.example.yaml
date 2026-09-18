@@ -180,7 +180,8 @@ max-retry-interval: 30
 # Matching policies replace request-retry for additional rounds. Nonmatching
 # errors stop; matched transient errors are recorded without suspending the route.
 # window-seconds bounds starting another retry, not an established upstream call.
-# The last delay repeats; existing jitter and max-retry-interval still apply.
+# The last delay repeats with jitter. Explicit policy delays take precedence
+# over global max-retry-interval; unmatched routes retain the global behavior.
 # Cancellation stops waiting; streams are never replayed after content delivery.
 retry-policies: []
 #  - providers: [claude]
