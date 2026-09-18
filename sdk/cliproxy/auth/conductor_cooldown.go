@@ -732,6 +732,10 @@ func cooldownReason(statusMessage string, quota QuotaState, lastErr *Error) stri
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
+	if m.policyNeutralResult(result) {
+		m.recordAvailabilityNeutralResult(ctx, result)
+		return
+	}
 	if result.AuthID == "" {
 		return
 	}

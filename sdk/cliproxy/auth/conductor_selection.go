@@ -1191,6 +1191,9 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	if isRequestInvalidError(err) || isRequestStopError(err) {
 		return 0, false
 	}
+	if wait, retry, configured := m.policyRetryDecision(ctx, err, attempt, maxWait); configured {
+		return wait, retry
+	}
 	// Explicit no-cooldown routes can retry transient model-not-found responses.
 	// Without a cooldown deadline, closestCooldownWait cannot schedule a retry.
 	// Home dispatch owns its own retry accounting, so this applies only to the

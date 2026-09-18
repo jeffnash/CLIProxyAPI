@@ -119,6 +119,7 @@ func preferredExecutionAttemptError(fallback, upstream error) error {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = withRetryPolicyState(ctx)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
@@ -152,7 +153,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if !shouldRetry {
 			break
 		}
-		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+		if errWait := waitForPolicyRetry(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
 	}
@@ -178,6 +179,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = withRetryPolicyState(ctx)
 	req, opts = cliproxysession.Enrich(req, opts)
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
@@ -211,7 +213,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if !shouldRetry {
 			break
 		}
-		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+		if errWait := waitForPolicyRetry(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
 	}
@@ -230,6 +232,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	ctx = withRetryPolicyState(ctx)
 	req, opts = cliproxysession.Enrich(req, opts)
 	if m.HomeEnabled() {
 		if unlockSession := m.lockHomeWebsocketSession(ctx, opts); unlockSession != nil {
@@ -282,7 +285,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if !shouldRetry {
 			break
 		}
-		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
+		if errWait := waitForPolicyRetry(ctx, wait, maxWait); errWait != nil {
 			return nil, errWait
 		}
 		attempt++
@@ -466,7 +469,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	if !homeMode {
-		for authID := range m.requestRetryRoundExclusions(retryRound, defaultRequestRetry) {
+		for authID := range m.policyRoundExclusions(ctx, retryRound, defaultRequestRetry, routeModel) {
 			tried[authID] = struct{}{}
 		}
 	}
@@ -494,6 +497,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			return cliproxyexecutor.Response{}, errPick
 		}
 
+		auth = m.retryPolicyAuth(ctx, auth, routeModel)
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
@@ -677,7 +681,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	if !homeMode {
-		for authID := range m.requestRetryRoundExclusions(retryRound, defaultRequestRetry) {
+		for authID := range m.policyRoundExclusions(ctx, retryRound, defaultRequestRetry, routeModel) {
 			tried[authID] = struct{}{}
 		}
 	}
@@ -705,6 +709,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			return cliproxyexecutor.Response{}, errPick
 		}
 
+		auth = m.retryPolicyAuth(ctx, auth, routeModel)
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		publishSelectedAuthMetadata(opts.Metadata, auth)
@@ -893,7 +898,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	if !homeMode {
-		for authID := range m.requestRetryRoundExclusions(retryRound, defaultRequestRetry) {
+		for authID := range m.policyRoundExclusions(ctx, retryRound, defaultRequestRetry, routeModel) {
 			tried[authID] = struct{}{}
 		}
 	}
@@ -1005,6 +1010,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 		}
 
+		auth = m.retryPolicyAuth(ctx, auth, routeModel)
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, routeModel)
 		if selection != nil {

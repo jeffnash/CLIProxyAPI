@@ -398,6 +398,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
+	if err := cfg.loadRetryPolicies(); err != nil {
+		return nil, err
+	}
+
 	// Return the populated configuration struct.
 	return &cfg, nil
 }
