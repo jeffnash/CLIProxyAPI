@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/url"
 	"reflect"
 	"testing"
 	"time"
@@ -203,5 +204,33 @@ func TestRetryPolicyDelayOverridesGlobalZeroInterval(t *testing.T) {
 	_, err := m.Execute(t.Context(), []string{"policy-provider"}, ex.Request{Model: "policy-model"}, ex.Options{})
 	if err != nil || len(e.calls) != 2 {
 		t.Fatalf("calls=%d err=%v", len(e.calls), err)
+	}
+}
+
+func TestRetryableProxyErrorConnectDenials(t *testing.T) {
+	retryable := []error{
+		&url.Error{Op: "Post", URL: "https://api.meta.ai/v1/messages?beta=true", Err: errors.New("Forbidden")},
+		errors.New("proxy CONNECT returned status 403 Forbidden"),
+		errors.New("read CONNECT response failed: EOF"),
+		errors.New("write CONNECT request failed: broken pipe"),
+		&net.OpError{Op: "proxyconnect", Err: errors.New("connection refused")},
+		errors.New("proxyconnect tcp: dial tcp 155.103.143.228:12323: connect: connection refused"),
+		errors.New("dial tcp 155.103.143.228:12323: i/o timeout"),
+	}
+	for _, err := range retryable {
+		if !retryableProxyError(err) {
+			t.Errorf("retryableProxyError(%v) = false, want true", err)
+		}
+	}
+	nonRetryable := []error{
+		nil,
+		errors.New("boom"),
+		&Error{HTTPStatus: 403, Message: "forbidden by upstream policy"},
+		&Error{HTTPStatus: 404, Message: "Model not found or access denied"},
+	}
+	for _, err := range nonRetryable {
+		if retryableProxyError(err) {
+			t.Errorf("retryableProxyError(%v) = true, want false", err)
+		}
 	}
 }

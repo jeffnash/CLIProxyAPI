@@ -76,13 +76,26 @@ func (m *Manager) retryPolicyAuth(ctx context.Context, auth *Auth, model string)
 }
 
 // Only pre-response connection failures are safe to replay as proxy errors.
+// An error carrying an upstream HTTP status already received a response, so it
+// is never a proxy error even if the body mentions one.
 func retryableProxyError(err error) bool {
+	if err == nil || statusCodeFromError(err) != 0 {
+		return false
+	}
 	var op *net.OpError
 	if errors.As(err, &op) && (op.Op == "proxyconnect" || op.Op == "dial") {
 		return true
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "proxyconnect tcp:") || strings.Contains(message, "dial tcp")
+	// CONNECT denials surface as plain transport errors: the egress proxy
+	// refuses the tunnel (observed bare "Forbidden" on the Meta route) or the
+	// CONNECT handshake itself fails. The upstream API was never reached.
+	return strings.Contains(message, "proxyconnect tcp:") ||
+		strings.Contains(message, "dial tcp") ||
+		strings.Contains(message, "forbidden") ||
+		strings.Contains(message, "proxy connect") ||
+		strings.Contains(message, "connect request failed") ||
+		strings.Contains(message, "connect response failed")
 }
 
 func retryPolicyMatches(p *config.RetryPolicy, err error) bool {
