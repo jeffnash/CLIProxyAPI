@@ -1,0 +1,8 @@
+data: {"model":"hy4-preview","choices":[{"index":0,"delta":{"reasoning_content":"Synthetic reasoning fixture."},"finish_reason":null}]}
+
+data: {"model":"hy4-preview","choices":[{"index":0,"delta":{"content":"42"},"finish_reason":null}]}
+
+data: {"model":"hy4-preview","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

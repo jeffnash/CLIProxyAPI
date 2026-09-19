@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -25,6 +26,9 @@ var oauthProviders = []oauthProvider{
 	{"Antigravity", "antigravity-auth-url", "🟪", false},
 	{"Kimi", "kimi-auth-url", "🟫", true},
 	{"xAI", "xai-auth-url", "⬛", true},
+	{"CodeBuddy CN", "codebuddy-auth-url?realm=cn", "🟥", true},
+	{"CodeBuddy Global", "codebuddy-auth-url?realm=global", "🟦", true},
+	{"WorkBuddy Global", "codebuddy-auth-url?realm=workbuddy-global", "🟨", true},
 }
 
 // oauthTabModel handles OAuth login flows.
@@ -279,8 +283,16 @@ func (m oauthTabModel) Update(msg tea.Msg) (oauthTabModel, tea.Cmd) {
 
 func (m oauthTabModel) startOAuth(provider oauthProvider, generation int) tea.Cmd {
 	return func() tea.Msg {
-		// Call the auth URL endpoint with is_webui=true
-		data, err := m.client.getJSON("/v0/management/" + provider.apiPath + "?is_webui=true")
+		// Call the auth URL endpoint with is_webui=true, preserving any
+		// provider query parameters such as the CodeBuddy realm.
+		endpoint, err := url.Parse("/v0/management/" + provider.apiPath)
+		if err != nil {
+			return oauthStartMsg{generation: generation, err: fmt.Errorf("failed to start %s login: %w", provider.name, err)}
+		}
+		query := endpoint.Query()
+		query.Set("is_webui", "true")
+		endpoint.RawQuery = query.Encode()
+		data, err := m.client.getJSON(endpoint.String())
 		if err != nil {
 			return oauthStartMsg{generation: generation, err: fmt.Errorf("failed to start %s login: %w", provider.name, err)}
 		}

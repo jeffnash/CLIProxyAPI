@@ -828,7 +828,6 @@ func (e *ManagedProviderExecutor) prepareRequestBody(ctx context.Context, auth *
 		if !managedProviderSupportsDeveloperRole(creds.provider, attrsFromAuth(auth)) {
 			body = helps.ConvertDeveloperRoleToSystem(body)
 		}
-		body = helps.RepairMissingReasoningContentForToolCalls(auth, body)
 		if stream {
 			body, _ = sjson.SetBytes(body, "stream_options.include_usage", true)
 		}
@@ -839,6 +838,11 @@ func (e *ManagedProviderExecutor) prepareRequestBody(ctx context.Context, auth *
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, target.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	if target == sdktranslator.FormatOpenAI {
+		// Repair last: payload-config filters above must not strip the
+		// restored reasoning_content this route opted into preserving.
+		body = helps.RepairMissingReasoningContentForToolCalls(auth, body)
+	}
 
 	return managedProviderPreparedRequest{
 		baseModel:      baseModel,

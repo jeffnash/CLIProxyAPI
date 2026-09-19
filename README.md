@@ -318,6 +318,10 @@ You can access the following providers locally and with multiple CLI accounts th
         <td align="center"><a href="https://x.ai/grok"><img src="./assets/logo/xai.svg" alt="xAI" width="28" height="28" /></a></td>
         <td>xAI Grok series models (Grok 4.5, Grok Composer 2.5 Fast, etc.). Grok 4.5 is SpaceXAI's frontier model built for coding, agentic tasks, and knowledge work. It was trained in SpaceXAI's data centers in Memphis with new datasets spanning science, engineering, and math.</td>
     </tr>
+    <tr>
+        <td align="center">CodeBuddy</td>
+        <td>Tencent CodeBuddy / WorkBuddy HY4 series models via native account login. Each account serves its own HY4 catalog snapshot across the cn, global and workbuddy-global profiles. See <a href="./docs/codebuddy.md">docs/codebuddy.md</a>.</td>
+    </tr>
 </tbody>
 </table>
 

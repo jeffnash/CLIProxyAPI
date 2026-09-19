@@ -12,8 +12,10 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -83,8 +85,6 @@ func shouldEnableExampleAPIKeySafeMode(cfg *config.Config, commandMode, tuiMode,
 // It parses command-line flags, loads configuration, and starts the appropriate
 // service based on the provided flags (login, codex-login, or server mode).
 func main() {
-	fmt.Printf("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
-
 	// Command-line flags to control the application's behavior.
 	var codexLogin bool
 	var copilotLogin bool
@@ -101,6 +101,10 @@ func main() {
 	var githubCopilotLogin bool
 	var kimiLogin bool
 	var xaiLogin bool
+	var codebuddyLogin bool
+	var codebuddyImport string
+	var codebuddyRealm string
+	var codebuddyExport bool
 	var vertexImport string
 	var vertexImportPrefix string
 	var configPath string
@@ -135,6 +139,10 @@ func main() {
 	flag.BoolVar(&githubCopilotLogin, "github-copilot-login", false, "Login to GitHub Copilot using device flow")
 	flag.BoolVar(&kimiLogin, "kimi-login", false, "Login to Kimi using OAuth")
 	flag.BoolVar(&xaiLogin, "xai-login", false, "Login to xAI using OAuth")
+	flag.BoolVar(&codebuddyLogin, "codebuddy-login", false, "Login to CodeBuddy using browser authorization")
+	flag.StringVar(&codebuddyImport, "codebuddy-import", "", "Import a CodeBuddy credential JSON file and refresh its model catalog")
+	flag.BoolVar(&codebuddyExport, "codebuddy-export", false, "Print the stored CodeBuddy auth record as compact JSON for CODEBUDDY_AUTH_JSON deployment")
+	flag.StringVar(&codebuddyRealm, "codebuddy-realm", "", "CodeBuddy profile: cn, global, workbuddy-global (login defaults to cn; import preserves the file profile)")
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
 	flag.StringVar(&vertexImportPrefix, "vertex-import-prefix", "", "Prefix for Vertex model namespacing (use with -vertex-import)")
@@ -184,6 +192,32 @@ func main() {
 
 	// Parse the command-line flags.
 	flag.Parse()
+
+	// The startup banner stays off stdout in export mode so the printed
+	// record can be captured directly.
+	if !codebuddyExport {
+		fmt.Printf("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+	}
+
+	// Validate CodeBuddy flags before any network call or server start.
+	otherLoginMode := vertexImport != "" ||
+		antigravityLogin ||
+		codexLogin ||
+		codexDeviceLogin ||
+		claudeLogin ||
+		copilotLogin ||
+		githubCopilotLogin ||
+		kiroLogin ||
+		kiroGoogleLogin ||
+		kiroAWSLogin ||
+		kiroAWSAuthCode ||
+		kiroImport ||
+		kimiLogin ||
+		xaiLogin
+	if err := validateCodeBuddyFlags(codebuddyLogin, codebuddyImport, codebuddyRealm, codebuddyExport, otherLoginMode); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
 
 	// Core application variables.
 	var err error
@@ -607,6 +641,9 @@ func main() {
 		log.Errorf("failed to configure log output: %v", err)
 		return
 	}
+	if codebuddyExport {
+		log.SetOutput(os.Stderr)
+	}
 
 	log.Infof("CLIProxyAPI Version: %s, Commit: %s, BuiltAt: %s", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
 
@@ -644,6 +681,9 @@ func main() {
 		kiroImport ||
 		kimiLogin ||
 		xaiLogin ||
+		codebuddyLogin ||
+		codebuddyImport != "" ||
+		codebuddyExport ||
 		authHealthCheck
 	cloudConfigMissing := isCloudDeploy && !configFileExists
 	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
@@ -722,6 +762,24 @@ func main() {
 		cmd.DoClaudeLogin(cfg, options)
 	} else if kimiLogin {
 		cmd.DoKimiLogin(cfg, options)
+	} else if codebuddyLogin {
+		if err := cmd.DoCodeBuddyLogin(cfg, options, codebuddyRealm); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "codebuddy login failed: %v\n", err)
+			os.Exit(1)
+		}
+	} else if codebuddyImport != "" {
+		importCtx, importStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		err := cmd.DoCodeBuddyImport(importCtx, cfg, codebuddyImport, codebuddyRealm)
+		importStop()
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "codebuddy import failed: %v\n", err)
+			os.Exit(1)
+		}
+	} else if codebuddyExport {
+		if err := cmd.DoCodeBuddyExport(cfg, codebuddyRealm); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "codebuddy export failed: %v\n", err)
+			os.Exit(1)
+		}
 	} else if xaiLogin {
 		cmd.DoXAILogin(cfg, options)
 	} else if authHealthCheck {
@@ -830,6 +888,37 @@ func main() {
 // modelCatalogUpdaterPlan decides which remote model catalogs should refresh.
 // Codex client templates still refresh under Home mode because the model list
 // comes from Home IDs while template metadata stays edge-local.
+// validateCodeBuddyFlags rejects malformed CodeBuddy flag combinations before
+// any network call. otherLoginMode reports whether another login/import mode
+// was requested in the same invocation.
+func validateCodeBuddyFlags(login bool, importPath, realm string, exportMode, otherLoginMode bool) error {
+	importMode := strings.TrimSpace(importPath) != ""
+	realmFlag := strings.TrimSpace(realm)
+	modes := 0
+	for _, on := range []bool{login, importMode, exportMode} {
+		if on {
+			modes++
+		}
+	}
+	if modes > 1 {
+		return fmt.Errorf("codebuddy: --codebuddy-login, --codebuddy-import and --codebuddy-export are mutually exclusive")
+	}
+	if realmFlag != "" && modes == 0 {
+		return fmt.Errorf("codebuddy: --codebuddy-realm requires --codebuddy-login, --codebuddy-import or --codebuddy-export")
+	}
+	if realmFlag != "" {
+		switch strings.ToLower(realmFlag) {
+		case "cn", "global", "workbuddy-global":
+		default:
+			return fmt.Errorf("codebuddy: invalid --codebuddy-realm %q (want cn, global or workbuddy-global)", realmFlag)
+		}
+	}
+	if modes > 0 && otherLoginMode {
+		return fmt.Errorf("codebuddy: CodeBuddy login/import/export cannot be combined with another login/import mode")
+	}
+	return nil
+}
+
 func modelCatalogUpdaterPlan(localModel, homeEnabled bool) (startModels, startCodexClient bool) {
 	if localModel {
 		return false, false

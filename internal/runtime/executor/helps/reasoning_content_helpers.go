@@ -3,7 +3,6 @@ package helps
 import (
 	"bytes"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -86,8 +85,14 @@ func NewOpenAIReasoningContentStreamRecorder(auth *cliproxyauth.Auth) *OpenAIRea
 	if !PreserveReasoningContentEnabled(auth) {
 		return nil
 	}
-	scope := reasoningContentScope(auth)
-	if scope == "" {
+	return newOpenAIReasoningContentStreamRecorderWithScope(reasoningContentScope(auth))
+}
+
+// newOpenAIReasoningContentStreamRecorderWithScope creates a recorder for a
+// pre-authorized scope. Providers with native (non-opt-in) preservation use
+// this instead of the attribute-gated constructor.
+func newOpenAIReasoningContentStreamRecorderWithScope(scope string) *OpenAIReasoningContentStreamRecorder {
+	if strings.TrimSpace(scope) == "" {
 		return nil
 	}
 	return &OpenAIReasoningContentStreamRecorder{
@@ -303,19 +308,22 @@ func (c *reasoningContentToolCache) pruneLocked(now time.Time) {
 			delete(c.entries, key)
 		}
 	}
-	if len(c.entries) <= reasoningContentCacheMax {
-		return
-	}
-	keys := make([]string, 0, len(c.entries))
-	for key := range c.entries {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		return c.entries[keys[i]].updatedAt.Before(c.entries[keys[j]].updatedAt)
-	})
-	for len(c.entries) > reasoningContentCacheMax && len(keys) > 0 {
-		delete(c.entries, keys[0])
-		keys = keys[1:]
+	// Evict oldest first with one linear scan per excess entry. Inserts exceed
+	// the cap by one at a time, so this avoids sorting all keys on every
+	// over-cap insert.
+	for len(c.entries) > reasoningContentCacheMax {
+		oldest := ""
+		var oldestAt time.Time
+		found := false
+		for key, entry := range c.entries {
+			if !found || entry.updatedAt.Before(oldestAt) {
+				oldest, oldestAt, found = key, entry.updatedAt, true
+			}
+		}
+		if !found {
+			return
+		}
+		delete(c.entries, oldest)
 	}
 }
 

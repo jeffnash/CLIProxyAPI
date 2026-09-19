@@ -209,6 +209,7 @@ func baselineExecutorAuths() []*coreauth.Auth {
 		"antigravity",
 		"kimi",
 		"xai",
+		"codebuddy",
 		"openai-compatibility",
 	}
 	auths := make([]*coreauth.Auth, 0, len(providers))
@@ -294,6 +295,8 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(cfg))
+	case "codebuddy":
+		s.coreManager.RegisterExecutor(executor.NewCodeBuddyExecutor(cfg))
 	case "chutes":
 		s.coreManager.RegisterExecutor(executor.NewChutesExecutor(cfg))
 	case "cursor":

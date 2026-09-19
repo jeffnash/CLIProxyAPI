@@ -3,6 +3,8 @@ package auth
 import (
 	"testing"
 	"time"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestProviderRefreshLeads(t *testing.T) {
@@ -16,6 +18,7 @@ func TestProviderRefreshLeads(t *testing.T) {
 		{name: "antigravity", authenticator: NewAntigravityAuthenticator(), want: 30 * time.Minute},
 		{name: "kimi", authenticator: NewKimiAuthenticator(), want: 5 * time.Minute},
 		{name: "xai", authenticator: NewXAIAuthenticator(), want: 5 * time.Minute},
+		{name: "codebuddy", authenticator: NewCodeBuddyAuthenticator(), want: 5 * time.Minute},
 	}
 
 	for _, test := range tests {
@@ -28,5 +31,19 @@ func TestProviderRefreshLeads(t *testing.T) {
 				t.Fatalf("RefreshLead() = %v, want %v", lead, test.want)
 			}
 		})
+	}
+}
+
+func TestProviderRefreshLeadRegistry(t *testing.T) {
+	if lead := cliproxyauth.ProviderRefreshLead("codebuddy", nil); lead == nil || *lead != 5*time.Minute {
+		t.Fatalf("codebuddy lead = %v", lead)
+	}
+	registerRefreshLead("codebuddy-nil-factory", nil)
+	if lead := cliproxyauth.ProviderRefreshLead("codebuddy-nil-factory", nil); lead != nil {
+		t.Fatalf("nil factory lead = %v", lead)
+	}
+	registerRefreshLead("codebuddy-nil-auth", func() Authenticator { return nil })
+	if lead := cliproxyauth.ProviderRefreshLead("codebuddy-nil-auth", nil); lead != nil {
+		t.Fatalf("nil authenticator lead = %v", lead)
 	}
 }

@@ -1,7 +1,9 @@
 package helps
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
@@ -128,5 +130,24 @@ func TestRepairMissingReasoningContentForToolCalls_FillsAssistantWithoutToolCall
 
 	if gotReasoning := gjson.GetBytes(got, "messages.0.reasoning_content").String(); gotReasoning != "Earlier answer." {
 		t.Fatalf("reasoning_content = %q, want assistant content fallback; payload=%s", gotReasoning, got)
+	}
+}
+
+func TestReasoningContentCachePruneEvictsOldest(t *testing.T) {
+	cache := &reasoningContentToolCache{entries: make(map[string]reasoningContentCacheEntry)}
+	now := time.Now()
+	for i := 0; i < reasoningContentCacheMax+3; i++ {
+		cache.entries[fmt.Sprintf("scope\x00%d", i)] = reasoningContentCacheEntry{
+			value: "v", updatedAt: now.Add(time.Duration(i) * time.Millisecond),
+		}
+	}
+	cache.pruneLocked(now.Add(time.Hour))
+	if len(cache.entries) != reasoningContentCacheMax {
+		t.Fatalf("entries = %d, want %d", len(cache.entries), reasoningContentCacheMax)
+	}
+	for i := 0; i < 3; i++ {
+		if _, ok := cache.entries[fmt.Sprintf("scope\x00%d", i)]; ok {
+			t.Fatalf("oldest entry %d survived prune", i)
+		}
 	}
 }

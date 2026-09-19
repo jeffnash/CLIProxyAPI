@@ -127,7 +127,6 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
-	translated = helps.RepairMissingReasoningContentForToolCalls(auth, translated)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -150,6 +149,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		}
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
 	}
+	// Repair last: payload-config filters and normalizations above must not
+	// strip the restored reasoning_content this route opted into preserving.
+	translated = helps.RepairMissingReasoningContentForToolCalls(auth, translated)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -351,7 +353,6 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if err != nil {
 		return nil, err
 	}
-	translated = helps.RepairMissingReasoningContentForToolCalls(auth, translated)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -374,6 +375,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if !e.nativeResponses {
 		translated = helps.SetBoolIfDifferent(translated, "stream_options.include_usage", true)
 	}
+	// Repair last: payload-config filters and normalizations above must not
+	// strip the restored reasoning_content this route opted into preserving.
+	translated = helps.RepairMissingReasoningContentForToolCalls(auth, translated)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint

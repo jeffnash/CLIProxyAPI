@@ -1,0 +1,1 @@
+{"code":0,"data":{"models":[{"id":"hy4-preview","name":"Global HY4","maxInputTokens":128000,"maxOutputTokens":16000,"supportsToolCall":true}],"agents":[{"name":"cli","models":[]}]}}

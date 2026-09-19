@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	codebuddy "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codebuddy"
 	grokauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/grok"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelconfig"
@@ -277,6 +278,26 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		}
 	case "kimi":
 		models = registry.GetKimiModels()
+		models = applyExcludedModels(models, excluded)
+	case "codebuddy":
+		// Pure snapshot registration: read the account's persisted catalog
+		// with zero network requests. Invalid snapshots yield no models so
+		// the tail below unregisters any stale entry.
+		credentials, errCredentials := codebuddy.CredentialsFromMetadata(a.Metadata)
+		var catalog codebuddy.Catalog
+		if errCredentials == nil {
+			catalog, errCredentials = codebuddy.CatalogFromMetadata(a.Metadata)
+		}
+		if errCredentials != nil {
+			reason := "invalid credential"
+			if strings.Contains(errCredentials.Error(), "catalog") {
+				reason = "invalid catalog snapshot"
+			}
+			log.Warnf("codebuddy: skip model registration for auth %s: %s", a.ID, reason)
+			models = nil
+		} else {
+			models = codebuddy.RegistryModels(credentials, catalog)
+		}
 		models = applyExcludedModels(models, excluded)
 	case "xai":
 		models = registry.GetXAIModels()

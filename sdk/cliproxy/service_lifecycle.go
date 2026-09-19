@@ -77,6 +77,9 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {
+		if _, errSeed := sdkAuth.SeedCodeBuddyAuthFromEnv(s.cfg.AuthDir); errSeed != nil {
+			log.Warnf("failed to seed codebuddy auth from env: %v", errSeed)
+		}
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
 			log.Warnf("failed to load auth store: %v", errLoad)
 		}
