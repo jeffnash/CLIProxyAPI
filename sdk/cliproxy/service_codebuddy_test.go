@@ -43,6 +43,17 @@ func codeBuddyService(t *testing.T, cfg *config.Config) (*Service, *coreauth.Man
 	return service, mgr
 }
 
+// codeBuddyRegister mirrors production flow: the auth must be known to the
+// conductor manager before model registration (the manager-membership gate in
+// registerModelsForAuthWithCache skips unknown IDs).
+func codeBuddyRegister(t *testing.T, service *Service, mgr *coreauth.Manager, auth *coreauth.Auth) {
+	t.Helper()
+	if _, err := mgr.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register error: %v", err)
+	}
+	service.registerModelsForAuth(context.Background(), auth)
+}
+
 func TestServiceCodeBuddyExecutorBinding(t *testing.T) {
 	service, mgr := codeBuddyService(t, &config.Config{})
 	foundBaseline := false
@@ -65,9 +76,9 @@ func TestServiceCodeBuddyExecutorBinding(t *testing.T) {
 }
 
 func TestServiceCodeBuddyRegistration(t *testing.T) {
-	service, _ := codeBuddyService(t, &config.Config{})
+	service, mgr := codeBuddyService(t, &config.Config{})
 	auth := codeBuddyServiceAuth("codebuddy-svc-a", codebuddy.RealmGlobal, "user-1", codebuddy.Model{ID: "hy4-preview", Name: "HY4"})
-	service.registerModelsForAuth(context.Background(), auth)
+	codeBuddyRegister(t, service, mgr, auth)
 	reg := GlobalModelRegistry()
 	if !reg.ClientSupportsModel(auth.ID, "codebuddy-global-hy4-preview") {
 		t.Fatal("model not registered for client")
@@ -79,11 +90,11 @@ func TestServiceCodeBuddyRegistration(t *testing.T) {
 }
 
 func TestServiceCodeBuddyRealmIsolation(t *testing.T) {
-	service, _ := codeBuddyService(t, &config.Config{})
+	service, mgr := codeBuddyService(t, &config.Config{})
 	cn := codeBuddyServiceAuth("codebuddy-svc-a", codebuddy.RealmCN, "same-user", codebuddy.Model{ID: "hy4-preview"})
 	global := codeBuddyServiceAuth("codebuddy-svc-b", codebuddy.RealmGlobal, "same-user", codebuddy.Model{ID: "hy4-preview"})
-	service.registerModelsForAuth(context.Background(), cn)
-	service.registerModelsForAuth(context.Background(), global)
+	codeBuddyRegister(t, service, mgr, cn)
+	codeBuddyRegister(t, service, mgr, global)
 	reg := GlobalModelRegistry()
 	if !reg.ClientSupportsModel(cn.ID, "codebuddy-cn-hy4-preview") || reg.ClientSupportsModel(cn.ID, "codebuddy-global-hy4-preview") {
 		t.Fatal("CN client model set wrong")
@@ -94,11 +105,11 @@ func TestServiceCodeBuddyRealmIsolation(t *testing.T) {
 }
 
 func TestServiceCodeBuddyDisjointCatalogs(t *testing.T) {
-	service, _ := codeBuddyService(t, &config.Config{})
+	service, mgr := codeBuddyService(t, &config.Config{})
 	a := codeBuddyServiceAuth("codebuddy-svc-a", codebuddy.RealmCN, "user-a", codebuddy.Model{ID: "hy4-preview"})
 	b := codeBuddyServiceAuth("codebuddy-svc-b", codebuddy.RealmCN, "user-b", codebuddy.Model{ID: "hy4-preview-f"})
-	service.registerModelsForAuth(context.Background(), a)
-	service.registerModelsForAuth(context.Background(), b)
+	codeBuddyRegister(t, service, mgr, a)
+	codeBuddyRegister(t, service, mgr, b)
 	reg := GlobalModelRegistry()
 	if !reg.ClientSupportsModel(a.ID, "codebuddy-cn-hy4-preview") || reg.ClientSupportsModel(a.ID, "codebuddy-cn-hy4-preview-f") {
 		t.Fatal("client A model set wrong")
@@ -112,9 +123,9 @@ func TestServiceCodeBuddyAlias(t *testing.T) {
 	cfg := &config.Config{OAuthModelAlias: map[string][]config.OAuthModelAlias{
 		"codebuddy": {{Name: "codebuddy-global-hy4-preview", Alias: "hy4", Fork: true}},
 	}}
-	service, _ := codeBuddyService(t, cfg)
+	service, mgr := codeBuddyService(t, cfg)
 	auth := codeBuddyServiceAuth("codebuddy-svc-alias", codebuddy.RealmGlobal, "user-alias", codebuddy.Model{ID: "hy4-preview"})
-	service.registerModelsForAuth(context.Background(), auth)
+	codeBuddyRegister(t, service, mgr, auth)
 	reg := GlobalModelRegistry()
 	if !reg.ClientSupportsModel(auth.ID, "hy4") || !reg.ClientSupportsModel(auth.ID, "codebuddy-global-hy4-preview") {
 		t.Fatalf("alias not registered: %+v", reg.GetModelsForClient(auth.ID))
@@ -127,35 +138,35 @@ func TestServiceCodeBuddyAlias(t *testing.T) {
 }
 
 func TestServiceCodeBuddyDisableAndEmptySnapshot(t *testing.T) {
-	service, _ := codeBuddyService(t, &config.Config{})
+	service, mgr := codeBuddyService(t, &config.Config{})
 	auth := codeBuddyServiceAuth("codebuddy-svc-disable", codebuddy.RealmCN, "user-d", codebuddy.Model{ID: "hy4-preview"})
-	service.registerModelsForAuth(context.Background(), auth)
+	codeBuddyRegister(t, service, mgr, auth)
 	reg := GlobalModelRegistry()
 	if !reg.ClientSupportsModel(auth.ID, "codebuddy-cn-hy4-preview") {
 		t.Fatal("model not registered")
 	}
 	// A successful empty snapshot removes old models.
 	empty := codeBuddyServiceAuth("codebuddy-svc-disable", codebuddy.RealmCN, "user-d")
-	service.registerModelsForAuth(context.Background(), empty)
+	codeBuddyRegister(t, service, mgr, empty)
 	if reg.ClientSupportsModel(auth.ID, "codebuddy-cn-hy4-preview") {
 		t.Fatal("stale model survived empty snapshot")
 	}
 	// Disabling removes the registration as well.
-	service.registerModelsForAuth(context.Background(), auth)
+	codeBuddyRegister(t, service, mgr, auth)
 	disabled := codeBuddyServiceAuth("codebuddy-svc-disable", codebuddy.RealmCN, "user-d", codebuddy.Model{ID: "hy4-preview"})
 	disabled.Disabled = true
-	service.registerModelsForAuth(context.Background(), disabled)
+	codeBuddyRegister(t, service, mgr, disabled)
 	if reg.ClientSupportsModel(auth.ID, "codebuddy-cn-hy4-preview") {
 		t.Fatal("disabled auth still registered")
 	}
 }
 
 func TestServiceCodeBuddyInvalidSnapshot(t *testing.T) {
-	service, _ := codeBuddyService(t, &config.Config{})
+	service, mgr := codeBuddyService(t, &config.Config{})
 	auth := codeBuddyServiceAuth("codebuddy-svc-a", codebuddy.RealmCN, "user-x", codebuddy.Model{ID: "hy4-preview"})
-	service.registerModelsForAuth(context.Background(), auth)
+	codeBuddyRegister(t, service, mgr, auth)
 	broken := &coreauth.Auth{ID: "codebuddy-svc-a", Provider: "codebuddy", Metadata: map[string]any{"type": "codebuddy"}}
-	service.registerModelsForAuth(context.Background(), broken)
+	codeBuddyRegister(t, service, mgr, broken)
 	if GlobalModelRegistry().ClientSupportsModel(auth.ID, "codebuddy-cn-hy4-preview") {
 		t.Fatal("stale model survived invalid snapshot")
 	}
@@ -165,10 +176,10 @@ func TestServiceCodeBuddyExclusions(t *testing.T) {
 	cfg := &config.Config{OAuthExcludedModels: map[string][]string{
 		"codebuddy": {"codebuddy-cn-hy4-preview-x"},
 	}}
-	service, _ := codeBuddyService(t, cfg)
+	service, mgr := codeBuddyService(t, cfg)
 	auth := codeBuddyServiceAuth("codebuddy-svc-a", codebuddy.RealmCN, "user-e",
 		codebuddy.Model{ID: "hy4-preview"}, codebuddy.Model{ID: "hy4-preview-x"})
-	service.registerModelsForAuth(context.Background(), auth)
+	codeBuddyRegister(t, service, mgr, auth)
 	reg := GlobalModelRegistry()
 	if !reg.ClientSupportsModel(auth.ID, "codebuddy-cn-hy4-preview") || reg.ClientSupportsModel(auth.ID, "codebuddy-cn-hy4-preview-x") {
 		t.Fatal("exclusion not applied")

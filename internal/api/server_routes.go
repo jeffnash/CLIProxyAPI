@@ -280,6 +280,42 @@ func (s *Server) setupRoutes() {
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
 
+	sharedOAuthCallbackHandler := func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		code := strings.TrimSpace(c.Query("code"))
+		state := strings.TrimSpace(c.Query("state"))
+		errStr := strings.TrimSpace(c.Query("error"))
+		if errStr == "" {
+			errStr = strings.TrimSpace(c.Query("error_description"))
+		}
+		if code == "" && errStr == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "code or error is required"})
+			return
+		}
+		// Provider-agnostic: resolve the provider from the pending session so
+		// this path can be shared by any provider with the same redirect
+		// constraint. Unknown states keep the historical devin default and
+		// fail closed below when no session is pending.
+		provider := "devin"
+		if sessionProvider, okSession := managementHandlers.OAuthSessionProvider(state); okSession {
+			provider = sessionProvider
+		}
+		if _, errWrite := managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, provider, state, code, errStr); errWrite != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired OAuth callback"})
+			return
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	}
+
+	// The bare /callback path exists solely because the Devin authorization
+	// page requires an exact http://127.0.0.1:<port>/callback redirect target;
+	// see devinCallbackURL in management/auth_files_devin_oauth.go. The handler
+	// resolves the provider from the pending session, so the path stays
+	// shareable if another provider adopts the same constraint.
+	s.engine.GET("/callback", sharedOAuthCallbackHandler)
+	s.engine.GET("/devin/callback", sharedOAuthCallbackHandler)
+
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
 
@@ -734,7 +770,15 @@ func (s *Server) handleGrokModels(c *gin.Context) {
 	} else {
 		models = grokModelsFromRegistryInfos(registry.GetGlobalRegistry().GetAvailableModelInfos())
 	}
-	c.JSON(http.StatusOK, grokbuild.BuildResponse(models))
+	s.writeModelListResponse(c, "openai", grokbuild.BuildResponse(models))
+}
+
+func (s *Server) writeModelListResponse(c *gin.Context, sourceFormat string, payload any) {
+	if s != nil && s.handlers != nil {
+		s.handlers.WriteModelListResponse(c, sourceFormat, payload)
+		return
+	}
+	c.JSON(http.StatusOK, payload)
 }
 
 // handleHomeCodexClientModels builds the Codex client catalog from Home model IDs.
@@ -750,7 +794,21 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context, clientVersion strin
 		models = append(models, formatHomeCodexModel(entry))
 	}
 
-	c.JSON(http.StatusOK, codexmodels.BuildResponseForClient(models, nil, s.cfg.Codex.OptimizeMultiAgentV2, clientVersion))
+	var webSearchCapabilityForModel codexmodels.WebSearchCapabilityForModelFunc
+	if clientVersion == "cpa" {
+		webSearchCapabilityForModel = homeWebSearchCapabilityForModel(entries)
+	}
+	s.writeModelListResponse(c, "openai", codexmodels.BuildResponseForClientWithCPACapabilities(models, nil, webSearchCapabilityForModel, s.cfg.Codex.OptimizeMultiAgentV2, clientVersion))
+}
+
+func homeWebSearchCapabilityForModel(entries []homeModelEntry) codexmodels.WebSearchCapabilityForModelFunc {
+	routesByID := make(map[string][]registry.NativeCapabilityRoute, len(entries))
+	for _, entry := range entries {
+		routesByID[entry.id] = append([]registry.NativeCapabilityRoute(nil), entry.nativeCapabilityRoutes...)
+	}
+	return func(id string) *bool {
+		return registry.ResolveResponsesWebSearchCapability(routesByID[strings.TrimSpace(id)])
+	}
 }
 
 func formatHomeCodexModel(entry homeModelEntry) map[string]any {
@@ -763,6 +821,12 @@ func formatHomeCodexModel(entry homeModelEntry) map[string]any {
 	}
 	if entry.ownedBy != "" {
 		model["owned_by"] = entry.ownedBy
+	}
+	for _, p := range entry.providers {
+		if strings.EqualFold(p, "devin") {
+			model["type"] = "devin"
+			break
+		}
 	}
 	if entry.displayName != "" {
 		model["display_name"] = entry.displayName
@@ -803,13 +867,15 @@ func (s *Server) geminiGetHandler(geminiHandler *gemini.GeminiAPIHandler) gin.Ha
 }
 
 type homeModelEntry struct {
-	id                  string
-	created             int64
-	ownedBy             string
-	displayName         string
-	contextLength       int
-	maxCompletionTokens int
-	thinking            *registry.ThinkingSupport
+	id                     string
+	created                int64
+	ownedBy                string
+	displayName            string
+	contextLength          int
+	maxCompletionTokens    int
+	thinking               *registry.ThinkingSupport
+	providers              []string
+	nativeCapabilityRoutes []registry.NativeCapabilityRoute
 }
 
 func (s *Server) handleHomeModels(c *gin.Context) {
@@ -822,7 +888,7 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 
 	if isClaude {
 		disableCloaking := s.cfg != nil && s.cfg.ClaudeCode.DisableCloakingModelList
-		c.JSON(http.StatusOK, claudemodels.BuildResponse(formatHomeClaudeModels(entries), disableCloaking))
+		s.writeModelListResponse(c, "claude", claudemodels.BuildResponse(formatHomeClaudeModels(entries), disableCloaking))
 		return
 	}
 
@@ -840,7 +906,7 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 		}
 		filtered = append(filtered, model)
 	}
-	c.JSON(http.StatusOK, gin.H{
+	s.writeModelListResponse(c, "openai", gin.H{
 		"object": "list",
 		"data":   filtered,
 	})
@@ -888,7 +954,7 @@ func (s *Server) handleHomeGeminiModels(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	s.writeModelListResponse(c, "gemini", gin.H{
 		"models": formatHomeGeminiModels(entries),
 	})
 }
@@ -1078,9 +1144,10 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 		return nil, fmt.Errorf("home models payload has no sections")
 	}
 
-	seen := make(map[string]struct{})
+	indexByID := make(map[string]int)
 	out := make([]homeModelEntry, 0, 256)
-	for _, models := range bySection {
+	for section, models := range bySection {
+		provider := strings.ToLower(strings.TrimSpace(section))
 		for _, model := range models {
 			id, _ := model["id"].(string)
 			id = strings.TrimSpace(id)
@@ -1092,10 +1159,16 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 			if id == "" {
 				continue
 			}
-			if _, ok := seen[id]; ok {
+			nativeCapabilities := homeModelNativeCapabilities(model)
+			route := registry.NativeCapabilityRoute{
+				Provider:           provider,
+				NativeCapabilities: nativeCapabilities,
+			}
+			if index, ok := indexByID[id]; ok {
+				out[index].providers = appendUniqueHomeProvider(out[index].providers, provider)
+				out[index].nativeCapabilityRoutes = append(out[index].nativeCapabilityRoutes, route)
 				continue
 			}
-			seen[id] = struct{}{}
 
 			ownedBy, _ := model["owned_by"].(string)
 			ownedBy = strings.TrimSpace(ownedBy)
@@ -1107,14 +1180,17 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 			}
 			thinking := homeModelThinkingSupport(model)
 
+			indexByID[id] = len(out)
 			out = append(out, homeModelEntry{
-				id:                  id,
-				created:             homeModelInt64Value(model, "created"),
-				ownedBy:             ownedBy,
-				displayName:         displayName,
-				contextLength:       int(homeModelInt64Value(model, "context_length", "contextLength", "inputTokenLimit", "max_input_tokens")),
-				maxCompletionTokens: int(homeModelInt64Value(model, "max_completion_tokens", "maxCompletionTokens", "outputTokenLimit", "max_tokens")),
-				thinking:            thinking,
+				id:                     id,
+				created:                homeModelInt64Value(model, "created"),
+				ownedBy:                ownedBy,
+				displayName:            displayName,
+				contextLength:          int(homeModelInt64Value(model, "context_length", "contextLength", "inputTokenLimit", "max_input_tokens")),
+				maxCompletionTokens:    int(homeModelInt64Value(model, "max_completion_tokens", "maxCompletionTokens", "outputTokenLimit", "max_tokens")),
+				thinking:               thinking,
+				providers:              appendUniqueHomeProvider(nil, provider),
+				nativeCapabilityRoutes: []registry.NativeCapabilityRoute{route},
 			})
 		}
 	}
@@ -1124,6 +1200,30 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 		return nil, fmt.Errorf("home models payload contains no models")
 	}
 	return out, nil
+}
+
+func homeModelNativeCapabilities(model map[string]any) *registry.NativeCapabilities {
+	raw, ok := model["native_capabilities"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	webSearch, ok := raw["web_search"].(bool)
+	if !ok {
+		return &registry.NativeCapabilities{}
+	}
+	return &registry.NativeCapabilities{WebSearch: &webSearch}
+}
+
+func appendUniqueHomeProvider(providers []string, provider string) []string {
+	if provider == "" {
+		return providers
+	}
+	for _, existing := range providers {
+		if existing == provider {
+			return providers
+		}
+	}
+	return append(providers, provider)
 }
 
 func homeModelThinkingSupport(model map[string]any) *registry.ThinkingSupport {

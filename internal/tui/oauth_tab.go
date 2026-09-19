@@ -29,6 +29,7 @@ var oauthProviders = []oauthProvider{
 	{"CodeBuddy CN", "codebuddy-auth-url?realm=cn", "🟥", true},
 	{"CodeBuddy Global", "codebuddy-auth-url?realm=global", "🟦", true},
 	{"WorkBuddy Global", "codebuddy-auth-url?realm=workbuddy-global", "🟨", true},
+	{"Meta", "meta-auth-url", "🔵", true},
 }
 
 // oauthTabModel handles OAuth login flows.
@@ -370,6 +371,8 @@ func (m oauthTabModel) submitCallback(callbackURL string) tea.Cmd {
 					providerKey = "kimi"
 				case "xai-auth-url":
 					providerKey = "xai"
+				case "meta-auth-url":
+					providerKey = "meta"
 				}
 				break
 			}

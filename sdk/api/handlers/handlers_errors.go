@@ -105,6 +105,13 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 		Retryable:  authErr.Retryable,
 		HTTPStatus: status,
 	}
+	var carrier interface{ WithAuthError(*coreauth.Error) error }
+	if errors.As(err, &carrier) && carrier != nil {
+		return carrier.WithAuthError(enriched)
+	}
+	if coreauth.IsTerminalAuthError(err) {
+		return coreauth.NewTerminalAuthError(enriched, cause)
+	}
 	if cause != nil {
 		return coreauth.WithCause(enriched, cause)
 	}
@@ -158,6 +165,10 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 
+	var errCause error
+	if msg != nil {
+		errCause = msg.Error
+	}
 	// A typed executor error (e.g. the composer bridge's capacity shed or round-lost
 	// errors) may supply its own redacted OpenAI-compatible JSON body, so the client sees the
 	// symbolic code and bounded capacity/retry fields instead of a generic re-wrap. The
@@ -183,7 +194,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 	if len(body) == 0 {
-		body = BuildErrorResponseBody(status, errText)
+		body = BuildErrorResponseBodyWithError(status, errText, errCause)
 	}
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte

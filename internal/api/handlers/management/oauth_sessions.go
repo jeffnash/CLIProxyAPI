@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -307,6 +309,17 @@ func IsOAuthSessionPending(state, provider string) bool {
 	return oauthSessions.IsPending(state, provider)
 }
 
+// OAuthSessionProvider returns the provider recorded for a pending OAuth
+// session state, letting shared callback paths route without hard-coding a
+// provider. It reports false when no session exists for the state.
+func OAuthSessionProvider(state string) (string, bool) {
+	session, ok := oauthSessions.Get(state)
+	if !ok || strings.TrimSpace(session.Provider) == "" {
+		return "", false
+	}
+	return session.Provider, true
+}
+
 // guardOAuthSessionPendingForSave returns errOAuthSessionNotPending when the session
 // is no longer pending (cancelled, completed, errored, or expired).
 // Call immediately before persisting credentials so a cancel that races with token
@@ -376,6 +389,10 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		return "antigravity", nil
 	case "xai", "x-ai", "x.ai", "grok":
 		return "xai", nil
+	case "devin", "cognition":
+		return "devin", nil
+	case "meta", "muse":
+		return "meta", nil
 	default:
 		return "", errUnsupportedOAuthFlow
 	}
@@ -453,8 +470,27 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 	if err != nil {
 		return "", fmt.Errorf("marshal oauth callback payload: %w", err)
 	}
-	if err := os.WriteFile(filePath, data, 0o600); err != nil {
-		return "", fmt.Errorf("write oauth callback file: %w", err)
+	// Publish complete JSON atomically so background waiters cannot read a partial callback.
+	tmp, errCreate := os.CreateTemp(authDir, ".oauth-callback-*")
+	if errCreate != nil {
+		return "", fmt.Errorf("create oauth callback file: %w", errCreate)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if errRemove := os.Remove(tmpPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			log.Warn("failed to remove temporary OAuth callback file")
+		}
+	}()
+	_, errWrite := tmp.Write(data)
+	errClose := tmp.Close()
+	if errWrite != nil {
+		return "", fmt.Errorf("write oauth callback file: %w", errWrite)
+	}
+	if errClose != nil {
+		return "", fmt.Errorf("close oauth callback file: %w", errClose)
+	}
+	if errRename := os.Rename(tmpPath, filePath); errRename != nil {
+		return "", fmt.Errorf("publish oauth callback file: %w", errRename)
 	}
 	return filePath, nil
 }

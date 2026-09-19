@@ -26,6 +26,7 @@ const (
 	codexCollaborationNamespace           = "collaboration"
 	codexOptimizedCollaborationNamespace  = "collaboration-optimize"
 	codexOptimizedCollaborationNamePrefix = codexOptimizedCollaborationNamespace + "__"
+	codexOptimizedCollaborationDotPrefix  = codexOptimizedCollaborationNamespace + "."
 )
 
 // CodexMultiAgentV2ToolsPreparedContextKey marks a request whose collaboration
@@ -83,13 +84,24 @@ func RewriteCodexOrphanDelegationInputForConfig(ctx context.Context, headers htt
 // TranslateRequestWithCodexMultiAgentV2 normalizes official Codex multi-agent
 // input before translating it to a non-Codex target protocol.
 func TranslateRequestWithCodexMultiAgentV2(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, model string, payload []byte, stream bool) []byte {
+	return TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx, headers, cfg, from, to, sdktranslator.RequestEnvelope{
+		Format: from,
+		Model:  model,
+		Stream: stream,
+		Body:   payload,
+	}).Body
+}
+
+// TranslateRequestEnvelopeWithCodexMultiAgentV2 normalizes official Codex
+// multi-agent input while preserving request-scoped translation metadata.
+func TranslateRequestEnvelopeWithCodexMultiAgentV2(ctx context.Context, headers http.Header, cfg *config.Config, from, to sdktranslator.Format, req sdktranslator.RequestEnvelope) sdktranslator.RequestEnvelope {
 	if from == sdktranslator.FormatOpenAIResponse {
-		payload = RewriteCodexOrphanDelegationInputForConfig(ctx, headers, payload, cfg)
+		req.Body = RewriteCodexOrphanDelegationInputForConfig(ctx, headers, req.Body, cfg)
 		if to != sdktranslator.FormatCodex && to != sdktranslator.FormatOpenAIResponse {
-			payload = RewriteCodexMultiAgentV2Input(ctx, headers, payload, cfg)
+			req.Body = RewriteCodexMultiAgentV2Input(ctx, headers, req.Body, cfg)
 		}
 	}
-	return sdktranslator.TranslateRequest(from, to, model, payload, stream)
+	return sdktranslator.TranslateRequestEnvelope(ctx, from, to, req)
 }
 
 // PrepareCodexMultiAgentV2Tools prepares collaboration tool definitions at the
@@ -193,7 +205,8 @@ func IsCodexClientUserAgent(userAgent string) bool {
 	return strings.HasPrefix(userAgent, "Codex Desktop/") ||
 		strings.HasPrefix(userAgent, "codex-tui/") ||
 		userAgent == "codex_cli_rs" ||
-		strings.HasPrefix(userAgent, "codex_cli_rs/")
+		strings.HasPrefix(userAgent, "codex_cli_rs/") ||
+		strings.HasPrefix(userAgent, "codex_exec/")
 }
 
 func isCodexMultiAgentClient(userAgent string) bool {
@@ -664,7 +677,7 @@ func codexToolsHaveOptimizedCollaborationConflict(tools gjson.Result) bool {
 	}
 	for _, tool := range tools.Array() {
 		name := strings.TrimSpace(tool.Get("name").String())
-		if name == codexOptimizedCollaborationNamespace || strings.HasPrefix(name, codexOptimizedCollaborationNamePrefix) {
+		if name == codexOptimizedCollaborationNamespace || strings.HasPrefix(name, codexOptimizedCollaborationNamePrefix) || strings.HasPrefix(name, codexOptimizedCollaborationDotPrefix) {
 			return true
 		}
 		if strings.TrimSpace(tool.Get("type").String()) == "namespace" && codexToolsHaveOptimizedCollaborationConflict(tool.Get("tools")) {
@@ -743,6 +756,13 @@ func restoreCodexCollaborationValue(value any) bool {
 			case name == codexOptimizedCollaborationNamespace && itemType == "namespace":
 				typed["name"] = codexCollaborationNamespace
 				changed = true
+			case isToolCall && strings.HasPrefix(name, codexOptimizedCollaborationDotPrefix):
+				toolName := strings.TrimPrefix(name, codexOptimizedCollaborationDotPrefix)
+				if toolName != "" {
+					typed["namespace"] = codexCollaborationNamespace
+					typed["name"] = toolName
+					changed = true
+				}
 			case isToolCall && strings.HasPrefix(name, codexOptimizedCollaborationNamePrefix):
 				typed["name"] = codexCollaborationNamespace + "__" + strings.TrimPrefix(name, codexOptimizedCollaborationNamePrefix)
 				changed = true

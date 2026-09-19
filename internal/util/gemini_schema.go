@@ -246,6 +246,10 @@ func normalizeMalformedSchemaObjects(jsonStr string, addMissingArrayItems bool) 
 		return jsonStr
 	}
 
+	if rootBool, ok := root.(bool); ok && rootBool {
+		return "{}"
+	}
+
 	rootMap, ok := root.(map[string]any)
 	if !ok || isAPIRequestDocument(rootMap) {
 		return jsonStr
@@ -259,6 +263,12 @@ func normalizeMalformedSchemaObjects(jsonStr string, addMissingArrayItems bool) 
 				return jsonStr
 			}
 			out, err := marshalJSONNoHTMLEscape(map[string]any{"schema": repairedInner})
+			if err != nil {
+				return jsonStr
+			}
+			return string(out)
+		} else if innerBool, ok := rootMap["schema"].(bool); ok && innerBool {
+			out, err := marshalJSONNoHTMLEscape(map[string]any{"schema": map[string]any{}})
 			if err != nil {
 				return jsonStr
 			}
@@ -453,6 +463,9 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 			clone["items"] = repairedList
 			modified = true
 		}
+	} else if itemsBool, ok := clone["items"].(bool); ok && itemsBool {
+		clone["items"] = map[string]any{}
+		modified = true
 	}
 
 	if addProps, ok := clone["additionalProperties"].(map[string]any); ok {
@@ -478,6 +491,9 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 				clone[key] = repairedSub
 				modified = true
 			}
+		} else if subBool, ok := clone[key].(bool); ok && subBool {
+			clone[key] = map[string]any{}
+			modified = true
 		}
 	}
 
@@ -491,7 +507,7 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 		}
 	}
 
-	for _, key := range []string{"$defs", "definitions", "dependentSchemas"} {
+	for _, key := range []string{"$defs", "definitions", "dependentSchemas", "dependencies"} {
 		if defsVal, ok := clone[key].(map[string]any); ok {
 			repairedDefs := make(map[string]any, len(defsVal))
 			defsModified := false
@@ -503,6 +519,10 @@ func repairSchemaNode(node map[string]any, addMissingArrayItems bool) (map[strin
 						defsModified = true
 						modified = true
 					}
+				} else if defBool, ok := dv.(bool); ok && defBool {
+					repairedDefs[dk] = map[string]any{}
+					defsModified = true
+					modified = true
 				} else {
 					repairedDefs[dk] = dv
 				}
@@ -526,6 +546,9 @@ func repairSchemaList(list []any, addMissingArrayItems bool) ([]any, bool) {
 			if itemMod {
 				listModified = true
 			}
+		} else if itemBool, ok := item.(bool); ok && itemBool {
+			repairedList = append(repairedList, map[string]any{})
+			listModified = true
 		} else {
 			repairedList = append(repairedList, item)
 		}
@@ -539,6 +562,12 @@ func repairPropertyMap(props map[string]any, addMissingArrayItems bool) (map[str
 	modified := false
 
 	for k, v := range props {
+		if b, ok := v.(bool); ok && b {
+			out[k] = map[string]any{}
+			modified = true
+			continue
+		}
+
 		childMap, isMap := v.(map[string]any)
 		if !isMap {
 			out[k] = v
@@ -1191,10 +1220,12 @@ func flattenTypeArrays(jsonStr string, preserveNativeNullable bool) string {
 
 func removeUnsupportedKeywords(jsonStr string, options jsonSchemaCleanOptions) string {
 	keywords := append(constraintKeywords(options),
-		"$schema", "$defs", "definitions", "const", "$ref", "$id", "additionalProperties",
+		"$schema", "$defs", "definitions", "const", "$ref", "$id", "id", "additionalProperties",
+		"$anchor", "$vocabulary", "$dynamicRef", "$dynamicAnchor",
 		"propertyNames", "patternProperties", // Gemini doesn't support these schema keywords
 		"if", "then", "else",
 		"$comment", "enumDescriptions", "enumTitles", "prefill", "deprecated", "encrypted", // Schema metadata fields unsupported by Gemini
+		"additionalItems", "unevaluatedProperties", "unevaluatedItems", "contentSchema",
 	)
 	if options.antigravitySemantics {
 		keywords = append(keywords, "not")

@@ -521,8 +521,11 @@ func TestForwardResponsesStreamExposesTerminalErrors(t *testing.T) {
 			if exposed != tc.wantExposed {
 				t.Fatalf("error exposed = %t, want %t: %q", exposed, tc.wantExposed, body)
 			}
-			if exposed && strings.Contains(body, `"error":{`) {
+			if exposed && !strings.Contains(body, "event: error\ndata: ") {
 				t.Fatalf("expected streaming error chunk, got HTTP error body: %q", body)
+			}
+			if exposed && !strings.Contains(body, `"error":{`) {
+				t.Fatalf("expected nested error in streaming error chunk, got: %q", body)
 			}
 		})
 	}
@@ -916,7 +919,18 @@ func TestForwardResponsesStreamTerminalErrorUsesResponsesErrorChunk(t *testing.T
 	if !strings.Contains(body, `"type":"error"`) {
 		t.Fatalf("expected responses error chunk, got: %q", body)
 	}
-	if strings.Contains(body, `"error":{`) {
-		t.Fatalf("expected streaming error chunk (top-level type), got HTTP error body: %q", body)
+	// The streaming chunk keeps a top-level type (chunk-union validation) while
+	// carrying the nested error detail object (code/message preserved).
+	if !strings.Contains(body, `"code":"internal_server_error"`) {
+		t.Fatalf("expected nested error code in stream chunk, got: %q", body)
+	}
+	if !strings.Contains(body, `"message":"unexpected EOF"`) {
+		t.Fatalf("expected nested error message in stream chunk, got: %q", body)
+	}
+	if !strings.Contains(body, `"sequence_number":0`) {
+		t.Fatalf("expected sequence_number in stream chunk, got: %q", body)
+	}
+	if strings.Contains(body, "response.failed") {
+		t.Fatalf("non-Codex client must get an error event, not response.failed: %q", body)
 	}
 }

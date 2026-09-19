@@ -203,9 +203,10 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 				// tool-delta chunk appends nothing and yields no frame.
 			}
 
-			// Handle finish reason. An explicit null is "not finished": it must
-			// not synthesize a STOP frame (gjson reports null as existing).
-			if finishReason := choice.Get("finish_reason"); finishReason.Exists() && finishReason.Type != gjson.Null {
+			// Handle finish reason. An explicit null or empty value is "not finished": it must
+			// not synthesize a STOP frame (gjson reports null as existing, and the mapper
+			// defaults unknown reasons to STOP).
+			if finishReason := choice.Get("finish_reason"); finishReason.Type == gjson.String && finishReason.String() != "" {
 				geminiFinishReason := mapOpenAIFinishReasonToGemini(finishReason.String())
 				template, _ = sjson.SetBytes(template, "candidates.0.finishReason", geminiFinishReason)
 
@@ -641,7 +642,7 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 			}
 
 			// Handle finish reason
-			if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
+			if finishReason := choice.Get("finish_reason"); finishReason.Type == gjson.String && finishReason.String() != "" {
 				geminiFinishReason := mapOpenAIFinishReasonToGemini(finishReason.String())
 				out, _ = sjson.SetBytes(out, "candidates.0.finishReason", geminiFinishReason)
 			}
