@@ -98,16 +98,22 @@ const PROTOCOL_DECODE_MAX_DEPTH = 32;
 const PROTOCOL_DECODE_MAX_NODES = 4096;
 
 const ARGUMENT_ALIASES = Object.freeze({
-  absolutepath: [["filePath", "path", "file", "filename"], 80],
+  // Cursor-native spellings (target_file, target_directory) are valid mapping
+  // targets: models may emit harness-style keys (path, file, directory) while
+  // the advertised client schema requires the Cursor-native name, or the
+  // reverse. Candidates stay ordered most-specific-first so an exact schema
+  // spelling always wins before any alias fallback.
+  absolutepath: [["filePath", "path", "file", "filename", "targetFile"], 80],
   cmd: [["command", "cmd", "script"], 95],
   commandline: [["command", "cmd", "script"], 80],
   content: [["content", "fileText", "text", "newString"], 95],
   contents: [["content", "newString", "text"], 70],
   cwd: [["cwd", "workingDirectory", "workdir"], 90],
-  directory: [["directory", "path"], 60],
+  directory: [["directory", "path", "targetDirectory"], 60],
+  file: [["file", "filePath", "path", "filename", "targetFile"], 70],
   filetext: [["content", "text", "newString"], 95],
-  filepath: [["filePath", "path", "file", "filename"], 90],
-  filename: [["filePath", "path", "file", "filename"], 75],
+  filepath: [["filePath", "path", "file", "filename", "targetFile"], 90],
+  filename: [["filePath", "path", "file", "filename", "targetFile"], 75],
   glob: [["pattern", "glob", "include"], 85],
   globpattern: [["pattern", "glob", "include"], 95],
   include: [["include", "pattern", "glob"], 70],
@@ -119,7 +125,7 @@ const ARGUMENT_ALIASES = Object.freeze({
   oldcontents: [["oldString", "old", "search", "text"], 80],
   oldstring: [["oldString", "old", "search"], 95],
   oldtext: [["oldString", "old", "search", "text"], 85],
-  path: [["filePath", "path", "file", "filename"], 75],
+  path: [["filePath", "path", "file", "filename", "targetFile"], 75],
   pattern: [["pattern", "query", "regex", "search"], 80],
   prompt: [["prompt", "description", "instructions", "query"], 80],
   query: [["query", "pattern", "search", "prompt"], 80],

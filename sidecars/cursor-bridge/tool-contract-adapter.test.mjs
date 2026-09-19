@@ -466,6 +466,46 @@ test("native read/write/shell keys adapt to Claude-style and other client spelli
   ).value, { command: "pwd", cwd: "/repo" });
 });
 
+test("harness-style file keys adapt to Cursor-native target_file and target_directory", () => {
+  const fileSchema = {
+    type: "object",
+    properties: { target_file: { type: "string" } },
+    required: ["target_file"],
+    additionalProperties: false,
+  };
+  for (const input of [{ path: "/repo/a.py" }, { file: "/repo/a.py" }, { filePath: "/repo/a.py" }, { filename: "/repo/a.py" }]) {
+    const translated = normalizeToolArguments(input, fileSchema);
+    assert.deepEqual(translated.value, { target_file: "/repo/a.py" });
+    assert.ok(translated.transforms.some((entry) => entry.kind === "rename-key" && entry.target === "target_file"));
+  }
+  assert.deepEqual(normalizeToolArguments(
+    { directory: "/repo" },
+    { type: "object", properties: { target_directory: { type: "string" } }, required: ["target_directory"], additionalProperties: false },
+  ).value, { target_directory: "/repo" });
+  // The reverse direction keeps working: a Cursor-native key adapts to a harness-style schema.
+  assert.deepEqual(normalizeToolArguments(
+    { target_file: "/repo/a.py" },
+    { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"], additionalProperties: false },
+  ).value, { file_path: "/repo/a.py" });
+  // An exact schema spelling still wins over any alias fallback.
+  const exact = normalizeToolArguments(
+    { path: "/repo/a.py" },
+    {
+      type: "object",
+      properties: { path: { type: "string" }, target_file: { type: "string" } },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  );
+  assert.deepEqual(exact.value, { path: "/repo/a.py" });
+  assert.equal(exact.transforms.filter((entry) => entry.kind === "rename-key").length, 0);
+  // Conflicting aliases against a Cursor-native schema still fail closed.
+  assert.throws(
+    () => normalizeToolArguments({ path: "/correct", file: "/wrong" }, fileSchema),
+    (error) => error instanceof ToolContractNormalizationError && error.code === "ambiguous_alias",
+  );
+});
+
 test("argument repair never maps workspace locations into search queries", () => {
   const schema = {
     type: "object",
