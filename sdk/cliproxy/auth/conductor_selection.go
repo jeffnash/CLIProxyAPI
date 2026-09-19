@@ -1188,11 +1188,19 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	if status == http.StatusOK {
 		return 0, false
 	}
+	// An explicit retry policy owns the decision for errors it matches: the
+	// operator listed them as transient, which overrides the heuristic
+	// request-error classification below (e.g. Meta reports transient model
+	// 404s on OpenAI-style endpoints with an invalid_request_error body).
+	policyWait, policyRetry, policyConfigured := m.policyRetryDecision(ctx, err, attempt)
+	if policyConfigured && policyRetry {
+		return policyWait, policyRetry
+	}
 	if isRequestInvalidError(err) || isRequestStopError(err) {
 		return 0, false
 	}
-	if wait, retry, configured := m.policyRetryDecision(ctx, err, attempt); configured {
-		return wait, retry
+	if policyConfigured {
+		return policyWait, policyRetry
 	}
 	// Explicit no-cooldown routes can retry transient model-not-found responses.
 	// Without a cooldown deadline, closestCooldownWait cannot schedule a retry.

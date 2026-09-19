@@ -207,6 +207,21 @@ func TestRetryPolicyDelayOverridesGlobalZeroInterval(t *testing.T) {
 	}
 }
 
+func TestRetryPolicyOverridesRequestFaultClassification(t *testing.T) {
+	// Meta reports transient model 404s on its OpenAI-style endpoints with an
+	// invalid_request_error body, which the heuristic classifier treats as a
+	// client request fault. An explicit retry policy listing that 404 must win.
+	p := testPolicy()
+	p.Errors = []config.RetryPolicyError{{Status: 404, Contains: "The requested model was not found."}}
+	body := `{"error":{"code":"model_not_found","message":"The requested model was not found.","type":"invalid_request_error"}}`
+	e := &policyExecutor{failures: 1, err: &Error{HTTPStatus: 404, Message: body}}
+	m := newPolicyManager(t, p, e)
+	_, err := m.Execute(t.Context(), []string{"policy-provider"}, ex.Request{Model: "policy-model"}, ex.Options{})
+	if err != nil || len(e.calls) != 2 {
+		t.Fatalf("calls=%d err=%v", len(e.calls), err)
+	}
+}
+
 func TestRetryableProxyErrorConnectDenials(t *testing.T) {
 	retryable := []error{
 		&url.Error{Op: "Post", URL: "https://api.meta.ai/v1/messages?beta=true", Err: errors.New("Forbidden")},
