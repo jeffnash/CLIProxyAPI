@@ -10,6 +10,44 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+func TestFileTokenStoreListSkipsRuntimeDirectories(t *testing.T) {
+	// The auth root itself may be hidden; ordinary nested auths remain supported.
+	baseDir := filepath.Join(t.TempDir(), ".auths")
+	for name, data := range map[string]string{
+		"meta.json":                                          `{"type":"meta"}`,
+		"accounts/codebuddy.json":                            `{"type":"codebuddy"}`,
+		".cursor-agent-store/agents/state.json":              `{}`,
+		".cursor-agent-store.pre-rollback/agents/state.json": `{}`,
+		"accounts/.runtime/state.json":                       `{"type":"meta"}`,
+	} {
+		path := filepath.Join(baseDir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+	auths, err := store.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"meta.json": "meta",
+		filepath.Join("accounts", "codebuddy.json"): "codebuddy",
+	}
+	if len(auths) != len(want) {
+		t.Fatalf("List() returned %d auths, want %d; runtime JSON must not become auths", len(auths), len(want))
+	}
+	for _, auth := range auths {
+		if provider, ok := want[auth.ID]; !ok || auth.Provider != provider {
+			t.Errorf("unexpected auth ID=%q provider=%q", auth.ID, auth.Provider)
+		}
+	}
+}
+
 func TestExtractAccessToken(t *testing.T) {
 	t.Parallel()
 
