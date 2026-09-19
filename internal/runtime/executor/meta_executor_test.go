@@ -1039,3 +1039,92 @@ func TestMetaExecutor_ExecuteNonStreamMultiEventSSE_RecordsModelAndWarnsOnSubsti
 		t.Fatalf("expected substitution warning in logs for substituted-meta-model")
 	}
 }
+
+func TestMetaStreamEventErrorNestedQuota(t *testing.T) {
+	eventData := []byte(`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Subscription quota exhausted.","resets_at":4102444800,"type":"rate_limit_error"}}}`)
+	errEvent := metaStreamEventError(eventData)
+	if errEvent == nil {
+		t.Fatal("expected error for response.failed")
+	}
+	var se statusErr
+	if !errors.As(errEvent, &se) {
+		t.Fatalf("expected statusErr, got %T: %v", errEvent, errEvent)
+	}
+	if se.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", se.StatusCode())
+	}
+	var scoped interface{ IsCredentialScoped() bool }
+	if !errors.As(errEvent, &scoped) || !scoped.IsCredentialScoped() {
+		t.Fatalf("expected credential-scoped quota error, got %T: %v", errEvent, errEvent)
+	}
+	if se.RetryAfter() == nil {
+		t.Fatal("expected non-nil RetryAfter from resets_at")
+	}
+}
+
+func TestMetaStreamEventErrorSymbolicTopLevel(t *testing.T) {
+	tests := []struct {
+		name     string
+		event    string
+		wantCode int
+	}{
+		{"top level symbolic quota", `{"type":"error","error":{"code":"rate_limit_exceeded","message":"slow down"}}`, http.StatusTooManyRequests},
+		{"auth type", `{"type":"error","error":{"code":"x","message":"no","type":"authentication_error"}}`, http.StatusUnauthorized},
+		{"numeric preserved", `{"type":"error","error":{"code":503,"message":"down"}}`, http.StatusServiceUnavailable},
+		{"unknown stays gateway", `{"type":"error","error":{"code":"weird","message":"?"}}`, http.StatusBadGateway},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errEvent := metaStreamEventError([]byte(tt.event))
+			if errEvent == nil {
+				t.Fatal("expected error")
+			}
+			var se statusErr
+			if !errors.As(errEvent, &se) {
+				t.Fatalf("expected statusErr, got %T", errEvent)
+			}
+			if se.StatusCode() != tt.wantCode {
+				t.Fatalf("status = %d, want %d", se.StatusCode(), tt.wantCode)
+			}
+		})
+	}
+	if errEvent := metaStreamEventError([]byte(`{"type":"response.created"}`)); errEvent != nil {
+		t.Fatalf("non-error event must return nil, got %v", errEvent)
+	}
+}
+
+func TestMetaExecutor_ExecuteStreamPrematureEOF(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewMetaExecutor(&config.Config{})
+	result, err := exec.ExecuteStream(context.Background(), &cliproxyauth.Auth{
+		Provider:   "meta",
+		Attributes: map[string]string{"api_key": "meta-token", "base_url": server.URL},
+	}, cliproxyexecutor.Request{
+		Model:   "muse-spark-1.3",
+		Payload: []byte(`{"model":"muse-spark-1.3","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("expected premature-EOF error for stream without terminal event")
+	}
+	var se statusErr
+	if !errors.As(streamErr, &se) || se.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("error = %v, want 502 statusErr", streamErr)
+	}
+}

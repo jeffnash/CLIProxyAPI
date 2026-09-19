@@ -10,7 +10,6 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	log "github.com/sirupsen/logrus"
 )
 
 // ResolveDiscoveryStateDir returns an absolute state directory for discovery metadata,
@@ -193,13 +192,13 @@ func BuildServiceSpec(cfg *config.Config, port int, tlsEnabled bool) (ServiceSpe
 		subtypes = []string{SubtypeChatCompletions}
 	}
 
-	// 5. Interface filtering (Scheme C)
+	// 5. Interface filtering (deny-list policy)
 	ifaces, err := FilterInterfaces(discCfg.Interfaces.Include, discCfg.Interfaces.Exclude)
 	if err != nil {
-		log.Warnf("discovery: failed to filter interfaces: %v", err)
+		return ServiceSpec{}, fmt.Errorf("discovery: failed to filter interfaces: %w", err)
 	}
 	if len(ifaces) == 0 {
-		return ServiceSpec{}, fmt.Errorf("discovery: no qualified physical interfaces found matching filters (refusing fallback to all interfaces)")
+		return ServiceSpec{}, fmt.Errorf("discovery: no qualified interfaces found matching include=%q exclude=%q (refusing fallback to all interfaces)", discCfg.Interfaces.Include, discCfg.Interfaces.Exclude)
 	}
 	bindHost := strings.TrimSpace(cfg.Host)
 	var bindIP net.IP

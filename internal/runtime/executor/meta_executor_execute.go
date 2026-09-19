@@ -270,11 +270,47 @@ func metaStreamEventError(eventData []byte) error {
 	if eventType != "error" && eventType != "response.failed" {
 		return nil
 	}
-	statusCode := http.StatusBadGateway
-	if code := int(gjson.GetBytes(eventData, "error.code").Int()); code >= 400 && code <= 599 {
-		statusCode = code
+	// response.failed carries the failure at response.error; extract it so
+	// quota/reset detection (which reads error.* paths) and status mapping see
+	// the real payload instead of the envelope.
+	body := eventData
+	errObj := gjson.GetBytes(eventData, "error")
+	if eventType == "response.failed" {
+		if nested := gjson.GetBytes(eventData, "response.error"); nested.Exists() && nested.IsObject() {
+			errObj = nested
+			if normalized, errSet := sjson.SetRawBytes([]byte(`{"error":{}}`), "error", []byte(nested.Raw)); errSet == nil {
+				body = normalized
+			}
+		}
 	}
-	return wrapMetaUpstreamError(statusCode, eventData)
+	statusCode := http.StatusBadGateway
+	if code := int(errObj.Get("code").Int()); code >= 400 && code <= 599 {
+		statusCode = code
+	} else if mapped, ok := metaSymbolicErrorStatus(errObj.Get("code").String(), errObj.Get("type").String()); ok {
+		statusCode = mapped
+	}
+	return wrapMetaUpstreamError(statusCode, body)
+}
+
+// metaSymbolicErrorStatus maps symbolic error codes/types to HTTP statuses,
+// mirroring the codex terminal vocabulary for shared Responses shapes.
+func metaSymbolicErrorStatus(code, errType string) (int, bool) {
+	code = strings.ToLower(strings.TrimSpace(code))
+	errType = strings.ToLower(strings.TrimSpace(errType))
+	switch {
+	case errType == "rate_limit_error" || code == "rate_limit_exceeded":
+		return http.StatusTooManyRequests, true
+	case errType == "authentication_error" || code == "invalid_api_key" || code == "unauthorized":
+		return http.StatusUnauthorized, true
+	case errType == "permission_error" || code == "forbidden" || code == "permission_denied":
+		return http.StatusForbidden, true
+	case errType == "not_found_error" || code == "not_found" || code == "model_not_found":
+		return http.StatusNotFound, true
+	case errType == "invalid_request_error" || errType == "bad_request_error":
+		return http.StatusBadRequest, true
+	default:
+		return 0, false
+	}
 }
 
 func metaAsCompletedEvent(data []byte) ([]byte, bool) {

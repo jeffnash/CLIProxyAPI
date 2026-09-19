@@ -38,7 +38,7 @@ func TestDevinOAuthRoutes(t *testing.T) {
 		{name: "success", provider: "devin", query: "code=test-code", callbackPath: "/callback", want: http.StatusOK},
 		{name: "success legacy path", provider: "devin", query: "code=test-code", callbackPath: "/devin/callback", want: http.StatusOK},
 		{name: "denied", provider: "devin", query: "error=access_denied", callbackPath: "/callback", want: http.StatusOK},
-		{name: "wrong provider", provider: "codex", query: "code=test-code", callbackPath: "/callback", want: http.StatusBadRequest},
+		{name: "shared path routes by session", provider: "codex", query: "code=test-code", callbackPath: "/callback", want: http.StatusOK},
 		{name: "missing code", provider: "devin", callbackPath: "/callback", want: http.StatusBadRequest},
 		{name: "unknown state", query: "code=test-code", callbackPath: "/callback", want: http.StatusBadRequest},
 	} {
@@ -57,7 +57,11 @@ func TestDevinOAuthRoutes(t *testing.T) {
 			if w.Code != test.want {
 				t.Fatalf("callback: %d %s", w.Code, w.Body.String())
 			}
-			filePath := filepath.Join(server.cfg.AuthDir, ".oauth-devin-"+state+".oauth")
+			fileProvider := test.provider
+			if fileProvider == "" {
+				fileProvider = "devin"
+			}
+			filePath := filepath.Join(server.cfg.AuthDir, ".oauth-"+fileProvider+"-"+state+".oauth")
 			data, errRead := os.ReadFile(filePath)
 			if test.want == http.StatusOK {
 				if errRead != nil {

@@ -24,7 +24,9 @@ var IgnoredInterfacePrefixes = []string{
 	"llw",
 }
 
-// FilterInterfaces selects qualified physical multicast-capable LAN interfaces according to Strategy C.
+// FilterInterfaces selects qualified multicast-capable interfaces: any up,
+// non-loopback interface with a usable address is accepted unless dropped by
+// the virtual/tunnel deny-list or the explicit filters.
 // If include is non-empty, only matching interface names are accepted.
 // If exclude is non-empty, matching interface names are dropped.
 func FilterInterfaces(include, exclude []string) ([]net.Interface, error) {
@@ -54,10 +56,11 @@ func FilterInterfaces(include, exclude []string) ([]net.Interface, error) {
 			continue
 		}
 
-		// 4. Default allow-list: only common physical LAN adapter names are
-		// accepted unless the user explicitly provides an include list.
+		// 4. Default deny-list: virtual/tunnel interfaces are dropped unless
+		// the user explicitly provides an include list (which then governs
+		// selection). Any remaining interface is treated as usable.
 		if len(include) == 0 {
-			if isVirtualOrTunnel(name) || !isLikelyPhysicalLAN(name) {
+			if isVirtualOrTunnel(name) {
 				continue
 			}
 		}
@@ -98,17 +101,6 @@ func FilterInterfaces(include, exclude []string) ([]net.Interface, error) {
 
 func isVirtualOrTunnel(name string) bool {
 	for _, prefix := range IgnoredInterfacePrefixes {
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func isLikelyPhysicalLAN(name string) bool {
-	for _, prefix := range []string{
-		"en", "eth", "em", "igb", "ix", "re", "wl", "wlan", "wifi", "wi-fi", "ethernet",
-	} {
 		if strings.HasPrefix(name, prefix) {
 			return true
 		}

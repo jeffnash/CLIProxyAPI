@@ -12,7 +12,9 @@ import (
 )
 
 // CreateAuthRecord builds the shared CLI and management OAuth credential record.
-// Profile and quota enrichment are best-effort; the session token is permanent.
+// Profile and quota enrichment are best-effort for transient or server-side
+// failures, but an authentication failure from either lookup is fatal: an
+// invalid token must never mint an active credential. The session token is permanent.
 func (s *DevinAuthService) CreateAuthRecord(ctx context.Context, token string) (*coreauth.Auth, error) {
 	sessionToken := FormatSessionToken(token)
 	if sessionToken == "" {
@@ -20,11 +22,17 @@ func (s *DevinAuthService) CreateAuthRecord(ctx context.Context, token string) (
 	}
 	userName, userID, orgID, errSelf := s.FetchSelfProfile(ctx, sessionToken)
 	if errSelf != nil {
-		log.Warn("failed to fetch devin user profile")
+		if IsDevinAuthError(errSelf) {
+			return nil, fmt.Errorf("devin authentication failed: %w", errSelf)
+		}
+		log.WithError(errSelf).Warn("failed to fetch devin user profile")
 	}
 	userStatus, errStatus := s.FetchUserStatus(ctx, sessionToken, "")
 	if errStatus != nil {
-		log.Warn("failed to fetch devin user status and quota")
+		if IsDevinAuthError(errStatus) {
+			return nil, fmt.Errorf("devin authentication failed: %w", errStatus)
+		}
+		log.WithError(errStatus).Warn("failed to fetch devin user status and quota")
 	}
 	if errCtx := ctx.Err(); errCtx != nil {
 		return nil, errCtx

@@ -302,13 +302,12 @@ func TestInterfaceFiltering_Helpers(t *testing.T) {
 		if isVirtualOrTunnel(name) {
 			t.Errorf("expected %s to be recognized as physical interface", name)
 		}
-		if !isLikelyPhysicalLAN(name) {
-			t.Errorf("expected %s to be accepted as a likely physical LAN interface", name)
-		}
 	}
+	// Default policy is deny-list-only: names outside the virtual/tunnel
+	// prefixes are usable even when they match no physical naming pattern.
 	for _, name := range []string{"bridge100", "p2p0", "ppp0", "mystery0"} {
-		if isLikelyPhysicalLAN(name) {
-			t.Errorf("expected %s not to be accepted by the default physical LAN allow-list", name)
+		if isVirtualOrTunnel(name) {
+			t.Errorf("expected %s to pass the default deny-list", name)
 		}
 	}
 
@@ -541,5 +540,28 @@ func TestAdvertiserAndBrowser_Integration(t *testing.T) {
 
 	if !found {
 		t.Fatalf("advertised instance CPA-LiveTest-42 was not discovered")
+	}
+}
+
+func TestBuildTXTRecordsTruncatesOptionalFirst(t *testing.T) {
+	opts := DefaultTXTOptions()
+	opts.Features = []string{strings.Repeat("f", 300)}
+	records := BuildTXTRecords(opts)
+	parsed := ParseTXTRecords(records)
+	if parsed["version"] == "" || parsed["product"] == "" {
+		t.Fatalf("core records must survive truncation: %v", records)
+	}
+	if _, ok := parsed["features"]; ok {
+		t.Fatalf("oversized optional record must be dropped: %v", records)
+	}
+	total := 0
+	for _, r := range records {
+		if len(r) > 255 {
+			t.Fatalf("record exceeds 255 bytes: %q", r)
+		}
+		total += len(r) + 1
+	}
+	if total > 400 {
+		t.Fatalf("total %d exceeds 400 bytes", total)
 	}
 }

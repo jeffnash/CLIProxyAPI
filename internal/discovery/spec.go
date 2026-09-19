@@ -2,7 +2,10 @@ package discovery
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -126,6 +129,12 @@ func BuildTXTRecords(opts TXTOptions) []string {
 		addCandidate("features", strings.Join(opts.Features, ","), 3)
 	}
 
+	// Honor the declared priority tiers so truncation drops optional records
+	// before core routing metadata regardless of append order.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].priority < candidates[j].priority
+	})
+
 	// Assemble records respecting single-string (255) and total length (400) limits
 	var records []string
 	totalBytes := 0
@@ -133,10 +142,12 @@ func BuildTXTRecords(opts TXTOptions) []string {
 	for _, item := range candidates {
 		entry := fmt.Sprintf("%s=%s", item.key, item.val)
 		if len(entry) > maxTXTRecordBytes {
+			log.Debugf("discovery: dropping TXT candidate %q exceeding per-record limit (%d > %d)", item.key, len(entry), maxTXTRecordBytes)
 			continue
 		}
 		entryCost := len(entry) + 1 // +1 for DNS TXT length prefix byte
 		if totalBytes+entryCost > maxTXTBytes {
+			log.Debugf("discovery: dropping TXT candidate %q exceeding total TXT budget (%d + %d > %d)", item.key, totalBytes, entryCost, maxTXTBytes)
 			continue
 		}
 

@@ -258,3 +258,38 @@ func TestOAuthServerCallback(t *testing.T) {
 		t.Errorf("res.State = %q, want mock-state", res.State)
 	}
 }
+
+func TestFetchSelfProfileAuthFailure(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"invalid token"}`))
+		}))
+		svc := NewDevinAuthService(server.Client())
+		svc.apiBaseURL = server.URL
+		_, _, _, errSelf := svc.FetchSelfProfile(context.Background(), "bad-token")
+		server.Close()
+		if errSelf == nil {
+			t.Fatalf("status %d: expected error", status)
+		}
+		if !IsDevinAuthError(errSelf) {
+			t.Fatalf("status %d: error %v is not a DevinAuthError", status, errSelf)
+		}
+	}
+}
+
+func TestFetchSelfProfileTransientFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	svc := NewDevinAuthService(server.Client())
+	svc.apiBaseURL = server.URL
+	_, _, _, errSelf := svc.FetchSelfProfile(context.Background(), "tok")
+	if errSelf == nil {
+		t.Fatal("expected error for 503")
+	}
+	if IsDevinAuthError(errSelf) {
+		t.Fatalf("503 must not be an auth failure: %v", errSelf)
+	}
+}

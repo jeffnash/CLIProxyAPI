@@ -2,7 +2,6 @@ package devin
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -13,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -41,17 +39,11 @@ type DevinUserStatus struct {
 	PlanEnd                     time.Time `json:"plan_end,omitempty"`
 }
 
-// GenerateDeviceFingerprint generates a 732-character hex device fingerprint.
-// When seed is empty, it generates a cryptographically random 732-character hex string per request.
-// When seed is provided, it derives a deterministic 732-character hex fingerprint.
+// GenerateDeviceFingerprint derives a deterministic 732-character hex device
+// fingerprint from seed by chaining SHA-256 digests. The output is stable for
+// a given seed; callers must supply a non-empty seed (see
+// BuildGetUserStatusRequest for the defaulting policy).
 func GenerateDeviceFingerprint(seed string) string {
-	if seed == "" {
-		var b [devinFingerprintHexLen / 2]byte
-		if _, err := rand.Read(b[:]); err == nil {
-			return hex.EncodeToString(b[:])
-		}
-		seed = uuid.New().String()
-	}
 	var sb strings.Builder
 	counter := 0
 	for sb.Len() < devinFingerprintHexLen {
@@ -63,10 +55,16 @@ func GenerateDeviceFingerprint(seed string) string {
 }
 
 // BuildGetUserStatusRequest serializes a Connect-RPC GetUserStatus request protobuf.
-func BuildGetUserStatusRequest(sessionToken, deviceFingerprint string) []byte {
-	if deviceFingerprint == "" {
-		deviceFingerprint = GenerateDeviceFingerprint(sessionToken)
+//
+// Device identity policy: the fingerprint is derived deterministically from the
+// session token, or from an explicit device seed when the caller provides one.
+// The session token is permanent, so the fingerprint is stable for the
+// credential lifetime without persisting extra state.
+func BuildGetUserStatusRequest(sessionToken, deviceSeed string) []byte {
+	if deviceSeed == "" {
+		deviceSeed = sessionToken
 	}
+	deviceFingerprint := GenerateDeviceFingerprint(deviceSeed)
 
 	var f1Bytes []byte
 	f1Bytes = protowire.AppendTag(f1Bytes, 1, protowire.BytesType)
@@ -342,7 +340,7 @@ func (s *DevinAuthService) FetchUserStatus(ctx context.Context, sessionToken, de
 		return nil, errors.New("devin auth service: session token is required")
 	}
 
-	reqBody := BuildGetUserStatusRequest(sessionToken, GenerateDeviceFingerprint(deviceSeed))
+	reqBody := BuildGetUserStatusRequest(sessionToken, deviceSeed)
 
 	endpoint := fmt.Sprintf("%s%s", strings.TrimRight(s.serverBaseURL, "/"), DevinGetUserStatusPath)
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(reqBody)))
@@ -369,6 +367,9 @@ func (s *DevinAuthService) FetchUserStatus(ctx context.Context, sessionToken, de
 		return nil, errRead
 	}
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, &DevinAuthError{StatusCode: resp.StatusCode, Excerpt: devinErrorExcerpt(respBytes)}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("devin seat management error (status %d): %s", resp.StatusCode, string(respBytes))
 	}

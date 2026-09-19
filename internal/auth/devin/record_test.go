@@ -98,3 +98,30 @@ func TestCreateAuthRecordSafeFallbackFilename(t *testing.T) {
 		t.Fatal("empty token accepted")
 	}
 }
+
+func TestCreateAuthRecordAuthFailureIsFatal(t *testing.T) {
+	for _, path := range []string{"/v3/self", DevinGetUserStatusPath} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == path {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if r.URL.Path == "/v3/self" {
+				_, _ = w.Write([]byte(`{"user_name":"u","user_id":"i","org_id":"o"}`))
+				return
+			}
+			_, _ = w.Write(buildMockUserStatusResponse())
+		}))
+		svc := NewDevinAuthService(server.Client())
+		svc.apiBaseURL = server.URL
+		svc.serverBaseURL = server.URL
+		record, errRecord := svc.CreateAuthRecord(context.Background(), "[REDACTED]")
+		server.Close()
+		if errRecord == nil {
+			t.Fatalf("%s 401: expected fatal error, got record %v", path, record)
+		}
+		if !IsDevinAuthError(errRecord) {
+			t.Fatalf("%s 401: error %v must wrap DevinAuthError", path, errRecord)
+		}
+	}
+}

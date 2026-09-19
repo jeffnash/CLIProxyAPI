@@ -247,3 +247,25 @@ func TestLiveDevinUserStatus(t *testing.T) {
 		t.Error("expected non-empty email")
 	}
 }
+
+func TestDeviceFingerprintDeterministicPolicy(t *testing.T) {
+	a := GenerateDeviceFingerprint("seed-1")
+	b := GenerateDeviceFingerprint("seed-1")
+	if a != b || len(a) != 732 {
+		t.Fatalf("fingerprint unstable or wrong length: %d", len(a))
+	}
+	if c := GenerateDeviceFingerprint("seed-2"); c == a {
+		t.Fatal("distinct seeds must produce distinct fingerprints")
+	}
+	// Empty seed falls back to the session token: identical bytes, stable across calls.
+	first := BuildGetUserStatusRequest("tok-1", "")
+	second := BuildGetUserStatusRequest("tok-1", "")
+	explicit := BuildGetUserStatusRequest("tok-1", "tok-1")
+	other := BuildGetUserStatusRequest("tok-1", "other-seed")
+	if string(first) != string(second) || string(first) != string(explicit) {
+		t.Fatal("empty device seed must derive deterministically from the session token")
+	}
+	if string(first) == string(other) {
+		t.Fatal("explicit device seed must alter the request")
+	}
+}

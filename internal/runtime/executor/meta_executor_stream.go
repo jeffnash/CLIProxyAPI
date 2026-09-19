@@ -84,6 +84,7 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		terminalSeen := false
 		emitTranslatedLine := func(translatedLine []byte) bool {
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, translatedLine, &param, claudeInputTokens)
 			for i := range chunks {
@@ -120,6 +121,7 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			case "response.output_item.done":
 				xaiCollectOutputItemDone(eventData, outputItemsByIndex, &outputItemsFallback)
 			case "response.completed", "response.incomplete":
+				terminalSeen = true
 				if detail, ok := helps.ParseCodexUsage(eventData); ok {
 					reporter.Publish(ctx, detail)
 				}
@@ -134,6 +136,18 @@ func (e *MetaExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			reporter.PublishFailure(ctx, errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case <-ctx.Done():
+			}
+		} else if !terminalSeen {
+			// A valid stream always ends with response.completed,
+			// response.incomplete, or an error event. Anything else is a
+			// truncated generation and must surface as an error (matching the
+			// non-streaming path) so retries and error handling can engage.
+			truncatedErr := wrapMetaUpstreamError(http.StatusBadGateway, []byte(`{"error":{"code":"truncated_response","message":"meta stream ended without response.completed or response.incomplete","type":"server_error"}}`))
+			helps.RecordAPIResponseError(ctx, e.cfg, truncatedErr)
+			reporter.PublishFailure(ctx, truncatedErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: truncatedErr}:
 			case <-ctx.Done():
 			}
 		}

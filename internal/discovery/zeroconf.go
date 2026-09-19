@@ -256,13 +256,21 @@ func (b *ZeroconfBrowser) Browse(ctx context.Context, serviceType, domain string
 	// Stop the underlying zeroconf client after a bounded number of entries. This
 	// is separate from the caller's context so a LAN flood cannot grow the
 	// dependency's internal sentEntries cache for the full browse lifetime.
+	//
+	// Channel ownership: entries is owned by libp2p/zeroconf/v2 and must never
+	// be closed here. Confirmed against v2.2.0 (client.go): run() always waits
+	// for mainloop to exit before Browse returns, and mainloop closes the
+	// channel via params.done() once its context is cancelled. The single
+	// exception is a synchronous newClient startup failure, where the library
+	// never runs: the collector below also selects on the browse context so it
+	// terminates independently in that case.
 	doneCh := make(chan struct{})
 	go func() {
 		defer close(doneCh)
 		entriesSeen := 0
-		for entry := range entries {
+		handle := func(entry *zeroconf.ServiceEntry) {
 			if entriesSeen >= maxBrowseEntries {
-				continue
+				return
 			}
 			entriesSeen++
 
@@ -285,12 +293,36 @@ func (b *ZeroconfBrowser) Browse(ctx context.Context, serviceType, domain string
 				cancelBrowse()
 			}
 		}
+		for {
+			select {
+			case entry, ok := <-entries:
+				if !ok {
+					return
+				}
+				handle(entry)
+			case <-browseCtx.Done():
+				// Drain anything the library already queued, then exit. When
+				// the library ran, it closes entries itself; when startup
+				// failed before run, the drain is empty and this branch is the
+				// collector's independent completion signal.
+				for {
+					select {
+					case entry, ok := <-entries:
+						if !ok {
+							return
+						}
+						handle(entry)
+					default:
+						return
+					}
+				}
+			}
+		}
 	}()
 
 	errBrowse := zeroconf.Browse(browseCtx, serviceType, domain, entries, b.options...)
 	if errBrowse != nil {
-		// zeroconf may already have closed entries after a runtime error.
-		closeBrowseEntries(entries)
+		cancelBrowse()
 		<-doneCh
 		return nil, fmt.Errorf("discovery: browse query failed: %w", errBrowse)
 	}
@@ -298,13 +330,6 @@ func (b *ZeroconfBrowser) Browse(ctx context.Context, serviceType, domain string
 	<-doneCh
 
 	return discovered, nil
-}
-
-func closeBrowseEntries(entries chan *zeroconf.ServiceEntry) {
-	defer func() {
-		_ = recover()
-	}()
-	close(entries)
 }
 
 func discoveredServiceKey(svc DiscoveredService) string {

@@ -149,7 +149,40 @@ func (s *DevinAuthService) ExchangeCodeForToken(ctx context.Context, code, codeV
 	return token, nil
 }
 
+// DevinAuthError reports a Devin authentication failure: the session token was
+// rejected (401/403), so the credential is invalid rather than temporarily
+// unreachable. Use IsDevinAuthError to distinguish it from transient failures.
+type DevinAuthError struct {
+	StatusCode int
+	Excerpt    string
+}
+
+func (e *DevinAuthError) Error() string {
+	if e.Excerpt != "" {
+		return fmt.Sprintf("devin authentication failed with status %d: %s", e.StatusCode, e.Excerpt)
+	}
+	return fmt.Sprintf("devin authentication failed with status %d", e.StatusCode)
+}
+
+// IsDevinAuthError reports whether err wraps a Devin authentication failure.
+func IsDevinAuthError(err error) bool {
+	var authErr *DevinAuthError
+	return errors.As(err, &authErr)
+}
+
+// devinErrorExcerpt truncates an upstream body for safe inclusion in errors.
+func devinErrorExcerpt(body []byte) string {
+	const maxExcerpt = 512
+	excerpt := string(body)
+	if len(excerpt) > maxExcerpt {
+		excerpt = excerpt[:maxExcerpt] + "...(truncated)"
+	}
+	return excerpt
+}
+
 // FetchSelfProfile retrieves the authenticated user's profile from api.devin.ai/v3/self.
+// Any non-2xx status is an error: 401/403 surface as *DevinAuthError (invalid
+// token), anything else as a transient failure.
 func (s *DevinAuthService) FetchSelfProfile(ctx context.Context, sessionToken string) (userName, userID, orgID string, err error) {
 	endpoint := fmt.Sprintf("%s/v3/self", strings.TrimRight(s.apiBaseURL, "/"))
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -172,12 +205,17 @@ func (s *DevinAuthService) FetchSelfProfile(ctx context.Context, sessionToken st
 		return "", "", "", errRead
 	}
 
-	if resp.StatusCode == http.StatusOK {
-		root := gjson.ParseBytes(respBytes)
-		userName = root.Get("user_name").String()
-		userID = root.Get("user_id").String()
-		orgID = root.Get("org_id").String()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", "", "", &DevinAuthError{StatusCode: resp.StatusCode, Excerpt: devinErrorExcerpt(respBytes)}
 	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", "", fmt.Errorf("devin profile lookup failed with status %d: %s", resp.StatusCode, devinErrorExcerpt(respBytes))
+	}
+
+	root := gjson.ParseBytes(respBytes)
+	userName = root.Get("user_name").String()
+	userID = root.Get("user_id").String()
+	orgID = root.Get("org_id").String()
 
 	return userName, userID, orgID, nil
 }

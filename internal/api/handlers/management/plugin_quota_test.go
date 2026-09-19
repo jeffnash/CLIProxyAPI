@@ -445,15 +445,9 @@ func TestResetCredentialQuota_FailureDoesNotClearCooldown(t *testing.T) {
 	}
 }
 
-func TestFetchCredentialQuota_DeclarativeProbe(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if authHdr := r.Header.Get("Authorization"); authHdr != "Bearer secret-token" {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
-		_, _ = w.Write([]byte(`{
+func TestProcessQuotaProbeResponse(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{
 			"subscription": {"plan": "ProbePro"},
 			"groups": [
 				{
@@ -463,46 +457,19 @@ func TestFetchCredentialQuota_DeclarativeProbe(t *testing.T) {
 					]
 				}
 			]
-		}`))
-	}))
-	defer upstream.Close()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-auth",
-		FileName: "probe.json",
-		Provider: "probe-provider",
-		Metadata: map[string]any{
-			"token": "secret-token",
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/usage",
-				"method": "GET",
-				"header": map[string]any{
-					"Authorization": "Bearer $TOKEN$",
-				},
+		}`),
+		0,
+		map[string]any{
+			"header": map[string]any{
+				"Authorization": "Bearer $TOKEN$",
 			},
 		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
+	)
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	if !handled || errProbe != nil {
+		t.Fatalf("processQuotaProbeResponse() handled=%v err=%v", handled, errProbe)
 	}
 
-	var quotaResp pluginapi.QuotaFetchResponse
-	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &quotaResp); errUnmarshal != nil {
-		t.Fatalf("failed to decode response: %v", errUnmarshal)
-	}
 	if quotaResp.Subscription == nil || quotaResp.Subscription.Plan != "ProbePro" {
 		t.Fatalf("unexpected probe subscription: %+v", quotaResp.Subscription)
 	}
@@ -511,37 +478,15 @@ func TestFetchCredentialQuota_DeclarativeProbe(t *testing.T) {
 	}
 }
 
-func TestFetchCredentialQuota_DeclarativeProbeSummaryOnly(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"summary":[{"key":"balance","label":"Balance","value":42,"unit":"credits"}]}`))
-	}))
-	defer upstream.Close()
+func TestProcessQuotaProbeResponseSummaryOnly(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{"summary":[{"key":"balance","label":"Balance","value":42,"unit":"credits"}]}`),
+		0,
+		map[string]any{},
+	)
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-summary-auth",
-		FileName: "probe-summary.json",
-		Provider: "probe-summary",
-		Metadata: map[string]any{"quota_probe": map[string]any{"url": upstream.URL, "method": "GET"}},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var quotaResp pluginapi.QuotaFetchResponse
-	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &quotaResp); errUnmarshal != nil {
-		t.Fatalf("failed to decode response: %v", errUnmarshal)
+	if !handled || errProbe != nil {
+		t.Fatalf("processQuotaProbeResponse() handled=%v err=%v", handled, errProbe)
 	}
 	if len(quotaResp.Summary) != 1 || quotaResp.Summary[0].Key != "balance" || quotaResp.Summary[0].Value != 42 {
 		t.Fatalf("unexpected summary: %+v", quotaResp.Summary)
@@ -555,21 +500,12 @@ func TestFilterUsableQuotaSummaryRequiresStringIdentifiers(t *testing.T) {
 	}
 }
 
-func TestExecuteQuotaProbeStripsSummaryKeyCaseInsensitively(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"subscription":{"plan":"ProbePro"},"Summary":"usage text"}`))
-	}))
-	defer upstream.Close()
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/probe", nil)
-
-	quotaResp, handled, errProbe := h.executeQuotaProbe(ctx, &coreauth.Auth{}, map[string]any{
-		"url": upstream.URL,
-	})
+func TestProcessQuotaProbeResponseStripsSummaryKeyCaseInsensitively(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{"subscription":{"plan":"ProbePro"},"Summary":"usage text"}`),
+		0,
+		map[string]any{},
+	)
 	if !handled || errProbe != nil {
 		t.Fatalf("executeQuotaProbe() handled=%v err=%v", handled, errProbe)
 	}
@@ -614,80 +550,36 @@ func TestFilterUsableQuotaSummaryOmitsNonStringOptionalMetadata(t *testing.T) {
 	}
 }
 
-func TestFetchCredentialQuota_DeclarativeProbeSummaryWithoutValueReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"summary":[{"key":"balance","label":"Balance"}]}`))
-	}))
-	defer upstream.Close()
+func TestProcessQuotaProbeResponseSummaryWithoutValueReturnsError(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{"summary":[{"key":"balance","label":"Balance"}]}`),
+		0,
+		map[string]any{},
+	)
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-summary-without-value-auth",
-		FileName: "probe-summary-without-value.json",
-		Provider: "probe-summary",
-		Metadata: map[string]any{"quota_probe": map[string]any{"url": upstream.URL, "method": "GET"}},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected status 502, got %d: %s", rec.Code, rec.Body.String())
+	if errProbe == nil {
+		t.Fatalf("expected error, got handled=%v resp=%+v", handled, quotaResp)
 	}
 }
 
-func TestFetchCredentialQuota_DeclarativeProbeIgnoresMalformedOptionalSummary(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"subscription":{"plan":"ProbePro"},"summary":"usage text"}`))
-	}))
-	defer upstream.Close()
+func TestProcessQuotaProbeResponseIgnoresMalformedOptionalSummary(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{"subscription":{"plan":"ProbePro"},"summary":"usage text"}`),
+		0,
+		map[string]any{},
+	)
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-malformed-summary-auth",
-		FileName: "probe-malformed-summary.json",
-		Provider: "probe-summary",
-		Metadata: map[string]any{"quota_probe": map[string]any{"url": upstream.URL, "method": "GET"}},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var quotaResp pluginapi.QuotaFetchResponse
-	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &quotaResp); errUnmarshal != nil {
-		t.Fatalf("failed to decode response: %v", errUnmarshal)
+	if !handled || errProbe != nil {
+		t.Fatalf("processQuotaProbeResponse() handled=%v err=%v", handled, errProbe)
 	}
 	if quotaResp.Subscription == nil || quotaResp.Subscription.Plan != "ProbePro" || len(quotaResp.Summary) != 0 {
 		t.Fatalf("unexpected response: %+v", quotaResp)
 	}
 }
 
-func TestFetchCredentialQuota_DeclarativeProbeWithMapping(t *testing.T) {
-	futureServerTime := time.Now().Add(5 * time.Minute).UTC().Truncate(time.Second)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Date", futureServerTime.Format(http.TimeFormat))
-		// Upstream returns raw non-normalized billing format
-		_, _ = w.Write([]byte(`{
+func TestProcessQuotaProbeResponseWithMapping(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{
 			"user": {"tier": "Enterprise"},
 			"Summary": [{"key": "credits_used", "label": "Credits used", "value": 40}],
 			"packages": [
@@ -699,55 +591,29 @@ func TestFetchCredentialQuota_DeclarativeProbeWithMapping(t *testing.T) {
 					"expires": "2026-10-15T00:00:00Z"
 				}
 			]
-		}`))
-	}))
-	defer upstream.Close()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-mapping-auth",
-		FileName: "probe-mapping.json",
-		Provider: "probe-mapping",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/billing",
-				"method": "GET",
-				"mapping": map[string]any{
-					"plan": "user.tier",
-					"groups": []any{
-						map[string]any{
-							"display_name":         "Resource Packages",
-							"buckets_path":         "packages",
-							"window_key":           "period",
-							"remaining_amount_key": "remain",
-							"total_amount_key":     "total",
-							"reset_time_key":       "expires",
-						},
+		}`),
+		5*60*1000,
+		map[string]any{
+			"mapping": map[string]any{
+				"plan": "user.tier",
+				"groups": []any{
+					map[string]any{
+						"display_name":         "Resource Packages",
+						"buckets_path":         "packages",
+						"window_key":           "period",
+						"remaining_amount_key": "remain",
+						"total_amount_key":     "total",
+						"reset_time_key":       "expires",
 					},
 				},
 			},
 		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
+	)
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	if !handled || errProbe != nil {
+		t.Fatalf("processQuotaProbeResponse() handled=%v err=%v", handled, errProbe)
 	}
 
-	var quotaResp pluginapi.QuotaFetchResponse
-	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &quotaResp); errUnmarshal != nil {
-		t.Fatalf("failed to decode response: %v", errUnmarshal)
-	}
 	if quotaResp.Subscription == nil || quotaResp.Subscription.Plan != "Enterprise" {
 		t.Fatalf("unexpected plan: %+v", quotaResp.Subscription)
 	}
@@ -771,381 +637,153 @@ func TestFetchCredentialQuota_DeclarativeProbeWithMapping(t *testing.T) {
 	}
 }
 
-func TestFetchCredentialQuota_DeclarativeProbeInvalidReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("random unmapped text"))
-	}))
-	defer upstream.Close()
+func TestProcessQuotaProbeResponseInvalidReturnsError(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte("random unmapped text"),
+		0,
+		map[string]any{},
+	)
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-invalid-auth",
-		FileName: "probe-invalid.json",
-		Provider: "probe-invalid",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/invalid",
-				"method": "GET",
-			},
-		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected status 502 Bad Gateway for unmapped invalid probe response, got %d", rec.Code)
+	if errProbe == nil {
+		t.Fatalf("expected error, got handled=%v resp=%+v", handled, quotaResp)
 	}
 }
 
-func TestFetchCredentialQuota_DeclarativeProbeMissingPathReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// Empty JSON object, missing all declared paths
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer upstream.Close()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-missing-path-auth",
-		FileName: "probe-missing.json",
-		Provider: "probe-missing",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/empty",
-				"method": "GET",
-				"mapping": map[string]any{
-					"plan": "missing.plan.path",
-					"groups": []any{
-						map[string]any{
-							"display_name": "Monthly",
-							"buckets": []any{
-								map[string]any{
-									"remaining_fraction": "missing.fraction.path",
-								},
+func TestProcessQuotaProbeResponseMissingPathReturnsError(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{}`),
+		0,
+		map[string]any{
+			"mapping": map[string]any{
+				"plan": "missing.plan.path",
+				"groups": []any{
+					map[string]any{
+						"display_name": "Monthly",
+						"buckets": []any{
+							map[string]any{
+								"remaining_fraction": "missing.fraction.path",
 							},
 						},
 					},
 				},
 			},
 		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
+	)
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected status 502 Bad Gateway when mapping paths are missing, got %d", rec.Code)
+	if errProbe == nil {
+		t.Fatalf("expected error, got handled=%v resp=%+v", handled, quotaResp)
 	}
 }
 
-func TestFetchCredentialQuota_DeclarativeProbeNonJSONWithMappingReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = w.Write([]byte(`<html>502 Gateway Timeout</html>`))
-	}))
-	defer upstream.Close()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-nonjson-auth",
-		FileName: "probe-nonjson.json",
-		Provider: "probe-nonjson",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/html",
-				"method": "GET",
-				"mapping": map[string]any{
-					"plan": "user.plan",
-				},
+func TestProcessQuotaProbeResponseNonJSONWithMappingReturnsError(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`<html>502 Gateway Timeout</html>`),
+		0,
+		map[string]any{
+			"mapping": map[string]any{
+				"plan": "user.plan",
 			},
 		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
+	)
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected status 502 Bad Gateway for non-JSON upstream with mapping, got %d", rec.Code)
+	if errProbe == nil {
+		t.Fatalf("expected error, got handled=%v resp=%+v", handled, quotaResp)
 	}
 }
 
-func TestFetchCredentialQuota_MalformedNormalizedGroupsReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// Malformed normalized shape with empty group and no buckets or plan
-		_, _ = w.Write([]byte(`{"groups": [{}]}`))
-	}))
-	defer upstream.Close()
+func TestProcessQuotaProbeResponse_MalformedNormalizedGroupsReturnsError(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{"groups": [{}]}`),
+		0,
+		map[string]any{},
+	)
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-malformed-auth",
-		FileName: "probe-malformed.json",
-		Provider: "probe-malformed",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/malformed",
-				"method": "GET",
-			},
-		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected status 502 Bad Gateway for malformed normalized groups, got %d", rec.Code)
+	if errProbe == nil {
+		t.Fatalf("expected error, got handled=%v resp=%+v", handled, quotaResp)
 	}
 }
 
-func TestFetchCredentialQuota_NonNumericFractionReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// Non-numeric string value for fraction
-		_, _ = w.Write([]byte(`{
+func TestProcessQuotaProbeResponse_NonNumericFractionReturnsError(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{
 			"quota": {
 				"remaining": "unknown",
 				"total": "unlimited"
 			}
-		}`))
-	}))
-	defer upstream.Close()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-nonnumeric-auth",
-		FileName: "probe-nonnumeric.json",
-		Provider: "probe-nonnumeric",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/usage",
-				"method": "GET",
-				"mapping": map[string]any{
-					"groups": []any{
-						map[string]any{
-							"display_name": "API Limits",
-							"buckets": []any{
-								map[string]any{
-									"remaining_fraction": "quota.remaining",
-								},
+		}`),
+		0,
+		map[string]any{
+			"mapping": map[string]any{
+				"groups": []any{
+					map[string]any{
+						"display_name": "API Limits",
+						"buckets": []any{
+							map[string]any{
+								"remaining_fraction": "quota.remaining",
 							},
 						},
 					},
 				},
 			},
 		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
+	)
 
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected status 502 Bad Gateway for non-numeric fraction string, got %d", rec.Code)
+	if errProbe == nil {
+		t.Fatalf("expected error, got handled=%v resp=%+v", handled, quotaResp)
 	}
 }
 
-func TestFetchCredentialQuota_EmptyBucketsNormalizedReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// Malformed normalized shape with group containing an empty bucket object
-		_, _ = w.Write([]byte(`{"groups":[{"buckets":[{}]}]}`))
-	}))
-	defer upstream.Close()
+func TestProcessQuotaProbeResponse_EmptyBucketsNormalizedReturnsError(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{"groups":[{"buckets":[{}]}]}`),
+		0,
+		map[string]any{},
+	)
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-empty-bucket-auth",
-		FileName: "probe-empty-bucket.json",
-		Provider: "probe-empty-bucket",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/empty-bucket",
-				"method": "GET",
-			},
-		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected status 502 Bad Gateway for empty bucket normalized groups, got %d", rec.Code)
+	if errProbe == nil {
+		t.Fatalf("expected error, got handled=%v resp=%+v", handled, quotaResp)
 	}
 }
 
-func TestFetchCredentialQuota_LegitimateZeroQuotaAccepted(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// Legitimate exhausted quota with remainingFraction: 0
-		_, _ = w.Write([]byte(`{"groups":[{"displayName":"Daily","buckets":[{"window":"daily","remainingFraction":0}]}]}`))
-	}))
-	defer upstream.Close()
+func TestProcessQuotaProbeResponse_LegitimateZeroQuotaAccepted(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{"groups":[{"displayName":"Daily","buckets":[{"window":"daily","remainingFraction":0}]}]}`),
+		0,
+		map[string]any{},
+	)
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-zero-quota-auth",
-		FileName: "probe-zero.json",
-		Provider: "probe-zero",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/zero-quota",
-				"method": "GET",
-			},
-		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200 for legitimate zero remaining fraction, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var quotaResp pluginapi.QuotaFetchResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &quotaResp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
+	if !handled || errProbe != nil {
+		t.Fatalf("processQuotaProbeResponse() handled=%v err=%v", handled, errProbe)
 	}
 	if len(quotaResp.Groups) != 1 || len(quotaResp.Groups[0].Buckets) != 1 || quotaResp.Groups[0].Buckets[0].RemainingFraction != 0 {
 		t.Fatalf("unexpected quota groups: %+v", quotaResp.Groups)
 	}
 }
 
-func TestFetchCredentialQuota_WindowOnlyBucketReturnsError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// Bucket has window label but completely lacks remaining fraction or amount
-		_, _ = w.Write([]byte(`{"groups":[{"displayName":"Weekly","buckets":[{"window":"weekly"}]}]}`))
-	}))
-	defer upstream.Close()
+func TestProcessQuotaProbeResponse_WindowOnlyBucketReturnsError(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{"groups":[{"displayName":"Weekly","buckets":[{"window":"weekly"}]}]}`),
+		0,
+		map[string]any{},
+	)
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-window-only-auth",
-		FileName: "probe-window.json",
-		Provider: "probe-window",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/window-only",
-				"method": "GET",
-			},
-		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expected status 502 Bad Gateway for bucket without remaining fraction, got %d", rec.Code)
+	if errProbe == nil {
+		t.Fatalf("expected error, got handled=%v resp=%+v", handled, quotaResp)
 	}
 }
 
-func TestFetchCredentialQuota_MixedValidAndInvalidBuckets(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// Mixed valid bucket and invalid bucket without remaining fraction
-		_, _ = w.Write([]byte(`{"groups":[{"displayName":"Limits","buckets":[
+func TestProcessQuotaProbeResponse_MixedValidAndInvalidBuckets(t *testing.T) {
+	quotaResp, handled, errProbe := processQuotaProbeResponse(
+		[]byte(`{"groups":[{"displayName":"Limits","buckets":[
 			{"window":"daily","remainingFraction":0.8,"description":"valid"},
 			{"window":"weekly","description":"missing fraction"}
-		]}]}`))
-	}))
-	defer upstream.Close()
+		]}]}`),
+		0,
+		map[string]any{},
+	)
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	auth := &coreauth.Auth{
-		ID:       "probe-mixed-auth",
-		FileName: "probe-mixed.json",
-		Provider: "probe-mixed",
-		Metadata: map[string]any{
-			"quota_probe": map[string]any{
-				"url":    upstream.URL + "/mixed",
-				"method": "GET",
-			},
-		},
-	}
-	authIndex := auth.EnsureIndex()
-	_, _ = manager.Register(context.Background(), auth)
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	h.SetPluginHost(pluginhost.New())
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.FetchCredentialQuota(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200 for response with at least one valid bucket, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var quotaResp pluginapi.QuotaFetchResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &quotaResp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
+	if !handled || errProbe != nil {
+		t.Fatalf("processQuotaProbeResponse() handled=%v err=%v", handled, errProbe)
 	}
 	if len(quotaResp.Groups) != 1 {
 		t.Fatalf("expected 1 group, got %d", len(quotaResp.Groups))
@@ -1202,5 +840,83 @@ func TestFetchCredentialQuota_MissingTokenDoesNotHitUpstream(t *testing.T) {
 	// Upstream must NEVER be contacted
 	if upstreamHit {
 		t.Fatal("upstream server must NOT be contacted when template requires token but token is missing")
+	}
+}
+
+func TestValidateQuotaProbeURL(t *testing.T) {
+	public := []string{"93.184.216.34"}
+	tests := []struct {
+		name    string
+		rawURL  string
+		allowed []string
+		wantErr string
+	}{
+		{"invalid URL", "http://[::1", nil, "probe URL is invalid"},
+		{"http rejected", "http://93.184.216.34/quota", public, "probe URL must use https"},
+		{"missing host", "https:///quota", public, "probe URL has no host"},
+		{"not allow-listed", "https://93.184.216.34/quota", nil, "not on the operator allow-list"},
+		{"not allow-listed other host", "https://api.example.com/quota", public, "not on the operator allow-list"},
+		{"loopback rejected", "https://127.0.0.1/quota", []string{"127.0.0.1"}, "disallowed address"},
+		{"private rejected", "https://10.0.0.1/quota", []string{"10.0.0.1"}, "disallowed address"},
+		{"link local rejected", "https://[fe80::1]/quota", []string{"fe80::1"}, "disallowed address"},
+		{"localhost resolves loopback", "https://localhost/quota", []string{"localhost"}, "disallowed address"},
+		{"unresolvable fails closed", "https://nonexistent.invalid/quota", []string{"nonexistent.invalid"}, "does not resolve"},
+		{"allow-list case insensitive", "https://93.184.216.34/quota", []string{"93.184.216.34"}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := validateQuotaProbeURL(tt.rawURL, tt.allowed)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateQuotaProbeURL() error = %v", err)
+				}
+				if got == nil || got.Scheme != "https" {
+					t.Fatalf("validateQuotaProbeURL() = %v", got)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateQuotaProbeURL() = %v, want error containing %q", got, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("validateQuotaProbeURL() error = %q, want %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestExpandQuotaProbeTokenEscapesURLOnly(t *testing.T) {
+	gotURL, gotData := expandQuotaProbeToken("https://h/q?tok=$TOKEN$", `{"t":"$TOKEN$"}`, "a+b/c=d&e")
+	if gotURL != "https://h/q?tok=a%2Bb%2Fc%3Dd%26e" {
+		t.Fatalf("url = %q", gotURL)
+	}
+	if gotData != `{"t":"a+b/c=d&e"}` {
+		t.Fatalf("data = %q", gotData)
+	}
+}
+
+func TestRedactQuotaProbeExcerpt(t *testing.T) {
+	if got := redactQuotaProbeExcerpt("ok secret-token ok", "secret-token"); got != "ok [REDACTED] ok" {
+		t.Fatalf("excerpt = %q", got)
+	}
+	long := strings.Repeat("x", quotaProbeMaxErrorExcerpt+100)
+	if got := redactQuotaProbeExcerpt(long, ""); !strings.HasSuffix(got, "...(truncated)") || len(got) != quotaProbeMaxErrorExcerpt+len("...(truncated)") {
+		t.Fatalf("excerpt len = %d", len(got))
+	}
+}
+
+func TestExecuteQuotaProbeRejectsInsecureURL(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/probe", nil)
+	_, handled, errProbe := h.executeQuotaProbe(ctx, &coreauth.Auth{}, map[string]any{
+		"url": "http://127.0.0.1:9/quota",
+	})
+	if !handled || errProbe == nil {
+		t.Fatalf("executeQuotaProbe() handled=%v err=%v, want validation error", handled, errProbe)
+	}
+	if !strings.Contains(errProbe.Error(), "https") {
+		t.Fatalf("error = %q, want https rejection", errProbe.Error())
 	}
 }
