@@ -2130,6 +2130,54 @@ func TestExecuteComposerStreamPingKeepalive(t *testing.T) {
 	}
 }
 
+func TestExecuteComposerStreamLiveUsagePreservesAnthropicToolHandoff(t *testing.T) {
+	previous := composerLiveUsageEnabled
+	composerLiveUsageEnabled = true
+	t.Cleanup(func() { composerLiveUsageEnabled = previous })
+	for _, prefix := range []string{"text", "tool_call"} {
+		t.Run(prefix, func(t *testing.T) {
+			long := strings.Repeat("x", 250)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if prefix == "text" {
+					fmt.Fprintf(w, "data: {\"type\":\"text\",\"delta\":%q}\n\n", long)
+				} else {
+					fmt.Fprintf(w, "data: {\"type\":\"tool_call\",\"id\":\"call_first\",\"name\":\"Read\",\"input\":{\"path\":%q}}\n\n", long)
+				}
+				fmt.Fprint(w, "data: {\"type\":\"tool_call\",\"id\":\"call_last\",\"name\":\"Read\",\"input\":{\"path\":\"/last\"}}\n\n")
+				fmt.Fprint(w, "data: {\"type\":\"turn_end\",\"stop_reason\":\"tool_use\"}\n\ndata: [DONE]\n\n")
+			}))
+			defer srv.Close()
+			e := NewCursorExecutor(&config.Config{})
+			auth := &cliproxyauth.Auth{ID: "live-usage-" + prefix, Attributes: map[string]string{"api_key": "k", "composer_client_tools_bridge_url": srv.URL}}
+			payload := []byte(`{"model":"grok-4.6","stream":true,"messages":[{"role":"user","content":"read files"}],"tools":[{"name":"Read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}`)
+			opts := composerExecOpts("claude", "live-usage-"+prefix)
+			opts.OriginalRequest = payload
+			sr, err := e.executeComposerStream(context.Background(), auth, "k", cliproxyexecutor.Request{Model: "grok-4.6", Payload: payload}, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out strings.Builder
+			for chunk := range sr.Chunks {
+				if chunk.Err != nil {
+					t.Fatal(chunk.Err)
+				}
+				out.Write(chunk.Payload)
+			}
+			wire := out.String()
+			if !strings.Contains(wire, `"id":"call_last"`) || !strings.Contains(wire, `\"path\":\"/last\"`) {
+				t.Fatalf("live usage dropped the final tool call or its arguments: %s", wire)
+			}
+			if !strings.Contains(wire, `"stop_reason":"tool_use"`) || strings.Contains(wire, `"stop_reason":"end_turn"`) {
+				t.Fatalf("tool handoff must finish with tool_use: %s", wire)
+			}
+			if strings.Count(wire, "event: message_stop\n") != 1 || !strings.HasSuffix(strings.TrimSpace(wire), `data: {"type":"message_stop"}`) {
+				t.Fatalf("message_stop must occur exactly once, after all content: %s", wire)
+			}
+		})
+	}
+}
+
 func TestExecuteComposerStreamResumeEmitsLiveBeforeTerminal(t *testing.T) {
 	releaseTerminal := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

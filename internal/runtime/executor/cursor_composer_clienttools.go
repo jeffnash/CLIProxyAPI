@@ -4696,16 +4696,20 @@ func composerSetMessageStartInputTokens(chunk []byte, inputTokens int) []byte {
 	return out
 }
 
-// composerUsageChunk builds an OpenAI streaming usage frame (empty choices + a usage object) so the per-schema
-// translator forwards token usage to the client (e.g. Anthropic message_delta.usage). It carries the composer
-// usage ESTIMATE, since the bridge / @cursor/sdk provide none.
-func composerUsageChunk(id, model string, promptTokens, completionTokens int) []byte {
+// composerUsageChunk carries estimated usage because the bridge / SDK provide none.
+// Running estimates need a nonterminal choice: empty choices signal trailing usage
+// to translators and can finalize the message before its tool calls arrive.
+func composerUsageChunk(id, model string, promptTokens, completionTokens int, running bool) []byte {
+	choices := []map[string]any{}
+	if running {
+		choices = append(choices, map[string]any{"index": 0, "delta": map[string]any{}})
+	}
 	c := map[string]any{
 		"id":      id,
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
 		"model":   model,
-		"choices": []map[string]any{},
+		"choices": choices,
 		"usage": map[string]any{
 			"prompt_tokens":     promptTokens,
 			"completion_tokens": completionTokens,
@@ -5597,7 +5601,7 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 				// supplied real usage; wire-only (the ledger still records the single authoritative estimate at the end).
 				if composerLiveUsageEnabled && !realUsage && completionChars-lastLiveUsageChars >= composerLiveUsageStepChars {
 					lastLiveUsageChars = completionChars
-					if !emit(sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), oai, composerUsageChunk(responseID, model, composerEstimateTokens(promptChars), composerEstimateTokens(completionChars)), &param)) {
+					if !emit(sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), oai, composerUsageChunk(responseID, model, composerEstimateTokens(promptChars), composerEstimateTokens(completionChars), true), &param)) {
 						return
 					}
 				}
@@ -5665,7 +5669,7 @@ func (e *CursorExecutor) executeComposerStream(ctx context.Context, auth *clipro
 					composerDebugf("[composer %s] publishing ESTIMATED usage (SDK exposes none; not billing-grade): prompt~%d completion~%d", responseID, pt, ct)
 					reporter.Publish(ctx, detail)
 				}
-				if !emit(sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), oai, composerUsageChunk(responseID, model, pt, ct), &param)) {
+				if !emit(sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), oai, composerUsageChunk(responseID, model, pt, ct, false), &param)) {
 					return
 				}
 			}
