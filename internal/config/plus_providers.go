@@ -16,6 +16,8 @@ import (
 // These routes synthesize runtime Auth entries, so they participate in normal
 // selection, retries, proxies, and logging.
 type PassthruRoute struct {
+	// Protocols selects matching native endpoints; Protocol remains the legacy single-protocol mode.
+	Protocols        []string            `yaml:"protocols,omitempty" json:"protocols,omitempty"`
 	Model            string              `yaml:"model" json:"model"`
 	ModelRoutingName string              `yaml:"model-routing-name,omitempty" json:"model-routing-name,omitempty"`
 	Protocol         string              `yaml:"protocol" json:"protocol"`

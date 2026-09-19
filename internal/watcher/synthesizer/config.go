@@ -98,6 +98,9 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 		if base == "" {
 			continue
 		}
+		if len(r.Protocols) > 0 {
+			protocol = "passthru-native"
+		}
 		proxyURL := strings.TrimSpace(r.ProxyURL)
 		upstreamModel := strings.TrimSpace(r.UpstreamModel)
 
@@ -137,6 +140,9 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 				"passthru_routing_name": routingModel,
 				"passthru_key_index":    fmt.Sprintf("%d", keyIndex),
 				"passthru_total_keys":   fmt.Sprintf("%d", len(apiKeys)),
+			}
+			if len(r.Protocols) > 0 {
+				attrs["native_protocols"] = strings.Join(r.Protocols, ",")
 			}
 			if apiKey != "" {
 				attrs["api_key"] = apiKey
@@ -182,6 +188,8 @@ func (s *ConfigSynthesizer) synthesizePassthru(ctx *SynthesisContext) []*coreaut
 			case "openai", "openai-chat", "openai_compat", "openai-compat", "openai-compatibility":
 				providerName = "openai-compatibility"
 				attrs["provider_key"] = "openai-compatibility"
+			case "passthru-native":
+				providerName = "passthru-native"
 			case "claude":
 				providerName = "claude"
 			case "codex", "responses":

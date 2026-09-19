@@ -274,6 +274,16 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		}
 	}
 
+	for _, route := range cfg.Passthru {
+		for _, protocol := range route.Protocols {
+			switch protocol {
+			case "claude", "openai", "responses":
+			default:
+				return nil, fmt.Errorf("unsupported passthru protocol %q for %s", protocol, route.Model)
+			}
+		}
+	}
+
 	// Load Chutes configuration from env.
 	if env := strings.TrimSpace(os.Getenv("CHUTES_API_KEY")); env != "" {
 		cfg.Chutes.APIKey = env
