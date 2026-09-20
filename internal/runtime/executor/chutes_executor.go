@@ -827,6 +827,21 @@ func EvictChutesModelCache() {
 	chutesModelCacheMu.Unlock()
 }
 
+// EvictExpiredChutesModelCache drops the model cache only when its TTL has
+// elapsed, reporting whether an eviction happened.
+func EvictExpiredChutesModelCache() bool {
+	chutesModelCacheMu.Lock()
+	defer chutesModelCacheMu.Unlock()
+	if chutesModelCache == nil {
+		return false
+	}
+	if time.Since(chutesModelCache.fetchedAt) < chutesModelCacheTTL {
+		return false
+	}
+	chutesModelCache = nil
+	return true
+}
+
 // chutesMaxRetries returns the configured max retries or the default.
 func chutesMaxRetries(cfg *config.Config) int {
 	if cfg == nil {

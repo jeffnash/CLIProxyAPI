@@ -1309,6 +1309,30 @@ func EvictCopilotModelCache(authID string) {
 	sharedModelCacheMu.Unlock()
 }
 
+// EvictAllCopilotModelCaches clears cached models for every auth ID so the next
+// registration refetches from the Copilot API.
+func EvictAllCopilotModelCaches() {
+	sharedModelCacheMu.Lock()
+	sharedModelCache = make(map[string]*sharedModelCacheEntry)
+	sharedModelCacheMu.Unlock()
+}
+
+// EvictExpiredCopilotModelCaches drops only cache entries whose TTL has elapsed
+// and returns the affected auth IDs.
+func EvictExpiredCopilotModelCaches() []string {
+	now := time.Now()
+	sharedModelCacheMu.Lock()
+	defer sharedModelCacheMu.Unlock()
+	var expired []string
+	for authID, entry := range sharedModelCache {
+		if entry == nil || now.Sub(entry.fetchedAt) >= sharedModelCacheTTL {
+			expired = append(expired, authID)
+			delete(sharedModelCache, authID)
+		}
+	}
+	return expired
+}
+
 func (e *CopilotExecutor) FetchModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) ([]*registry.ModelInfo, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("copilot executor: auth is nil")

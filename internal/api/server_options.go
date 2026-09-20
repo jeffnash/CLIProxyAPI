@@ -26,6 +26,7 @@ type serverOptionConfig struct {
 	postAuthPersistHook   auth.PostAuthHook
 	pluginHost            *pluginhost.Host
 	configReloadHook      func(context.Context, *config.Config)
+	modelRefreshHook      func(context.Context, []string) int
 	exampleAPIKeySafeMode bool
 }
 
@@ -125,6 +126,14 @@ func WithPluginHost(host *pluginhost.Host) ServerOption {
 func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.configReloadHook = hook
+	}
+}
+
+// WithModelRefreshHook registers the callback used by the management models
+// refresh endpoint to evict fetched-model caches and re-register models.
+func WithModelRefreshHook(hook func(context.Context, []string) int) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.modelRefreshHook = hook
 	}
 }
 

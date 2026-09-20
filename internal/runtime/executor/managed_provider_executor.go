@@ -1309,6 +1309,23 @@ func EvictManagedProviderModelCache(providerName string) {
 	delete(managedProviderModelCache, providerName)
 }
 
+// EvictExpiredManagedProviderModelCache drops only cache entries whose TTL has
+// elapsed and returns the affected provider names. It lets background refresh
+// honor the configured model-discovery TTL without refetching fresh entries.
+func EvictExpiredManagedProviderModelCache() []string {
+	now := time.Now()
+	managedProviderModelCacheMu.Lock()
+	defer managedProviderModelCacheMu.Unlock()
+	var expired []string
+	for providerName, entry := range managedProviderModelCache {
+		if entry == nil || now.Sub(entry.fetchedAt) >= entry.ttl {
+			expired = append(expired, providerName)
+			delete(managedProviderModelCache, providerName)
+		}
+	}
+	return expired
+}
+
 func (e *ManagedProviderExecutor) creds(auth *cliproxyauth.Auth) managedProviderCredentials {
 	provider, _ := config.FindManagedProvider(e.sdkConfig(), e.Identifier())
 	if provider.Name == "" {

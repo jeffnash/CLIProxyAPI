@@ -301,6 +301,9 @@ func (b *Builder) Build() (*Service, error) {
 		api.WithConfigReloadHook(func(_ context.Context, _ *config.Config) {
 			service.reloadConfigFromWatcher()
 		}),
+		api.WithModelRefreshHook(func(ctx context.Context, providers []string) int {
+			return service.RefreshFetchedModels(ctx, providers)
+		}),
 	)
 	return service, nil
 }

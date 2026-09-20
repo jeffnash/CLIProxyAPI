@@ -329,42 +329,7 @@ func (s *Service) registerModelRefreshCallback() {
 			return
 		}
 
-		providerSet := make(map[string]bool, len(changedProviders))
-		for _, p := range changedProviders {
-			providerSet[strings.ToLower(strings.TrimSpace(p))] = true
-		}
-
-		auths := s.coreManager.List()
-		refreshed := 0
-		var refreshedMu sync.Mutex
-		tasks := make([]modelRegistrationTask, 0, len(auths))
-		for _, item := range auths {
-			if item == nil || item.ID == "" {
-				continue
-			}
-			auth, ok := s.coreManager.GetByID(item.ID)
-			if !ok || auth == nil || auth.Disabled {
-				continue
-			}
-			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-			if !providerSet[provider] {
-				continue
-			}
-			authForRefresh := auth
-			tasks = append(tasks, modelRegistrationTask{
-				phase:    modelRegistrationPhase(authForRefresh),
-				category: modelRegistrationCategory(authForRefresh),
-				run: func(compatCache *openAICompatibilityRegistrationCache) {
-					if s.refreshModelRegistrationForAuthWithCache(authForRefresh, compatCache) {
-						refreshedMu.Lock()
-						refreshed++
-						refreshedMu.Unlock()
-					}
-				},
-			})
-		}
-		s.runModelRegistrationTasks(context.Background(), tasks)
-
+		refreshed := s.refreshModelRegistrations(context.Background(), normalizeProviderFilter(changedProviders))
 		if refreshed > 0 {
 			log.Infof("re-registered models for %d auth(s) due to model catalog changes: %v", refreshed, changedProviders)
 		}

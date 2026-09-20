@@ -57,6 +57,7 @@ type Handler struct {
 	postAuthPersistHook     coreauth.PostAuthHook
 	pluginHost              *pluginhost.Host
 	configReloadHook        func(context.Context, *config.Config)
+	modelRefreshHook        func(context.Context, []string) int
 	pluginStoreRegistryURL  string
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
@@ -253,6 +254,17 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetModelRefreshHook registers the callback used by the models refresh
+// endpoint to evict fetched-model caches and re-register provider models.
+func (h *Handler) SetModelRefreshHook(hook func(context.Context, []string) int) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.modelRefreshHook = hook
+	h.mu.Unlock()
 }
 
 // SetPostAuthPersistHook registers a hook to be called after auth persistence.

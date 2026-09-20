@@ -215,6 +215,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.registerModelRefreshCallback()
+	s.startDynamicModelRefreshLoop(ctx)
 
 	select {
 	case <-ctx.Done():
