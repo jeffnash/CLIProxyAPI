@@ -6308,7 +6308,7 @@ function writeDurableFingerprint(cursorKey, agentId, fp) {
 //   Cursor Grok 4.7 (SDK id "grok-4.7"; display "Cursor Grok 4.7"):
 //     Same fast/effort matrix as Grok 4.6, including native xhigh effort, but the effort
 //     param was renamed to `reasoning_effort` (the registry rejects `effort` for 4.7).
-//     `context` (256k|500k) is omitted so Cursor applies its own default.
+//     `context` (256k|500k) is pinned to 500k to match the advertised window.
 //     CLIENT-FACING ids remain namespaced `cursor-grok-4.7*` to disambiguate them from xAI.
 //
 // Non-recognized ids pass through unchanged (Cursor resolves their own default). Composer thinking levels are
@@ -6363,8 +6363,12 @@ function composerModelSelection(model, { utilityOneShot = false, reasoningEffort
     // SDK id stays bare regardless of the client-facing cursor- prefix.
     const effort = mapGrokEffort(thinking, id) || mapGrokEffort(normalizedRequestedThinking, id) || (utilityOneShot ? "low" : COMPOSER_GROK_EFFORT_DEFAULT);
     // Grok 4.7 renamed the effort param; older Grok models still require "effort".
-    const effortParamId = id === "grok-4.7" ? "reasoning_effort" : "effort";
-    return { id, params: [{ id: "fast", value: fast }, { id: effortParamId, value: effort }] };
+    if (id === "grok-4.7") {
+      // 4.7 also requires an explicit context selection; pin 500k to match the
+      // advertised window (Cursor's own default is 256k).
+      return { id, params: [{ id: "fast", value: fast }, { id: "reasoning_effort", value: effort }, { id: "context", value: "500k" }] };
+    }
+    return { id, params: [{ id: "fast", value: fast }, { id: "effort", value: effort }] };
   }
   return { id: raw }; // non-recognized: pass the original id through (Cursor resolves its default)
 }
