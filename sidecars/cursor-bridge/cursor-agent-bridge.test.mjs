@@ -7015,11 +7015,11 @@ test("Grok 4.6 model aliases preserve native xhigh and map the fast tier", () =>
   assert.deepEqual(composerModelSelection("grok-4.6-fast-medium"), { id: "grok-4.6", params: [{ id: "fast", value: "true" }, { id: "effort", value: "medium" }] });
 });
 
-test("Grok 4.7 model aliases use reasoning_effort and pin 500k context", () => {
-  assert.deepEqual(composerModelSelection("cursor-grok-4.7"), { id: "grok-4.7", params: [{ id: "fast", value: "false" }, { id: "reasoning_effort", value: "high" }, { id: "context", value: "500k" }] });
-  assert.deepEqual(composerModelSelection("cursor-grok-4.7-fast-low"), { id: "grok-4.7", params: [{ id: "fast", value: "true" }, { id: "reasoning_effort", value: "low" }, { id: "context", value: "500k" }] });
-  assert.deepEqual(composerModelSelection("cursor-grok-4.7-xhigh"), { id: "grok-4.7", params: [{ id: "fast", value: "false" }, { id: "reasoning_effort", value: "xhigh" }, { id: "context", value: "500k" }] });
-  assert.deepEqual(composerModelSelection("grok-4.7-fast-medium"), { id: "grok-4.7", params: [{ id: "fast", value: "true" }, { id: "reasoning_effort", value: "medium" }, { id: "context", value: "500k" }] });
+test("Grok 4.7 model aliases use reasoning_effort and map the fast tier", () => {
+  assert.deepEqual(composerModelSelection("cursor-grok-4.7"), { id: "grok-4.7", params: [{ id: "fast", value: "false" }, { id: "reasoning_effort", value: "high" }] });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.7-fast-low"), { id: "grok-4.7", params: [{ id: "fast", value: "true" }, { id: "reasoning_effort", value: "low" }] });
+  assert.deepEqual(composerModelSelection("cursor-grok-4.7-xhigh"), { id: "grok-4.7", params: [{ id: "fast", value: "false" }, { id: "reasoning_effort", value: "xhigh" }] });
+  assert.deepEqual(composerModelSelection("grok-4.7-fast-medium"), { id: "grok-4.7", params: [{ id: "fast", value: "true" }, { id: "reasoning_effort", value: "medium" }] });
 });
 
 test("requested reasoning effort selects Cursor Grok tiers when the model has no explicit suffix", () => {
