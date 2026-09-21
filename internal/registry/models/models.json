@@ -4174,6 +4174,37 @@
   ],
   "xai": [
     {
+      "id": "grok-4.7",
+      "native_capabilities": {
+        "web_search": true
+      },
+      "object": "model",
+      "created": 1789948800,
+      "owned_by": "xai",
+      "type": "xai",
+      "display_name": "Grok 4.7",
+      "name": "grok-4.7",
+      "description": "SpaceXAI's most capable model for coding, knowledge work, and long-running agents.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
       "id": "grok-4.6",
       "native_capabilities": {
         "web_search": true
@@ -4434,6 +4465,48 @@
       "display_name": "Grok 4.6 Xhigh",
       "name": "grok-4.6-xhigh",
       "description": "xAI Grok 4.6 with xhigh reasoning effort.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "grok-4.7-high",
+      "object": "model",
+      "created": 1789948800,
+      "owned_by": "xai",
+      "type": "xai",
+      "display_name": "Grok 4.7 High",
+      "name": "grok-4.7-high",
+      "description": "xAI Grok 4.7 with high reasoning effort.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "grok-4.7-xhigh",
+      "object": "model",
+      "created": 1789948800,
+      "owned_by": "xai",
+      "type": "xai",
+      "display_name": "Grok 4.7 Xhigh",
+      "name": "grok-4.7-xhigh",
+      "description": "xAI Grok 4.7 with xhigh reasoning effort.",
       "context_length": 500000,
       "max_completion_tokens": 65536,
       "thinking": {
@@ -4819,6 +4892,46 @@
       "type": "cursor",
       "display_name": "Cursor Grok 4.6 Fast",
       "description": "Cursor Grok 4.6 Fast (SDK id grok-4.6, fast=true). Force with cursor-grok-4.6-fast.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "grok-4.7",
+      "object": "model",
+      "created": 1789948800,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Cursor Grok 4.7",
+      "description": "Cursor Grok 4.7 (SDK id grok-4.7). Force Cursor vs xAI with cursor-grok-4.7. Variants: grok-4.7-fast, grok-4.7-{low,medium,high,xhigh}.",
+      "context_length": 500000,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "grok-4.7-fast",
+      "object": "model",
+      "created": 1789948800,
+      "owned_by": "cursor",
+      "type": "cursor",
+      "display_name": "Cursor Grok 4.7 Fast",
+      "description": "Cursor Grok 4.7 Fast (SDK id grok-4.7, fast=true). Force with cursor-grok-4.7-fast.",
       "context_length": 500000,
       "max_completion_tokens": 65536,
       "thinking": {

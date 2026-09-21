@@ -13,6 +13,7 @@ const (
 	codexBuiltinImage25SunburstModelID = "gpt-image-2.5-sunburst"
 	codexBuiltinImage25ModelID         = "gpt-image-2.5"
 	xaiBuiltinGrok46ModelID            = "grok-4.6"
+	xaiBuiltinGrok47ModelID            = "grok-4.7"
 	xaiBuiltinImageModelID             = "grok-imagine-image"
 	xaiBuiltinImageQualityModelID      = "grok-imagine-image-quality"
 	xaiBuiltinImage20ModelID           = "grok-imagine-image-2.0"
@@ -258,7 +259,7 @@ func GetXAIModels() []*ModelInfo {
 
 // GetCursorModels returns the standard Cursor model definitions plus cursor- explicit-routing
 // aliases (same pattern as GetCopilotModels / GenerateCopilotAliases). Bare ids are the SDK
-// ids (composer-2.5, grok-4.5, grok-4.6); cursor-grok-* forces Cursor when xAI
+// ids (composer-2.5, grok-4.5, grok-4.6, grok-4.7); cursor-grok-* forces Cursor when xAI
 // also owns the same bare Grok id.
 // Uses hard-coded builtins to survive remote catalog replacements (see model_updater.go).
 func GetCursorModels() []*ModelInfo {
@@ -279,6 +280,9 @@ var cursorBuiltinModelDefs = []*ModelInfo{
 	// Grok 4.6 adds a native xhigh effort value; the other model-selection semantics match Grok 4.5.
 	{ID: "grok-4.6", Object: "model", Created: 1786492800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Cursor Grok 4.6", Description: "Cursor Grok 4.6 - Non-fast high effort (use cursor-grok-4.6 to force Cursor vs xAI)", ContextLength: 500000, MaxCompletionTokens: 65536},
 	{ID: "grok-4.6-fast", Object: "model", Created: 1786492800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Cursor Grok 4.6 Fast", Description: "Cursor Grok 4.6 Fast - Fast high effort (use cursor-grok-4.6-fast to force Cursor vs xAI)", ContextLength: 500000, MaxCompletionTokens: 65536},
+	// Grok 4.7 keeps the native xhigh effort value and the same fast matrix as Grok 4.6.
+	{ID: "grok-4.7", Object: "model", Created: 1789948800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Cursor Grok 4.7", Description: "Cursor Grok 4.7 - Non-fast high effort (use cursor-grok-4.7 to force Cursor vs xAI)", ContextLength: 500000, MaxCompletionTokens: 65536},
+	{ID: "grok-4.7-fast", Object: "model", Created: 1789948800, OwnedBy: "cursor", Type: "cursor", DisplayName: "Cursor Grok 4.7 Fast", Description: "Cursor Grok 4.7 Fast - Fast high effort (use cursor-grok-4.7-fast to force Cursor vs xAI)", ContextLength: 500000, MaxCompletionTokens: 65536},
 }
 
 // composerReasoningLevels is the GPT-standard reasoning-effort set advertised as composer dash-suffix variants
@@ -295,6 +299,9 @@ var grok45EffortLevels = []string{"low", "medium", "high", "xhigh"}
 // grok46EffortLevels is the native Cursor Grok 4.6 SDK effort set. Unlike Grok 4.5,
 // the SDK accepts xhigh directly.
 var grok46EffortLevels = []string{"low", "medium", "high", "xhigh"}
+
+// grok47EffortLevels is the native Cursor Grok 4.7 SDK effort set, matching Grok 4.6.
+var grok47EffortLevels = []string{"low", "medium", "high", "xhigh"}
 
 // cursorBuiltinModels returns the static composer + Grok models PLUS the generated reasoning/fast
 // dash-suffix variants (mirrors the codex `-<level>` generation), so a client can select e.g.
@@ -327,6 +334,7 @@ func cursorBuiltinModels() []*ModelInfo {
 	}{
 		{id: "grok-4.5", name: "Cursor Grok 4.5", created: 1783526400, levels: grok45EffortLevels},
 		{id: "grok-4.6", name: "Cursor Grok 4.6", created: 1786492800, levels: grok46EffortLevels},
+		{id: "grok-4.7", name: "Cursor Grok 4.7", created: 1789948800, levels: grok47EffortLevels},
 	} {
 		for _, fast := range []struct{ suffix, label string }{{"", ""}, {"-fast", " Fast"}} {
 			for _, level := range grok.levels {
@@ -360,7 +368,7 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 // WithXAIBuiltins injects hard-coded xAI model definitions that should
 // not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
-	extras := expandReasoningAliases([]*ModelInfo{xaiBuiltinGrok46ModelInfo()}, "high", "xhigh")
+	extras := expandReasoningAliases([]*ModelInfo{xaiBuiltinGrok46ModelInfo(), xaiBuiltinGrok47ModelInfo()}, "high", "xhigh")
 	extras = append(extras, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo())
 	extras = append(extras, xaiComposerReasoningAliases()...)
 	return upsertModelInfos(models, extras...)
@@ -432,6 +440,25 @@ func xaiBuiltinGrok46ModelInfo() *ModelInfo {
 		DisplayName:         "Grok 4.6",
 		Name:                xaiBuiltinGrok46ModelID,
 		Description:         "xAI Grok 4.6 model for agentic coding and reasoning workloads.",
+		ContextLength:       500000,
+		MaxCompletionTokens: 65536,
+		Thinking: &ThinkingSupport{
+			ZeroAllowed: true,
+			Levels:      []string{"low", "medium", "high", "xhigh"},
+		},
+	}
+}
+
+func xaiBuiltinGrok47ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  xaiBuiltinGrok47ModelID,
+		Object:              "model",
+		Created:             1789948800,
+		OwnedBy:             "xai",
+		Type:                "xai",
+		DisplayName:         "Grok 4.7",
+		Name:                xaiBuiltinGrok47ModelID,
+		Description:         "xAI Grok 4.7 model for agentic coding and reasoning workloads.",
 		ContextLength:       500000,
 		MaxCompletionTokens: 65536,
 		Thinking: &ThinkingSupport{

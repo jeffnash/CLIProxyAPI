@@ -6305,16 +6305,22 @@ function writeDurableFingerprint(cursorKey, agentId, fp) {
 //     Uses the same fast/effort matrix, but the SDK accepts xhigh as a native fourth effort value.
 //     CLIENT-FACING ids remain namespaced `cursor-grok-4.6*` to disambiguate them from xAI.
 //
+//   Cursor Grok 4.7 (SDK id "grok-4.7"; display "Cursor Grok 4.7"):
+//     Same fast/effort matrix as Grok 4.6, including native xhigh effort.
+//     CLIENT-FACING ids remain namespaced `cursor-grok-4.7*` to disambiguate them from xAI.
+//
 // Non-recognized ids pass through unchanged (Cursor resolves their own default). Composer thinking levels are
-// passed THROUGH (Cursor validates). Grok 4.5 effort is clamped to {low,medium,high}; Grok 4.6 also supports xhigh.
+// passed THROUGH (Cursor validates). Grok 4.5 effort is clamped to {low,medium,high}; Grok 4.6+ also supports xhigh.
 const COMPOSER_THINKING_LEVELS = new Set(["minimal", "none", "low", "medium", "high", "xhigh", "max"]);
+// Grok SDK models with native xhigh effort support (4.5 clamps xhigh/max to high).
+const GROK_NATIVE_XHIGH_MODELS = new Set(["grok-4.6", "grok-4.7"]);
 // Map GPT/CLI-style effort suffixes onto each Grok SDK model's supported values.
 function mapGrokEffort(level, modelId) {
   if (!level) return null;
   const l = String(level).toLowerCase();
   if (l === "low" || l === "medium" || l === "high") return l;
-  if (l === "xhigh") return modelId === "grok-4.6" ? "xhigh" : "high";
-  if (l === "max") return modelId === "grok-4.6" ? "xhigh" : "high";
+  if (l === "xhigh") return GROK_NATIVE_XHIGH_MODELS.has(modelId) ? "xhigh" : "high";
+  if (l === "max") return GROK_NATIVE_XHIGH_MODELS.has(modelId) ? "xhigh" : "high";
   if (l === "minimal" || l === "none") return "low";
   return null;
 }
@@ -6322,7 +6328,7 @@ function composerModelSelection(model, { utilityOneShot = false, reasoningEffort
   const raw = String(model || "");
   let id = raw;
   // Disambiguate from xAI: client-facing Cursor Grok ids carry cursor-. Strip it only for supported SDK ids.
-  if (/^cursor-grok-4\.(?:5|6)(?:$|-)/i.test(id)) id = id.slice("cursor-".length);
+  if (/^cursor-grok-4\.(?:5|6|7)(?:$|-)/i.test(id)) id = id.slice("cursor-".length);
   let fast = "false";
   let thinking = null;
   // Suffix order is base[-fast][-<level>]: strip the innermost reasoning level first, then the -fast variant, so
@@ -6347,7 +6353,7 @@ function composerModelSelection(model, { utilityOneShot = false, reasoningEffort
     if (effectiveThinking) params.push({ id: "thinking", value: effectiveThinking });
     return { id, params };
   }
-  if (id === "grok-4.5" || id === "grok-4.6") {
+  if (id === "grok-4.5" || id === "grok-4.6" || id === "grok-4.7") {
     // Bare / missing level => the fleet default (P8: CURSOR_COMPOSER_GROK_EFFORT_DEFAULT,
     // historically high, matching the CLI's primary "Cursor Grok 4.5" = grok-4.5-xhigh).
     // Utility one-shots default to low, but an explicit model suffix always wins.

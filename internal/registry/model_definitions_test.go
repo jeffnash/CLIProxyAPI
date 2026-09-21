@@ -53,23 +53,25 @@ func TestWithXAIBuiltinsIncludesGrok46WithoutRemoteCatalog(t *testing.T) {
 		}
 	}
 
-	for _, id := range []string{"grok-4.6", "grok-4.6-high", "grok-4.6-xhigh"} {
-		model := found[id]
-		if model == nil {
-			t.Fatalf("expected xAI builtin model %s", id)
-		}
-		if model.Type != "xai" || model.OwnedBy != "xai" {
-			t.Fatalf("%s ownership/type = %s/%s, want xai/xai", id, model.OwnedBy, model.Type)
-		}
-		if model.Thinking == nil || len(model.Thinking.Levels) != 4 {
-			t.Fatalf("%s thinking support = %#v, want four effort levels", id, model.Thinking)
-		}
-		if id != "grok-4.6" {
-			if model.UpstreamID != "grok-4.6" {
-				t.Fatalf("%s upstream id = %q, want grok-4.6", id, model.UpstreamID)
+	for _, base := range []string{"grok-4.6", "grok-4.7"} {
+		for _, id := range []string{base, base + "-high", base + "-xhigh"} {
+			model := found[id]
+			if model == nil {
+				t.Fatalf("expected xAI builtin model %s", id)
 			}
-			if model.ReasoningEffort != id[len("grok-4.6-"):] {
-				t.Fatalf("%s reasoning effort = %q", id, model.ReasoningEffort)
+			if model.Type != "xai" || model.OwnedBy != "xai" {
+				t.Fatalf("%s ownership/type = %s/%s, want xai/xai", id, model.OwnedBy, model.Type)
+			}
+			if model.Thinking == nil || len(model.Thinking.Levels) != 4 {
+				t.Fatalf("%s thinking support = %#v, want four effort levels", id, model.Thinking)
+			}
+			if id != base {
+				if model.UpstreamID != base {
+					t.Fatalf("%s upstream id = %q, want %s", id, model.UpstreamID, base)
+				}
+				if model.ReasoningEffort != id[len(base+"-"):] {
+					t.Fatalf("%s reasoning effort = %q", id, model.ReasoningEffort)
+				}
 			}
 		}
 	}
@@ -80,19 +82,21 @@ func TestGrok46EffortAliasesUseAutomaticProviderRegistry(t *testing.T) {
 	modelRegistry.RegisterClient("xai-auth", "xai", GetXAIModels())
 	modelRegistry.RegisterClient("cursor-auth", "cursor", GetCursorModels())
 
-	for _, id := range []string{"grok-4.6-high", "grok-4.6-xhigh"} {
-		providers := modelRegistry.GetModelProviders(id)
-		found := map[string]bool{}
-		for _, provider := range providers {
-			found[provider] = true
-		}
-		if !found["xai"] || !found["cursor"] {
-			t.Fatalf("%s providers = %v, want automatic xai and cursor candidates", id, providers)
-		}
+	for _, base := range []string{"grok-4.6", "grok-4.7"} {
+		for _, id := range []string{base + "-high", base + "-xhigh"} {
+			providers := modelRegistry.GetModelProviders(id)
+			found := map[string]bool{}
+			for _, provider := range providers {
+				found[provider] = true
+			}
+			if !found["xai"] || !found["cursor"] {
+				t.Fatalf("%s providers = %v, want automatic xai and cursor candidates", id, providers)
+			}
 
-		xaiInfo := modelRegistry.GetModelInfo(id, "xai")
-		if xaiInfo == nil || xaiInfo.UpstreamID != "grok-4.6" {
-			t.Fatalf("%s xAI model info = %#v, want upstream grok-4.6", id, xaiInfo)
+			xaiInfo := modelRegistry.GetModelInfo(id, "xai")
+			if xaiInfo == nil || xaiInfo.UpstreamID != base {
+				t.Fatalf("%s xAI model info = %#v, want upstream %s", id, xaiInfo, base)
+			}
 		}
 	}
 }
@@ -116,6 +120,9 @@ func TestGetCursorModelsIncludesGrok45And46Variants(t *testing.T) {
 		// Grok 4.6 preserves native xhigh and has the same fast matrix.
 		"grok-4.6", "grok-4.6-fast", "grok-4.6-xhigh", "grok-4.6-fast-medium",
 		"cursor-grok-4.6", "cursor-grok-4.6-fast", "cursor-grok-4.6-xhigh", "cursor-grok-4.6-fast-medium",
+		// Grok 4.7 mirrors the Grok 4.6 matrix including native xhigh.
+		"grok-4.7", "grok-4.7-fast", "grok-4.7-xhigh", "grok-4.7-fast-medium",
+		"cursor-grok-4.7", "cursor-grok-4.7-fast", "cursor-grok-4.7-xhigh", "cursor-grok-4.7-fast-medium",
 		// Composer force aliases remain available.
 		"cursor-composer-2.5", "cursor-composer-2.5-fast",
 	} {
