@@ -5167,6 +5167,14 @@ class Session {
     }
     return acted;
   }
+  // A call registered while no response was open stays REGISTERED. Hand it as soon as a live
+  // response exists so the client is not left waiting on a tool frame that was only journaled.
+  flushReadyJournaledCalls() {
+    const round = this.currentRound;
+    if (!round || round.state === RoundState.TERMINAL || !this.activeRes || this.writeFailed) return false;
+    if (!this.queuedToolCalls().some((call) => call.state === CallState.REGISTERED)) return false;
+    return this.flushJournaledCalls();
+  }
   // When the SDK has announced more tools for this step than the durable round has handed to the response,
   // wait one more debounce window for the rest of the
   // wave instead of pausing now — so a slow burst lands in ONE turn_end rather than spilling its tail into the
@@ -6159,6 +6167,9 @@ class Session {
     const wasDone = this.done;
     const runToCancel = this.run;
     const agentToClose = this.agent;
+    const ownedAgentPromise = this.agentPromise;
+    const ownedTurnToken = this.turnToken;
+    const ownedSettle = this.settleTurn;
     const cancelledRunEpoch = this.runEpoch;
     // The SDK's AbortError has no Session/request identity. Record the local
     // cancellation cause before invoking the SDK so a later floating abort
@@ -6220,19 +6231,27 @@ class Session {
         if (cleanupTimer) clearTimeout(cleanupTimer);
       }
     }
-    this.run = null;
-    this.sendPending = false;
-    this.activeClientMessageId = "";
-    this.activeClientMessageHash = "";
-    this.activeClientMessageGeneration = 1;
-    this.activeClientMessageKind = "";
-    this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE;
-    this.activeDeferredInputId = "";
-    // Null the closed agent handle so a surviving queued waiter (the session is kept when waiters remain)
-    // re-resumes/recreates a live agent via ensureAgent instead of reusing this dead one.
-    this.agent = null; this.agentPromise = null;
-    this.mcpServerKeys = null;
-    this.settle();
+    // SDK teardown awaits. A successor turn can attach during that gap. Only clear the
+    // run, agent, and HTTP waiter captured at the start of THIS cancel; settling the
+    // successor here detaches its response and journals the next tool call forever.
+    if (this.run === runToCancel) this.run = null;
+    if (this.agent === agentToClose) {
+      this.agent = null;
+      if (this.agentPromise === ownedAgentPromise) this.agentPromise = null;
+    }
+    if (this.turnToken === ownedTurnToken) {
+      this.sendPending = false;
+      this.activeClientMessageId = "";
+      this.activeClientMessageHash = "";
+      this.activeClientMessageGeneration = 1;
+      this.activeClientMessageKind = "";
+      this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE;
+      this.activeDeferredInputId = "";
+      this.mcpServerKeys = null;
+      this.settle();
+    } else if (ownedSettle) {
+      try { ownedSettle(); } catch {}
+    }
     if (this.cancelNotifyRequested) this.notifyLogicalDone(); // run torn down -> release any queued waiter so the chain advances
   }
 }
@@ -9850,6 +9869,20 @@ function refreshSessionFromBody(session, body, preparedToolRegistry = undefined,
   }
 }
 
+// A second HTTP turn must not overwrite settleTurn or activeRes while an earlier turn is
+// still waiting. That orphans the earlier response: its tool calls are journaled, no
+// turn_end is written, and the client hangs until its own timeout (the connection error).
+export async function waitForExclusiveTurnSlot(session) {
+  while (session.settleTurn) {
+    const token = session.turnToken;
+    if (session.lastSettledTurnToken >= token) {
+      session.settleTurn = null;
+      break;
+    }
+    await session.whenTurnSettled(token);
+  }
+}
+
 async function runTurn(req, res, session, model, input, constraints = {}, continuation = null) {
   // ADD-98/ADD-101: declare the turn-latch + close handler BEFORE the first res.write and before assigning
   // session.activeRes, then register res.on('close') first and wrap the whole body (from the activeRes
@@ -9960,7 +9993,24 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
           && sessions.get(session.id) === session) sessions.delete(session.id);
       return;
     }
-    session.beginResponse(res); session.touch(); session.turnToken++;
+    for (;;) {
+      await waitForExclusiveTurnSlot(session);
+      if (session.settleTurn) continue;
+      // Claim the slot synchronously so a second turn cannot overwrite this waiter.
+      session.turnToken++;
+      session.settleTurn = settleOnce;
+      break;
+    }
+    if (clientMessageId) {
+      session.activeClientMessageId = clientMessageId;
+      session.activeClientMessageHash = clientMessageHash;
+      session.activeClientMessageGeneration = clientMessageGeneration;
+      session.activeClientMessageKind = clientMessageKind;
+      session.activeIdentityPolicy = identityPolicy;
+      session.sendPending = true;
+    }
+    if (deferredInputId) session.activeDeferredInputId = deferredInputId;
+    session.beginResponse(res); session.touch();
     {
       const caps = input && (input.capabilities || input.clientCapabilities || "");
       const wantsResume = input?.streamResume === true || hasStreamResumeCapability(caps);
@@ -10007,10 +10057,12 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
       } : {}),
     }));
     session.flushPendingDeltas();
+    session.flushReadyJournaledCalls();
 
     // Keepalive through same writer (truthful signal), skip if blocked handled inside sse
     keepalive = setInterval(() => {
       try {
+        session.flushReadyJournaledCalls();
         session.sse({ type: "ping" });
         const now = nowMs();
         const quietMs = Math.max(0, now - session.lastSdkActivityAt);

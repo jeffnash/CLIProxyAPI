@@ -1279,6 +1279,83 @@ test("Session.cancel emits exactly one terminal receipt before clearing a live r
   }
 });
 
+test("cancel cleanup does not detach a successor turn that attached during SDK teardown", async () => {
+  const session = new Session("cancel-successor-attached", "key");
+  let releaseCleanup;
+  const cleanupGate = new Promise((resolve) => { releaseCleanup = resolve; });
+  session.turnToken = 3;
+  session.lastSettledTurnToken = 2;
+  session.run = { async cancel() { await cleanupGate; } };
+  session.agent = { async close() {} };
+  let predecessorSettled = false;
+  session.settleTurn = () => { predecessorSettled = true; };
+  const pending = session.cancel({ terminalReason: TerminalReason.INTERRUPTED, detail: "superseded by durable deferred user input" });
+  await Promise.resolve();
+  const successorRun = { async cancel() {} };
+  const successorAgent = { async close() {} };
+  session.run = successorRun;
+  session.agent = successorAgent;
+  session.turnToken = 4;
+  session.sendPending = true;
+  session.activeClientMessageId = "successor-message";
+  let successorSettled = false;
+  session.settleTurn = () => { successorSettled = true; };
+  releaseCleanup();
+  await pending;
+  assert.equal(session.run, successorRun);
+  assert.equal(session.agent, successorAgent);
+  assert.equal(session.activeClientMessageId, "successor-message");
+  assert.equal(session.sendPending, true);
+  assert.equal(successorSettled, false);
+  assert.equal(predecessorSettled, true);
+  assert.equal(session.turnToken, 4);
+});
+
+test("waitForExclusiveTurnSlot holds a successor until the open turn settles", async () => {
+  const session = new Session("exclusive-turn-slot", "key");
+  session.turnToken = 2;
+  session.lastSettledTurnToken = 1;
+  let predecessorSettled = false;
+  session.settleTurn = () => { predecessorSettled = true; };
+  let attached = false;
+  const pending = bridge.waitForExclusiveTurnSlot(session).then(() => { attached = true; });
+  await Promise.resolve();
+  assert.equal(attached, false);
+  session.settle();
+  await pending;
+  assert.equal(attached, true);
+  assert.equal(predecessorSettled, true);
+  assert.equal(session.settleTurn, null);
+});
+
+test("an open response flushes a tool call that was journaled while no response was attached", async () => {
+  const { session } = seedSession("flush-journaled-on-open-response", "key");
+  const first = await openTool(session, { rawId: "flush-first" });
+  first.round.batch = [];
+  session.activeRes = null;
+  session.responseWriter = null;
+  const tailPromise = session.openClientTool({
+    source: "test",
+    rawToolCallId: "flush-tail",
+    name: "Lookup",
+    input: { q: "journaled" },
+    resultAdapter: (value) => value,
+  });
+  tailPromise.catch(() => {});
+  await waitFor(() => first.round.fifo.length === 2, "journaled call registered");
+  const tail = first.round.calls.get(first.round.fifo[1]);
+  assert.equal(tail.handedAt, null);
+  assert.equal(session.flushReadyJournaledCalls(), false);
+  const response = new MockResponse();
+  session.beginResponse(response);
+  assert.equal(session.flushReadyJournaledCalls(), true);
+  await waitFor(() => tail.handedAt != null, "journaled call handed on the open response");
+  assert.match(response.text(), new RegExp(tail.wireId));
+  first.round.terminalize("client_cancelled", "cleanup");
+  await assert.rejects(first.promise);
+  await assert.rejects(tailPromise);
+});
+
 test("an existing terminal prevents cancellation cleanup from emitting a duplicate", async () => {
   const session = new Session("terminal-before-double-cancel", "key");
   const response = new MockResponse();
