@@ -1328,6 +1328,35 @@ test("waitForExclusiveTurnSlot holds a successor until the open turn settles", a
   assert.equal(session.settleTurn, null);
 });
 
+test("holdTurnSlot cancel preserves the turn latch and slot while tearing down the stale run", async () => {
+  const session = new Session("hold-turn-slot", "key");
+  session.turnToken = 3;
+  session.lastSettledTurnToken = 2;
+  session.run = { async cancel() {} };
+  session.agent = { async close() {} };
+  session.sendPending = true;
+  session.activeClientMessageId = "live-message";
+  let fired = false;
+  const latch = () => { fired = true; };
+  session.settleTurn = latch;
+  await session.cancel({ notify: false, terminalReason: TerminalReason.INTERRUPTED, detail: "superseded by a new user turn", holdTurnSlot: true });
+  assert.equal(session.run, null);
+  assert.equal(session.agent, null);
+  assert.equal(fired, false, "holdTurnSlot must not fire the turn latch");
+  assert.equal(session.settleTurn, latch, "holdTurnSlot must leave settleTurn owned by the turn");
+  assert.equal(session.lastSettledTurnToken, 2, "holdTurnSlot must not mark the live token settled");
+  assert.equal(session.activeClientMessageId, "live-message");
+  assert.equal(session.sendPending, true);
+  // A queued slot waiter must still be blocked: the turn is mid-send.
+  let attached = false;
+  const pending = bridge.waitForExclusiveTurnSlot(session).then(() => { attached = true; });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(attached, false);
+  session.settle();
+  await pending;
+  assert.equal(attached, true);
+});
 test("an open response flushes a tool call that was journaled while no response was attached", async () => {
   const { session } = seedSession("flush-journaled-on-open-response", "key");
   const first = await openTool(session, { rawId: "flush-first" });

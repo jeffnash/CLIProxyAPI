@@ -4593,7 +4593,7 @@ class Session {
     });
     return true;
   }
-  async finishRotationCancel() {
+  async finishRotationCancel({ holdTurnSlot = false } = {}) {
     // A context rotation can happen after ensureAgent() resumes the old agent
     // but before agent.send() installs a run. The current HTTP response and
     // request-carried reseed authorization belong to the replacement turn;
@@ -4629,7 +4629,7 @@ class Session {
       this.done = false;
       return;
     }
-    await this.cancel();
+    await this.cancel({ holdTurnSlot });
     this.done = false;
   }
   whenLogicalDone() {
@@ -5931,7 +5931,7 @@ class Session {
   // rotate + re-seed (NOT 409-reject, NOT silently reuse the old model's agent). Bounded so pathological
   // model-flapping cannot churn agentIds without limit; past the cap we keep the last rotated agent (the next
   // turn re-seeds into it) rather than dropping the session.
-  async rotateForModelChange(newModel) {
+  async rotateForModelChange(newModel, { holdTurnSlot = false } = {}) {
     const COMPOSER_MAX_MODEL_ROTATIONS = 8;
     const oldAgentId = this.agentId;
     const oldModel = this.model;
@@ -5957,7 +5957,7 @@ class Session {
     this.model = newModel;
     this.resetSeedState();
     dbg("rotateForModelChange -> rotate durable agentId for new model (no resumeAgent(old model's agent))", "session=" + this.id, "old=" + oldAgentId, "new=" + this.agentId, "oldModel=" + oldModel, "newModel=" + newModel);
-    await this.finishRotationCancel();
+    await this.finishRotationCancel({ holdTurnSlot });
   }
   // rotateForKeyChange (ADD-79) rotates the durable agent when the upstream Cursor key changes for the SAME
   // external session (a tenant rotates their key, an admin rebinds it, or multi-tenant forwards a different
@@ -6002,7 +6002,7 @@ class Session {
   // appending another instruction to an already-contextualized model. Rotate to
   // a fresh durable agent and faithfully re-seed bounded history instead. This
   // is role/provenance based and independent of any client or harness name.
-  async rotateForSystemReplacement(nextBlockIds) {
+  async rotateForSystemReplacement(nextBlockIds, { holdTurnSlot = false } = {}) {
     if (!validSystemBlockIds(nextBlockIds)) {
       throw new ToolRoundError("invalid_system_blocks", "replacement system block identity is invalid", 422);
     }
@@ -6033,13 +6033,13 @@ class Session {
     this.seededSystemBlockIds = [...nextBlockIds];
     dbg("rotateForSystemReplacement -> rotate and faithfully re-seed",
       "session=" + this.id, "old=" + oldAgentId, "new=" + targetAgentId);
-    await this.finishRotationCancel();
+    await this.finishRotationCancel({ holdTurnSlot });
   }
   // A rewritten/compacted transcript is a context replacement just like a
   // changed system block set: it cannot be appended to the old durable agent.
   // Commit a fresh context epoch before closing the old handle, then re-seed
   // the bounded replacement history into that new agent.
-  async rotateForHistoryReplacement() {
+  async rotateForHistoryReplacement({ holdTurnSlot = false } = {}) {
     if (this.contextEpoch >= 1024) {
       throw new ToolRoundError(
         "history_context_rotation_exhausted",
@@ -6069,7 +6069,7 @@ class Session {
     this.seededSystemBlockIds = systemBlockIds;
     dbg("rotateForHistoryReplacement -> rotate and faithfully re-seed",
       "session=" + this.id, "old=" + oldAgentId, "new=" + targetAgentId);
-    await this.finishRotationCancel();
+    await this.finishRotationCancel({ holdTurnSlot });
   }
   // An all-legacy `call_*` continuation has no signed ToolRound to resume after the bridge upgrade. Move it
   // to one deterministic replacement agent, persist the alias before the first SDK send, and seed that agent
@@ -6147,14 +6147,14 @@ class Session {
   // failWrite) use the default notify:true so the FIFO advances. Internal SUPERSESSION (cancelStaleRun) passes
   // notify:false so a queued new-user turn is NOT promoted before driveUserSend installs the replacement
   // session.run — otherwise the queued turn and the replacement send would race on the same durable agent.
-  async cancel({ notify = true, terminalReason = TerminalReason.CLIENT_CANCELLED, detail = "session cancelled" } = {}) {
+  async cancel({ notify = true, terminalReason = TerminalReason.CLIENT_CANCELLED, detail = "session cancelled", holdTurnSlot = false } = {}) {
     if (notify) this.cancelNotifyRequested = true;
     if (this.cancelPromise) {
       await this.cancelPromise;
       return;
     }
     this.cancelNotifyRequested = notify;
-    const cancelPromise = this.cancelOnce({ terminalReason, detail });
+    const cancelPromise = this.cancelOnce({ terminalReason, detail, holdTurnSlot });
     this.cancelPromise = cancelPromise;
     try {
       await cancelPromise;
@@ -6163,7 +6163,7 @@ class Session {
       this.cancelNotifyRequested = false;
     }
   }
-  async cancelOnce({ terminalReason = TerminalReason.CLIENT_CANCELLED, detail = "session cancelled" } = {}) {
+  async cancelOnce({ terminalReason = TerminalReason.CLIENT_CANCELLED, detail = "session cancelled", holdTurnSlot = false } = {}) {
     const wasDone = this.done;
     const runToCancel = this.run;
     const agentToClose = this.agent;
@@ -6240,16 +6240,24 @@ class Session {
       if (this.agentPromise === ownedAgentPromise) this.agentPromise = null;
     }
     if (this.turnToken === ownedTurnToken) {
-      this.sendPending = false;
-      this.activeClientMessageId = "";
-      this.activeClientMessageHash = "";
-      this.activeClientMessageGeneration = 1;
-      this.activeClientMessageKind = "";
-      this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE;
-      this.activeDeferredInputId = "";
-      this.mcpServerKeys = null;
-      this.settle();
-    } else if (ownedSettle) {
+      // holdTurnSlot: internal supersession WITHIN this turn (stale-run cancel,
+      // model/history/system rotation). The turn still owns the response, so the
+      // latch must not fire and lastSettledTurnToken must not advance — releasing
+      // whenTurnSettled waiters here would let a queued HTTP turn claim the slot
+      // while this turn is still mid-send. The detach/restore pattern callers used
+      // before only hid the settleOnce callback; settle() itself caused the leak.
+      if (!holdTurnSlot) {
+        this.sendPending = false;
+        this.activeClientMessageId = "";
+        this.activeClientMessageHash = "";
+        this.activeClientMessageGeneration = 1;
+        this.activeClientMessageKind = "";
+        this.activeIdentityPolicy = TURN_IDENTITY_POLICY.NONE;
+        this.activeDeferredInputId = "";
+        this.mcpServerKeys = null;
+        this.settle();
+      }
+    } else if (ownedSettle && !holdTurnSlot) {
       try { ownedSettle(); } catch {}
     }
     if (this.cancelNotifyRequested) this.notifyLogicalDone(); // run torn down -> release any queued waiter so the chain advances
@@ -10150,7 +10158,7 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
             410,
           );
         }
-        await session.rotateForSystemReplacement(contextPlan.ids || []);
+        await session.rotateForSystemReplacement(contextPlan.ids || [], { holdTurnSlot: true });
         agent = await ensureAgent(session, modelSelection);
         if (settled) {
           releaseInputDeliveryAdmission(input);
@@ -10513,18 +10521,17 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     markDeferred(DeferredInputState.DELIVERED, { evidence: "agent_send_resolved" });
   };
 
-  // cancelStaleRun cancels a superseded run WITHOUT settling THIS turn. cancel() calls settle(), which fires
-  // session.settleTurn; that handle points to this turn's settleOnce, so a naive cancel here would settle the
-  // very turn we are mid-driving (driveUserSend would early-return on `settled`). Detach + restore the handle.
+  // cancelStaleRun cancels a superseded run WITHOUT settling THIS turn. holdTurnSlot keeps
+  // cancel() from firing this turn's settleOnce, clearing its message-latch state, or
+  // releasing whenTurnSettled waiters — the turn still owns the response while the stale
+  // run/agent are torn down underneath it.
   // ADD-90: pass {notify:false} so cancel() does NOT release a queued new-user waiter here — that waiter must
   // not be promoted until driveUserSend has installed the replacement session.run (whose wait()->onRunComplete/
   // onRunError fires notifyLogicalDone on real completion). Otherwise the queued turn could start a SECOND
   // concurrent send on the same durable agent in the window between cancel and the replacement send. If the
   // replacement send fails, the runTurn catch path fires notifyLogicalDone as a safety net so the FIFO advances.
   const cancelStaleRun = async (terminalReason = TerminalReason.INTERRUPTED, detail = "run superseded by a new user turn") => {
-    session.settleTurn = null;
-    await session.cancel({ notify: false, terminalReason, detail });
-    session.settleTurn = settleOnce;
+    await session.cancel({ notify: false, terminalReason, detail, holdTurnSlot: true });
     session.done = false; // cancel() set done=true; clear it so a subsequent driveUserSend wires completion
   };
 
@@ -10552,13 +10559,11 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
     if (session.run === null && persistedModelSelectionIdentity && persistedModelSelectionIdentity !== modelSelectionIdentity) {
       dbg("runTurn MODEL SELECTION CHANGED (no live run) -> rotate durable agent + re-seed", "session=" + session.id, "from=" + persistedModelSelectionIdentity, "to=" + modelSelectionIdentity);
       // Rotation cancellation belongs to the old durable agent, not to this
-      // newly-opened HTTP turn. Detach the current settle callback while the
-      // old handle closes; otherwise cancel() settles this response before the
-      // fallback send starts and driveUserSend correctly refuses to create an
-      // orphan, yielding a session frame plus empty [DONE].
-      session.settleTurn = null;
-      try { await session.rotateForModelChange(modelSelectionIdentity); }
-      finally { session.settleTurn = settleOnce; }
+      // newly-opened HTTP turn. holdTurnSlot keeps cancel() from settling this
+      // response before the fallback send starts — driveUserSend would correctly
+      // refuse to create an orphan, yielding a session frame plus empty [DONE].
+      try { await session.rotateForModelChange(modelSelectionIdentity, { holdTurnSlot: true }); }
+      finally { if (session.settleTurn !== settleOnce) session.settleTurn = settleOnce; }
       if (clientMessageId) {
         session.activeClientMessageId = clientMessageId;
         session.activeClientMessageHash = clientMessageHash;
@@ -10613,9 +10618,8 @@ async function runTurn(req, res, session, model, input, constraints = {}, contin
             410,
           );
         }
-        session.settleTurn = null;
-        try { await session.rotateForHistoryReplacement(); }
-        finally { session.settleTurn = settleOnce; }
+        try { await session.rotateForHistoryReplacement({ holdTurnSlot: true }); }
+        finally { if (session.settleTurn !== settleOnce) session.settleTurn = settleOnce; }
         if (clientMessageId) {
           session.activeClientMessageId = clientMessageId;
           session.activeClientMessageHash = clientMessageHash;
