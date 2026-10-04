@@ -7795,3 +7795,40 @@ test("utility helpers preserve strict types and bounded output", () => {
   assert.equal(envInt(name, 3, { min: 1 }), 3);
   delete process.env[name];
 });
+
+test("a journaled tool call is emitted once even when two flushes land before its hand receipt", async (t) => {
+  const { session } = seedSession("flush-emit-dedup");
+  t.after(() => sessions.delete(session.id));
+  // Register the call with no live response: it is journaled as REGISTERED.
+  session.activeRes = null;
+  session.responseWriter = null;
+  const promise = session.openClientTool({
+    source: "test", rawToolCallId: "dup-call", name: "Lookup",
+    input: { q: "x" }, resultAdapter: (value) => value,
+  });
+  promise.catch(() => {});
+  await waitFor(() => session.currentRound && session.currentRound.outbound.length === 1, "journaled tool call");
+
+  const res = new MockResponse();
+  session.beginResponse(res);
+  // First flush emits the frame; markHanded only runs once the async write
+  // receipt resolves, so a second flush in the same tick previously emitted
+  // the same signed wire id a second time (-> client _dupN suffix -> next
+  // continuation 400 invalid_tool_call_id).
+  assert.equal(session.flushJournaledCalls(), true);
+  assert.equal(session.flushJournaledCalls(), false);
+  assert.equal(res.chunks.filter((chunk) => chunk.includes('"tool_call"')).length, 1);
+
+  const round = session.currentRound;
+  const call = round.calls.get(round.fifo[0]);
+  await waitFor(() => call.handedAt != null, "hand receipt");
+  assert.equal(session.flushJournaledCalls(), false);
+  assert.equal(res.chunks.filter((chunk) => chunk.includes('"tool_call"')).length, 1);
+
+  // Settle the round: disarm the batch flush timer and apply a result so the
+  // pending callback resolves and no timer outlives the test.
+  if (session.flushTimer) { clearTimeout(session.flushTimer); session.flushTimer = null; }
+  round.markAwaitingResults();
+  session.applyClientResults([{ toolCallId: call.wireId, content: "done" }], round);
+  await promise;
+});

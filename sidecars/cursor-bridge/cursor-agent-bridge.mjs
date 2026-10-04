@@ -4256,6 +4256,13 @@ class Session {
     this.pendingRecoveryAlias = "";
     this.cancelPromise = null; this.cancelNotifyRequested = false;
     this.activeRes = null; this.responseWriter = null;
+    // Ids of tool calls already emitted to the CURRENT response. markHanded
+    // runs asynchronously (receipt.handedToNode.then), so a call stays in the
+    // REGISTERED outbound queue for a window after its frame was written; any
+    // second flushJournaledCalls in that window would emit the same signed
+    // wire id twice on one response (observed: client dedup suffixes the
+    // repeat -> next continuation 400 invalid_tool_call_id).
+    this.emittedToolCallIds = new Set();
     this.sendPending = false;
     this.activeClientMessageId = "";
     this.activeClientMessageHash = "";
@@ -4644,6 +4651,9 @@ class Session {
   }
   beginResponse(res) {
     this.activeRes = res;
+    // New response: a still-REGISTERED call may legitimately be (re-)emitted
+    // here even if it was already emitted on the previous, dead response.
+    this.emittedToolCallIds.clear();
     this.writeFailed = false;
     const writer = new SseWriter(res, {
       maxQueueBytes: COMPOSER_OUT_QUEUE_MAX_BYTES,
@@ -5041,9 +5051,14 @@ class Session {
       dbg("emitToolUse journaled for next response", "session=" + this.id, "id=" + id, "name=" + name);
       return;
     }
+    // The frame was already written to THIS response but the async markHanded
+    // has not run yet, so the call still looks REGISTERED/queued. Re-emitting
+    // would hand the client the same signed wire id twice.
+    if (this.emittedToolCallIds.has(id)) return;
     dbg("emitToolUse", "session=" + this.id, "id=" + id, "name=" + name, "in=" + dbgInputShape(input));
     const receipt = this.sseReceipt({ type: "tool_call", id, name, input });
     if (!receipt.ok) return;
+    this.emittedToolCallIds.add(id);
     receipt.handedToNode.then(() => {
       if (round.state === RoundState.TERMINAL) return;
       try { round.markHanded(id); }
@@ -5093,7 +5108,10 @@ class Session {
   // REGISTERED calls in the durable round are the only not-yet-handed queue. Re-emitting them uses the same
   // receipt path as a call produced while this response was already open.
   flushJournaledCalls() {
-    const batch = this.queuedToolCalls();
+    // Exclude calls already emitted to this response: they are still REGISTERED
+    // until the async markHanded lands, so without this filter a second flush
+    // would re-validate and re-emit them (duplicate signed wire id downstream).
+    const batch = this.queuedToolCalls().filter((call) => !this.emittedToolCallIds.has(call.wireId));
     if (!batch.length || !this.activeRes || this.writeFailed) return false;
     dbg("flushJournaledCalls", "session=" + this.id, "count=" + batch.length, "ids=" + safeJson(batch.map((call) => call.wireId)));
     const round = this.currentRound;
