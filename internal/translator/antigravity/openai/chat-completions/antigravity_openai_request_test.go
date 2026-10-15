@@ -1,9 +1,10 @@
 package chat_completions
 
 import (
+	"regexp"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	"github.com/tidwall/gjson"
 )
 
@@ -32,7 +33,7 @@ func TestConvertOpenAIRequestToAntigravitySkipsEmptyTextPartsWithoutNulls(t *tes
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	result, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	userParts := gjson.GetBytes(result, "request.contents.0.parts").Array()
 	if len(userParts) != 1 {
 		t.Fatalf("user parts length = %d, want 1. Output: %s", len(userParts), result)
@@ -66,7 +67,7 @@ func TestConvertOpenAIRequestToAntigravity_ClaudeModelSanitizesUnsignedReasoning
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("claude-sonnet-4-6", []byte(inputJSON), false)
+	result, _ := ConvertOpenAIRequestToAntigravity("claude-sonnet-4-6", []byte(inputJSON), false)
 	contents := gjson.GetBytes(result, "request.contents").Array()
 	if len(contents) != 3 {
 		t.Fatalf("contents length = %d, want 3. Output: %s", len(contents), result)
@@ -93,7 +94,7 @@ func TestConvertOpenAIRequestToAntigravity_ClaudeModelDropsEmptyAssistantTurnAft
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("claude-sonnet-4-6", []byte(inputJSON), false)
+	result, _ := ConvertOpenAIRequestToAntigravity("claude-sonnet-4-6", []byte(inputJSON), false)
 	contents := gjson.GetBytes(result, "request.contents").Array()
 	if len(contents) != 2 {
 		t.Fatalf("contents length = %d, want 2 (empty model turn dropped). Output: %s", len(contents), result)
@@ -116,7 +117,7 @@ func TestConvertOpenAIRequestToAntigravityPreservesReasoningContent(t *testing.T
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), true)
+	result, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), true)
 	contents := gjson.GetBytes(result, "request.contents").Array()
 	if len(contents) != 3 {
 		t.Fatalf("contents length = %d, want 3. Output: %s", len(contents), result)
@@ -131,8 +132,8 @@ func TestConvertOpenAIRequestToAntigravityPreservesReasoningContent(t *testing.T
 	if !part.Get("thought").Bool() {
 		t.Fatalf("reasoning part should be marked as thought. Output: %s", result)
 	}
-	if got := part.Get("thoughtSignature").String(); got != antigravityFunctionThoughtSignature {
-		t.Fatalf("thoughtSignature = %q, want bypass sentinel. Output: %s", got, result)
+	if part.Get("thoughtSignature").Exists() {
+		t.Fatalf("reasoning part should not synthesize thoughtSignature; output=%s", result)
 	}
 }
 
@@ -147,7 +148,7 @@ func TestConvertOpenAIRequestToAntigravityPreservesReasoningBeforeVisibleContent
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), true)
+	result, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), true)
 	contents := gjson.GetBytes(result, "request.contents").Array()
 	if len(contents) != 4 {
 		t.Fatalf("contents length = %d, want 4. Output: %s", len(contents), result)
@@ -158,6 +159,9 @@ func TestConvertOpenAIRequestToAntigravityPreservesReasoningBeforeVisibleContent
 	}
 	if got := parts[0].Get("text").String(); got != "thinking only" || !parts[0].Get("thought").Bool() {
 		t.Fatalf("first part should be the reasoning thought. Output: %s", result)
+	}
+	if parts[0].Get("thoughtSignature").Exists() {
+		t.Fatalf("first part should not synthesize thoughtSignature. Output: %s", result)
 	}
 	if got := parts[1].Get("text").String(); got != "visible answer" || parts[1].Get("thought").Bool() {
 		t.Fatalf("second part should be visible assistant content. Output: %s", result)
@@ -183,7 +187,7 @@ func TestConvertOpenAIRequestToAntigravitySkipsEmptyAssistantMessages(t *testing
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), true)
+	result, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), true)
 	contents := gjson.GetBytes(result, "request.contents").Array()
 	if len(contents) != 2 {
 		t.Fatalf("contents length = %d, want 2. Output: %s", len(contents), result)
@@ -202,7 +206,7 @@ func TestConvertOpenAIRequestToAntigravity_MidSessionDeveloperMessageDoesNotMuta
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	result, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	output := gjson.ParseBytes(result)
 
 	// request.systemInstruction must contain only original system prompt
@@ -246,7 +250,7 @@ func TestConvertOpenAIRequestToAntigravity_MidSessionSystemReminderEnvelope(t *t
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	result, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	output := gjson.ParseBytes(result)
 
 	contents := output.Get("request.contents").Array()
@@ -282,8 +286,8 @@ func TestConvertOpenAIRequestToAntigravity_MidSessionTransientSystemInstructionP
 		]
 	}`
 
-	outWith := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(turnWithTransient), false)
-	outWithout := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(turnWithoutTransient), false)
+	outWith, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(turnWithTransient), false)
+	outWithout, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(turnWithoutTransient), false)
 
 	contentsWith := gjson.GetBytes(outWith, "request.contents").Array()
 	contentsWithout := gjson.GetBytes(outWithout, "request.contents").Array()
@@ -324,7 +328,7 @@ func TestConvertOpenAIRequestToAntigravity_MidSessionSystemReminderObjectAndArra
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	result, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	output := gjson.ParseBytes(result)
 
 	contents := output.Get("request.contents").Array()
@@ -432,7 +436,7 @@ func TestConvertOpenAIRequestToAntigravityThinkingAliases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := ConvertOpenAIRequestToAntigravity("gemini-3.1-pro-low", []byte(tt.body), false)
+			result, _ := ConvertOpenAIRequestToAntigravity("gemini-3.1-pro-low", []byte(tt.body), false)
 			includeThoughts := gjson.GetBytes(result, "request.generationConfig.thinkingConfig.includeThoughts")
 			if includeThoughts.Exists() != tt.wantExists {
 				t.Fatalf("includeThoughts exists = %v, want %v. Output: %s", includeThoughts.Exists(), tt.wantExists, result)
@@ -466,7 +470,7 @@ func TestConvertOpenAIRequestToAntigravityDeduplicatesAndDisambiguatesTools(t *t
 		"tool_choice":{"type":"function","function":{"name":"` + second + `"}}
 	}`
 
-	out := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	declarations := gjson.GetBytes(out, "request.tools.0.functionDeclarations").Array()
 	if len(declarations) != 3 {
 		t.Fatalf("declaration count = %d, want 3. Output: %s", len(declarations), out)
@@ -498,7 +502,7 @@ func TestConvertOpenAIRequestToAntigravityMapsToolChoiceModes(t *testing.T) {
 	} {
 		t.Run(tt.mode+tt.choice, func(t *testing.T) {
 			inputJSON := []byte(`{"messages":[{"role":"user","content":"hi"}],"tool_choice":` + tt.choice + `}`)
-			out := ConvertOpenAIRequestToAntigravity("gemini-3-flash", inputJSON, false)
+			out, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", inputJSON, false)
 			if got := gjson.GetBytes(out, "request.toolConfig.functionCallingConfig.mode").String(); got != tt.mode {
 				t.Fatalf("tool choice mode = %q, want %q. Output: %s", got, tt.mode, out)
 			}
@@ -519,7 +523,7 @@ func TestConvertOpenAIRequestToAntigravityMapsResponseFormatJSONObject(t *testin
 		"response_format":{"type":"json_object"}
 	}`)
 
-	out := ConvertOpenAIRequestToAntigravity("gemini-3.6-flash-high", inputJSON, false)
+	out, _ := ConvertOpenAIRequestToAntigravity("gemini-3.6-flash-high", inputJSON, false)
 	if got := gjson.GetBytes(out, "request.generationConfig.responseMimeType").String(); got != "application/json" {
 		t.Fatalf("responseMimeType = %q, want application/json. Output: %s", got, out)
 	}
@@ -552,7 +556,7 @@ func TestConvertOpenAIRequestToAntigravityMapsResponseFormatJSONSchema(t *testin
 		}
 	}`)
 
-	out := ConvertOpenAIRequestToAntigravity("gemini-3.6-flash-high", inputJSON, false)
+	out, _ := ConvertOpenAIRequestToAntigravity("gemini-3.6-flash-high", inputJSON, false)
 	if got := gjson.GetBytes(out, "request.generationConfig.responseMimeType").String(); got != "application/json" {
 		t.Fatalf("responseMimeType = %q, want application/json. Output: %s", got, out)
 	}
@@ -590,7 +594,7 @@ func TestConvertOpenAIRequestToAntigravityTranslatesVideoURL(t *testing.T) {
 		}]
 	}`)
 
-	out := ConvertOpenAIRequestToAntigravity("gemini-3.7-flash-high", inputJSON, false)
+	out, _ := ConvertOpenAIRequestToAntigravity("gemini-3.7-flash-high", inputJSON, false)
 	parts := gjson.GetBytes(out, "request.contents.0.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("parts length = %d, want 2. Output: %s", len(parts), out)
@@ -637,7 +641,7 @@ func TestConvertOpenAIRequestToAntigravity_MaxCompletionTokens(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out := ConvertOpenAIRequestToAntigravity("gemini-2.5-flash", []byte(tt.body), false)
+			out, _ := ConvertOpenAIRequestToAntigravity("gemini-2.5-flash", []byte(tt.body), false)
 			got := gjson.GetBytes(out, "request.generationConfig.maxOutputTokens")
 			if !got.Exists() {
 				t.Fatalf("request.generationConfig.maxOutputTokens missing. Output: %s", out)
@@ -673,7 +677,7 @@ func TestConvertOpenAIRequestToAntigravityPreservesToolResponseAsString(t *testi
 		]
 	}`
 
-	result := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	result, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	contents := gjson.GetBytes(result, "request.contents").Array()
 	if len(contents) < 3 {
 		t.Fatalf("expected at least 3 contents, got %d. Output: %s", len(contents), result)
@@ -703,7 +707,7 @@ func TestConvertOpenAIRequestToAntigravityToolChoiceNoneOmitsTools(t *testing.T)
 				"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],
 				"tool_choice":` + tc.toolChoice + `
 			}`)
-			out := ConvertOpenAIRequestToAntigravity("gemini-3-flash", inputJSON, false)
+			out, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", inputJSON, false)
 			if got := gjson.GetBytes(out, "request.toolConfig.functionCallingConfig.mode").String(); got != "NONE" {
 				t.Fatalf("expected mode NONE, got %q", got)
 			}
@@ -741,7 +745,7 @@ func TestConvertOpenAIRequestToAntigravity_MultiTurnRepeatedToolCallID_Issue5933
 		]
 	}`
 
-	out := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 
 	// In Turn 1 (contents[1] = model functionCall, contents[2] = user functionResponse):
 	// functionCall.name must be "glob", and functionResponse.name must be "glob".
@@ -798,7 +802,7 @@ func TestConvertOpenAIRequestToAntigravity_ParallelAndOutOfOrderToolResponses(t 
 		]
 	}`
 
-	out := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 
 	resp0Name := gjson.GetBytes(out, "request.contents.2.parts.0.functionResponse.name").String()
 	resp0Result := gjson.GetBytes(out, "request.contents.2.parts.0.functionResponse.response.result").String()
@@ -810,6 +814,197 @@ func TestConvertOpenAIRequestToAntigravity_ParallelAndOutOfOrderToolResponses(t 
 	}
 	if resp1Name != "tool_b" || resp1Result != "res_b" {
 		t.Fatalf("part 1 want tool_b / res_b, got %s / %s", resp1Name, resp1Result)
+	}
+
+	if errPairing := signature.ValidateGeminiFunctionCallPairing(out); errPairing != nil {
+		t.Fatalf("ValidateGeminiFunctionCallPairing failed: %v; output=%s", errPairing, out)
+	}
+}
+
+func TestConvertOpenAIRequestToAntigravity_SanitizesClaudeToolIDs(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-sonnet-4-6",
+		"messages": [
+			{"role": "user", "content": "hello"},
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{
+						"id": "call_test|fc_test",
+						"type": "function",
+						"function": {"name": "example_tool", "arguments": "{\"arg\":\"val\"}"}
+					},
+					{
+						"id": "call_valid-123_456",
+						"type": "function",
+						"function": {"name": "valid_tool", "arguments": "{}"}
+					}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_test|fc_test", "content": "{\"result\":\"ok\"}"},
+			{"role": "tool", "tool_call_id": "call_valid-123_456", "content": "{\"result\":\"valid_ok\"}"}
+		]
+	}`
+
+	out, _ := ConvertOpenAIRequestToAntigravity("claude-sonnet-4-6", []byte(inputJSON), false)
+
+	claudePattern := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+	fc0ID := gjson.GetBytes(out, "request.contents.1.parts.0.functionCall.id").String()
+	fc1ID := gjson.GetBytes(out, "request.contents.1.parts.1.functionCall.id").String()
+	fr0ID := gjson.GetBytes(out, "request.contents.2.parts.0.functionResponse.id").String()
+	fr1ID := gjson.GetBytes(out, "request.contents.2.parts.1.functionResponse.id").String()
+
+	if !claudePattern.MatchString(fc0ID) {
+		t.Fatalf("functionCall 0 id %q does not match Claude pattern ^[a-zA-Z0-9_-]+$", fc0ID)
+	}
+	if want := "call_test_fc_test"; fc0ID != want {
+		t.Fatalf("functionCall 0 id = %q, want %q", fc0ID, want)
+	}
+	if fr0ID != fc0ID {
+		t.Fatalf("functionResponse 0 id = %q, want matching functionCall id %q", fr0ID, fc0ID)
+	}
+
+	fr0Result := gjson.GetBytes(out, "request.contents.2.parts.0.functionResponse.response.result").String()
+	if want := `{"result":"ok"}`; fr0Result != want {
+		t.Fatalf("functionResponse 0 result = %q, want %q", fr0Result, want)
+	}
+
+	if !claudePattern.MatchString(fc1ID) {
+		t.Fatalf("functionCall 1 id %q does not match Claude pattern ^[a-zA-Z0-9_-]+$", fc1ID)
+	}
+	if want := "call_valid-123_456"; fc1ID != want {
+		t.Fatalf("functionCall 1 id = %q, want %q", fc1ID, want)
+	}
+	if fr1ID != fc1ID {
+		t.Fatalf("functionResponse 1 id = %q, want matching functionCall id %q", fr1ID, fc1ID)
+	}
+
+	fr1Result := gjson.GetBytes(out, "request.contents.2.parts.1.functionResponse.response.result").String()
+	if want := `{"result":"valid_ok"}`; fr1Result != want {
+		t.Fatalf("functionResponse 1 result = %q, want %q", fr1Result, want)
+	}
+}
+
+func TestConvertOpenAIRequestToAntigravity_SanitizesClaudeToolIDs_DisambiguatesCollisionsAndReversedResponses(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-sonnet-4-6",
+		"messages": [
+			{"role": "user", "content": "run multiple tools"},
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{
+						"id": "call_a|b",
+						"type": "function",
+						"function": {"name": "tool_first", "arguments": "{\"n\":1}"}
+					},
+					{
+						"id": "call_a_b",
+						"type": "function",
+						"function": {"name": "tool_second", "arguments": "{\"n\":2}"}
+					}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_a_b", "content": "result_for_a_b"},
+			{"role": "tool", "tool_call_id": "call_a|b", "content": "result_for_a_pipe_b"}
+		]
+	}`
+
+	out, _ := ConvertOpenAIRequestToAntigravity("claude-sonnet-4-6", []byte(inputJSON), false)
+
+	claudePattern := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+	fc0ID := gjson.GetBytes(out, "request.contents.1.parts.0.functionCall.id").String()
+	fc1ID := gjson.GetBytes(out, "request.contents.1.parts.1.functionCall.id").String()
+	fr0ID := gjson.GetBytes(out, "request.contents.2.parts.0.functionResponse.id").String()
+	fr1ID := gjson.GetBytes(out, "request.contents.2.parts.1.functionResponse.id").String()
+
+	if !claudePattern.MatchString(fc0ID) {
+		t.Fatalf("functionCall 0 id %q does not match Claude pattern", fc0ID)
+	}
+	if !claudePattern.MatchString(fc1ID) {
+		t.Fatalf("functionCall 1 id %q does not match Claude pattern", fc1ID)
+	}
+	if fc0ID == fc1ID {
+		t.Fatalf("functionCall IDs collided: fc0=%q, fc1=%q", fc0ID, fc1ID)
+	}
+
+	if fr0ID != fc0ID {
+		t.Fatalf("functionResponse 0 id = %q, want matching functionCall id %q", fr0ID, fc0ID)
+	}
+	if fr1ID != fc1ID {
+		t.Fatalf("functionResponse 1 id = %q, want matching functionCall id %q", fr1ID, fc1ID)
+	}
+
+	// Verify that results did not get swapped or overwritten despite reverse response order and raw ID collision
+	fr0Result := gjson.GetBytes(out, "request.contents.2.parts.0.functionResponse.response.result").String()
+	if want := "result_for_a_pipe_b"; fr0Result != want {
+		t.Fatalf("functionResponse 0 result = %q, want %q", fr0Result, want)
+	}
+
+	fr1Result := gjson.GetBytes(out, "request.contents.2.parts.1.functionResponse.response.result").String()
+	if want := "result_for_a_b"; fr1Result != want {
+		t.Fatalf("functionResponse 1 result = %q, want %q", fr1Result, want)
+	}
+
+	if errPairing := signature.ValidateGeminiFunctionCallPairing(out); errPairing != nil {
+		t.Fatalf("ValidateGeminiFunctionCallPairing failed: %v; output=%s", errPairing, out)
+	}
+}
+
+func TestConvertOpenAIRequestToAntigravity_SanitizesClaudeToolIDs_MissingResponseDoesNotStealCollidingID(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-sonnet-4-6",
+		"messages": [
+			{"role": "user", "content": "run multiple tools"},
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{
+						"id": "call_a|b",
+						"type": "function",
+						"function": {"name": "tool_first", "arguments": "{\"n\":1}"}
+					},
+					{
+						"id": "call_a_b",
+						"type": "function",
+						"function": {"name": "tool_second", "arguments": "{\"n\":2}"}
+					}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_a_b", "content": "result_for_a_b"}
+		]
+	}`
+
+	out, _ := ConvertOpenAIRequestToAntigravity("claude-sonnet-4-6", []byte(inputJSON), false)
+
+	claudePattern := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+	fc0ID := gjson.GetBytes(out, "request.contents.1.parts.0.functionCall.id").String()
+	fc1ID := gjson.GetBytes(out, "request.contents.1.parts.1.functionCall.id").String()
+	fr0ID := gjson.GetBytes(out, "request.contents.2.parts.0.functionResponse.id").String()
+	fr1ID := gjson.GetBytes(out, "request.contents.2.parts.1.functionResponse.id").String()
+
+	if !claudePattern.MatchString(fc0ID) || !claudePattern.MatchString(fc1ID) {
+		t.Fatalf("functionCall ids do not match Claude pattern: fc0=%q, fc1=%q", fc0ID, fc1ID)
+	}
+	if fc0ID == fc1ID {
+		t.Fatalf("functionCall IDs collided: fc0=%q, fc1=%q", fc0ID, fc1ID)
+	}
+	if fr0ID != fc0ID || fr1ID != fc1ID {
+		t.Fatalf("functionResponse ids must match functionCall ids: fr0=%q, fc0=%q, fr1=%q, fc1=%q", fr0ID, fc0ID, fr1ID, fc1ID)
+	}
+
+	// First call has missing response, should fallback to "{}" and NOT steal second call's result
+	fr0Result := gjson.GetBytes(out, "request.contents.2.parts.0.functionResponse.response.result").String()
+	if want := "{}"; fr0Result != want {
+		t.Fatalf("functionResponse 0 result = %q, want %q (stole colliding call's result)", fr0Result, want)
+	}
+
+	fr1Result := gjson.GetBytes(out, "request.contents.2.parts.1.functionResponse.response.result").String()
+	if want := "result_for_a_b"; fr1Result != want {
+		t.Fatalf("functionResponse 1 result = %q, want %q", fr1Result, want)
 	}
 
 	if errPairing := signature.ValidateGeminiFunctionCallPairing(out); errPairing != nil {

@@ -4,10 +4,10 @@ import (
 	"context"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	auth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	ex "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	auth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	ex "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 // NativeProtocolExecutor preserves the client's protocol for explicitly multi-protocol routes.
@@ -19,6 +19,20 @@ func NewNativeProtocolExecutor(cfg *config.Config) *NativeProtocolExecutor {
 
 func (e *NativeProtocolExecutor) RequestToFormat(_ ex.Request, opts ex.Options) translator.Format {
 	return opts.SourceFormat
+}
+
+// ForAPIKey scopes the embedded compat executor's config without unwrapping
+// the native-protocol dispatch; inheriting OpenAICompatExecutor.ForAPIKey
+// would silently route every protocol through Chat Completions.
+func (e *NativeProtocolExecutor) ForAPIKey() auth.ProviderExecutor {
+	if e == nil || e.OpenAICompatExecutor == nil {
+		return e
+	}
+	scoped, ok := e.OpenAICompatExecutor.ForAPIKey().(*OpenAICompatExecutor)
+	if !ok || scoped == nil {
+		return e
+	}
+	return &NativeProtocolExecutor{OpenAICompatExecutor: scoped}
 }
 
 func (e *NativeProtocolExecutor) selectExecutor(a *auth.Auth, opts ex.Options) (auth.ProviderExecutor, *auth.Auth, error) {

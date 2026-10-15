@@ -7,9 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/copilot"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/copilot"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 )
 
 // DoCopilotLogin triggers the GitHub Copilot device code OAuth flow.

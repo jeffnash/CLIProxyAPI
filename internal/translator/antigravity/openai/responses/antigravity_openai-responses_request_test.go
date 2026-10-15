@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
 	"google.golang.org/protobuf/encoding/protowire"
 )
@@ -56,7 +56,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_ClaudeReasoningKeepsClaudeSi
 				]
 			}`)
 
-			out := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
+			out, _ := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
 			part := gjson.GetBytes(out, "request.contents.0.parts.0")
 			if !part.Get("thought").Bool() {
 				t.Fatalf("first part should remain a thought block. Output: %s", out)
@@ -93,7 +93,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_ClaudeReasoningDropsIncompat
 		]
 	}`)
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
 	if strings.Contains(string(out), sigcompat.GeminiSkipThoughtSignatureValidator) {
 		t.Fatalf("Claude target must not receive Gemini bypass signature. Output: %s", out)
 	}
@@ -130,7 +130,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_ClaudeReasoningDropsEmptyThi
 		]
 	}`)
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
 	if gjson.GetBytes(out, `request.contents.#.parts.#(thought=true)#`).Int() != 0 {
 		t.Fatalf("empty-text reasoning block should be dropped for Antigravity Claude. Output: %s", out)
 	}
@@ -199,7 +199,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_EmptyClaudeReasoningDoesNotS
 			{"role":"user","content":[{"type":"input_text","text":"continue"}]}
 		]
 	}`)
-	out := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
 	var thoughts []gjson.Result
 	for _, content := range gjson.GetBytes(out, "request.contents").Array() {
 		for _, part := range content.Get("parts").Array() {
@@ -236,7 +236,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_EmptyClaudeReasoningBeforeFu
 			{"role":"user","content":[{"type":"input_text","text":"continue"}]}
 		]
 	}`)
-	out := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("claude-opus-4-6-thinking", raw, false)
 	var thoughts []gjson.Result
 	for _, content := range gjson.GetBytes(out, "request.contents").Array() {
 		for _, part := range content.Get("parts").Array() {
@@ -256,7 +256,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_EmptyClaudeReasoningBeforeFu
 func TestConvertOpenAIResponsesRequestToAntigravity_GeminiReasoningUsesNativeThoughtSignaturePlacement(t *testing.T) {
 	sig := "EjQKMgEMOdbHO0Gd+c9Mxk4ELwPGbpCEcp2mFfYYLix2UVtBH3fL8GECc4+JITVnHF4qZDsA"
 	raw := []byte(`{"model":"gemini-3.5-flash","input":[{"type":"reasoning","encrypted_content":"gemini#` + sig + `","summary":[{"type":"summary_text","text":"reasoning summary"}]}]}`)
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash-agent", raw, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash-agent", raw, false)
 	parts := gjson.GetBytes(out, "request.contents.0.parts").Array()
 	if len(parts) != 1 {
 		t.Fatalf("parts length = %d, want 1. Output: %s", len(parts), out)
@@ -285,7 +285,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_PreservesToolResultImage(t *
 			}
 		]
 	}`
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	contents := gjson.GetBytes(out, "request.contents").Array()
 	if len(contents) != 3 {
 		t.Fatalf("expected 3 contents, got %d. Output: %s", len(contents), out)
@@ -341,7 +341,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_AttachesParallelToolImagesTo
 			}
 		]
 	}`
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	parts := gjson.GetBytes(out, "request.contents.2.parts").Array()
 	if len(parts) != 2 {
 		t.Fatalf("function parts = %d, want 2. Output: %s", len(parts), out)
@@ -385,7 +385,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_PreservesAdditionalToolsAndT
 		}
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	if !gjson.ValidBytes(out) {
 		t.Fatalf("invalid JSON output: %s", out)
 	}
@@ -439,7 +439,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_MidSessionDeveloperMessageDo
 		]
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	if !gjson.ValidBytes(out) {
 		t.Fatalf("invalid JSON output: %s", out)
 	}
@@ -500,7 +500,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_MidSessionSystemReminderEnve
 		]
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	result := gjson.ParseBytes(out)
 
 	contents := result.Get("request.contents").Array()
@@ -544,7 +544,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_InterveningDeveloperMessageP
 		]
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
 	if !gjson.ValidBytes(out) {
 		t.Fatalf("invalid JSON output: %s", out)
 	}
@@ -591,23 +591,32 @@ func TestConvertOpenAIResponsesRequestToAntigravity_ReasoningSummaries(t *testin
 		{
 			name:       "explicit summary preserved without overriding",
 			inputJSON:  `{"model":"gemini-3-flash","reasoning":{"effort":"high","summary":"auto"},"input":"hello"}`,
-			wantExists: false, // ConvertOpenAIResponsesRequestToAntigravity leaves explicit summary to ApplySummaryConfig downstream
+			wantExists: true,
+			wantVal:    true,
 		},
 		{
 			name:       "explicit null summary preserved without enabling",
 			inputJSON:  `{"model":"gemini-3-flash","reasoning":{"effort":"high","summary":null},"input":"hello"}`,
-			wantExists: false, // ConvertOpenAIResponsesRequestToAntigravity does not enable includeThoughts on null summary
+			wantExists: true,
+			wantVal:    false,
+		},
+		{
+			name:       "explicit none summary disables includeThoughts",
+			inputJSON:  `{"model":"gemini-3-flash","reasoning":{"effort":"high","summary":"none"},"input":"hello"}`,
+			wantExists: true,
+			wantVal:    false,
 		},
 		{
 			name:       "explicit generate_summary preserved",
 			inputJSON:  `{"model":"gemini-3-flash","reasoning":{"effort":"high","generate_summary":"detailed"},"input":"hello"}`,
-			wantExists: false, // ConvertOpenAIResponsesRequestToAntigravity leaves explicit summary to ApplySummaryConfig downstream
+			wantExists: true,
+			wantVal:    true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(tc.inputJSON), false)
+			out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(tc.inputJSON), false)
 			res := gjson.GetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts")
 			if res.Exists() != tc.wantExists {
 				t.Fatalf("includeThoughts exists = %v, want %v; out=%s", res.Exists(), tc.wantExists, out)
@@ -629,7 +638,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_FunctionCallOutputAlternateI
 		]
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.7-flash-high", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.7-flash-high", []byte(inputJSON), false)
 	rawRequest := gjson.GetBytes(out, "request").Raw
 	if errPair := sigcompat.ValidateGeminiFunctionCallPairing([]byte(rawRequest)); errPair != nil {
 		t.Fatalf("ValidateGeminiFunctionCallPairing failed on Antigravity request: %v; output=%s", errPair, out)
@@ -660,7 +669,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_InterruptedFunctionCallPrese
 		"stream": false
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.8-flash-high", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.8-flash-high", []byte(inputJSON), false)
 	rawRequest := gjson.GetBytes(out, "request").Raw
 	if errPair := sigcompat.ValidateGeminiFunctionCallPairing([]byte(rawRequest)); errPair != nil {
 		t.Fatalf("ValidateGeminiFunctionCallPairing failed on Antigravity request: %v; output=%s", errPair, out)
@@ -697,7 +706,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_ParallelInterruptedFunctionC
 		"stream": false
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.8-flash-high", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.8-flash-high", []byte(inputJSON), false)
 	rawRequest := gjson.GetBytes(out, "request").Raw
 	if errPair := sigcompat.ValidateGeminiFunctionCallPairing([]byte(rawRequest)); errPair != nil {
 		t.Fatalf("ValidateGeminiFunctionCallPairing failed on Antigravity request: %v; output=%s", errPair, out)
@@ -731,7 +740,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_TrailingPartialParallelCalls
 		"stream": false
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.8-flash-high", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.8-flash-high", []byte(inputJSON), false)
 	rawRequest := gjson.GetBytes(out, "request").Raw
 	if errPair := sigcompat.ValidateGeminiFunctionCallPairing([]byte(rawRequest)); errPair != nil {
 		t.Fatalf("ValidateGeminiFunctionCallPairing failed on Antigravity trailing partial parallel request: %v; output=%s", errPair, out)
@@ -766,7 +775,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_InterruptedMessageBeforeReal
 		"stream": false
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.8-flash-high", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.8-flash-high", []byte(inputJSON), false)
 	rawRequest := gjson.GetBytes(out, "request").Raw
 	if errPair := sigcompat.ValidateGeminiFunctionCallPairing([]byte(rawRequest)); errPair != nil {
 		t.Fatalf("ValidateGeminiFunctionCallPairing failed on Antigravity interrupted message before real output request: %v; output=%s", errPair, out)
@@ -804,7 +813,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_FunctionCallOutputWithFCOIte
 		"stream": false
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.7-flash-high", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.7-flash-high", []byte(inputJSON), false)
 	rawRequest := gjson.GetBytes(out, "request").Raw
 	if errPair := sigcompat.ValidateGeminiFunctionCallPairing([]byte(rawRequest)); errPair != nil {
 		t.Fatalf("ValidateGeminiFunctionCallPairing failed on Antigravity fco item ID request: %v; output=%s", errPair, out)
@@ -846,7 +855,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_OrphanFunctionCallOutputBeco
 		"stream": false
 	}`
 
-	out := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.7-flash-high", []byte(inputJSON), false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3.7-flash-high", []byte(inputJSON), false)
 	rawRequest := gjson.GetBytes(out, "request").Raw
 	if errPair := sigcompat.ValidateGeminiFunctionCallPairing([]byte(rawRequest)); errPair != nil {
 		t.Fatalf("ValidateGeminiFunctionCallPairing failed on Antigravity orphan output request: %v; output=%s", errPair, out)
@@ -908,7 +917,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_WebSearch(t *testing.T) {
 		}]
 	}`)
 
-	out := ConvertOpenAIResponsesRequestToAntigravity(capableModel, input, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity(capableModel, input, false)
 	parsed := gjson.ParseBytes(out)
 
 	if parsed.Get("requestType").String() != "web_search" {
@@ -931,7 +940,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_WebSearch(t *testing.T) {
 		"input": "What is the newest Go release?",
 		"tools": [{"type": "web_search"}]
 	}`)
-	incapableOut := ConvertOpenAIResponsesRequestToAntigravity(incapableModel, incapableInput, false)
+	incapableOut, _ := ConvertOpenAIResponsesRequestToAntigravity(incapableModel, incapableInput, false)
 	if gjson.GetBytes(incapableOut, "requestType").String() == "web_search" {
 		t.Fatalf("incapable model should not build web_search requestType envelope, got: %s", incapableOut)
 	}
@@ -957,7 +966,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_MixedToolsSuppressesGoogleSe
 		]
 	}`)
 
-	out := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
 	parsed := gjson.ParseBytes(out)
 
 	// 1. Must not build independent web_search requestType envelope
@@ -1016,7 +1025,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_CrossProviderCapabilityIsola
 		t.Fatalf("shouldBuildAntigravityResponsesWebSearchRequest should be false for Antigravity route when Antigravity model lacks search capability")
 	}
 
-	out := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
 	if gjson.GetBytes(out, "requestType").String() == "web_search" {
 		t.Fatalf("ConvertOpenAIResponsesRequestToAntigravity should not build web_search requestType envelope when Antigravity route lacks capability: %s", out)
 	}
@@ -1037,7 +1046,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_DoesNotBorrowNativeCapabilit
 		"input": "Search web",
 		"tools": [{"type": "web_search"}]
 	}`)
-	out := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
 	if gjson.GetBytes(out, "requestType").String() == "web_search" {
 		t.Fatalf("borrowed Gemini capability for Antigravity route: %s", out)
 	}
@@ -1074,9 +1083,13 @@ func TestConvertOpenAIResponsesRequestToAntigravity_LocalWebSearchCapability(t *
 			}
 
 			input := []byte(`{"model":"` + modelID + `","input":"Search weather","tools":[{"type":"web_search"}]}`)
+			legacy, errLegacy := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+			if errLegacy != nil {
+				t.Fatal(errLegacy)
+			}
 			unknownInfo := &registry.ModelInfo{ID: modelID, NativeCapabilities: &registry.NativeCapabilities{}}
 			for name, out := range map[string][]byte{
-				"legacy": ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false),
+				"legacy": legacy,
 				"unknown envelope with suffix": ConvertOpenAIResponsesRequestEnvelopeToAntigravity(context.Background(), sdktranslator.RequestEnvelope{
 					Model: modelID + "(high)", Body: input, Stream: true, ModelInfo: unknownInfo,
 				}).Body,
@@ -1108,7 +1121,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_IgnoresOtherProviderSearchVe
 	})
 
 	input := []byte(`{"model":"` + modelID + `","input":"Search weather","tools":[{"type":"web_search"}]}`)
-	out := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
 	if gjson.GetBytes(out, "requestType").String() != "web_search" {
 		t.Fatalf("another provider disabled Antigravity search: %s", out)
 	}
@@ -1152,7 +1165,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_WebSearchPreservesMultiTurnC
 		"tools": [{"type": "web_search"}]
 	}`)
 
-	out := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
 	parsed := gjson.ParseBytes(out)
 	if parsed.Get("requestType").String() != "web_search" {
 		t.Fatalf("expected requestType web_search, got %q. Output: %s", parsed.Get("requestType").String(), out)
@@ -1195,7 +1208,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_WebSearchPreservesInstructio
 		"tools": [{"type": "web_search"}]
 	}`)
 
-	out := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
 	parsed := gjson.ParseBytes(out)
 	if parsed.Get("requestType").String() != "web_search" {
 		t.Fatalf("expected requestType web_search, got %q. Output: %s", parsed.Get("requestType").String(), out)
@@ -1241,7 +1254,7 @@ func TestConvertOpenAIResponsesRequestToAntigravity_WebSearchToolChoiceAutoPrese
 		"tools": [{"type": "web_search"}]
 	}`)
 
-	out := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity(modelID, input, false)
 	parsed := gjson.ParseBytes(out)
 	if parsed.Get("requestType").String() != "web_search" {
 		t.Fatalf("expected requestType web_search with tool_choice auto, got %q. Output: %s", parsed.Get("requestType").String(), out)
@@ -1311,5 +1324,499 @@ func TestConvertOpenAIResponsesRequestEnvelopeToAntigravity(t *testing.T) {
 				t.Fatalf("googleSearch present = %v, want %v; output=%s", got, tc.enabled, out.Body)
 			}
 		})
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToAntigravity_AudioAndVideoInput(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"input": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "input_text", "text": "Analyze audio and video"},
+					{"type": "input_audio", "input_audio": {"data": "SUQzBA==", "format": "mp3"}},
+					{"type": "audio", "audio": {"data": "SUQzBA==", "format": "mp3"}},
+					{"type": "audio", "audio": {"data": "UklGRg==", "format": "wav"}},
+					{"type": "input_video", "video_url": "data:video/mp4;base64,AAAAIGZ0eXA="},
+					{"type": "video", "video": {"data": "GkXfo59ChoEBQveBAULygQ8=", "format": "webm"}}
+				]
+			}
+		]
+	}`
+
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	contents := gjson.GetBytes(out, "request.contents").Array()
+	if len(contents) == 0 {
+		t.Fatalf("expected at least 1 content, got 0. Output: %s", out)
+	}
+
+	parts := contents[0].Get("parts").Array()
+	if len(parts) < 6 {
+		t.Fatalf("expected at least 6 parts, got %d. Output: %s", len(parts), out)
+	}
+
+	var foundAudio, foundAudioAliasMp3, foundWavAudio, foundVideo, foundWebm bool
+	var audioCount int
+	for _, part := range parts {
+		inline := part.Get("inline_data")
+		if !inline.Exists() {
+			inline = part.Get("inlineData")
+		}
+		if !inline.Exists() {
+			continue
+		}
+		mime := inline.Get("mime_type").String()
+		if mime == "" {
+			mime = inline.Get("mimeType").String()
+		}
+		data := inline.Get("data").String()
+		if mime == "audio/mpeg" && data == "SUQzBA==" {
+			audioCount++
+			if audioCount == 1 {
+				foundAudio = true
+			} else {
+				foundAudioAliasMp3 = true
+			}
+		}
+		if mime == "audio/wav" && data == "UklGRg==" {
+			foundWavAudio = true
+		}
+		if mime == "video/mp4" && data == "AAAAIGZ0eXA=" {
+			foundVideo = true
+		}
+		if mime == "video/webm" && data == "GkXfo59ChoEBQveBAULygQ8=" {
+			foundWebm = true
+		}
+	}
+
+	if !foundAudio {
+		t.Fatalf("expected audio part with mime audio/mpeg, not found. Output: %s", out)
+	}
+	if !foundAudioAliasMp3 {
+		t.Fatalf("expected audio alias part with mime audio/mpeg, not found. Output: %s", out)
+	}
+	if !foundWavAudio {
+		t.Fatalf("expected audio alias part with mime audio/wav, not found. Output: %s", out)
+	}
+	if !foundVideo {
+		t.Fatalf("expected video part with mime video/mp4, not found. Output: %s", out)
+	}
+	if !foundWebm {
+		t.Fatalf("expected video part with mime video/webm, not found. Output: %s", out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToAntigravity_InvalidDataURLsRejected(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"input": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "input_audio", "data": " DATA:audio/wav;base64,!!!"},
+					{"type": "input_image", "source": {"type": "base64", "data": " DATA:image/png;base64,!!!"}},
+					{"type": "input_video", "video_url": "data:text/plain,hello"}
+				]
+			}
+		]
+	}`
+
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	contents := gjson.GetBytes(out, "request.contents").Array()
+	for _, content := range contents {
+		for _, part := range content.Get("parts").Array() {
+			if part.Get("inline_data").Exists() || part.Get("inlineData").Exists() {
+				t.Fatalf("expected no inlineData/inline_data for invalid data URLs, got: %s", part.Raw)
+			}
+		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToAntigravity_FallbackMIME(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"input": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "input_image", "image_url": "data:;base64,AAAA", "filename": "photo.jpeg"},
+					{"type": "input_file", "file_data": "data:;base64,BBBB", "format": "pdf"},
+					{"type": "input_image", "image_url": "data:;base64,CCCC", "filename": "photo"},
+					{"type": "input_image", "image_url": "data:;base64,DDDD", "filename": "photo.unknownext"},
+					{"type": "input_image", "image_url": "data:binary/octet-stream;base64,EEEE", "filename": "photo.jpeg"},
+					{"type": "input_file", "file_data": "QUJD", "filename": "report.pdf", "mime_type": "binary/octet-stream"}
+				]
+			}
+		]
+	}`
+
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	parts := gjson.GetBytes(out, "request.contents.0.parts").Array()
+	if len(parts) < 6 {
+		t.Fatalf("expected at least 6 parts, got %d. Output: %s", len(parts), out)
+	}
+
+	getMime := func(part gjson.Result) string {
+		if inline := part.Get("inline_data"); inline.Exists() {
+			if m := inline.Get("mime_type").String(); m != "" {
+				return m
+			}
+			return inline.Get("mimeType").String()
+		}
+		if inline := part.Get("inlineData"); inline.Exists() {
+			if m := inline.Get("mimeType").String(); m != "" {
+				return m
+			}
+			return inline.Get("mime_type").String()
+		}
+		return ""
+	}
+
+	if got := getMime(parts[0]); got != "image/jpeg" {
+		t.Errorf("parts[0] mime = %q, want image/jpeg. Output: %s", got, out)
+	}
+	if got := getMime(parts[1]); got != "application/pdf" {
+		t.Errorf("parts[1] mime = %q, want application/pdf. Output: %s", got, out)
+	}
+	if got := getMime(parts[2]); got != "image/png" {
+		t.Errorf("parts[2] (photo no ext) mime = %q, want image/png. Output: %s", got, out)
+	}
+	if got := getMime(parts[3]); got != "image/png" {
+		t.Errorf("parts[3] (photo.unknownext) mime = %q, want image/png. Output: %s", got, out)
+	}
+	if got := getMime(parts[4]); got != "image/jpeg" {
+		t.Errorf("parts[4] (binary/octet-stream fallback) mime = %q, want image/jpeg. Output: %s", got, out)
+	}
+	if got := getMime(parts[5]); got != "application/pdf" {
+		t.Errorf("parts[5] (file binary/octet-stream fallback) mime = %q, want application/pdf. Output: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToAntigravity_RemoteAudioAndVideo(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"input": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "input_audio", "audio_url": "https://example.com/audio.wav"},
+					{"type": "input_video", "video_url": "https://example.com/video.mp4"},
+					{"type": "input_image", "image_url": "https://example.com/photo.jpeg"},
+					{"type": "input_video", "video_url": "https://example.com/clip.webm", "format": "binary/octet-stream"},
+					{"type": "input_audio", "audio_url": "https://example.com/recording.mp3", "mime_type": "application/octet-stream"}
+				]
+			}
+		]
+	}`
+
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	contents := gjson.GetBytes(out, "request.contents").Array()
+	if len(contents) == 0 {
+		t.Fatalf("expected at least 1 content, got 0. Output: %s", out)
+	}
+
+	parts := contents[0].Get("parts").Array()
+	if len(parts) < 5 {
+		t.Fatalf("expected at least 5 parts, got %d. Output: %s", len(parts), out)
+	}
+
+	var foundAudio, foundVideo, foundImage, foundWebm, foundMp3 bool
+	for _, part := range parts {
+		fileData := part.Get("file_data")
+		if !fileData.Exists() {
+			fileData = part.Get("fileData")
+		}
+		if !fileData.Exists() {
+			continue
+		}
+		mime := fileData.Get("mime_type").String()
+		if mime == "" {
+			mime = fileData.Get("mimeType").String()
+		}
+		uri := fileData.Get("file_uri").String()
+		if uri == "" {
+			uri = fileData.Get("fileUri").String()
+		}
+		if mime == "audio/wav" && uri == "https://example.com/audio.wav" {
+			foundAudio = true
+		}
+		if mime == "video/mp4" && uri == "https://example.com/video.mp4" {
+			foundVideo = true
+		}
+		if mime == "image/jpeg" && uri == "https://example.com/photo.jpeg" {
+			foundImage = true
+		}
+		if mime == "video/webm" && uri == "https://example.com/clip.webm" {
+			foundWebm = true
+		}
+		if mime == "audio/mpeg" && uri == "https://example.com/recording.mp3" {
+			foundMp3 = true
+		}
+	}
+
+	if !foundAudio {
+		t.Fatalf("expected remote audio part with mime audio/wav, not found. Output: %s", out)
+	}
+	if !foundVideo {
+		t.Fatalf("expected remote video part with mime video/mp4, not found. Output: %s", out)
+	}
+	if !foundImage {
+		t.Fatalf("expected remote image part with mime image/jpeg, not found. Output: %s", out)
+	}
+	if !foundWebm {
+		t.Fatalf("expected remote video part with mime video/webm, not found. Output: %s", out)
+	}
+	if !foundMp3 {
+		t.Fatalf("expected remote audio part with mime audio/mpeg, not found. Output: %s", out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToAntigravity_InlineExplicitFormatNotOverriddenByFilename(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"input": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "input_audio", "data": "UklGRg==", "format": "wav", "filename": "download.bin"},
+					{"type": "input_video", "data": "AAAAIGZ0eXA=", "format": "mp4", "filename": "download.bin"}
+				]
+			}
+		]
+	}`
+
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	parts := gjson.GetBytes(out, "request.contents.0.parts").Array()
+	if len(parts) < 2 {
+		t.Fatalf("expected at least 2 parts, got %d. Output: %s", len(parts), out)
+	}
+
+	getMime := func(part gjson.Result) string {
+		if inline := part.Get("inline_data"); inline.Exists() {
+			if m := inline.Get("mime_type").String(); m != "" {
+				return m
+			}
+			return inline.Get("mimeType").String()
+		}
+		if inline := part.Get("inlineData"); inline.Exists() {
+			if m := inline.Get("mimeType").String(); m != "" {
+				return m
+			}
+			return inline.Get("mime_type").String()
+		}
+		return ""
+	}
+
+	if got := getMime(parts[0]); got != "audio/wav" {
+		t.Errorf("audio inline mime = %q, want audio/wav. Output: %s", got, out)
+	}
+	if got := getMime(parts[1]); got != "video/mp4" {
+		t.Errorf("video inline mime = %q, want video/mp4. Output: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToAntigravity_RemoteNestedFormatNotOverriddenByFilename(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"input": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "input_video", "video_url": "https://example.com/download.bin", "input_video": {"format": "mp4"}},
+					{"type": "input_audio", "audio_url": "https://example.com/download.bin", "input_audio": {"mime_type": "audio/wav"}},
+					{"type": "input_file", "file_url": "https://example.com/download.bin", "file": {"format": "pdf"}},
+					{"type": "input_file", "file_url": "https://example.com/download.bin", "file": {"format": "jpeg"}},
+					{"type": "input_image", "image_url": "https://example.com/download.bin", "image": {"format": "jpeg"}}
+				]
+			}
+		]
+	}`
+
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	parts := gjson.GetBytes(out, "request.contents.0.parts").Array()
+	if len(parts) < 5 {
+		t.Fatalf("expected at least 5 parts, got %d. Output: %s", len(parts), out)
+	}
+
+	getFileMime := func(part gjson.Result) string {
+		if fileData := part.Get("file_data"); fileData.Exists() {
+			if m := fileData.Get("mime_type").String(); m != "" {
+				return m
+			}
+			return fileData.Get("mimeType").String()
+		}
+		if fileData := part.Get("fileData"); fileData.Exists() {
+			if m := fileData.Get("mimeType").String(); m != "" {
+				return m
+			}
+			return fileData.Get("mime_type").String()
+		}
+		return ""
+	}
+
+	if got := getFileMime(parts[0]); got != "video/mp4" {
+		t.Errorf("video file_data mime = %q, want video/mp4. Output: %s", got, out)
+	}
+	if got := getFileMime(parts[1]); got != "audio/wav" {
+		t.Errorf("audio file_data mime = %q, want audio/wav. Output: %s", got, out)
+	}
+	if got := getFileMime(parts[2]); got != "application/pdf" {
+		t.Errorf("file file_data mime = %q, want application/pdf. Output: %s", got, out)
+	}
+	if got := getFileMime(parts[3]); got != "image/jpeg" {
+		t.Errorf("jpeg file file_data mime = %q, want image/jpeg. Output: %s", got, out)
+	}
+	if got := getFileMime(parts[4]); got != "image/jpeg" {
+		t.Errorf("image.format jpeg file_data mime = %q, want image/jpeg. Output: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToAntigravity_GenericMIMEWithNestedFormatNotOverriddenByFilename(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"input": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "input_video", "video_url": "https://example.com/download.bin", "mime_type": "application/octet-stream", "input_video": {"format": "mp4"}},
+					{"type": "input_audio", "audio_url": "https://example.com/download.bin", "mime_type": "binary/octet-stream", "input_audio": {"format": "wav"}},
+					{"type": "input_file", "file_url": "https://example.com/download.bin", "mime_type": "application/octet-stream", "file": {"format": "pdf"}}
+				]
+			}
+		]
+	}`
+
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	parts := gjson.GetBytes(out, "request.contents.0.parts").Array()
+	if len(parts) < 3 {
+		t.Fatalf("expected at least 3 parts, got %d. Output: %s", len(parts), out)
+	}
+
+	getFileMime := func(part gjson.Result) string {
+		if fileData := part.Get("file_data"); fileData.Exists() {
+			if m := fileData.Get("mime_type").String(); m != "" {
+				return m
+			}
+			return fileData.Get("mimeType").String()
+		}
+		if fileData := part.Get("fileData"); fileData.Exists() {
+			if m := fileData.Get("mimeType").String(); m != "" {
+				return m
+			}
+			return fileData.Get("mime_type").String()
+		}
+		return ""
+	}
+
+	if got := getFileMime(parts[0]); got != "video/mp4" {
+		t.Errorf("video file_data mime = %q, want video/mp4. Output: %s", got, out)
+	}
+	if got := getFileMime(parts[1]); got != "audio/wav" {
+		t.Errorf("audio file_data mime = %q, want audio/wav. Output: %s", got, out)
+	}
+	if got := getFileMime(parts[2]); got != "application/pdf" {
+		t.Errorf("file file_data mime = %q, want application/pdf. Output: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToAntigravity_UnknownExtensionFallsBackToDefaults(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"input": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "input_audio", "audio_url": "https://example.com/download.bin", "mime_type": "application/octet-stream"},
+					{"type": "input_video", "video_url": "https://example.com/download.bin", "mime_type": "application/octet-stream"}
+				]
+			}
+		]
+	}`
+
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	parts := gjson.GetBytes(out, "request.contents.0.parts").Array()
+	if len(parts) < 2 {
+		t.Fatalf("expected at least 2 parts, got %d. Output: %s", len(parts), out)
+	}
+
+	getFileMime := func(part gjson.Result) string {
+		if fileData := part.Get("file_data"); fileData.Exists() {
+			if m := fileData.Get("mime_type").String(); m != "" {
+				return m
+			}
+			return fileData.Get("mimeType").String()
+		}
+		if fileData := part.Get("fileData"); fileData.Exists() {
+			if m := fileData.Get("mimeType").String(); m != "" {
+				return m
+			}
+			return fileData.Get("mime_type").String()
+		}
+		return ""
+	}
+
+	if got := getFileMime(parts[0]); got != "audio/wav" {
+		t.Errorf("audio file_data mime = %q, want audio/wav. Output: %s", got, out)
+	}
+	if got := getFileMime(parts[1]); got != "video/mp4" {
+		t.Errorf("video file_data mime = %q, want video/mp4. Output: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToAntigravity_TopLevelMedia(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"input": [
+			{"type": "input_text", "text": "Describe video and audio"},
+			{"type": "input_video", "video_url": "data:video/mp4;base64,AAAAIGZ0eXA="},
+			{"type": "input_audio", "input_audio": {"data": "SUQzBA==", "format": "mp3"}}
+		]
+	}`
+
+	out, _ := ConvertOpenAIResponsesRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	contents := gjson.GetBytes(out, "request.contents").Array()
+	if len(contents) == 0 {
+		t.Fatalf("expected at least 1 content, got 0. Output: %s", out)
+	}
+
+	parts := contents[0].Get("parts").Array()
+	if len(parts) < 3 {
+		t.Fatalf("expected at least 3 parts, got %d. Output: %s", len(parts), out)
+	}
+
+	var foundText, foundVideo, foundAudio bool
+	for _, part := range parts {
+		if part.Get("text").String() == "Describe video and audio" {
+			foundText = true
+		}
+		inline := part.Get("inline_data")
+		if !inline.Exists() {
+			inline = part.Get("inlineData")
+		}
+		if !inline.Exists() {
+			continue
+		}
+		mime := inline.Get("mime_type").String()
+		if mime == "" {
+			mime = inline.Get("mimeType").String()
+		}
+		data := inline.Get("data").String()
+		if mime == "video/mp4" && data == "AAAAIGZ0eXA=" {
+			foundVideo = true
+		}
+		if mime == "audio/mpeg" && data == "SUQzBA==" {
+			foundAudio = true
+		}
+	}
+
+	if !foundText {
+		t.Errorf("expected text part in output: %s", out)
+	}
+	if !foundVideo {
+		t.Errorf("expected video inline part in output: %s", out)
+	}
+	if !foundAudio {
+		t.Errorf("expected audio inline part in output: %s", out)
 	}
 }

@@ -3,18 +3,18 @@ package chat_completions
 import (
 	"context"
 
-	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/translator"
+	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/translator"
 )
 
 func init() {
 	translator.Register(
 		Grok,
 		OpenAI,
-		func(modelName string, rawJSON []byte, stream bool) []byte {
+		func(modelName string, rawJSON []byte, stream bool) ([]byte, error) {
 			// Identity function: Grok requests stay as-is when targeting OpenAI
-			return rawJSON
+			return rawJSON, nil
 		},
 		interfaces.TranslateResponse{
 			Stream: func(ctx context.Context, model string, originalRequest, request, rawResponse []byte, param *any) [][]byte {

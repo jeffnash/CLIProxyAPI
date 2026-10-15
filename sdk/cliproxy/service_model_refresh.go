@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -174,6 +174,13 @@ func normalizeProviderFilter(providers []string) map[string]bool {
 			filter = make(map[string]bool)
 		}
 		filter[name] = true
+		switch name {
+		case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
+			filter["kimi"] = true
+			filter["kimi-ai"] = true
+			filter["kimi.ai"] = true
+			filter["kimi.com"] = true
+		}
 	}
 	return filter
 }

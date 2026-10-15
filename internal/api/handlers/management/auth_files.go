@@ -21,17 +21,17 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/copilot"
-	geminiAuth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gemini"
-	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/copilot"
+	geminiAuth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/gemini"
+	kiroauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialweight"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
@@ -135,9 +135,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	h.mu.Lock()
 	host := h.pluginHost
 	h.mu.Unlock()
-	var quotaSupportedProviders map[string]struct{}
+	quota := authFileQuotaContext{v8: c.GetBool(ConfigV8ContextKey)}
 	if host != nil {
-		quotaSupportedProviders = host.QuotaSupportedProvidersSet(c.Request.Context())
+		quota.pluginIDs = host.QuotaProviderPluginIDs(c.Request.Context())
 	}
 	auths := h.authManager.List()
 	observedAt := time.Now().UTC()
@@ -157,7 +157,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		start, end := pagination.bounds(total)
 		files := make([]gin.H, 0, end-start)
 		for _, auth := range matching[start:end] {
-			if entry := h.buildAuthFileEntry(auth, quotaSupportedProviders); entry != nil {
+			if entry := h.buildAuthFileEntry(auth, quota); entry != nil {
 				entry["cooldowns"] = nil
 				if cooldownsKnown {
 					entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
@@ -173,7 +173,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		if !matchesAuthFileLookup(auth, nameFilter, authIndexFilter) {
 			continue
 		}
-		if entry := h.buildAuthFileEntry(auth, quotaSupportedProviders); entry != nil {
+		if entry := h.buildAuthFileEntry(auth, quota); entry != nil {
 			entry["cooldowns"] = nil
 			if cooldownsKnown {
 				entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
@@ -494,13 +494,172 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 	c.JSON(200, authFilesListResponse(observedAt, files, pagination, total, end))
 }
 
-func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, quotaSupported ...map[string]struct{}) gin.H {
-	authFileEntryMu.Lock()
-	defer authFileEntryMu.Unlock()
-	return h.buildAuthFileEntryLocked(auth, quotaSupported...)
+// authFileQuotaContext carries request-scoped quota capability data for auth file entries.
+type authFileQuotaContext struct {
+	// pluginIDs maps normalized provider keys to the quota plugin selected for them.
+	// A nil map means no quota plugins are available.
+	pluginIDs map[string]string
+	// v8 hides declarative quota_probe support because v8 only serves plugin quota routes.
+	v8 bool
 }
 
-func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported ...map[string]struct{}) gin.H {
+func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, quota authFileQuotaContext) gin.H {
+	authFileEntryMu.Lock()
+	defer authFileEntryMu.Unlock()
+	return h.buildAuthFileEntryLocked(auth, quota)
+}
+
+func isPersistentAuthFailure(auth *coreauth.Auth, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	// Terminal unauthorized failure with no refresh scheduled.
+	if coreauth.HasUnauthorizedAuthFailure(auth) {
+		return true
+	}
+	// An OAuth credential whose access token is expired cannot be used to serve requests.
+	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
+		return true
+	}
+	// An explicit token expiration status.
+	if strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "token expired") {
+		return true
+	}
+	return false
+}
+
+func isModelStateBlocked(state *coreauth.ModelState, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	if state.Status == coreauth.StatusDisabled {
+		return true
+	}
+	if !state.Unavailable && !state.Quota.Exceeded {
+		return false
+	}
+	hasRecoveryTime := !state.NextRetryAfter.IsZero() || (!state.Quota.NextRecoverAt.IsZero() && state.Quota.Exceeded)
+	if !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
+		return true
+	}
+	if state.Quota.Exceeded && !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
+		return true
+	}
+	if hasRecoveryTime {
+		return false
+	}
+	return true
+}
+
+func reconcileAuthFileCooldownState(auth *coreauth.Auth, now time.Time) (unavailable bool, status coreauth.Status, statusMessage string, nextRetry time.Time) {
+	if auth == nil {
+		return false, coreauth.StatusActive, "", time.Time{}
+	}
+	unavailable = auth.Unavailable
+	status = auth.Status
+	statusMessage = auth.StatusMessage
+	if !auth.NextRetryAfter.IsZero() {
+		nextRetry = auth.NextRetryAfter
+	}
+
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return unavailable, coreauth.StatusDisabled, statusMessage, nextRetry
+	}
+
+	// Never reconcile an active authentication or token failure to active.
+	if isPersistentAuthFailure(auth, now) {
+		if !nextRetry.IsZero() && !nextRetry.After(now) {
+			nextRetry = time.Time{}
+		}
+		return true, coreauth.StatusError, statusMessage, nextRetry
+	}
+
+	// Check if there is an active credential-level cooldown.
+	// Matching selector.availabilityBlock: if neither Unavailable nor Quota.Exceeded is true,
+	// an inactive timestamp does not block the credential.
+	hasActiveCredCooldown := false
+	if auth.Unavailable || auth.Quota.Exceeded {
+		if !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
+			hasActiveCredCooldown = true
+		}
+		if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+			hasActiveCredCooldown = true
+			if nextRetry.IsZero() || auth.Quota.NextRecoverAt.After(nextRetry) {
+				nextRetry = auth.Quota.NextRecoverAt
+			}
+		}
+	}
+
+	// Check per-model states.
+	hasSchedulableModels := false
+	allSchedulableBlocked := true
+	hasActiveModelCooldown := false
+	hadAnyModelCooldown := false
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if state.Status == coreauth.StatusDisabled {
+			continue
+		}
+		hasSchedulableModels = true
+		if !state.NextRetryAfter.IsZero() || (state.Quota.Exceeded && !state.Quota.NextRecoverAt.IsZero()) {
+			hadAnyModelCooldown = true
+		}
+		if (!state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now)) ||
+			(state.Quota.Exceeded && !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now)) {
+			hasActiveModelCooldown = true
+		}
+		if !isModelStateBlocked(state, now) {
+			allSchedulableBlocked = false
+		}
+	}
+
+	hadCooldown := !auth.NextRetryAfter.IsZero() ||
+		(auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero()) ||
+		hadAnyModelCooldown
+
+	// If there is an active credential cooldown, keep unavailable/error.
+	// If all recorded models are blocked and the credential itself was marked unavailable, keep unavailable/error.
+	if hasActiveCredCooldown || (hasSchedulableModels && allSchedulableBlocked && auth.Unavailable) {
+		if !nextRetry.IsZero() && !nextRetry.After(now) {
+			nextRetry = time.Time{}
+		}
+		return true, coreauth.StatusError, statusMessage, nextRetry
+	}
+
+	// If the credential was not marked unavailable and has no active credential cooldown, keep unavailable=false.
+	if !auth.Unavailable && !hasActiveCredCooldown {
+		if status == coreauth.StatusError && hasSchedulableModels && !allSchedulableBlocked {
+			status = coreauth.StatusActive
+			statusMessage = ""
+		}
+		return false, status, statusMessage, time.Time{}
+	}
+
+	// If a cooldown was recorded but has expired (and no active model cooldown blocks all models):
+	if hadCooldown && !hasActiveCredCooldown && !hasActiveModelCooldown {
+		return false, coreauth.StatusActive, "", time.Time{}
+	}
+
+	// If partial models are still cooling, the credential as a whole remains available for other models.
+	if hadCooldown && hasSchedulableModels && !allSchedulableBlocked {
+		if status == coreauth.StatusError && !hasActiveCredCooldown {
+			status = coreauth.StatusActive
+			statusMessage = ""
+		}
+		return false, status, statusMessage, time.Time{}
+	}
+
+	// If nextRetry is in the past, do not expose a past retry deadline.
+	if !nextRetry.IsZero() && !nextRetry.After(now) {
+		nextRetry = time.Time{}
+	}
+
+	return unavailable, status, statusMessage, nextRetry
+}
+
+func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQuotaContext) gin.H {
 	if auth == nil {
 		return nil
 	}
@@ -517,6 +676,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if name == "" {
 		name = auth.ID
 	}
+	unavailable, status, statusMessage, nextRetryAfter := reconcileAuthFileCooldownState(auth, time.Now().UTC())
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
@@ -524,10 +684,10 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 		"type":           strings.TrimSpace(auth.Provider),
 		"provider":       strings.TrimSpace(auth.Provider),
 		"label":          auth.Label,
-		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
+		"status":         status,
+		"status_message": statusMessage,
 		"disabled":       auth.Disabled,
-		"unavailable":    auth.Unavailable,
+		"unavailable":    unavailable,
 		"runtime_only":   runtimeOnly,
 		"source":         "memory",
 		"size":           int64(0),
@@ -539,25 +699,15 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if modelQuotas := modelQuotaObservationPayload(auth.Provider, auth.ModelStates); len(modelQuotas) > 0 {
 		entry["model_quotas"] = modelQuotas
 	}
-	var quotaSupportedMap map[string]struct{}
-	if len(quotaSupported) > 0 {
-		quotaSupportedMap = quotaSupported[0]
-	}
-	if quotaSupportedMap != nil {
-		if _, ok := quotaSupportedMap[strings.ToLower(strings.TrimSpace(auth.Provider))]; ok {
-			entry["supports_quota"] = true
-			entry["quota_provider"] = auth.Provider
-		}
-	} else {
-		h.mu.Lock()
-		host := h.pluginHost
-		h.mu.Unlock()
-		if host != nil && host.HasQuotaProvider(auth.Provider) {
-			entry["supports_quota"] = true
-			entry["quota_provider"] = auth.Provider
+	if pluginID := quota.pluginIDs[strings.ToLower(strings.TrimSpace(auth.Provider))]; pluginID != "" {
+		entry["supports_quota"] = true
+		entry["quota_provider"] = auth.Provider
+		if quota.v8 {
+			entry["quota_plugin_id"] = pluginID
 		}
 	}
-	if auth.Metadata != nil {
+	// Declarative quota_probe is only executed by the v0 quota/fetch route.
+	if !quota.v8 && auth.Metadata != nil {
 		if probe, okProbe := auth.Metadata["quota_probe"]; okProbe && probe != nil {
 			entry["supports_quota"] = true
 			entry["quota_probe"] = probe
@@ -587,8 +737,8 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	if !auth.LastRefreshedAt.IsZero() {
 		entry["last_refresh"] = auth.LastRefreshedAt
 	}
-	if !auth.NextRetryAfter.IsZero() {
-		entry["next_retry_after"] = auth.NextRetryAfter
+	if !nextRetryAfter.IsZero() {
+		entry["next_retry_after"] = nextRetryAfter
 	}
 	if path != "" {
 		entry["path"] = path

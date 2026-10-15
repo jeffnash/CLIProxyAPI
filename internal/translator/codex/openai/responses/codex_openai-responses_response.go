@@ -5,7 +5,7 @@ import (
 	"context"
 	"strings"
 
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -19,19 +19,41 @@ type codexResponsesSSEState struct {
 // to OpenAI Responses SSE events (response.*).
 
 func ConvertCodexResponseToOpenAIResponses(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
+	// An executor-owned bridge in param opts into apply_patch translation;
+	// native Codex never opts in, even when configuration supplies the bridge schema.
+	if bridge := responsesBridge(param); bridge != nil {
+		sse := bytes.HasPrefix(rawJSON, []byte("data:"))
+		payload := rawJSON
+		if sse {
+			payload = bytes.TrimSpace(rawJSON[5:])
+		}
+		updated := setResponsesModel(payload, modelName, originalRequestRawJSON, requestRawJSON)
+		outputs, _ := bridge.Transform(updated)
+		if sse {
+			for i := range outputs {
+				outputs[i] = append([]byte("data: "), outputs[i]...)
+			}
+		}
+		return outputs
+	}
+
 	// If the caller doesn't provide a persistent param state, pass framing lines
 	// through without stateful buffering.
 	if param == nil {
 		rawJSON = bytes.TrimSuffix(rawJSON, []byte("\r"))
 		if bytes.HasPrefix(rawJSON, []byte("data:")) {
+			framed := bytes.HasSuffix(rawJSON, []byte("\n\n"))
 			payload := bytes.TrimSpace(rawJSON[5:])
 			if len(payload) == 0 {
 				return [][]byte{}
 			}
 			payload = enrichResponsesDataPayload(payload, modelName, originalRequestRawJSON, requestRawJSON)
-			out := make([]byte, 0, len(payload)+len("data: "))
+			out := make([]byte, 0, len(payload)+len("data: ")+2)
 			out = append(out, []byte("data: ")...)
 			out = append(out, payload...)
+			if framed {
+				out = append(out, '\n', '\n')
+			}
 			return [][]byte{out}
 		}
 		return [][]byte{rawJSON}
@@ -61,6 +83,9 @@ func ConvertCodexResponseToOpenAIResponses(_ context.Context, modelName string, 
 	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
+		// Bridge-expanded events arrive as complete SSE frames ("data: ...\n\n");
+		// keep the frame terminator so downstream sees a complete event.
+		framed := bytes.HasSuffix(rawJSON, []byte("\n\n"))
 		payload := bytes.TrimSpace(rawJSON[5:])
 		if len(payload) == 0 {
 			st.pendingEventLine = ""
@@ -68,10 +93,15 @@ func ConvertCodexResponseToOpenAIResponses(_ context.Context, modelName string, 
 			return [][]byte{}
 		}
 		payload = enrichResponsesDataPayload(payload, modelName, originalRequestRawJSON, requestRawJSON)
-		out := make([]byte, 0, len(payload)+len("data: "))
+		out := make([]byte, 0, len(payload)+len("data: ")+2)
 		out = append(out, []byte("data: ")...)
 		out = append(out, payload...)
-		st.hasNonEmptyDataSinceBoundary = true
+		if framed {
+			out = append(out, '\n', '\n')
+			st.hasNonEmptyDataSinceBoundary = false
+		} else {
+			st.hasNonEmptyDataSinceBoundary = true
+		}
 		if st.pendingEventLine != "" {
 			eventLine := st.pendingEventLine
 			st.pendingEventLine = ""
@@ -80,6 +110,15 @@ func ConvertCodexResponseToOpenAIResponses(_ context.Context, modelName string, 
 		return [][]byte{out}
 	}
 	return [][]byte{rawJSON}
+}
+
+// Only an executor-owned param can enable bridging on this shared translator.
+func responsesBridge(param *any) *translatorcommon.ApplyPatchResponsesBridge {
+	if param != nil {
+		bridge, _ := (*param).(*translatorcommon.ApplyPatchResponsesBridge)
+		return bridge
+	}
+	return nil
 }
 
 // enrichResponsesDataPayload applies per-payload enrichment for lifecycle events:
@@ -124,10 +163,22 @@ func setResponsesModel(rawJSON []byte, _ string, originalRequestRawJSON, request
 
 // ConvertCodexResponseToOpenAIResponsesNonStream builds a single Responses JSON
 // from a non-streaming OpenAI Chat Completions response.
-func ConvertCodexResponseToOpenAIResponsesNonStream(_ context.Context, _ string, _, _, rawJSON []byte, _ *any) []byte {
-	rootResult := gjson.ParseBytes(rawJSON)
+func ConvertCodexResponseToOpenAIResponsesNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []byte {
+	bridge := responsesBridge(param)
+	converted := rawJSON
+	if bridge != nil {
+		var errTransform error
+		converted, errTransform = bridge.TransformNonStream(rawJSON)
+		if errTransform != nil {
+			return nil
+		}
+	}
+	rootResult := gjson.ParseBytes(converted)
 	// Verify this is a terminal response event.
 	responseType := rootResult.Get("type").String()
+	if responseType == "" && rootResult.Get("output").IsArray() {
+		return converted
+	}
 	if responseType != "response.completed" && responseType != "response.incomplete" {
 		return []byte{}
 	}

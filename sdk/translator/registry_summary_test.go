@@ -20,13 +20,21 @@ func TestRegistryTranslateRequestAppliesSummaryIntent(t *testing.T) {
 		wantExists bool
 	}{
 		{
-			name:       "chat effort enables Claude summary",
+			name:       "chat effort leaves Claude display unspecified",
 			from:       FormatOpenAI,
 			to:         FormatClaude,
 			input:      `{"reasoning_effort":"high"}`,
 			translated: `{"thinking":{"type":"adaptive"}}`,
 			path:       "thinking.display",
-			want:       "summarized",
+		},
+		{
+			name:       "chat explicit exclusion disables Claude summary",
+			from:       FormatOpenAI,
+			to:         FormatClaude,
+			input:      `{"reasoning_effort":"high","reasoning":{"exclude":true}}`,
+			translated: `{"thinking":{"type":"adaptive"}}`,
+			path:       "thinking.display",
+			want:       "omitted",
 			wantExists: true,
 		},
 		{
@@ -72,8 +80,8 @@ func TestRegistryTranslateRequestAppliesSummaryIntent(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			registry := NewRegistry()
-			registry.Register(test.from, test.to, func(_ string, _ []byte, _ bool) []byte {
-				return []byte(test.translated)
+			registry.Register(test.from, test.to, func(_ string, _ []byte, _ bool) ([]byte, error) {
+				return []byte(test.translated), nil
 			}, ResponseTransform{})
 			out := registry.TranslateRequest(test.from, test.to, "model", []byte(test.input), false)
 			result := gjson.GetBytes(out, test.path)
@@ -89,8 +97,8 @@ func TestRegistryTranslateRequestAppliesSummaryIntent(t *testing.T) {
 
 func TestRegistryTranslateRequestActivatesClaudeForEnabledSummary(t *testing.T) {
 	registry := NewRegistry()
-	registry.Register(FormatOpenAIResponse, FormatClaude, func(_ string, _ []byte, _ bool) []byte {
-		return []byte(`{"model":"claude-opus-5","max_tokens":32000}`)
+	registry.Register(FormatOpenAIResponse, FormatClaude, func(_ string, _ []byte, _ bool) ([]byte, error) {
+		return []byte(`{"model":"claude-opus-5","max_tokens":32000}`), nil
 	}, ResponseTransform{})
 	out := registry.TranslateRequest(
 		FormatOpenAIResponse,
@@ -109,8 +117,8 @@ func TestRegistryTranslateRequestActivatesClaudeForEnabledSummary(t *testing.T) 
 
 func TestRegistryTranslateRequestDoesNotActivateClaudeForDisabledSummary(t *testing.T) {
 	registry := NewRegistry()
-	registry.Register(FormatOpenAIResponse, FormatClaude, func(_ string, _ []byte, _ bool) []byte {
-		return []byte(`{"model":"claude-opus-5","max_tokens":32000}`)
+	registry.Register(FormatOpenAIResponse, FormatClaude, func(_ string, _ []byte, _ bool) ([]byte, error) {
+		return []byte(`{"model":"claude-opus-5","max_tokens":32000}`), nil
 	}, ResponseTransform{})
 	out := registry.TranslateRequest(
 		FormatOpenAIResponse,
@@ -233,8 +241,8 @@ func TestRegistryTranslateRequestPluginNormalizerOwnsSourceSummaryIntent(t *test
 
 func TestRegistryTranslateRequestNormalizerOwnsFinalSummaryField(t *testing.T) {
 	registry := NewRegistry()
-	registry.Register(FormatOpenAIResponse, FormatGemini, func(_ string, _ []byte, _ bool) []byte {
-		return []byte(`{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}`)
+	registry.Register(FormatOpenAIResponse, FormatGemini, func(_ string, _ []byte, _ bool) ([]byte, error) {
+		return []byte(`{"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}`), nil
 	}, ResponseTransform{})
 	hooks := &fakePluginHooks{normalizeRequest: func(body []byte) []byte {
 		if !gjson.GetBytes(body, "generationConfig.thinkingConfig.includeThoughts").Bool() {

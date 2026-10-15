@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 func TestStartNonStreamingKeepAliveDoesNotCommitStatus(t *testing.T) {

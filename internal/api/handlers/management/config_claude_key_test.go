@@ -1,6 +1,7 @@
 package management
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func TestPatchClaudeKeyFingerprintProfile(t *testing.T) {
@@ -801,5 +802,106 @@ func TestPutClaudeKeysOmittedCloakPreservesExistingMode(t *testing.T) {
 	savedText := string(savedBytes)
 	if !strings.Contains(savedText, "mode: always") {
 		t.Fatalf("saved YAML lost preserved 'mode: always':\n%s", savedText)
+	}
+}
+
+func TestPatchClaudeKeyPriority(t *testing.T) {
+	configFile := writeTestConfigFile(t)
+	cfg := &config.Config{
+		ClaudeKey: []config.ClaudeKey{
+			{APIKey: "key-0", Priority: 0},
+			{APIKey: "key-1", Priority: 5},
+		},
+	}
+	h := &Handler{cfg: cfg, configFilePath: configFile}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/claude-api-key",
+		strings.NewReader(`{"index":1,"value":{"priority":20}}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	h.PatchClaudeKey(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := cfg.ClaudeKey[1].Priority; got != 20 {
+		t.Fatalf("ClaudeKey[1].Priority = %d, want 20", got)
+	}
+
+	savedBytes, errRead := os.ReadFile(configFile)
+	if errRead != nil {
+		t.Fatalf("os.ReadFile() error = %v", errRead)
+	}
+	savedText := string(savedBytes)
+	if !strings.Contains(savedText, "priority: 20") {
+		t.Fatalf("saved YAML missing 'priority: 20':\n%s", savedText)
+	}
+
+	// Verify GET returns the updated priority with structured unmarshaling
+	getRec := httptest.NewRecorder()
+	getCtx, _ := gin.CreateTestContext(getRec)
+	getCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/claude-api-key", nil)
+	h.GetClaudeKeys(getCtx)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body=%s", getRec.Code, getRec.Body.String())
+	}
+	var resp struct {
+		ClaudeKey []config.ClaudeKey `json:"claude-api-key"`
+	}
+	if errJSON := json.Unmarshal(getRec.Body.Bytes(), &resp); errJSON != nil {
+		t.Fatalf("unmarshal GET response: %v", errJSON)
+	}
+	if len(resp.ClaudeKey) != 2 {
+		t.Fatalf("GET response ClaudeKey length = %d, want 2", len(resp.ClaudeKey))
+	}
+	if resp.ClaudeKey[1].Priority != 20 {
+		t.Fatalf("GET response ClaudeKey[1].Priority = %d, want 20", resp.ClaudeKey[1].Priority)
+	}
+
+	// Omitting priority must preserve existing non-zero value (20)
+	rec = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/claude-api-key",
+		strings.NewReader(`{"index":1,"value":{"prefix":"team-test"}}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	h.PatchClaudeKey(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := cfg.ClaudeKey[1].Priority; got != 20 {
+		t.Fatalf("ClaudeKey[1].Priority = %d, want preserved 20", got)
+	}
+	if got := cfg.ClaudeKey[1].Prefix; got != "team-test" {
+		t.Fatalf("ClaudeKey[1].Prefix = %q, want %q", got, "team-test")
+	}
+
+	// Reset priority to 0 explicitly
+	rec = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/claude-api-key",
+		strings.NewReader(`{"index":1,"value":{"priority":0}}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	h.PatchClaudeKey(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := cfg.ClaudeKey[1].Priority; got != 0 {
+		t.Fatalf("ClaudeKey[1].Priority = %d, want 0", got)
+	}
+
+	// Invalid priority type returns 400
+	rec = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/claude-api-key",
+		strings.NewReader(`{"index":1,"value":{"priority":"invalid"}}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	h.PatchClaudeKey(ctx)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
 }

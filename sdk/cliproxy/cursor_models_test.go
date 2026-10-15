@@ -3,7 +3,7 @@ package cliproxy
 import (
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 // RC3: cursor-api-key[].models are registered for /v1/models under their client-facing ALIASES (the alias

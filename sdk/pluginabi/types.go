@@ -94,6 +94,8 @@ const (
 
 	MethodHostHTTPDo             = "host.http.do"
 	MethodHostHTTPDoStream       = "host.http.do_stream"
+	MethodHostHTTPOperationOpen  = "host.http.operation_open"
+	MethodHostHTTPCancel         = "host.http.cancel"
 	MethodHostHTTPStreamRead     = "host.http.stream_read"
 	MethodHostHTTPStreamClose    = "host.http.stream_close"
 	MethodHostModelExecute       = "host.model.execute"
@@ -108,6 +110,8 @@ const (
 	MethodHostAuthGetRuntime     = "host.auth.get_runtime"
 	MethodHostAuthSave           = "host.auth.save"
 	MethodHostAffinityLookup     = "host.affinity.lookup"
+
+	MethodHostRoutingResetCooldown = "host.routing.reset_cooldown"
 )
 
 type Envelope struct {

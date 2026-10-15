@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	codebuddy "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codebuddy"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	codebuddy "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codebuddy"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 type codeBuddyMgmtRoundTripperFunc func(*http.Request) (*http.Response, error)

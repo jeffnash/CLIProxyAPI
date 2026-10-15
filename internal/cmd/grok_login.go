@@ -8,8 +8,8 @@ import (
 	"regexp"
 	"strings"
 
-	grokauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/grok"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	grokauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/grok"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 // DoGrokLogin prompts for Grok SSO JWT and saves it as an auth file.

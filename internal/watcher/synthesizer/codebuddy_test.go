@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	codebuddy "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codebuddy"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	codebuddy "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codebuddy"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 // TestFileSynthesizer_CodeBuddyMetadata verifies the existing generic file

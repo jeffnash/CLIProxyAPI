@@ -126,6 +126,81 @@ func TestStreaming_LateUsageOnlyDoesNotEmitAfterMessageStop(t *testing.T) {
 	}
 }
 
+func TestStreaming_SplitUsageFinishReasonThenTrailingUsageChunk_PreservesCachedTokens(t *testing.T) {
+	tests := []struct {
+		name         string
+		firstChunks  []string
+		finishChunk  string
+		wantStopType string
+	}{
+		{
+			name: "text content with stop finish_reason",
+			firstChunks: []string{
+				`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+			},
+			finishChunk:  `{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":140025,"completion_tokens":741,"total_tokens":140766,"prompt_tokens_details":{}}}`,
+			wantStopType: "end_turn",
+		},
+		{
+			name: "tool call with tool_calls finish_reason",
+			firstChunks: []string{
+				`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":null}]}`,
+			},
+			finishChunk:  `{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":140025,"completion_tokens":741,"total_tokens":140766,"prompt_tokens_details":{}}}`,
+			wantStopType: "tool_use",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trailingUsageChunk := `{"id":"c1","model":"m","choices":[],"usage":{"prompt_tokens":140025,"completion_tokens":741,"total_tokens":140766,"prompt_tokens_details":{"cached_tokens":139136}}}`
+			allChunks := append(append([]string{}, tt.firstChunks...), tt.finishChunk, trailingUsageChunk)
+
+			events := runStream(t, streamReq, allChunks...)
+
+			if got := countByType(events, "message_delta"); got != 1 {
+				t.Fatalf("expected exactly one message_delta, got %d (events=%+v)", got, events)
+			}
+			if got := countByType(events, "message_stop"); got != 1 {
+				t.Fatalf("expected exactly one message_stop, got %d (events=%+v)", got, events)
+			}
+			if len(events) == 0 || events[len(events)-1].Type != "message_stop" {
+				t.Fatalf("message_stop must be the last semantic event (events=%+v)", events)
+			}
+
+			var deltaPayload string
+			for _, e := range events {
+				if e.Type == "message_delta" {
+					deltaPayload = e.Payload
+					break
+				}
+			}
+			if deltaPayload == "" {
+				t.Fatalf("missing message_delta event in %+v", events)
+			}
+
+			if gotStop := gjson.Get(deltaPayload, "delta.stop_reason").String(); gotStop != tt.wantStopType {
+				t.Fatalf("stop_reason = %q, want %q", gotStop, tt.wantStopType)
+			}
+
+			cached := gjson.Get(deltaPayload, "usage.cache_read_input_tokens").Int()
+			if cached != 139136 {
+				t.Fatalf("expected cache_read_input_tokens = 139136, got %d (payload=%s)", cached, deltaPayload)
+			}
+
+			input := gjson.Get(deltaPayload, "usage.input_tokens").Int()
+			if input != 889 {
+				t.Fatalf("expected deducted input_tokens = 889, got %d (payload=%s)", input, deltaPayload)
+			}
+
+			output := gjson.Get(deltaPayload, "usage.output_tokens").Int()
+			if output != 741 {
+				t.Fatalf("expected output_tokens = 741, got %d (payload=%s)", output, deltaPayload)
+			}
+		})
+	}
+}
+
 func TestConvertOpenAIResponseToClaude_StreamIgnoresNullToolNameDelta(t *testing.T) {
 	originalRequest := []byte(streamReq)
 	var param any
@@ -772,7 +847,7 @@ func TestStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 		{
 			name:                 "cache_write_tokens field",
 			usageJSON:            `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":150}}`,
-			wantInputTokens:      200,
+			wantInputTokens:      50,
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 150,
@@ -780,7 +855,7 @@ func TestStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 		{
 			name:                 "cache_creation_tokens alias",
 			usageJSON:            `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":800,"cache_creation_tokens":150}}`,
-			wantInputTokens:      200,
+			wantInputTokens:      50,
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 150,
@@ -800,6 +875,22 @@ func TestStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 0,
+		},
+		{
+			name:                 "cache_write_tokens only deducts from input_tokens",
+			usageJSON:            `{"prompt_tokens":4022,"completion_tokens":462,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":4019}}`,
+			wantInputTokens:      3,
+			wantOutputTokens:     462,
+			wantCacheReadTokens:  0,
+			wantCacheWriteTokens: 4019,
+		},
+		{
+			name:                 "combined cached and cache_write greater than prompt_tokens clamps to zero",
+			usageJSON:            `{"prompt_tokens":500,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":300,"cache_write_tokens":300}}`,
+			wantInputTokens:      0,
+			wantOutputTokens:     100,
+			wantCacheReadTokens:  300,
+			wantCacheWriteTokens: 300,
 		},
 	}
 
@@ -986,7 +1077,7 @@ func TestNonStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 		{
 			name:                 "cache_write_tokens field",
 			usageJSON:            `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":150}}`,
-			wantInputTokens:      200,
+			wantInputTokens:      50,
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 150,
@@ -994,7 +1085,7 @@ func TestNonStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 		{
 			name:                 "cache_creation_tokens alias",
 			usageJSON:            `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":800,"cache_creation_tokens":150}}`,
-			wantInputTokens:      200,
+			wantInputTokens:      50,
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 150,
@@ -1014,6 +1105,22 @@ func TestNonStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 0,
+		},
+		{
+			name:                 "cache_write_tokens only deducts from input_tokens",
+			usageJSON:            `{"prompt_tokens":4022,"completion_tokens":462,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":4019}}`,
+			wantInputTokens:      3,
+			wantOutputTokens:     462,
+			wantCacheReadTokens:  0,
+			wantCacheWriteTokens: 4019,
+		},
+		{
+			name:                 "combined cached and cache_write greater than prompt_tokens clamps to zero",
+			usageJSON:            `{"prompt_tokens":500,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":300,"cache_write_tokens":300}}`,
+			wantInputTokens:      0,
+			wantOutputTokens:     100,
+			wantCacheReadTokens:  300,
+			wantCacheWriteTokens: 300,
 		},
 	}
 
@@ -1447,5 +1554,132 @@ func TestThinkingGateSuppressesReasoningPaths(t *testing.T) {
 		if block.Get("type").String() == "thinking" {
 			t.Fatalf("gated non-stream emitted thinking block: %s", string(out))
 		}
+	}
+}
+
+func TestExtractOpenAIUsage(t *testing.T) {
+	tests := []struct {
+		name                 string
+		rawUsage             string
+		wantInputTokens      int64
+		wantOutputTokens     int64
+		wantCachedTokens     int64
+		wantCacheWriteTokens int64
+	}{
+		{
+			name:                 "nil / absent usage",
+			rawUsage:             "",
+			wantInputTokens:      0,
+			wantOutputTokens:     0,
+			wantCachedTokens:     0,
+			wantCacheWriteTokens: 0,
+		},
+		{
+			name:                 "null usage",
+			rawUsage:             "null",
+			wantInputTokens:      0,
+			wantOutputTokens:     0,
+			wantCachedTokens:     0,
+			wantCacheWriteTokens: 0,
+		},
+		{
+			name:                 "only prompt and completion tokens without cache details",
+			rawUsage:             `{"prompt_tokens":100,"completion_tokens":50}`,
+			wantInputTokens:      100,
+			wantOutputTokens:     50,
+			wantCachedTokens:     0,
+			wantCacheWriteTokens: 0,
+		},
+		{
+			name:                 "deducts cache_read_tokens only",
+			rawUsage:             `{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":30}}`,
+			wantInputTokens:      70,
+			wantOutputTokens:     50,
+			wantCachedTokens:     30,
+			wantCacheWriteTokens: 0,
+		},
+		{
+			name:                 "deducts cache_write_tokens only (issue 5956)",
+			rawUsage:             `{"prompt_tokens":4022,"completion_tokens":462,"prompt_tokens_details":{"cache_write_tokens":4019}}`,
+			wantInputTokens:      3,
+			wantOutputTokens:     462,
+			wantCachedTokens:     0,
+			wantCacheWriteTokens: 4019,
+		},
+		{
+			name:                 "deducts cache_creation_tokens alias only",
+			rawUsage:             `{"prompt_tokens":4022,"completion_tokens":462,"prompt_tokens_details":{"cache_creation_tokens":4019}}`,
+			wantInputTokens:      3,
+			wantOutputTokens:     462,
+			wantCachedTokens:     0,
+			wantCacheWriteTokens: 4019,
+		},
+		{
+			name:                 "deducts both cached_tokens and cache_write_tokens",
+			rawUsage:             `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":150}}`,
+			wantInputTokens:      50,
+			wantOutputTokens:     200,
+			wantCachedTokens:     800,
+			wantCacheWriteTokens: 150,
+		},
+		{
+			name:                 "clamps input_tokens to zero when cache exceeds prompt",
+			rawUsage:             `{"prompt_tokens":500,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":300,"cache_write_tokens":300}}`,
+			wantInputTokens:      0,
+			wantOutputTokens:     100,
+			wantCachedTokens:     300,
+			wantCacheWriteTokens: 300,
+		},
+		{
+			name:                 "handles negative cache numbers safely without corrupting input",
+			rawUsage:             `{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":-10,"cache_write_tokens":-5}}`,
+			wantInputTokens:      100,
+			wantOutputTokens:     50,
+			wantCachedTokens:     -10,
+			wantCacheWriteTokens: 0,
+		},
+		{
+			name:                 "clamps raw negative prompt_tokens to zero",
+			rawUsage:             `{"prompt_tokens":-10,"completion_tokens":50}`,
+			wantInputTokens:      0,
+			wantOutputTokens:     50,
+			wantCachedTokens:     0,
+			wantCacheWriteTokens: 0,
+		},
+		{
+			name:                 "negative cache_write_tokens falls back to cache_creation_tokens alias",
+			rawUsage:             `{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cache_write_tokens":-1,"cache_creation_tokens":40}}`,
+			wantInputTokens:      60,
+			wantOutputTokens:     50,
+			wantCachedTokens:     0,
+			wantCacheWriteTokens: 40,
+		},
+		{
+			name:                 "prevents int64 overflow when cached_tokens and cache_write_tokens are huge",
+			rawUsage:             `{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":9223372036854775800,"cache_write_tokens":100}}`,
+			wantInputTokens:      0,
+			wantOutputTokens:     50,
+			wantCachedTokens:     9223372036854775800,
+			wantCacheWriteTokens: 100,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			usage := gjson.Parse(tt.rawUsage)
+			input, output, cached, cacheWrite := extractOpenAIUsage(usage)
+			if input != tt.wantInputTokens {
+				t.Fatalf("input_tokens = %d, want %d", input, tt.wantInputTokens)
+			}
+			if output != tt.wantOutputTokens {
+				t.Fatalf("output_tokens = %d, want %d", output, tt.wantOutputTokens)
+			}
+			if cached != tt.wantCachedTokens {
+				t.Fatalf("cached_tokens = %d, want %d", cached, tt.wantCachedTokens)
+			}
+			if cacheWrite != tt.wantCacheWriteTokens {
+				t.Fatalf("cache_write_tokens = %d, want %d", cacheWrite, tt.wantCacheWriteTokens)
+			}
+		})
 	}
 }

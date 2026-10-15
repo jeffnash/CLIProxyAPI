@@ -56,11 +56,10 @@ func FilterInterfaces(include, exclude []string) ([]net.Interface, error) {
 			continue
 		}
 
-		// 4. Default deny-list: virtual/tunnel interfaces are dropped unless
-		// the user explicitly provides an include list (which then governs
-		// selection). Any remaining interface is treated as usable.
+		// 4. Default allow-list: accept common physical LAN adapters and
+		// bonded LAN interfaces unless the user provides an include list.
 		if len(include) == 0 {
-			if isVirtualOrTunnel(name) {
+			if isVirtualOrTunnel(name) || !isLikelyPhysicalLAN(name) {
 				continue
 			}
 		}
@@ -101,6 +100,17 @@ func FilterInterfaces(include, exclude []string) ([]net.Interface, error) {
 
 func isVirtualOrTunnel(name string) bool {
 	for _, prefix := range IgnoredInterfacePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isLikelyPhysicalLAN(name string) bool {
+	for _, prefix := range []string{
+		"en", "eth", "em", "igb", "ix", "re", "wl", "wlan", "wifi", "wi-fi", "ethernet", "bond",
+	} {
 		if strings.HasPrefix(name, prefix) {
 			return true
 		}

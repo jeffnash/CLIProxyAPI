@@ -3,11 +3,12 @@ package pluginhost
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func (h *Host) RegisterFrontendAuthProviders() {
@@ -125,6 +126,10 @@ func (a *accessAdapter) Authenticate(ctx context.Context, r *http.Request) (resu
 
 	body, errReadAll := readAndRestoreRequestBody(r)
 	if errReadAll != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(errReadAll, &maxBytesErr) {
+			return nil, sdkaccess.NewRequestEntityTooLargeError(errReadAll)
+		}
 		return nil, sdkaccess.NewInternalAuthError("failed to read plugin auth request body", errReadAll)
 	}
 	resp, errAuthenticate := a.provider.Authenticate(ctx, pluginapi.FrontendAuthRequest{

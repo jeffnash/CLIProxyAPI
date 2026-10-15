@@ -7,12 +7,12 @@ import (
 	"strconv"
 	"strings"
 
-	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	kiroauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -527,6 +527,9 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if ck.RebuildMidSystemMessage {
 			attrs["rebuild_mid_system_message"] = "true"
 		}
+		if ck.NativeToolSearch {
+			attrs["native_tool_search"] = "true"
+		}
 		if profile := strings.ToLower(strings.TrimSpace(ck.FingerprintProfile)); profile != "" {
 			attrs["fingerprint_profile"] = profile
 		}
@@ -611,6 +614,9 @@ func (s *ConfigSynthesizer) synthesizeCodexStyleKeys(ctx *SynthesisContext, entr
 		}
 		if provider == "codex" && entry.AlphaSearch {
 			attrs[coreauth.AttributeCodexAlphaSearch] = "true"
+		}
+		if provider == "codex" && entry.DisableCodexCloaking != nil {
+			attrs[coreauth.AttributeCodexDisableCloaking] = strconv.FormatBool(*entry.DisableCodexCloaking)
 		}
 		if hash := diff.ComputeCodexModelsHash(entry.Models); hash != "" {
 			attrs["models_hash"] = hash
@@ -784,6 +790,9 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 		}
 		if hash := diff.ComputeVertexCompatModelsHash(compat.Models); hash != "" {
 			attrs["models_hash"] = hash
+		}
+		if compat.Interactions != nil && *compat.Interactions {
+			attrs["interactions"] = "true"
 		}
 		addConfigHeadersToAttrs(compat.Headers, attrs)
 		metadata := map[string]any{}

@@ -44,7 +44,6 @@ func rewriteModelInResponse(data []byte, targetModel string) []byte {
 	for _, path := range modelFieldPaths {
 		if gjson.GetBytes(data, path).Exists() {
 			data, _ = sjson.SetBytes(data, path, targetModel)
-			log.Debugf("response rewriter: rewrote model at path %s to %s", path, targetModel)
 		}
 	}
 	return data
@@ -57,16 +56,74 @@ type StreamRewriteOptions struct {
 
 // StreamRewriter rewrites model names in streaming SSE responses.
 type StreamRewriter struct {
-	options    StreamRewriteOptions
-	pendingBuf []byte
+	options         StreamRewriteOptions
+	pendingBuf      []byte
+	loggedPaths     map[string]bool
+	rewrittenChunks int
+	loggedFinished  bool
 }
 
 // NewStreamRewriter creates a new stream rewriter.
 func NewStreamRewriter(options StreamRewriteOptions) *StreamRewriter {
 	return &StreamRewriter{
-		options:    options,
-		pendingBuf: nil,
+		options:     options,
+		pendingBuf:  nil,
+		loggedPaths: make(map[string]bool),
 	}
+}
+
+func (r *StreamRewriter) rewriteModel(data []byte) []byte {
+	if r == nil || r.options.RewriteModel == "" || len(data) == 0 {
+		return data
+	}
+	targetModel := r.options.RewriteModel
+	rewroteAny := false
+	for _, path := range modelFieldPaths {
+		if gjson.GetBytes(data, path).Exists() {
+			data, _ = sjson.SetBytes(data, path, targetModel)
+			rewroteAny = true
+			if r.loggedPaths == nil {
+				r.loggedPaths = make(map[string]bool)
+			}
+			if !r.loggedPaths[path] {
+				r.loggedPaths[path] = true
+				log.Debugf("response rewriter: stream started, rewrote model at path %s to %s", path, targetModel)
+			}
+		}
+	}
+	if rewroteAny {
+		r.rewrittenChunks++
+	}
+	return data
+}
+
+func (r *StreamRewriter) rewriteSSELines(payload []byte) []byte {
+	if r == nil || r.options.RewriteModel == "" || len(payload) == 0 {
+		return payload
+	}
+	lines := bytes.Split(payload, []byte("\n"))
+	out := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		prefix, jsonData, ok := extractSSEDataLine(line)
+		if ok && len(jsonData) > 0 && jsonData[0] == '{' && gjson.ValidBytes(jsonData) {
+			rewritten := r.rewriteModel(jsonData)
+			line = append(append([]byte{}, prefix...), rewritten...)
+		}
+		out = append(out, line)
+	}
+	joined := bytes.Join(out, []byte("\n"))
+	if len(payload) > 0 && payload[len(payload)-1] == '\n' && (len(joined) == 0 || joined[len(joined)-1] != '\n') {
+		joined = append(joined, '\n')
+	}
+	return joined
+}
+
+func (r *StreamRewriter) logStreamFinishedOnce() {
+	if r == nil || r.loggedFinished || r.rewrittenChunks == 0 {
+		return
+	}
+	r.loggedFinished = true
+	log.Debugf("response rewriter: stream finished, successfully rewrote %d chunks to %s", r.rewrittenChunks, r.options.RewriteModel)
 }
 
 // RewriteChunk rewrites model names in a single SSE chunk.
@@ -102,7 +159,7 @@ func (r *StreamRewriter) RewriteChunk(chunk []byte) []byte {
 		}
 		rewritten := trimmed
 		if r.options.RewriteModel != "" {
-			rewritten = rewriteModelInResponse(rewritten, r.options.RewriteModel)
+			rewritten = r.rewriteModel(rewritten)
 		}
 		return rewritten
 	}
@@ -177,7 +234,7 @@ func (r *StreamRewriter) RewriteChunk(chunk []byte) []byte {
 
 			rewritten := jsonData
 			if r.options.RewriteModel != "" {
-				rewritten = rewriteModelInResponse(jsonData, r.options.RewriteModel)
+				rewritten = r.rewriteModel(jsonData)
 			}
 			result = append(result, append(dataPrefix, rewritten...))
 			continue
@@ -196,7 +253,10 @@ func (r *StreamRewriter) RewriteChunk(chunk []byte) []byte {
 
 	joined := bytes.Join(result, []byte("\n"))
 	if len(joined) == 0 && len(chunk) > 0 {
-		return rewriteSSEPayloadLines(chunk, r.options.RewriteModel)
+		return r.rewriteSSELines(chunk)
+	}
+	if bytes.Contains(chunk, []byte("[DONE]")) {
+		r.logStreamFinishedOnce()
 	}
 	return joined
 }
@@ -285,7 +345,7 @@ func (r *StreamRewriter) Finish() []byte {
 	r.pendingBuf = nil
 	out := r.RewriteChunk(buf)
 	if len(r.pendingBuf) > 0 {
-		tail := rewriteSSEPayloadLines(r.pendingBuf, r.options.RewriteModel)
+		tail := r.rewriteSSELines(r.pendingBuf)
 		r.pendingBuf = nil
 		if len(tail) > 0 {
 			if len(out) > 0 {
@@ -295,5 +355,6 @@ func (r *StreamRewriter) Finish() []byte {
 			}
 		}
 	}
+	r.logStreamFinishedOnce()
 	return out
 }

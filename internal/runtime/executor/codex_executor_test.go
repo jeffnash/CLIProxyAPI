@@ -5,9 +5,9 @@ import (
 	"io"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -281,7 +281,7 @@ func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministicForStructuredSession(
 	key := helps.CodexPromptCacheKey(req.Model, "claude:u1")
 	helps.DeleteCodexCache(key)
 
-	httpReq1, _, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, nil, req, req.Payload, raw)
+	httpReq1, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
 	if err != nil {
 		t.Fatalf("cacheHelper #1 error: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministicForStructuredSession(
 	// Simulate a cache miss (e.g., restart/eviction) and ensure the ID is still stable.
 	helps.DeleteCodexCache(key)
 
-	httpReq2, _, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, nil, req, req.Payload, raw)
+	httpReq2, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
 	if err != nil {
 		t.Fatalf("cacheHelper #2 error: %v", err)
 	}

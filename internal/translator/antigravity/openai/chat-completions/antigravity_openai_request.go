@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/antigravity/gemini"
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/antigravity/gemini"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -28,8 +28,16 @@ const antigravityFunctionThoughtSignature = "skip_thought_signature_validator"
 //
 // Returns:
 //   - []byte: The transformed request data in Antigravity API format
-func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
+func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
+	return convertOpenAIRequestToAntigravity(modelName, inputRawJSON, stream)
+
+}
+
+// convertOpenAIRequestToAntigravity also reports a file part Antigravity cannot
+// receive when it leaves a user turn with nothing to send.
+func convertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) ([]byte, error) {
 	rawJSON := inputRawJSON
+	var drops translatorcommon.UserTurnDrops
 	functionNameMap := util.SanitizedFunctionNameMap(rawJSON)
 	// Base envelope (no default thinkingConfig)
 	out := []byte(`{"project":"","request":{"contents":[]},"model":"gemini-2.5-pro"}`)
@@ -172,22 +180,17 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 								partItems = append(partItems, antigravityOpenAITextPart(antigravityDemotedSystemText(text, isDemotedSystem)))
 							}
 						case "image_url":
-							imageURL := item.Get("image_url.url").String()
-							if len(imageURL) > 5 {
-								pieces := strings.SplitN(imageURL[5:], ";", 2)
-								if len(pieces) == 2 && len(pieces[1]) > 7 {
-									part := antigravityOpenAIInlineDataPart(pieces[0], pieces[1][7:], false)
-									part, _ = sjson.SetBytes(part, "thoughtSignature", antigravityFunctionThoughtSignature)
-									partItems = append(partItems, part)
-								}
+							// Only a base64 data URL can be inlined; a remote URL has no equivalent here.
+							if mimeType, data, ok := translatorcommon.NormalizeOpenAIFileData("", "", item.Get("image_url.url").String()); ok {
+								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, data, false))
+							} else {
+								drops.Drop("image_url")
 							}
 						case "video_url":
-							videoURL := item.Get("video_url.url").String()
-							if len(videoURL) > 5 {
-								pieces := strings.SplitN(videoURL[5:], ";", 2)
-								if len(pieces) == 2 && len(pieces[1]) > 7 {
-									partItems = append(partItems, antigravityOpenAIInlineDataPart(pieces[0], pieces[1][7:], false))
-								}
+							if mimeType, data, ok := translatorcommon.NormalizeOpenAIFileData("", "", item.Get("video_url.url").String()); ok {
+								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, data, false))
+							} else {
+								drops.Drop("video_url")
 							}
 						case "file":
 							filename := item.Get("file.filename").String()
@@ -196,16 +199,21 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, data, false))
 							} else {
 								log.Warn("Invalid file data or unknown file name extension in user message, skip")
+								drops.Drop("file")
 							}
 						case "input_audio":
 							audioData := item.Get("input_audio.data").String()
 							if audioData != "" {
 								mimeType := antigravityOpenAIAudioMIMEType(item.Get("input_audio.format").String())
 								partItems = append(partItems, antigravityOpenAIInlineDataPart(mimeType, audioData, true))
+							} else {
+								drops.Drop("input_audio")
 							}
 						}
 					}
 				}
+				// Whitespace-only text is forwarded but never keeps an emptied turn alive.
+				drops.EndTurn(translatorcommon.CountSendableGeminiParts(partItems))
 				if len(partItems) > 0 {
 					contentItems = append(contentItems, antigravityOpenAIContent("user", partItems))
 				}
@@ -215,7 +223,6 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				if reasoningContent := m.Get("reasoning_content"); reasoningContent.Type == gjson.String && reasoningContent.String() != "" {
 					part := antigravityOpenAITextPart(reasoningContent.String())
 					part, _ = sjson.SetBytes(part, "thought", true)
-					part, _ = sjson.SetBytes(part, "thoughtSignature", antigravityFunctionThoughtSignature)
 					partItems = append(partItems, part)
 				}
 				if content.Type == gjson.String && content.String() != "" {
@@ -235,7 +242,6 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 								pieces := strings.SplitN(imageURL[5:], ";", 2)
 								if len(pieces) == 2 && len(pieces[1]) > 7 {
 									part := antigravityOpenAIInlineDataPart(pieces[0], pieces[1][7:], false)
-									part, _ = sjson.SetBytes(part, "thoughtSignature", antigravityFunctionThoughtSignature)
 									partItems = append(partItems, part)
 								}
 							}
@@ -247,15 +253,28 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				tcs := m.Get("tool_calls")
 				if tcs.IsArray() {
 					type assistantToolCall struct {
-						id   string
-						name string
+						rawID string
+						id    string
+						name  string
 					}
 					toolCalls := make([]assistantToolCall, 0)
+					usedToolCallIDs := make(map[string]struct{})
 					for _, tc := range tcs.Array() {
 						if tc.Get("type").String() != "function" {
 							continue
 						}
-						functionID := tc.Get("id").String()
+						rawID := tc.Get("id").String()
+						baseID := util.SanitizeClaudeToolID(rawID)
+						functionID := baseID
+						suffix := 1
+						for {
+							if _, exists := usedToolCallIDs[functionID]; !exists {
+								usedToolCallIDs[functionID] = struct{}{}
+								break
+							}
+							functionID = fmt.Sprintf("%s_%d", baseID, suffix)
+							suffix++
+						}
 						functionName := util.MapSanitizedFunctionName(functionNameMap, tc.Get("function.name").String())
 						if functionName == "" {
 							continue
@@ -272,8 +291,9 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						part, _ = sjson.SetBytes(part, "thoughtSignature", antigravityFunctionThoughtSignature)
 						partItems = append(partItems, part)
 						toolCalls = append(toolCalls, assistantToolCall{
-							id:   functionID,
-							name: functionName,
+							rawID: rawID,
+							id:    functionID,
+							name:  functionName,
 						})
 					}
 					if len(partItems) > 0 {
@@ -300,7 +320,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						part := []byte(`{"functionResponse":{"id":"","name":""}}`)
 						part, _ = sjson.SetBytes(part, "functionResponse.id", call.id)
 						part, _ = sjson.SetBytes(part, "functionResponse.name", call.name)
-						response := turnToolResponses[call.id]
+						response := turnToolResponses[call.rawID]
 						if response == "" {
 							response = "{}"
 						}
@@ -435,7 +455,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	if strings.Contains(strings.ToLower(modelName), "claude") {
 		out = gemini.SanitizeAntigravityClaudeGeminiRequestSignatures(modelName, out)
 	}
-	return common.AttachDefaultSafetySettings(out, "request.safetySettings")
+	return common.AttachDefaultSafetySettings(out, "request.safetySettings"), drops.Err()
 }
 
 func antigravityOpenAITextPart(text string) []byte {

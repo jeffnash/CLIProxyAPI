@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	codebuddy "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codebuddy"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+	codebuddy "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codebuddy"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 )
 
 func jsonUnmarshalCodeBuddyTest(raw []byte, target *map[string]any) error {

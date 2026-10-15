@@ -8,9 +8,9 @@ package geminiCLI
 import (
 	"fmt"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -18,7 +18,7 @@ import (
 // PrepareClaudeRequest parses and transforms a Claude API request into internal client format.
 // It extracts the model name, system instruction, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the internal client.
-func ConvertGeminiCLIRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte {
+func ConvertGeminiCLIRequestToGemini(_ string, inputRawJSON []byte, _ bool) ([]byte, error) {
 	rawJSON := inputRawJSON
 	modelResult := gjson.GetBytes(rawJSON, "model")
 	rawJSON = []byte(gjson.GetBytes(rawJSON, "request").Raw)
@@ -48,5 +48,5 @@ func ConvertGeminiCLIRequestToGemini(_ string, inputRawJSON []byte, _ bool) []by
 
 	rawJSON = signature.SanitizeGeminiRequestThoughtSignatures(rawJSON, "contents")
 
-	return common.AttachDefaultSafetySettings(rawJSON, "safetySettings")
+	return common.AttachDefaultSafetySettings(rawJSON, "safetySettings"), nil
 }

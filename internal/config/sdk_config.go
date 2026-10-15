@@ -5,11 +5,28 @@
 package config
 
 import (
+	"math"
 	"strings"
+	"time"
 )
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// MaxRequestBodyBytes limits the size (in bytes) of incoming HTTP request bodies.
+	// Values <= 0 disable the limit (default).
+	MaxRequestBodyBytes int64 `yaml:"max-request-body-bytes" json:"max-request-body-bytes"`
+
+	// Client configures client-facing compatibility behavior.
+	Client ClientConfig `yaml:"client" json:"client"`
+
+	// OAuthOnlyFields records v8 provider settings that must wait for credential
+	// selection and must not affect API-key credentials. Config YAML snapshots
+	// preserve the corresponding v8 paths instead of serializing this metadata.
+	OAuthOnlyFields map[string]bool `yaml:"-" json:"-"`
+
+	// CodexResponseSteering mirrors the provider-wide runtime setting for API handlers.
+	CodexResponseSteering bool `yaml:"-" json:"-"`
+
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
@@ -19,6 +36,20 @@ type SDKConfig struct {
 	//
 	// Typical values: "copilot", "codex", "openai", "anthropic", "google".
 	ProxyServices []string `yaml:"proxy-services,omitempty" json:"proxy-services,omitempty"`
+	// TLSHandshakeTimeoutSeconds bounds upstream TLS handshakes made by the
+	// shared uTLS client, in seconds. It applies to both the Claude Code
+	// Anthropic transport and the Chrome ChatGPT/Codex transport; the
+	// standard fallback transport is unaffected. It starts after TCP or
+	// proxy connection establishment returns and does not bound dialing or
+	// proxy CONNECT. Those uTLS paths use custom TLS dialing, for which Go
+	// ignores http.Transport.TLSHandshakeTimeout, so a peer that accepts the
+	// connection but never answers the ClientHello would otherwise block the
+	// request indefinitely and request-retry could never engage. The bound
+	// applies only during the TLS handshake and is removed once it succeeds,
+	// so inference and long-running streams are unaffected. The default 0
+	// disables the bound (previous behavior); negative values are treated as
+	// 0, and values beyond the representable duration range saturate.
+	TLSHandshakeTimeoutSeconds int `yaml:"tls-handshake-timeout-seconds" json:"tls-handshake-timeout-seconds"`
 
 	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
 	//
@@ -53,9 +84,6 @@ type SDKConfig struct {
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 
-	// CodexOptimizeMultiAgentV2 mirrors the provider-wide runtime setting for API handlers.
-	CodexOptimizeMultiAgentV2 bool `yaml:"-" json:"-"`
-
 	// CodexOrphanDelegationCompatibility mirrors the provider-wide runtime setting for API handlers.
 	CodexOrphanDelegationCompatibility bool `yaml:"-" json:"-"`
 
@@ -81,6 +109,36 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// TLSHandshakeTimeout returns the configured upstream TLS handshake bound
+// for requests using the shared uTLS client. A non-positive configured
+// value disables the bound and yields 0.
+func (c *SDKConfig) TLSHandshakeTimeout() time.Duration {
+	if c == nil || c.TLSHandshakeTimeoutSeconds <= 0 {
+		return 0
+	}
+	const maxTLSHandshakeTimeoutSeconds = math.MaxInt64 / int64(time.Second)
+	if int64(c.TLSHandshakeTimeoutSeconds) > maxTLSHandshakeTimeoutSeconds {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(c.TLSHandshakeTimeoutSeconds) * time.Second
+}
+
+// ClientConfig configures client-facing compatibility behavior.
+type ClientConfig struct {
+	Codex CodexClientConfig `yaml:"codex" json:"codex"`
+}
+
+// CodexClientConfig configures Codex client compatibility and the model catalog.
+type CodexClientConfig struct {
+	// OptimizeMultiAgentV2 optimizes official Codex multi-agent requests across providers.
+	// Default false leaves the client's multi-agent behavior unchanged.
+	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
+
+	// EnableApplyPatch advertises freeform apply_patch only for supported models.
+	// Default false clears the capability regardless of template metadata.
+	EnableApplyPatch bool `yaml:"enable-apply-patch" json:"enable-apply-patch"`
 }
 
 // ClaudeCodeConfig configures Claude Code compatibility behavior.
@@ -126,6 +184,9 @@ type StreamingConfig struct {
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
 
+	// SendKeepAliveBeforeFT controls whether SSE heartbeats are sent before the first token arrives
+	// when KeepAliveSeconds > 0. Default is false.
+	SendKeepAliveBeforeFT bool `yaml:"send-keepalive-before-ft,omitempty" json:"send-keepalive-before-ft,omitempty"`
 	// DisableProxyBuffering when true adds "X-Accel-Buffering: no" header to SSE responses.
 	// This tells reverse proxies (Nginx, Railway) to not buffer the response.
 	// Useful when SSE streams get corrupted due to proxy chunking. Default is false.

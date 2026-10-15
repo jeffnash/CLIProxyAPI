@@ -56,7 +56,7 @@ func TestConvertGeminiCLIRequestToCodex_PreservesSchemaPropertyNamedType(t *test
 		}
 	}`)
 
-	out := ConvertGeminiCLIRequestToCodex("gpt-5.2", input, true)
+	out, _ := ConvertGeminiCLIRequestToCodex("gpt-5.2", input, true)
 	tool := gjson.GetBytes(out, "tools.0")
 	if got := tool.Get("type").String(); got != "function" {
 		t.Fatalf("expected tool type %q, got %q; output=%s", "function", got, string(out))

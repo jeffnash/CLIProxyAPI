@@ -10,7 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
-	requestmiddleware "github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
+	requestmiddleware "github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
 )
 
 func Middleware(svc *Service) gin.HandlerFunc {

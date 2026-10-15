@@ -14,8 +14,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	xcurrency "golang.org/x/text/currency"
@@ -391,7 +392,7 @@ func (h *Handler) FetchPluginQuota(c *gin.Context) {
 	pluginID := strings.TrimSpace(c.Param("id"))
 	var body credentialQuotaRequest
 	if errBind := c.ShouldBindJSON(&body); errBind != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		c.JSON(clienterror.HTTPStatusFromErrorOr(errBind, http.StatusBadRequest), gin.H{"error": "invalid request body"})
 		return
 	}
 	authIndex := resolveQuotaAuthIndex(c, &body)
@@ -410,9 +411,20 @@ func (h *Handler) FetchPluginQuota(c *gin.Context) {
 // ResetPluginQuota handles DELETE /v0/management/plugins/:id/quota and POST /v0/management/plugins/:id/quota/reset
 func (h *Handler) ResetPluginQuota(c *gin.Context) {
 	pluginID := strings.TrimSpace(c.Param("id"))
-	var body credentialQuotaRequest
-	_ = c.ShouldBindJSON(&body)
-	authIndex := resolveQuotaAuthIndex(c, &body)
+	authIndex := strings.TrimSpace(c.Query("auth_index"))
+	if authIndex == "" {
+		authIndex = strings.TrimSpace(c.Query("authIndex"))
+	}
+	if authIndex == "" {
+		var body credentialQuotaRequest
+		if errBind := c.ShouldBindJSON(&body); errBind != nil {
+			if status := clienterror.HTTPStatusFromError(errBind); status == http.StatusRequestEntityTooLarge {
+				c.JSON(status, gin.H{"error": errBind.Error()})
+				return
+			}
+		}
+		authIndex = body.resolveAuthIndex()
+	}
 	if authIndex == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index is required"})
 		return

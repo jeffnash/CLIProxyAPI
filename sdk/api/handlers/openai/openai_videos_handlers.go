@@ -14,12 +14,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -255,6 +255,15 @@ func readXAIVideosNativeRequest(c *gin.Context) ([]byte, error) {
 }
 
 func videosCreateRequestFromForm(c *gin.Context) ([]byte, error) {
+	if strings.EqualFold(strings.TrimSpace(c.ContentType()), "multipart/form-data") {
+		if _, errForm := c.MultipartForm(); errForm != nil {
+			return nil, errForm
+		}
+	} else if c != nil && c.Request != nil {
+		if errForm := c.Request.ParseForm(); errForm != nil {
+			return nil, errForm
+		}
+	}
 	rawJSON := []byte(`{}`)
 	for _, field := range []string{"model", "prompt", "seconds", "size", "aspect_ratio", "resolution"} {
 		if value := strings.TrimSpace(c.PostForm(field)); value != "" {
@@ -288,14 +297,12 @@ func firstPostForm(c *gin.Context, keys ...string) string {
 
 func (h *OpenAIAPIHandler) videoAuthBindingTTL() time.Duration {
 	if h != nil && h.BaseAPIHandler != nil {
-		cfg := h.CurrentConfig()
-		if cfg == nil {
-			return defaultVideoAuthBindingTTL
-		}
-		raw := strings.TrimSpace(cfg.VideoResultAuthCacheTTL)
-		if raw != "" {
-			if ttl, err := time.ParseDuration(raw); err == nil && ttl > 0 {
-				return ttl
+		if cfg := h.CurrentConfig(); cfg != nil {
+			raw := strings.TrimSpace(cfg.VideoResultAuthCacheTTL)
+			if raw != "" {
+				if ttl, err := time.ParseDuration(raw); err == nil && ttl > 0 {
+					return ttl
+				}
 			}
 		}
 	}
@@ -695,7 +702,7 @@ func openAIVideoStatus(status string) string {
 func (h *OpenAIAPIHandler) VideosCreate(c *gin.Context) {
 	rawJSON, err := readVideosCreateRequest(c)
 	if err != nil {
-		writeVideosFailedError(c, http.StatusBadRequest, defaultXAIVideosModel, "invalid_request_error", fmt.Sprintf("Invalid request: %v", err))
+		writeVideosFailedError(c, clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), defaultXAIVideosModel, "invalid_request_error", fmt.Sprintf("Invalid request: %v", err))
 		return
 	}
 
@@ -731,7 +738,7 @@ func (h *OpenAIAPIHandler) XAIVideosExtensions(c *gin.Context) {
 func (h *OpenAIAPIHandler) handleXAIVideosNativePost(c *gin.Context) {
 	rawJSON, err := readXAIVideosNativeRequest(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+		c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
 				Type:    "invalid_request_error",

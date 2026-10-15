@@ -8,7 +8,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func TestConvertOpenAIRequestToGrok_BasicConversions(t *testing.T) {
@@ -55,7 +55,7 @@ func TestConvertOpenAIRequestToGrok_BasicConversions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			payload, _ := json.Marshal(tt.input)
 			modelName := gjson.GetBytes(payload, "model").String()
-			got := ConvertOpenAIRequestToGrok(modelName, payload, false)
+			got, _ := ConvertOpenAIRequestToGrok(modelName, payload, false)
 
 			if gjson.GetBytes(got, "modelName").String() != tt.wantModel {
 				t.Errorf("modelName = %v, want %v", gjson.GetBytes(got, "modelName"), tt.wantModel)
@@ -101,7 +101,7 @@ func TestConvertOpenAIRequestToGrok_ImageAttachments(t *testing.T) {
 			}
 			payload, _ := json.Marshal(input)
 			modelName := gjson.GetBytes(payload, "model").String()
-			got := ConvertOpenAIRequestToGrok(modelName, payload, false)
+			got, _ := ConvertOpenAIRequestToGrok(modelName, payload, false)
 
 			images := gjson.GetBytes(got, "imageAttachments").Array()
 			if len(images) != tt.wantImagesLen {
@@ -143,7 +143,7 @@ func TestConvertOpenAIRequestToGrok_ToolHandling(t *testing.T) {
 			}
 			payload, _ := json.Marshal(input)
 			modelName := gjson.GetBytes(payload, "model").String()
-			got := ConvertOpenAIRequestToGrok(modelName, payload, false)
+			got, _ := ConvertOpenAIRequestToGrok(modelName, payload, false)
 
 			msg := gjson.GetBytes(got, "message").String()
 			if tt.wantPrefix != "" && !strings.Contains(msg, tt.wantPrefix) {
@@ -333,7 +333,7 @@ func TestConvertOpenAIRequestToGrok_Toggles(t *testing.T) {
 	}
 	payload, _ := json.Marshal(input)
 	modelName := gjson.GetBytes(payload, "model").String()
-	got := ConvertOpenAIRequestToGrok(modelName, payload, false)
+	got, _ := ConvertOpenAIRequestToGrok(modelName, payload, false)
 
 	// Verify all default toggles as per plan
 	boolDefaults := map[string]bool{
@@ -365,7 +365,7 @@ func TestConvertOpenAIRequestToGrok_Toggles(t *testing.T) {
 
 func TestConvertOpenAIRequestToGrok_EdgeCases(t *testing.T) {
 	t.Run("nil payload", func(t *testing.T) {
-		got := ConvertOpenAIRequestToGrok("grok-3", nil, false)
+		got, _ := ConvertOpenAIRequestToGrok("grok-3", nil, false)
 		if msg := gjson.GetBytes(got, "message").String(); msg == "" {
 			t.Error("nil payload should still produce a message")
 		}
@@ -379,7 +379,7 @@ func TestConvertOpenAIRequestToGrok_EdgeCases(t *testing.T) {
 		}
 		payload, _ := json.Marshal(input)
 		modelName := gjson.GetBytes(payload, "model").String()
-		got := ConvertOpenAIRequestToGrok(modelName, payload, false)
+		got, _ := ConvertOpenAIRequestToGrok(modelName, payload, false)
 
 		if len(gjson.GetBytes(got, "message").String()) <= 1000 {
 			t.Error("long message was truncated")

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	codebuddy "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codebuddy"
+	codebuddy "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codebuddy"
 )
 
 // CodeBuddyStream decodes one CodeBuddy SSE response into validated

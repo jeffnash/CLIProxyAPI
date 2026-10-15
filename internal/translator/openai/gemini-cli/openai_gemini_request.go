@@ -6,7 +6,7 @@
 package geminiCLI
 
 import (
-	. "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/gemini"
+	. "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/openai/gemini"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -14,7 +14,7 @@ import (
 // ConvertGeminiCLIRequestToOpenAI parses and transforms a Gemini API request into OpenAI Chat Completions API format.
 // It extracts the model name, generation config, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the OpenAI API.
-func ConvertGeminiCLIRequestToOpenAI(modelName string, inputRawJSON []byte, stream bool) []byte {
+func ConvertGeminiCLIRequestToOpenAI(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
 	rawJSON := inputRawJSON
 	rawJSON = []byte(gjson.GetBytes(rawJSON, "request").Raw)
 	rawJSON, _ = sjson.SetBytes(rawJSON, "model", modelName)

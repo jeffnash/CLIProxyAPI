@@ -30,7 +30,7 @@ func TestConvertClaudeRequestToCLI_ToolChoice_SpecificTool(t *testing.T) {
 		"tool_choice": {"type": "tool", "name": "json"}
 	}`)
 
-	output := ConvertClaudeRequestToCLI("gemini-3-flash-preview", inputJSON, false)
+	output, _ := ConvertClaudeRequestToCLI("gemini-3-flash-preview", inputJSON, false)
 
 	if got := gjson.GetBytes(output, "request.toolConfig.functionCallingConfig.mode").String(); got != "ANY" {
 		t.Fatalf("Expected request.toolConfig.functionCallingConfig.mode 'ANY', got '%s'", got)
@@ -51,7 +51,7 @@ func TestConvertClaudeRequestToCLI_StripsClaudeCodeAttribution(t *testing.T) {
 		"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
 	}`)
 
-	output := ConvertClaudeRequestToCLI("gemini-3-flash-preview", inputJSON, false)
+	output, _ := ConvertClaudeRequestToCLI("gemini-3-flash-preview", inputJSON, false)
 
 	parts := gjson.GetBytes(output, "request.systemInstruction.parts").Array()
 	if len(parts) != 1 {
@@ -73,7 +73,7 @@ func TestConvertClaudeRequestToCLI_ConvertsMessageSystemRoleToUserContent(t *tes
 		]
 	}`)
 
-	output := ConvertClaudeRequestToCLI("gemini-3-flash-preview", inputJSON, false)
+	output, _ := ConvertClaudeRequestToCLI("gemini-3-flash-preview", inputJSON, false)
 
 	if systemContent := gjson.GetBytes(output, `request.contents.#(role=="system")`); systemContent.Exists() {
 		t.Fatalf("system role should not be emitted in request.contents: %s", systemContent.Raw)

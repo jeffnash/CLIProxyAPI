@@ -9,9 +9,9 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
 	"gopkg.in/yaml.v3"
 
 	log "github.com/sirupsen/logrus"
@@ -49,40 +49,56 @@ func (w *Watcher) ReloadConfigIfChanged() {
 }
 
 func (w *Watcher) reloadConfigIfChanged() {
-	data, err := os.ReadFile(w.configPath)
-	if err != nil {
-		log.Errorf("failed to read config file for hash check: %v", err)
-		return
-	}
-	if len(data) == 0 {
-		log.Debugf("ignoring empty config file write event")
-		return
-	}
-	sum := sha256.Sum256(data)
-	newHash := hex.EncodeToString(sum[:])
+	// The file can change again while a reload is being applied. Only record
+	// a hash as seen once the file is stable across the whole reload;
+	// otherwise loop so the newest content is applied instead of being
+	// marked as already loaded.
+	const maxReloadPasses = 10
+	for pass := 0; pass < maxReloadPasses; pass++ {
+		data, err := os.ReadFile(w.configPath)
+		if err != nil {
+			log.Errorf("failed to read config file for hash check: %v", err)
+			return
+		}
+		if len(data) == 0 {
+			log.Debugf("ignoring empty config file write event")
+			return
+		}
+		sum := sha256.Sum256(data)
+		newHash := hex.EncodeToString(sum[:])
 
-	w.clientsMutex.RLock()
-	currentHash := w.lastConfigHash
-	w.clientsMutex.RUnlock()
+		w.clientsMutex.RLock()
+		currentHash := w.lastConfigHash
+		w.clientsMutex.RUnlock()
 
-	if currentHash != "" && currentHash == newHash {
-		log.Debugf("config file content unchanged (hash match), skipping reload")
-		return
-	}
-	log.Infof("config file changed, reloading: %s", w.configPath)
-	if w.reloadConfig() {
-		finalHash := newHash
-		if updatedData, errRead := os.ReadFile(w.configPath); errRead == nil && len(updatedData) > 0 {
-			sumUpdated := sha256.Sum256(updatedData)
-			finalHash = hex.EncodeToString(sumUpdated[:])
-		} else if errRead != nil {
+		if currentHash != "" && currentHash == newHash {
+			log.Debugf("config file content unchanged (hash match), skipping reload")
+			return
+		}
+		log.Infof("config file changed, reloading: %s", w.configPath)
+		if !w.reloadConfig() {
+			return
+		}
+		updatedData, errRead := os.ReadFile(w.configPath)
+		if errRead != nil {
 			log.WithError(errRead).Debug("failed to compute updated config hash after reload")
+			w.clientsMutex.Lock()
+			w.lastConfigHash = newHash
+			w.clientsMutex.Unlock()
+			w.persistConfigAsync()
+			return
+		}
+		sumUpdated := sha256.Sum256(updatedData)
+		if hex.EncodeToString(sumUpdated[:]) != newHash {
+			continue
 		}
 		w.clientsMutex.Lock()
-		w.lastConfigHash = finalHash
+		w.lastConfigHash = newHash
 		w.clientsMutex.Unlock()
 		w.persistConfigAsync()
+		return
 	}
+	log.Warnf("config file kept changing during reload, deferring to next event: %s", w.configPath)
 }
 
 func (w *Watcher) reloadConfig() bool {
@@ -136,7 +152,7 @@ func (w *Watcher) reloadConfig() bool {
 
 	authDirChanged := oldConfig == nil || oldConfig.AuthDir != newConfig.AuthDir
 	retryConfigChanged := oldConfig != nil && (oldConfig.RequestRetry != newConfig.RequestRetry || oldConfig.MaxRetryInterval != newConfig.MaxRetryInterval || oldConfig.MaxRetryCredentials != newConfig.MaxRetryCredentials)
-	forceAuthRefresh := oldConfig != nil && (oldConfig.ForceModelPrefix != newConfig.ForceModelPrefix || !reflect.DeepEqual(oldConfig.OAuthModelAlias, newConfig.OAuthModelAlias) || retryConfigChanged)
+	forceAuthRefresh := oldConfig != nil && (oldConfig.ForceModelPrefix != newConfig.ForceModelPrefix || !reflect.DeepEqual(oldConfig.OAuthModelAlias, newConfig.OAuthModelAlias) || !reflect.DeepEqual(oldConfig.OAuthSettings, newConfig.OAuthSettings) || retryConfigChanged)
 
 	log.Infof("config successfully reloaded, triggering client reload")
 	w.reloadClients(authDirChanged, affectedOAuthProviders, forceAuthRefresh)

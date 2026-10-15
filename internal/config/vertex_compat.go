@@ -3,7 +3,7 @@ package config
 import (
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 // VertexCompatKey represents the configuration for Vertex AI-compatible API keys.
@@ -53,6 +53,9 @@ type VertexCompatKey struct {
 	// RequestRetry optionally overrides the global request-retry for this credential.
 	// Nil or a negative value means "use the global request-retry". 0 disables additional retry rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
+
+	// Interactions optionally enables native Vertex Interactions API routing for this key.
+	Interactions *bool `yaml:"interactions,omitempty" json:"interactions,omitempty"`
 }
 
 func (k VertexCompatKey) GetAPIKey() string   { return k.APIKey }

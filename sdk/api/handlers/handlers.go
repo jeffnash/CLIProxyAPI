@@ -13,22 +13,24 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/secretdlp"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	coresession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretdlp"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
@@ -68,7 +70,8 @@ const (
 )
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
-// If errText is already valid JSON, it is returned as-is to preserve upstream error payloads.
+// If errText is already valid JSON, it is compacted to ensure single-line SSE compatibility
+// while preserving upstream error payloads.
 func BuildErrorResponseBody(status int, errText string) []byte {
 	return BuildErrorResponseBodyWithError(status, errText, nil)
 }
@@ -116,6 +119,10 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 	}
 
 	if trimmed != "" && json.Valid([]byte(trimmed)) {
+		var compact bytes.Buffer
+		if errCompact := json.Compact(&compact, []byte(trimmed)); errCompact == nil {
+			return compact.Bytes()
+		}
 		return []byte(trimmed)
 	}
 
@@ -134,6 +141,9 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 	case http.StatusNotFound:
 		errType = "invalid_request_error"
 		code = "model_not_found"
+	case http.StatusRequestTimeout:
+		errType = "server_error"
+		code = "request_timeout"
 	default:
 		if status >= http.StatusInternalServerError {
 			errType = "server_error"
@@ -154,6 +164,11 @@ func BuildErrorResponseBodyWithError(status int, errText string, err error) []by
 	return payload
 }
 
+var streamingKeepAliveTickerFactory = func(interval time.Duration) (<-chan time.Time, func()) {
+	ticker := time.NewTicker(interval)
+	return ticker.C, ticker.Stop
+}
+
 // StreamingKeepAliveInterval returns the streaming keep-alive interval for this server (SSE heartbeats and WebSocket Ping frames).
 // Returning 0 disables keep-alives (default when unset).
 func StreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
@@ -165,6 +180,42 @@ func StreamingKeepAliveInterval(cfg *config.SDKConfig) time.Duration {
 		return 0
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// StreamingSendKeepAliveBeforeFT returns whether SSE keep-alives should be sent before the first token arrives.
+// It is active only when streaming.send-keepalive-before-ft is true and streaming.keepalive-seconds > 0.
+func StreamingSendKeepAliveBeforeFT(cfg *config.SDKConfig) bool {
+	return cfg != nil && cfg.Streaming.SendKeepAliveBeforeFT && StreamingKeepAliveInterval(cfg) > 0
+}
+
+// NewStreamingKeepAliveTicker returns a ticker channel and a stop function for streaming keep-alives.
+// When interval <= 0, it returns a nil channel and a no-op stop function.
+func NewStreamingKeepAliveTicker(interval time.Duration) (<-chan time.Time, func()) {
+	if interval <= 0 {
+		return nil, func() {}
+	}
+	return streamingKeepAliveTickerFactory(interval)
+}
+
+// NewPreFirstTokenKeepAliveTicker returns a ticker channel and a stop function for pre-first-token SSE keep-alives.
+// It is active only when streaming.send-keepalive-before-ft is true and streaming.keepalive-seconds > 0.
+func NewPreFirstTokenKeepAliveTicker(cfg *config.SDKConfig) (<-chan time.Time, func()) {
+	if !StreamingSendKeepAliveBeforeFT(cfg) {
+		return nil, func() {}
+	}
+	return NewStreamingKeepAliveTicker(StreamingKeepAliveInterval(cfg))
+}
+
+// SetStreamingKeepAliveTickerFactoryForTest overrides the keep-alive ticker factory for deterministic tests
+// and returns a restore function.
+func SetStreamingKeepAliveTickerFactoryForTest(factory func(interval time.Duration) (<-chan time.Time, func())) func() {
+	prev := streamingKeepAliveTickerFactory
+	if factory != nil {
+		streamingKeepAliveTickerFactory = factory
+	}
+	return func() {
+		streamingKeepAliveTickerFactory = prev
+	}
 }
 
 // NonStreamingKeepAliveInterval returns the keep-alive interval for non-streaming responses.
@@ -196,6 +247,12 @@ func StreamingBootstrapRetries(cfg *config.SDKConfig) int {
 // Default is false.
 func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 	return cfg != nil && cfg.PassthroughHeaders
+}
+
+// executionPassthroughHeaders keeps client responses behind passthrough-headers while
+// plugin-host internal executions always receive filtered upstream headers.
+func executionPassthroughHeaders(cfg *config.SDKConfig, internal bool) bool {
+	return internal || PassthroughHeadersEnabled(cfg)
 }
 
 func requestExecutionMetadata(ctx context.Context) map[string]any {
@@ -357,6 +414,8 @@ func setGenerateMetadata(meta map[string]any, rawJSON []byte) {
 // It holds a pool of clients to interact with the backend service and manages
 // load balancing, client selection, and configuration.
 type BaseAPIHandler struct {
+	runtimeMu sync.RWMutex
+
 	// AuthManager manages auth lifecycle and execution in the new architecture.
 	AuthManager *coreauth.Manager
 
@@ -403,7 +462,9 @@ func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) {
 	if h == nil {
 		return
 	}
+	h.runtimeMu.Lock()
 	h.Cfg = cfg
+	h.runtimeMu.Unlock()
 	h.cfg.Store(cfg)
 }
 
@@ -415,7 +476,10 @@ func (h *BaseAPIHandler) CurrentConfig() *config.SDKConfig {
 	if cfg := h.cfg.Load(); cfg != nil {
 		return cfg
 	}
-	return h.Cfg
+	h.runtimeMu.RLock()
+	cfg := h.Cfg
+	h.runtimeMu.RUnlock()
+	return cfg
 }
 
 // SetPluginHost configures the optional plugin interceptor host.
@@ -424,10 +488,11 @@ func (h *BaseAPIHandler) SetPluginHost(host PluginInterceptorHost) {
 		return
 	}
 	if isNilPluginInterceptorHost(host) {
-		h.PluginHost = nil
-		return
+		host = nil
 	}
+	h.runtimeMu.Lock()
 	h.PluginHost = host
+	h.runtimeMu.Unlock()
 }
 
 // SetModelRouterHost configures the optional plugin model router host.
@@ -436,10 +501,25 @@ func (h *BaseAPIHandler) SetModelRouterHost(host PluginModelRouterHost) {
 		return
 	}
 	if isNilPluginModelRouterHost(host) {
-		h.ModelRouterHost = nil
-		return
+		host = nil
 	}
+	h.runtimeMu.Lock()
 	h.ModelRouterHost = host
+	h.runtimeMu.Unlock()
+}
+
+// ModelRouterHostSnapshot returns the configured plugin model router host snapshot.
+func (h *BaseAPIHandler) ModelRouterHostSnapshot() PluginModelRouterHost {
+	if h == nil {
+		return nil
+	}
+	h.runtimeMu.RLock()
+	host := h.ModelRouterHost
+	h.runtimeMu.RUnlock()
+	if isNilPluginModelRouterHost(host) {
+		return nil
+	}
+	return host
 }
 
 func (h *BaseAPIHandler) SetSecretDLP(svc *secretdlp.Service) {
@@ -536,6 +616,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		requestCtx = c.Request.Context()
 	}
 
+	if requestCtx != nil {
+		parentCtx = httptransport.InheritDecorator(parentCtx, requestCtx)
+	}
 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {
 		if requestID := logging.GetRequestID(requestCtx); requestID != "" {
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
@@ -566,11 +649,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	if c != nil && c.Request != nil {
 		sessionID, parentSessionID := extractSessionIDsFromRequest(c.Request)
 		newCtx = logging.WithClientRequestMetadata(newCtx, logging.ClientRequestMetadata{
-			ClientIP:        requestClientIP(c.Request),
-			XForwardedFor:   strings.TrimSpace(strings.Join(c.Request.Header.Values("X-Forwarded-For"), ", ")),
-			UserAgent:       strings.TrimSpace(c.Request.UserAgent()),
-			SessionID:       sessionID,
-			ParentSessionID: parentSessionID,
+			ClientIP:         requestClientIP(c.Request),
+			ResolvedClientIP: strings.TrimSpace(c.ClientIP()),
+			XForwardedFor:    strings.TrimSpace(strings.Join(c.Request.Header.Values("X-Forwarded-For"), ", ")),
+			UserAgent:        strings.TrimSpace(c.Request.UserAgent()),
+			SessionID:        sessionID,
+			ParentSessionID:  parentSessionID,
 		})
 	}
 	newCtx = logging.WithResponseStatusHolder(newCtx)

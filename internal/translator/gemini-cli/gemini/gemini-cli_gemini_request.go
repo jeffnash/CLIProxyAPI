@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -33,7 +33,7 @@ import (
 //
 // Returns:
 //   - []byte: The transformed request data in Gemini API format
-func ConvertGeminiRequestToGeminiCLI(_ string, inputRawJSON []byte, _ bool) []byte {
+func ConvertGeminiRequestToGeminiCLI(_ string, inputRawJSON []byte, _ bool) ([]byte, error) {
 	rawJSON := inputRawJSON
 	template := []byte(`{"project":"","request":{},"model":""}`)
 	template, _ = sjson.SetRawBytes(template, "request", rawJSON)
@@ -42,7 +42,7 @@ func ConvertGeminiRequestToGeminiCLI(_ string, inputRawJSON []byte, _ bool) []by
 
 	templateStr, errFixCLIToolResponse := fixCLIToolResponse(string(template))
 	if errFixCLIToolResponse != nil {
-		return []byte{}
+		return []byte{}, nil
 	}
 	template = []byte(templateStr)
 
@@ -117,7 +117,7 @@ func ConvertGeminiRequestToGeminiCLI(_ string, inputRawJSON []byte, _ bool) []by
 		rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.contents", filteredContents)
 	}
 
-	return common.AttachDefaultSafetySettings(rawJSON, "request.safetySettings")
+	return common.AttachDefaultSafetySettings(rawJSON, "request.safetySettings"), nil
 }
 
 // FunctionCallGroup represents a group of function calls and their responses

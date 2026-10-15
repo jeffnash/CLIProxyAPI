@@ -11,22 +11,22 @@ import (
 	"strings"
 	"time"
 
-	grokauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/grok"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	grokauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/grok"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
-func ConvertOpenAIRequestToGrok(modelName string, inputRawJSON []byte, stream bool) []byte {
+func ConvertOpenAIRequestToGrok(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
 	// Streaming is handled by the executor; Grok payload shape is the same for stream/non-stream.
 	rawJSON := bytes.Clone(inputRawJSON)
 
 	cfg, ok := grokauth.GrokModels[modelName]
 	if !ok {
 		log.Warnf("grok translator: unknown model %q; returning original payload for upstream handling", modelName)
-		return rawJSON
+		return rawJSON, nil
 	}
 
 	message, plainText, imageAttachments := extractOpenAIContent(rawJSON)
@@ -64,7 +64,7 @@ func ConvertOpenAIRequestToGrok(modelName string, inputRawJSON []byte, stream bo
 	// Grok controls these via model configuration; executors should enforce or translate
 	// these settings if/when Grok adds equivalent per-request controls.
 
-	return out
+	return out, nil
 }
 
 func extractOpenAIContent(rawJSON []byte) (messageWithRoles string, plainText string, imageAttachments []map[string]string) {
@@ -384,7 +384,8 @@ func BuildGrokVideoPayload(ctx context.Context, client *grokauth.GrokHTTPClient,
 	messageWithRoles, plainText, imageAttachments := extractOpenAIContent(inputRawJSON)
 	if len(imageAttachments) == 0 {
 		log.Warnf("grok translator: video model %q called without images; falling back to text payload", modelName)
-		return ConvertOpenAIRequestToGrok(modelName, inputRawJSON, false), "", nil
+		converted, _ := ConvertOpenAIRequestToGrok(modelName, inputRawJSON, false)
+		return converted, "", nil
 	}
 
 	imageAttachments = imageAttachments[:1]

@@ -8,8 +8,8 @@ package config
 import (
 	"strings"
 
-	copilotshared "github.com/router-for-me/CLIProxyAPI/v7/internal/copilot"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	copilotshared "github.com/router-for-me/CLIProxyAPI/v8/internal/copilot"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 // PassthruRoute maps a local model name to an upstream provider endpoint.

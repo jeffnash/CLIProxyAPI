@@ -9,11 +9,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -461,12 +462,14 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 	}
 
 	// Emit message_delta and message_stop only when generation is finished:
-	// 1. Upstream provided a finish_reason, or
-	// 2. Upstream sent a trailing usage-only chunk (choices array is empty or absent) after content/tools started.
+	// - Upstream sent a trailing usage-only chunk (choices array is empty or absent) after content/tools started, or
+	// - Upstream sent [DONE] (handled in convertOpenAIDoneToAnthropic).
+	// Content chunks with finish_reason and preliminary usage must not emit message_delta early,
+	// because authoritative token counts (such as cached_tokens) can arrive in the trailing usage-only chunk.
 	isTrailingUsageChunk := hasUsage && !root.Get("choices.0").Exists() &&
 		(param.FinishReason != "" || param.SawToolCall || param.TextContentBlockStarted || param.ThinkingContentBlockStarted || param.ContentAccumulator.Len() > 0 || len(param.InterleavedContentChunks) > 0)
 
-	if !param.MessageDeltaSent && (param.FinishReason != "" || isTrailingUsageChunk) && hasUsage {
+	if !param.MessageDeltaSent && isTrailingUsageChunk {
 		finalizeOpenAIAnthropicContentBlocks(param, &results)
 		emitAnthropicMessageDelta(param, &results, param.UsageInputTokens, param.UsageOutputTokens, param.UsageCachedTokens, param.UsageCacheWriteTokens)
 		emitMessageStopIfNeeded(param, &results)
@@ -1029,16 +1032,31 @@ func extractOpenAIUsage(usage gjson.Result) (int64, int64, int64, int64) {
 	outputTokens := usage.Get("completion_tokens").Int()
 	cachedTokens := usage.Get("prompt_tokens_details.cached_tokens").Int()
 	cacheWriteTokens := usage.Get("prompt_tokens_details.cache_write_tokens").Int()
-	if cacheWriteTokens == 0 {
+	if cacheWriteTokens <= 0 {
 		cacheWriteTokens = usage.Get("prompt_tokens_details.cache_creation_tokens").Int()
 	}
 
+	deductTokens := int64(0)
 	if cachedTokens > 0 {
-		if inputTokens >= cachedTokens {
-			inputTokens -= cachedTokens
+		deductTokens += cachedTokens
+	}
+	if cacheWriteTokens > 0 {
+		if math.MaxInt64-deductTokens < cacheWriteTokens {
+			deductTokens = math.MaxInt64
+		} else {
+			deductTokens += cacheWriteTokens
+		}
+	}
+
+	if deductTokens > 0 {
+		if inputTokens >= deductTokens {
+			inputTokens -= deductTokens
 		} else {
 			inputTokens = 0
 		}
+	}
+	if inputTokens < 0 {
+		inputTokens = 0
 	}
 
 	return inputTokens, outputTokens, cachedTokens, cacheWriteTokens

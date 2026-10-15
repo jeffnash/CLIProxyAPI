@@ -8,8 +8,8 @@ package claude
 import (
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -34,7 +34,7 @@ const geminiCLIClaudeThoughtSignature = "skip_thought_signature_validator"
 //
 // Returns:
 //   - []byte: The transformed request data in Gemini CLI API format
-func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []byte {
+func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) ([]byte, error) {
 	rawJSON := inputRawJSON
 
 	// Build output Gemini CLI request JSON
@@ -243,5 +243,5 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 	}
 
 	out = common.AttachDefaultSafetySettings(out, "request.safetySettings")
-	return out
+	return out, nil
 }

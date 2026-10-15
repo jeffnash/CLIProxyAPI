@@ -3,15 +3,15 @@ package handlers
 import (
 	"testing"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 func TestGetRequestDetails_ChutesPrefixRouting(t *testing.T) {
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
 
-	providers, model, metadata, err := handler.getRequestDetailsWithOptions("chutes-gpt-4.1", false)
+	providers, model, metadata, err := handler.getRequestDetailsWithOptions("chutes-gpt-4.1", false, false)
 	if err != nil {
 		t.Fatalf("getRequestDetails(): %v", err)
 	}
@@ -37,7 +37,7 @@ func TestGetRequestDetails_ManagedProviderPrefixRouting(t *testing.T) {
 		}},
 	}, coreauth.NewManager(nil, nil, nil))
 
-	providers, model, metadata, err := handler.getRequestDetailsWithOptions("example-glm-5.2", false)
+	providers, model, metadata, err := handler.getRequestDetailsWithOptions("example-glm-5.2", false, false)
 	if err != nil {
 		t.Fatalf("getRequestDetails(): %v", err)
 	}
@@ -72,7 +72,7 @@ func TestGetRequestDetails_ManagedProviderProtocolPrefixRouting(t *testing.T) {
 		{requested: "openai-responses-example-qwen3.7-max", transport: "openai-responses"},
 		{requested: "openai-completions-example-qwen3.7-max", transport: "openai-completions"},
 	} {
-		providers, model, metadata, err := handler.getRequestDetailsWithOptions(tc.requested, false)
+		providers, model, metadata, err := handler.getRequestDetailsWithOptions(tc.requested, false, false)
 		if err != nil {
 			t.Fatalf("getRequestDetails(%q): %v", tc.requested, err)
 		}

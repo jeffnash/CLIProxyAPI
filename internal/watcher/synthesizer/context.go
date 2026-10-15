@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 // PluginAuthParser parses auth JSON owned by plugin providers.
@@ -32,4 +32,6 @@ type SynthesisContext struct {
 	IDGenerator *StableIDGenerator
 	// PluginAuthParser parses plugin-owned auth files
 	PluginAuthParser PluginAuthParser
+	// StrictFileParsing surfaces parse errors instead of silently skipping or falling back.
+	StrictFileParsing bool
 }

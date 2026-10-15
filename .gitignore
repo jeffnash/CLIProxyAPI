@@ -37,6 +37,7 @@ auths/*
 # Documentation
 docs/*
 !docs/composer-clienttools-durable-round-implementation.md
+!docs/management-api-v8.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md

@@ -21,6 +21,8 @@ const (
 	xaiBuiltinVideo15ModelID           = "grok-imagine-video-1.5"
 	xaiBuiltinVideo15PreviewModelID    = "grok-imagine-video-1.5-preview"
 	xaiBuiltinVideo15PreviewID         = "grok-imagine-video-1.5-preview"
+	xaiBuiltinSpeechModelID            = "grok-tts"
+	xaiBuiltinSpeechVoiceModelID       = "grok-voice-tts-1.0"
 )
 
 // staticModelsJSON mirrors the top-level structure of models.json.
@@ -104,6 +106,7 @@ func GetAntigravityModels() []*ModelInfo {
 }
 
 var staticDevinModels = []*ModelInfo{
+	devinBuiltinSWE16SlowModelInfo(),
 	{
 		ID:                  "devin/swe-2",
 		Type:                "devin",
@@ -369,7 +372,7 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 // not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
 	extras := expandReasoningAliases([]*ModelInfo{xaiBuiltinGrok46ModelInfo(), xaiBuiltinGrok47ModelInfo()}, "high", "xhigh")
-	extras = append(extras, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo())
+	extras = append(extras, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo(), xaiBuiltinSpeechModelInfo(), xaiBuiltinSpeechVoiceModelInfo())
 	extras = append(extras, xaiComposerReasoningAliases()...)
 	return upsertModelInfos(models, extras...)
 }
@@ -582,6 +585,32 @@ func xaiBuiltinVideo15PreviewModelInfo() *ModelInfo {
 	}
 }
 
+func xaiBuiltinSpeechModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinSpeechModelID,
+		Object:      "model",
+		Created:     1773619200, // 2026-03-16
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok TTS",
+		Name:        xaiBuiltinSpeechModelID,
+		Description: "xAI Grok unary text-to-speech model.",
+	}
+}
+
+func xaiBuiltinSpeechVoiceModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:          xaiBuiltinSpeechVoiceModelID,
+		Object:      "model",
+		Created:     1773619200, // 2026-03-16
+		OwnedBy:     "xai",
+		Type:        "xai",
+		DisplayName: "Grok Voice TTS 1.0",
+		Name:        xaiBuiltinSpeechVoiceModelID,
+		Description: "xAI Grok unary text-to-speech model.",
+	}
+}
+
 func upsertModelInfos(models []*ModelInfo, extras ...*ModelInfo) []*ModelInfo {
 	if len(extras) == 0 {
 		return models
@@ -674,7 +703,7 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetQwenModels()
 	case "iflow":
 		return GetIFlowModels()
-	case "kimi":
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 		return GetKimiModels()
 	case "antigravity":
 		return GetAntigravityModels()
@@ -734,9 +763,11 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Antigravity,
 		data.XAI,
 		GetCursorModels(),
-		data.Devin,
-		staticDevinModels,
-		data.Meta,
+		// The getters return the active (possibly refreshed) catalog and
+		// fall back to the embedded static catalog when no refresh is
+		// active; models absent from an active catalog must not resurrect.
+		GetDevinModels(),
+		GetMetaModels(),
 	}
 	for _, models := range allModels {
 		for _, m := range models {

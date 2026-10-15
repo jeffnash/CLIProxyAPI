@@ -11,9 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/httptransport"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/proxy"
 )
@@ -105,9 +107,10 @@ func maskProxyURL(raw string) string { return MaskProxyURL(raw) }
 func logProxyOnce(key, msg string, args ...any) { LogProxyOnce(key, msg, args...) }
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
-// 1. Use auth.ProxyURL if configured (highest priority)
-// 2. Use cfg.ProxyURL if auth proxy is not configured AND the proxy is enabled for the given service
-// 3. Use RoundTripper from context if neither are configured
+// 1. Use the execution-scoped request proxy if configured (highest priority)
+// 2. Use auth.ProxyURL if configured
+// 3. Use cfg.ProxyURL if auth proxy is not configured AND the proxy is enabled for the given service
+// 4. Use RoundTripper from context if none are configured
 //
 // This function caches HTTP clients by proxy URL to enable TCP/TLS connection reuse.
 //
@@ -124,7 +127,8 @@ func logProxyOnce(key, msg string, args ...any) { LogProxyOnce(key, msg, args...
 //
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
-func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, serviceOverride ...string) *http.Client {
+func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, serviceOverride ...string) (clientOut *http.Client) {
+	defer func() { clientOut = httptransport.Decorate(ctx, clientOut) }()
 	service := ""
 	if len(serviceOverride) > 0 {
 		service = strings.TrimSpace(serviceOverride[0])
@@ -135,17 +139,26 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		}
 	}
 
-	// Priority 1: Use auth.ProxyURL if configured
+	// Priority 1: Use the execution-scoped request proxy if configured
 	var proxyURL string
 	proxySource := ""
-	if auth != nil {
+	if ctx != nil {
+		if requestProxy := strings.TrimSpace(cliproxyexecutor.RequestProxyURL(ctx)); requestProxy != "" {
+			proxyURL = requestProxy
+			proxySource = "request"
+		}
+	}
+
+	// Priority 2: Use auth.ProxyURL if configured
+	if proxyURL == "" && auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
 		if proxyURL != "" {
 			proxySource = "auth"
 		}
 	}
 
-	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
+	// Priority 3: Use cfg.ProxyURL if no higher-priority proxy is configured
+	// and the proxy is enabled for this service.
 	if proxyURL == "" && cfg != nil {
 		if cfg.SDKConfig.ProxyEnabledFor(service) {
 			proxyURL = strings.TrimSpace(cfg.ProxyURL)
@@ -253,9 +266,11 @@ var devinTransportCache = NewTransportCache[string](DefaultTransportCacheCapacit
 
 // NewDevinHTTPClient creates an HTTP client customized for Devin Connect-RPC upstream.
 // Suppresses automatic Accept-Encoding: gzip while preserving connection reuse across requests.
-func NewDevinHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	// Respect explicitly injected context RoundTripper (e.g. from Conductor, Home, or integration test fixtures)
-	if ctx != nil {
+func NewDevinHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (clientOut *http.Client) {
+	defer func() { clientOut = httptransport.Decorate(ctx, clientOut) }()
+	// A request proxy replaces both the injected round tripper and credential/global proxy.
+	// Respect explicitly injected context RoundTripper only when no request override is set.
+	if cliproxyexecutor.RequestProxyURL(ctx) == "" && ctx != nil {
 		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
 			if tr, ok := rt.(*http.Transport); ok {
 				key := fmt.Sprintf("rt:%p", tr)
@@ -278,12 +293,7 @@ func NewDevinHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxya
 		}
 	}
 
-	proxyURL := ""
-	if auth != nil && strings.TrimSpace(auth.ProxyURL) != "" {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	} else if cfg != nil && strings.TrimSpace(cfg.ProxyURL) != "" {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	proxyURL := effectiveProxyURL(ctx, cfg, auth)
 
 	noProxyRaw := ""
 	noProxyList := []string(nil)
@@ -330,6 +340,21 @@ func (rt devinNoGzipRoundTripper) RoundTrip(req *http.Request) (*http.Response, 
 		req.Header.Set("Accept-Encoding", "identity")
 	}
 	return rt.base.RoundTrip(req)
+}
+
+func effectiveProxyURL(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if proxyURL := cliproxyexecutor.RequestProxyURL(ctx); proxyURL != "" {
+		return proxyURL
+	}
+	if auth != nil {
+		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+			return proxyURL
+		}
+	}
+	if cfg != nil {
+		return strings.TrimSpace(cfg.ProxyURL)
+	}
+	return ""
 }
 
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.

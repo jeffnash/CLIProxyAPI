@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -99,8 +99,33 @@ func (h *Handler) GetLatestVersion(c *gin.Context) {
 }
 
 func WriteConfig(path string, data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	if len(doc.Content) > 0 && config.IsV8ConfigLayout(doc.Content[0]) {
+		var err error
+		data, _, err = config.NormalizeConfigLayout(data, true)
+		if err != nil {
+			return err
+		}
+	}
 	data = config.NormalizeCommentIndentation(data)
-	return util.AtomicWriteFile(path, data, 0o600)
+	// Write in place (no temp-file rename) so a bind-mounted single-file
+	// configuration keeps its inode; rename replacement would detach it.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if _, errWrite := f.Write(data); errWrite != nil {
+		_ = f.Close()
+		return errWrite
+	}
+	if errSync := f.Sync(); errSync != nil {
+		_ = f.Close()
+		return errSync
+	}
+	return f.Close()
 }
 
 func (h *Handler) PutConfigYAML(c *gin.Context) {

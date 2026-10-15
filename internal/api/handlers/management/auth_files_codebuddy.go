@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	codebuddy "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codebuddy"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+	codebuddy "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codebuddy"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	log "github.com/sirupsen/logrus"
 )
 

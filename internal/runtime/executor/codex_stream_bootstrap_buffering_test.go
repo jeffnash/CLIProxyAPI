@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -678,6 +678,7 @@ func TestCodexExecutor_BootstrapBuffering_ByteCapReleasesStream(t *testing.T) {
 	if result == nil {
 		t.Fatal("expected a stream result once the byte cap released the stream")
 	}
+	drainChunks(result)
 }
 
 // Upstream interleaves keepalive heartbeats and item announcements while the model is still
@@ -1396,10 +1397,11 @@ func TestCodexExecutor_BootstrapBuffering_TimeBudgetReleasesStream(t *testing.T)
 	bootstrapStarted := make(chan struct{})
 	var once sync.Once
 	cleanup := setCodexBootstrapNowForTest(func() time.Time {
+		now := clock.now()
 		once.Do(func() {
 			close(bootstrapStarted)
 		})
-		return clock.now()
+		return now
 	})
 	t.Cleanup(cleanup)
 
@@ -1442,6 +1444,17 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_TimeBudgetReleasesStream(t *
 	t0 := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
 	clock := withMockClock(t, t0)
 
+	bootstrapStarted := make(chan struct{})
+	var once sync.Once
+	cleanup := setCodexBootstrapNowForTest(func() time.Time {
+		now := clock.now()
+		once.Do(func() {
+			close(bootstrapStarted)
+		})
+		return now
+	})
+	t.Cleanup(cleanup)
+
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -1454,6 +1467,7 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_TimeBudgetReleasesStream(t *
 		}
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(codexInProgressEvent))
 
+		<-bootstrapStarted
 		// Advance clock past default 10s timeout
 		clock.advance(11 * time.Second)
 
@@ -1596,10 +1610,11 @@ func TestCodexExecutor_BootstrapBuffering_OverloadDirectlyAfterTimeoutDeliveredI
 	bootstrapStarted := make(chan struct{})
 	var once sync.Once
 	cleanup := setCodexBootstrapNowForTest(func() time.Time {
+		now := clock.now()
 		once.Do(func() {
 			close(bootstrapStarted)
 		})
-		return clock.now()
+		return now
 	})
 	t.Cleanup(cleanup)
 
@@ -1638,6 +1653,17 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_OverloadDirectlyAfterTimeout
 	t0 := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
 	clock := withMockClock(t, t0)
 
+	bootstrapStarted := make(chan struct{})
+	var once sync.Once
+	cleanup := setCodexBootstrapNowForTest(func() time.Time {
+		now := clock.now()
+		once.Do(func() {
+			close(bootstrapStarted)
+		})
+		return now
+	})
+	t.Cleanup(cleanup)
+
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -1649,6 +1675,7 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_OverloadDirectlyAfterTimeout
 			return
 		}
 
+		<-bootstrapStarted
 		// Advance clock past 10s timeout before writing any messages
 		clock.advance(11 * time.Second)
 
@@ -1675,6 +1702,17 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_StatusBearingErrorAfterTimeo
 	t0 := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
 	clock := withMockClock(t, t0)
 
+	bootstrapStarted := make(chan struct{})
+	var once sync.Once
+	cleanup := setCodexBootstrapNowForTest(func() time.Time {
+		now := clock.now()
+		once.Do(func() {
+			close(bootstrapStarted)
+		})
+		return now
+	})
+	t.Cleanup(cleanup)
+
 	statusBearingError := `{"type":"error","status":429,"error":{"message":"Rate limit exceeded","type":"requests","code":"rate_limit_exceeded"}}`
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -1688,6 +1726,7 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_StatusBearingErrorAfterTimeo
 			return
 		}
 
+		<-bootstrapStarted
 		// Advance clock past 10s timeout before writing error frame
 		clock.advance(11 * time.Second)
 
@@ -1705,5 +1744,71 @@ func TestCodexWebsocketsExecutor_BootstrapBuffering_StatusBearingErrorAfterTimeo
 	}
 	if _, streamErr := drainChunks(result); streamErr == nil {
 		t.Fatal("expected status-bearing error to be delivered in-stream")
+	}
+}
+
+// The downstream handler closes the client connection as soon as the executor publishes an
+// upstream disconnect, which cancels the request context. A usage-limit error must reach the
+// conductor before that happens, otherwise the cancellation drops the error and the credential
+// cooldown it carries (issue 6503).
+func TestCodexWebsocketsExecutor_UnbufferedUpstreamErrorIsDeliveredBeforeDisconnectNotify(t *testing.T) {
+	frames := map[string]string{
+		"error frame":     `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":600}}`,
+		"response.failed": `{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","status_code":429,"message":"The usage limit has been reached","resets_in_seconds":600}}}`,
+	}
+	for name, frame := range frames {
+		t.Run(name, func(t *testing.T) {
+			server := codexWebsocketServerHoldingConnection(t, frame)
+			defer server.Close()
+
+			exec := NewCodexWebsocketsExecutor(codexBufferingConfig(false))
+			exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+
+			const sessionID = "issue-6503-session"
+			disconnectCh := exec.UpstreamDisconnectChan(sessionID)
+			if disconnectCh == nil {
+				t.Fatal("expected a disconnect channel")
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			canceled := make(chan struct{})
+			go func() {
+				<-disconnectCh
+				cancel()
+				close(canceled)
+			}()
+
+			req, opts := codexWebsocketRequest()
+			opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID}
+			result, err := exec.ExecuteStream(ctx, codexTestAuth(server.URL), req, opts)
+			if err != nil {
+				t.Fatalf("ExecuteStream() error = %v", err)
+			}
+
+			// Give a premature disconnect notification time to cancel the context before the error is read.
+			select {
+			case <-canceled:
+			case <-time.After(200 * time.Millisecond):
+			}
+
+			var streamErr error
+			for chunk := range result.Chunks {
+				if chunk.Err != nil {
+					streamErr = chunk.Err
+				}
+			}
+			if streamErr == nil {
+				t.Fatal("the upstream usage-limit error was dropped by the disconnect-triggered cancellation")
+			}
+			if got := statusCodeFromTestError(t, streamErr); got != http.StatusTooManyRequests {
+				t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+			}
+			select {
+			case <-canceled:
+			case <-time.After(5 * time.Second):
+				t.Fatal("downstream disconnect was never signalled after the error was delivered")
+			}
+		})
 	}
 }

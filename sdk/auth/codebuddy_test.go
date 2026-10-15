@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	codebuddy "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codebuddy"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	codebuddy "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codebuddy"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 type codeBuddyAuthRoundTripperFunc func(*http.Request) (*http.Response, error)

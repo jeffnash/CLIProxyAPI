@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	coresession "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/session"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
@@ -19,9 +19,10 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 		ctx := internallogging.WithRequestID(context.Background(), "ctx-request-id")
 		ctx = internallogging.WithEndpoint(ctx, "POST /v1/chat/completions")
 		ctx = internallogging.WithClientRequestMetadata(ctx, internallogging.ClientRequestMetadata{
-			ClientIP:      "192.0.2.10",
-			XForwardedFor: "203.0.113.5, 198.51.100.8",
-			UserAgent:     "test-client/1.0",
+			ClientIP:         "192.0.2.10",
+			ResolvedClientIP: "203.0.113.5",
+			XForwardedFor:    "203.0.113.5, 198.51.100.8",
+			UserAgent:        "test-client/1.0",
 		})
 		ctx = internallogging.WithResponseStatusHolder(ctx)
 		internallogging.SetResponseStatus(ctx, http.StatusOK)
@@ -67,6 +68,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 		requireMissingField(t, payload, "user_api_key")
 		requireStringField(t, payload, "request_id", "ctx-request-id")
 		requireStringField(t, payload, "client_ip", "192.0.2.10")
+		requireStringField(t, payload, "resolved_client_ip", "203.0.113.5")
 		requireStringField(t, payload, "x_forwarded_for", "203.0.113.5, 198.51.100.8")
 		requireStringField(t, payload, "user_agent", "test-client/1.0")
 		requireStringField(t, payload, "reasoning_effort", "medium")
@@ -708,5 +710,155 @@ func TestUsageQueuePluginPayloadSameOriginFallback(t *testing.T) {
 		if _, exists := payload["parent_session_id"]; exists {
 			t.Fatalf("expected parent_session_id to be omitted when record is independent root, got %s", payload["parent_session_id"])
 		}
+	})
+}
+
+func TestUsageQueuePlugin_SchemeB_ExecutionIDAndTraceID(t *testing.T) {
+	prevEnabled := Enabled()
+	prevUsageEnabled := UsageStatisticsEnabled()
+	SetEnabled(true)
+	SetUsageStatisticsEnabled(true)
+	t.Cleanup(func() {
+		SetEnabled(prevEnabled)
+		SetUsageStatisticsEnabled(prevUsageEnabled)
+	})
+
+	plugin := &usageQueuePlugin{}
+	ctx := internallogging.WithRequestID(context.Background(), "000000ab")
+	execUUID := "12345678-1234-4234-8234-123456789abc"
+
+	plugin.HandleUsage(ctx, coreusage.Record{
+		RequestID: execUUID,
+		TraceID:   "000000ab",
+		Provider:  "openai",
+		Model:     "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 5,
+			TotalTokens:  15,
+		},
+	})
+
+	payload := popSinglePayload(t)
+	// Scheme B: request_id preserves the 8-character hex trace ID
+	requireStringField(t, payload, "request_id", "000000ab")
+	// Scheme B: execution_id carries the UUID v4 execution instance ID
+	requireStringField(t, payload, "execution_id", execUUID)
+	// Scheme B: trace_id explicitly carries the 8-character hex trace ID
+	requireStringField(t, payload, "trace_id", "000000ab")
+}
+
+func TestUsageQueuePlugin_SchemeB_StrictLegacyRequestIDPreservation(t *testing.T) {
+	prevEnabled := Enabled()
+	prevUsageEnabled := UsageStatisticsEnabled()
+	SetEnabled(true)
+	SetUsageStatisticsEnabled(true)
+	t.Cleanup(func() {
+		SetEnabled(prevEnabled)
+		SetUsageStatisticsEnabled(prevUsageEnabled)
+	})
+
+	plugin := &usageQueuePlugin{}
+	ctx := internallogging.WithRequestID(context.Background(), "legacy-log-id")
+	execUUID := "12345678-1234-4234-8234-123456789abc"
+
+	plugin.HandleUsage(ctx, coreusage.Record{
+		RequestID: execUUID,
+		TraceID:   "custom-trace-id",
+		Provider:  "openai",
+		Model:     "gpt-5.4",
+		Detail: coreusage.Detail{
+			InputTokens: 5,
+		},
+	})
+
+	payload := popSinglePayload(t)
+	// request_id strictly preserves legacy GetRequestID(ctx)
+	requireStringField(t, payload, "request_id", "legacy-log-id")
+	// execution_id carries the UUID v4
+	requireStringField(t, payload, "execution_id", execUUID)
+	// trace_id reflects the record.TraceID
+	requireStringField(t, payload, "trace_id", "custom-trace-id")
+}
+
+func TestUsageQueuePluginPayloadDistinguishesNativeKey(t *testing.T) {
+	withEnabledQueue(t, func() {
+		t.Run("native_key", func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			w := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(w)
+			ginCtx.Set("userApiKey", "sk-native-key-123")
+			ginCtx.Set("accessProvider", "config-inline")
+
+			ctx := context.WithValue(context.Background(), "gin", ginCtx)
+			ctx = internallogging.WithRequestID(ctx, "req-native-1")
+
+			plugin := &usageQueuePlugin{}
+			plugin.HandleUsage(ctx, coreusage.Record{
+				Provider: "openai",
+				Model:    "gpt-5.4",
+				APIKey:   "sk-native-key-123",
+			})
+
+			payload := popSinglePayload(t)
+			requireStringField(t, payload, "api_key", "sk-native-key-123")
+			requireBoolField(t, payload, "is_native_key", true)
+			requireStringField(t, payload, "access_provider", "config-inline")
+		})
+
+		t.Run("plugin_key", func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			w := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(w)
+			ginCtx.Set("userApiKey", "plugin-principal-456")
+			ginCtx.Set("accessProvider", "custom-auth-plugin")
+
+			ctx := context.WithValue(context.Background(), "gin", ginCtx)
+			ctx = internallogging.WithRequestID(ctx, "req-plugin-1")
+
+			plugin := &usageQueuePlugin{}
+			plugin.HandleUsage(ctx, coreusage.Record{
+				Provider: "openai",
+				Model:    "gpt-5.4",
+				APIKey:   "plugin-principal-456",
+			})
+
+			payload := popSinglePayload(t)
+			requireStringField(t, payload, "api_key", "plugin-principal-456")
+			requireBoolField(t, payload, "is_native_key", false)
+			requireStringField(t, payload, "access_provider", "custom-auth-plugin")
+		})
+
+		t.Run("record_explicit_native", func(t *testing.T) {
+			ctx := internallogging.WithRequestID(context.Background(), "req-explicit-1")
+
+			plugin := &usageQueuePlugin{}
+			plugin.HandleUsage(ctx, coreusage.Record{
+				Provider:       "openai",
+				Model:          "gpt-5.4",
+				APIKey:         "sk-explicit-native",
+				IsNativeKey:    true,
+				AccessProvider: "config-inline",
+			})
+
+			payload := popSinglePayload(t)
+			requireStringField(t, payload, "api_key", "sk-explicit-native")
+			requireBoolField(t, payload, "is_native_key", true)
+			requireStringField(t, payload, "access_provider", "config-inline")
+		})
+
+		t.Run("unauthenticated", func(t *testing.T) {
+			ctx := internallogging.WithRequestID(context.Background(), "req-unauth-1")
+
+			plugin := &usageQueuePlugin{}
+			plugin.HandleUsage(ctx, coreusage.Record{
+				Provider: "openai",
+				Model:    "gpt-5.4",
+			})
+
+			payload := popSinglePayload(t)
+			requireBoolField(t, payload, "is_native_key", false)
+			requireMissingField(t, payload, "access_provider")
+		})
 	})
 }

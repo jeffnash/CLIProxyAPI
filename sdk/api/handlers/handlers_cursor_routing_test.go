@@ -3,7 +3,7 @@ package handlers
 import (
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 // TestGetRequestDetails_CursorPrefixRouting locks the cursor- force-prefix path
@@ -33,7 +33,7 @@ func TestGetRequestDetails_CursorPrefixRouting(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions(tt.modelName, false)
+			providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions(tt.modelName, false, false)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

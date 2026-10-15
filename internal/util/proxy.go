@@ -11,8 +11,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/proxy"
 )
@@ -117,6 +117,12 @@ func SetProxyForService(cfg *config.SDKConfig, service string, httpClient *http.
 	}
 
 	noProxyList := ParseNoProxyList(NoProxyEnvRaw())
+	// Clone the default transport so proxy transports retain its settings
+	// (TLS config, dialer defaults, connection pooling).
+	baseTransport := &http.Transport{}
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok && dt != nil {
+		baseTransport = dt.Clone()
+	}
 	var transport *http.Transport
 
 	if setting.URL.Scheme == "socks5" {
@@ -132,22 +138,21 @@ func SetProxyForService(cfg *config.SDKConfig, service string, httpClient *http.
 			return httpClient
 		}
 		direct := &net.Dialer{}
-		transport = &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				if ShouldBypassProxy(addr, noProxyList) {
-					return direct.DialContext(ctx, network, addr)
-				}
-				return dialer.Dial(network, addr)
-			},
+		transport = baseTransport
+		transport.Proxy = nil
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if ShouldBypassProxy(addr, noProxyList) {
+				return direct.DialContext(ctx, network, addr)
+			}
+			return dialer.Dial(network, addr)
 		}
 	} else if setting.URL.Scheme == "http" || setting.URL.Scheme == "https" {
-		transport = &http.Transport{
-			Proxy: func(req *http.Request) (*url.URL, error) {
-				if req != nil && req.URL != nil && ShouldBypassProxy(req.URL.Hostname(), noProxyList) {
-					return nil, nil
-				}
-				return setting.URL, nil
-			},
+		transport = baseTransport
+		transport.Proxy = func(req *http.Request) (*url.URL, error) {
+			if req != nil && req.URL != nil && ShouldBypassProxy(req.URL.Hostname(), noProxyList) {
+				return nil, nil
+			}
+			return setting.URL, nil
 		}
 	}
 

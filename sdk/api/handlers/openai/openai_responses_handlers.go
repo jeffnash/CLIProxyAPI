@@ -18,24 +18,29 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/optimize-multi-agent-v2"
-	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/optimize-multi-agent-v2"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
-func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
+func writeResponsesSSEChunk(w io.Writer, chunk []byte) error {
 	if w == nil || len(chunk) == 0 {
-		return
+		return nil
 	}
-	if _, err := w.Write(chunk); err != nil {
-		return
+	if n, errWrite := w.Write(chunk); errWrite != nil {
+		return errWrite
+	} else if n != len(chunk) {
+		return io.ErrShortWrite
 	}
 	if bytes.HasSuffix(chunk, []byte("\n\n")) || bytes.HasSuffix(chunk, []byte("\r\n\r\n")) {
-		return
+		return nil
 	}
 	suffix := []byte("\n\n")
 	if bytes.HasSuffix(chunk, []byte("\r\n")) {
@@ -43,9 +48,17 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 	} else if bytes.HasSuffix(chunk, []byte("\n")) {
 		suffix = []byte("\n")
 	}
-	if _, err := w.Write(suffix); err != nil {
-		return
+	if n, errWrite := w.Write(suffix); errWrite != nil {
+		return errWrite
+	} else if n != len(suffix) {
+		return io.ErrShortWrite
 	}
+	return nil
+}
+
+// flushResponsesSSE preserves middleware behavior and transport flush errors.
+func flushResponsesSSE(w http.ResponseWriter) error {
+	return httpwire.FlushResponse(w)
 }
 
 type responsesSSEFramer struct {
@@ -57,7 +70,10 @@ type responsesSSEFramer struct {
 	terminalEvent        string
 	terminalError        *interfaces.ErrorMessage
 	failureEvent         string
+	isCodexClient        bool
 	dataFrames           int
+	writeErr             error
+	canComplete          func() bool
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -116,11 +132,51 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 }
 
 func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
-	writeResponsesSSEChunk(w, f.repairFrame(frame))
+	if f.writeErr == nil {
+		f.writeErr = writeResponsesSSEChunk(w, f.repairFrame(frame))
+	}
+}
+
+func (f *responsesSSEFramer) shouldFilterPrivateEvent(streamEvent, payloadType string) bool {
+	check := func(name string) bool {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return false
+		}
+		if responsesSSEErrorEvent(name) {
+			return false
+		}
+
+		// Always filter internal WebSocket timing telemetry from SSE streams.
+		if strings.HasPrefix(name, "responsesapi.") {
+			return true
+		}
+
+		// If official Codex client, preserve codex.response.metadata but filter rate limits.
+		if f != nil && f.isCodexClient {
+			if name == "codex.rate_limits" {
+				return true
+			}
+			return false
+		}
+
+		// For standard Responses API clients: filter any codex.* private events.
+		if strings.HasPrefix(name, "codex.") {
+			return true
+		}
+
+		return false
+	}
+
+	return check(streamEvent) || check(payloadType)
 }
 
 func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 	payload, ok := responsesSSEDataPayload(frame)
+	streamEvent := responsesSSEEventName(frame)
+	if streamEvent != "" && f.shouldFilterPrivateEvent(streamEvent, "") {
+		return nil
+	}
 	if !ok || len(payload) == 0 {
 		return frame
 	}
@@ -131,16 +187,20 @@ func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 	if !json.Valid(payload) {
 		return frame
 	}
-	f.dataFrames++
 
 	payloadType := gjson.GetBytes(payload, "type").String()
+	if f.shouldFilterPrivateEvent(streamEvent, payloadType) {
+		return nil
+	}
+
+	f.dataFrames++
+
 	if responsesSSEErrorEvent(payloadType) || responsesSSEPayloadHasError(payload) {
 		if payloadType != "" {
 			f.lastEvent = sanitizeResponsesStreamEventName(payloadType)
 		}
 		return f.repairErrorPayload(payload)
 	}
-	streamEvent := responsesSSEEventName(frame)
 	eventType := payloadType
 	if responsesSSETerminalEvent(streamEvent) {
 		eventType = streamEvent
@@ -592,7 +652,11 @@ func (h *OpenAIResponsesAPIHandler) OpenAIResponsesModels(c *gin.Context) {
 }
 
 func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2Tools(c *gin.Context, payload []byte) []byte {
-	if h == nil || h.Cfg == nil {
+	if h == nil {
+		return payload
+	}
+	cfg := h.CurrentConfig()
+	if cfg == nil {
 		return payload
 	}
 
@@ -611,7 +675,7 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2Tools(c *gin.Context
 		requestCtx,
 		requestHeaders,
 		payload,
-		h.Cfg.CodexOptimizeMultiAgentV2,
+		cfg.Client.Codex.OptimizeMultiAgentV2,
 		homeEnabled,
 	)
 	if prepared && c != nil {
@@ -621,7 +685,11 @@ func (h *OpenAIResponsesAPIHandler) prepareCodexMultiAgentV2Tools(c *gin.Context
 }
 
 func (h *OpenAIResponsesAPIHandler) prepareCodexOrphanDelegation(c *gin.Context, payload []byte) []byte {
-	if h == nil || h.Cfg == nil || !h.Cfg.CodexOrphanDelegationCompatibility {
+	if h == nil {
+		return payload
+	}
+	cfg := h.CurrentConfig()
+	if cfg == nil || !cfg.CodexOrphanDelegationCompatibility {
 		return payload
 	}
 	requestCtx := context.Background()
@@ -644,7 +712,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 	rawJSON, err := handlers.ReadRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+		c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
 				Type:    "invalid_request_error",
@@ -669,7 +737,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	rawJSON, err := handlers.ReadRequestBody(c)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+		c.JSON(clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: fmt.Sprintf("Invalid request: %v", err),
 				Type:    "invalid_request_error",
@@ -760,9 +828,13 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
-
+	deliveryCtx, finishDelivery := usage.WithStreamDelivery(context.Background())
+	defer finishDelivery(context.Canceled)
+	cliCtx, cancelExecution := h.GetContextWithCancel(h, c, deliveryCtx)
+	cliCancel := func(err error) {
+		finishDelivery(err)
+		cancelExecution(err)
+	}
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache, no-transform")
@@ -772,11 +844,45 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			c.Header("X-Accel-Buffering", "no") // Disable proxy buffering for SSE
 		}
 	}
+	var upstreamHeaders http.Header
+	committed := false
+	commitSSE := func() {
+		if committed {
+			return
+		}
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		committed = true
+	}
+	writeKeepAlive := func() bool {
+		commitSSE()
+		if errWrite := writeResponsesSSEChunk(c.Writer, []byte(": keep-alive\n\n")); errWrite != nil {
+			cliCancel(errWrite)
+			return false
+		}
+		if errFlush := flushResponsesSSE(c.Writer); errFlush != nil {
+			cliCancel(errFlush)
+			return false
+		}
+		return true
+	}
+	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(h.CurrentConfig())
+	defer stopKeepAlive()
+
+	dataChan, resolvedHeaders, errChan, okBootstrap := h.ExecuteStreamWithPreFTKeepAlive(
+		c, cliCtx, cliCancel, h.HandlerType(), modelName, rawJSON, "", keepAliveC, writeKeepAlive,
+	)
+	if !okBootstrap {
+		return
+	}
+	upstreamHeaders = resolvedHeaders
+
+	isCodexClient := isCodexResponsesClientRequest(c)
 	failureEvent := "error"
-	if isCodexResponsesClientRequest(c) {
+	if isCodexClient {
 		failureEvent = "response.failed"
 	}
-	framer := &responsesSSEFramer{failureEvent: failureEvent}
+	framer := &responsesSSEFramer{failureEvent: failureEvent, isCodexClient: isCodexClient, canComplete: func() bool { return usage.StreamDeliverySupported(cliCtx) }}
 	var initialOutput bytes.Buffer
 
 	// Peek at the first complete SSE data frame.
@@ -792,22 +898,32 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				continue
 			}
 			framer.Flush(&initialOutput)
-			safeErrMsg := sanitizeResponsesStreamErrorMessage(errMsg)
-			if framer.dataFrames == 0 {
-				safeErrMsg = sanitizeResponsesInitialErrorMessage(errMsg)
-			}
-			if safeErrMsg != nil && framer.dataFrames > 0 {
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-				_, _ = c.Writer.Write(initialOutput.Bytes())
-				flusher.Flush()
+			if committed || framer.dataFrames > 0 {
+				stopKeepAlive()
+				safeErrMsg := sanitizeResponsesStreamErrorMessage(errMsg)
+				commitSSE()
+				if initialOutput.Len() > 0 {
+					if errWrite := writeResponsesSSEChunk(c.Writer, initialOutput.Bytes()); errWrite != nil {
+						cliCancel(errWrite)
+						return
+					}
+					if errFlush := flushResponsesSSE(c.Writer); errFlush != nil {
+						cliCancel(errFlush)
+						return
+					}
+				}
+				if safeErrMsg == nil {
+					cliCancel(nil)
+					return
+				}
 				pendingErrors := make(chan *interfaces.ErrorMessage, 1)
 				pendingErrors <- safeErrMsg
 				close(pendingErrors)
 				h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, make(chan []byte), pendingErrors, framer)
 				return
 			}
-			// Upstream failed before a complete SSE data frame. Return JSON.
+			// Upstream failed before SSE was committed. Return JSON with HTTP status.
+			safeErrMsg := sanitizeResponsesInitialErrorMessage(errMsg)
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), safeErrMsg)
 			h.WriteErrorResponse(c, safeErrMsg)
 			if safeErrMsg != nil {
@@ -827,17 +943,25 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 					}
 					errMsg = &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("%s", message)}
 				}
-				if framer.dataFrames > 0 {
+				if committed || framer.dataFrames > 0 {
 					errMsg = sanitizeResponsesStreamErrorMessage(errMsg)
 				} else {
 					errMsg = sanitizeResponsesInitialErrorMessage(errMsg)
 				}
 
-				if framer.dataFrames > 0 {
-					setSSEHeaders()
-					handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-					_, _ = c.Writer.Write(initialOutput.Bytes())
-					flusher.Flush()
+				if committed || framer.dataFrames > 0 {
+					stopKeepAlive()
+					commitSSE()
+					if initialOutput.Len() > 0 {
+						if errWrite := writeResponsesSSEChunk(c.Writer, initialOutput.Bytes()); errWrite != nil {
+							cliCancel(errWrite)
+							return
+						}
+						if errFlush := flushResponsesSSE(c.Writer); errFlush != nil {
+							cliCancel(errFlush)
+							return
+						}
+					}
 					if framer.terminalError != nil {
 						h.logResponsesStreamError(c, framer, framer.terminalError)
 						cliCancel(framer.terminalError.Error)
@@ -869,10 +993,16 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				continue
 			}
 
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-			_, _ = c.Writer.Write(initialOutput.Bytes())
-			flusher.Flush()
+			stopKeepAlive()
+			commitSSE()
+			if errWrite := writeResponsesSSEChunk(c.Writer, initialOutput.Bytes()); errWrite != nil {
+				cliCancel(errWrite)
+				return
+			}
+			if errFlush := flushResponsesSSE(c.Writer); errFlush != nil {
+				cliCancel(errFlush)
+				return
+			}
 			if framer.terminalError != nil {
 				h.logResponsesStreamError(c, framer, framer.terminalError)
 				cliCancel(framer.terminalError.Error)
@@ -881,6 +1011,10 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
+		case <-keepAliveC:
+			if !writeKeepAlive() {
+				return
+			}
 		}
 	}
 }
@@ -1072,8 +1206,22 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 	}
 	if isCodexResponsesClientRequest(c) {
 		framer.failureEvent = "response.failed"
+		framer.isCodexClient = true
 	} else {
 		framer.failureEvent = "error"
+		framer.isCodexClient = false
+	}
+	// Initial frames have already been written and flushed by the caller.
+	if framer.writeErr != nil {
+		cancel(framer.writeErr)
+		return
+	}
+	if framer.canComplete != nil && framer.canComplete() && framer.terminalEvent == "response.completed" && framer.terminalError == nil {
+		if errMsg, pending := handlers.PendingStreamError(errs); pending {
+			h.logResponsesStreamError(c, framer, sanitizeResponsesStreamErrorMessage(errMsg))
+		}
+		cancel(nil)
+		return
 	}
 	writeTerminalError := func(errMsg *interfaces.ErrorMessage) {
 		framer.Flush(c.Writer)
@@ -1107,10 +1255,17 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		NormalizeTerminalError: sanitizeResponsesStreamErrorMessage,
+		Flush:                  func() error { return flushResponsesSSE(c.Writer) },
 		WriteChunk: func(chunk []byte) {
 			framer.WriteChunk(c.Writer, chunk)
 		},
+		ChunkDone: func() bool {
+			return framer.canComplete != nil && framer.canComplete() && framer.terminalEvent == "response.completed" && framer.writeErr == nil
+		},
 		ChunkError: func() *interfaces.ErrorMessage {
+			if framer.writeErr != nil {
+				return &interfaces.ErrorMessage{Error: framer.writeErr}
+			}
 			if framer.terminalError != nil {
 				h.logResponsesStreamError(c, framer, framer.terminalError)
 			}
@@ -1119,6 +1274,9 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 		WriteTerminalError: writeTerminalError,
 		CloseError: func() *interfaces.ErrorMessage {
 			framer.Flush(c.Writer)
+			if framer.writeErr != nil {
+				return &interfaces.ErrorMessage{Error: framer.writeErr}
+			}
 			if framer.terminalError != nil {
 				return framer.terminalError
 			}

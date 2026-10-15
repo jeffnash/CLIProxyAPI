@@ -44,12 +44,18 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config payload: %w", err)
 	}
+	if errValidate := validateTrustedProxies(cfg.TrustedProxies); errValidate != nil {
+		return nil, errValidate
+	}
 
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
 	if errValidate := cfg.ValidateCredentialWeights(); errValidate != nil {
+		return nil, errValidate
+	}
+	if errValidate := cfg.Codex.LiveMediaRelay.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
 	if cfg.Discovery.ServiceType == "" {
@@ -107,14 +113,20 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.SanitizeInteractionsKeys()
 	cfg.SanitizeVertexCompatKeys()
 	cfg.SanitizeCodexKeys()
+	cfg.SanitizeCopilotKeys()
+	cfg.SanitizeGrokKeys()
+	cfg.SanitizeGrokConfig()
+	cfg.SanitizeCursorKeys()
 	cfg.SanitizeXAIKeys()
 	cfg.SanitizeMetaKeys()
 	cfg.SanitizeCodexHeaderDefaults()
 	cfg.SanitizeClaudeHeaderDefaults()
 	cfg.SanitizeClaudeKeys()
+	cfg.SanitizeKiroKeys()
 	cfg.SanitizeOpenAICompatibility()
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 	cfg.SanitizeOAuthModelAlias()
+	cfg.SanitizeOAuthSettings()
 	cfg.SanitizeOAuthRequestScopedErrors()
 	cfg.SanitizePayloadRules()
 

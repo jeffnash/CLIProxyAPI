@@ -3,7 +3,7 @@ package handlers
 import (
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 // TestGetRequestDetails_CopilotPrefixRouting tests that the copilot- prefix correctly
@@ -57,7 +57,7 @@ func TestGetRequestDetails_CopilotPrefixRouting(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions(tt.modelName, false)
+			providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions(tt.modelName, false, false)
 
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -127,7 +127,7 @@ func TestGetRequestDetails_CopilotPrefixWithThinkingSuffix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions(tt.modelName, false)
+			providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions(tt.modelName, false, false)
 
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -191,7 +191,7 @@ func TestGetRequestDetails_ForcedProviderMetadataIsSet(t *testing.T) {
 	handler := &BaseAPIHandler{}
 
 	// Test with copilot prefix - should set forced_provider
-	_, _, metadata, err := handler.getRequestDetailsWithOptions("copilot-gpt-5", false)
+	_, _, metadata, err := handler.getRequestDetailsWithOptions("copilot-gpt-5", false, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestGetRequestDetails_MetadataForCopilotPrefixOnly(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.model, func(t *testing.T) {
-			_, _, metadata, err := handler.getRequestDetailsWithOptions(tc.model, false)
+			_, _, metadata, err := handler.getRequestDetailsWithOptions(tc.model, false, false)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -252,7 +252,7 @@ func TestGetRequestDetails_MetadataForCopilotPrefixOnly(t *testing.T) {
 
 func TestGetRequestDetails_CodexPrefixRouting(t *testing.T) {
 	handler := &BaseAPIHandler{}
-	providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions("codex-gpt-5.3-codex-spark-high", false)
+	providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions("codex-gpt-5.3-codex-spark-high", false, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestGetRequestDetails_CodexPrefixRouting(t *testing.T) {
 
 func TestGetRequestDetails_KimiPrefixRouting(t *testing.T) {
 	handler := &BaseAPIHandler{}
-	providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions("kimi-kimi-k2.5", false)
+	providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions("kimi-kimi-k2.5", false, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestGetRequestDetails_KimiPrefixRouting(t *testing.T) {
 
 func TestGetRequestDetails_IFlowPrefixRouting(t *testing.T) {
 	handler := &BaseAPIHandler{}
-	providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions("iflow-iflow-rome-30ba3b", false)
+	providers, normalizedModel, metadata, err := handler.getRequestDetailsWithOptions("iflow-iflow-rome-30ba3b", false, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

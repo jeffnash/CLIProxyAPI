@@ -6,7 +6,7 @@
 package geminiCLI
 
 import (
-	. "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/claude/gemini"
+	. "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/claude/gemini"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -27,7 +27,7 @@ import (
 //
 // Returns:
 //   - []byte: The transformed request data in Claude Code API format
-func ConvertGeminiCLIRequestToClaude(modelName string, inputRawJSON []byte, stream bool) []byte {
+func ConvertGeminiCLIRequestToClaude(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
 	rawJSON := inputRawJSON
 
 	modelResult := gjson.GetBytes(rawJSON, "model")
