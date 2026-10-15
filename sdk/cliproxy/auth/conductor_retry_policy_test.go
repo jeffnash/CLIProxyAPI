@@ -171,21 +171,21 @@ func TestRetryPolicyDelayWindowAndMatching(t *testing.T) {
 	if _, yes, _ := m.policyRetryDecision(ctx, &Error{HTTPStatus: 404, Message: "Model not found"}, 0); yes {
 		t.Fatal("retried expired window")
 	}
-	if m.retryPolicyFor(a, "other") != nil {
+	if p, _ := m.retryPolicyFor(a, "other"); p != nil {
 		t.Fatal("matched wrong model")
 	}
 	a.Provider = "other"
-	if m.retryPolicyFor(a, "policy-model") != nil {
+	if p, _ := m.retryPolicyFor(a, "policy-model"); p != nil {
 		t.Fatal("matched wrong provider")
 	}
 	a.Provider = "policy-provider"
 	p.BaseURL = "https://api.example"
 	m.SetConfig(&config.Config{RetryPolicies: []config.RetryPolicy{p}})
-	if m.retryPolicyFor(a, "policy-model") != nil {
+	if p, _ := m.retryPolicyFor(a, "policy-model"); p != nil {
 		t.Fatal("matched wrong route")
 	}
 	a.Attributes = map[string]string{"base_url": "https://api.example/"}
-	if m.retryPolicyFor(a, "policy-model") == nil {
+	if p, _ := m.retryPolicyFor(a, "policy-model"); p == nil {
 		t.Fatal("route did not match")
 	}
 	for _, err := range []error{&Error{HTTPStatus: 404, Message: "different error"}, &Error{HTTPStatus: 401, Message: "invalid key"}, &net.OpError{Op: "read", Err: errors.New("timeout")}} {
@@ -247,5 +247,82 @@ func TestRetryableProxyErrorConnectDenials(t *testing.T) {
 		if retryableProxyError(err) {
 			t.Errorf("retryableProxyError(%v) = true, want false", err)
 		}
+	}
+}
+
+func TestMetaModelNotFoundDefaultRetryPolicy(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&config.Config{})
+	m.SetRetryConfig(2, 0, 0)
+	a := &Auth{ID: "meta-policy-auth", Provider: "meta"}
+	m.auths[a.ID] = a
+	const model = "muse-wonder-full-1.0-contributor"
+	p, _ := m.retryPolicyFor(a, model)
+	if p == nil {
+		t.Fatal("native Meta has no model-not-found retry policy")
+	}
+	if p.MaxRetries != 2 {
+		t.Fatalf("retry budget=%d, want configured 2", p.MaxRetries)
+	}
+	ctx := withRetryPolicyState(t.Context())
+	m.retryPolicyAuth(ctx, a, model)
+	if _, _, configured := m.policyRetryDecision(ctx, &Error{HTTPStatus: 503, Message: "upstream unavailable"}, 0); configured {
+		t.Fatal("Meta model-not-found default overrides ordinary retry handling")
+	}
+	for _, tc := range []struct {
+		name string
+		err  *Error
+		want bool
+	}{
+		{"model not found", &Error{HTTPStatus: 404, Code: "model_not_found", Message: `{"error":{"code":"model_not_found","message":"The requested model was not found.","type":"invalid_request_error"}}`}, true},
+		{"endpoint not found", &Error{HTTPStatus: 404, Message: "Not Found"}, false},
+		{"invalid key", &Error{HTTPStatus: 401, Message: "invalid_api_key"}, false},
+		{"quota", &Error{HTTPStatus: 429, Message: "rate_limit_exceeded"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := m.policyNeutralResult(Result{AuthID: a.ID, Model: model, RouteModel: model, Error: tc.err}); got != tc.want {
+				t.Fatalf("availability-neutral=%v, want %v", got, tc.want)
+			}
+		})
+	}
+	a.Metadata = map[string]any{"request_retry": 0}
+	if p, _ := m.retryPolicyFor(a, model); p.MaxRetries != 0 {
+		t.Fatalf("explicit retry opt-out=%d, want 0", p.MaxRetries)
+	}
+	a.Provider = "claude"
+	if p, _ := m.retryPolicyFor(a, model); p != nil {
+		t.Fatal("native Meta default leaked to another provider")
+	}
+	a.Provider = "meta"
+	m.SetConfig(&config.Config{RetryPolicies: []config.RetryPolicy{{Providers: []string{"meta"}, MaxRetries: 7}}})
+	if p, _ := m.retryPolicyFor(a, model); p.MaxRetries != 7 {
+		t.Fatalf("explicit route policy budget=%d, want 7", p.MaxRetries)
+	}
+}
+
+func TestRetryPolicyModelNotFoundUsesConfiguredDelay(t *testing.T) {
+	p := testPolicy()
+	p.Errors = []config.RetryPolicyError{{Status: 404}, {Status: 429}}
+	m := newPolicyManager(t, p, &policyExecutor{})
+	ctx := withRetryPolicyState(t.Context())
+	a, _ := m.GetByID("policy-auth")
+	m.retryPolicyAuth(ctx, a, "policy-model")
+	for _, tc := range []struct {
+		name    string
+		status  int
+		message string
+		want    time.Duration
+	}{
+		{"model cooldown", 404, `{"error":{"code":"model_not_found","message":"The requested model was not found."}}`, 0},
+		{"other 404", 404, "endpoint not found", 5 * time.Minute},
+		{"quota reset", 429, "rate_limit_exceeded", 5 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &retryAfterStatusError{status: tc.status, message: tc.message, retryAfter: 5 * time.Minute}
+			wait, retry, matched := m.policyRetryDecision(ctx, err, 0)
+			if !retry || !matched || wait < tc.want || wait > tc.want+cooldownWaitJitterCap {
+				t.Fatalf("wait=%v retry=%v matched=%v, want %v", wait, retry, matched, tc.want)
+			}
+		})
 	}
 }

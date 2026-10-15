@@ -1280,7 +1280,7 @@ func TestMetaExecutor_Refresh_ClearsStaleSubscriptionMetadata_Issue6117(t *testi
 	}
 }
 
-func TestMetaExecutor_NotFoundCooldown_Shortened_Issue6117(t *testing.T) {
+func TestMetaExecutor_ModelNotFoundDoesNotSuspend_Issue6117(t *testing.T) {
 	previous := cliproxyauth.QuotaCooldownDisabledForAuth(nil)
 	cliproxyauth.SetQuotaCooldownDisabled(false)
 	t.Cleanup(func() { cliproxyauth.SetQuotaCooldownDisabled(previous) })
@@ -1315,21 +1315,20 @@ func TestMetaExecutor_NotFoundCooldown_Shortened_Issue6117(t *testing.T) {
 		Model:   "muse-spark-1.3",
 		Payload: []byte(`{"model":"muse-spark-1.3","messages":[{"role":"user","content":"hi"}]}`),
 	}
-	_, _ = manager.Execute(context.Background(), []string{"meta"}, req, cliproxyexecutor.Options{
+	_, errExecute := manager.Execute(context.Background(), []string{"meta"}, req, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai"),
 	})
+	if errExecute == nil || !strings.Contains(errExecute.Error(), "model_not_found") {
+		t.Fatalf("expected upstream model_not_found, got %v", errExecute)
+	}
 
 	updated, ok := manager.GetByID(auth.ID)
 	if !ok || updated == nil {
 		t.Fatal("expected auth to be registered")
 	}
 	state := updated.ModelStates["muse-spark-1.3"]
-	if state == nil || !state.Unavailable {
-		t.Fatalf("expected model state to be unavailable, got %#v", state)
-	}
-	remaining := time.Until(state.NextRetryAfter)
-	if remaining < 4*time.Minute || remaining > 6*time.Minute {
-		t.Fatalf("expected short ~5m cooldown for Meta 404, got remaining=%v", remaining)
+	if state != nil && (state.Unavailable || !state.NextRetryAfter.IsZero()) {
+		t.Fatalf("transient Meta model error scheduled a cooldown: %#v", state)
 	}
 }
 

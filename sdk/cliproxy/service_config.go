@@ -283,14 +283,6 @@ func (s *Service) updateServerClientsContext(ctx context.Context, cfg *config.Co
 	return s.server.UpdateClientsContext(ctx, cfg)
 }
 
-func (s *Service) reloadConfigFromWatcher() bool {
-	w := s.currentWatcher()
-	if w == nil {
-		return false
-	}
-	return w.ReloadConfigIfChanged()
-}
-
 func (s *Service) registerConfigAPIKeyAuths(ctx context.Context, cfg *config.Config) {
 	if s == nil || s.coreManager == nil || cfg == nil {
 		return

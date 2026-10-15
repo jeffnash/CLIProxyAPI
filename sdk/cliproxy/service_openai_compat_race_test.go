@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -20,6 +21,7 @@ import (
 )
 
 func TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559(t *testing.T) {
+	const iterations = 10
 	authDir := t.TempDir()
 	fileName := "codex-race-6559.json"
 	filePath := filepath.Join(authDir, fileName)
@@ -37,7 +39,7 @@ func TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559(t *testing.T) {
 	}
 
 	configPath := filepath.Join(authDir, "config.yaml")
-	initialYAML := fmt.Sprintf("port: 8317\nauth-dir: %q\nremote-management:\n  allow-remote: true\n  secret-key: %q\n", filepath.ToSlash(authDir), string(hashedSecret))
+	initialYAML := fmt.Sprintf("config-version: 8\nserver:\n  port: 8317\noauth:\n  auth-dir: %q\nmanagement:\n  allow-remote: true\n  secret-key: %q\n", filepath.ToSlash(authDir), string(hashedSecret))
 	if errWrite := os.WriteFile(configPath, []byte(initialYAML), 0o600); errWrite != nil {
 		t.Fatalf("write config file: %v", errWrite)
 	}
@@ -86,6 +88,15 @@ func TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559(t *testing.T) {
 	if errWatcher != nil {
 		t.Fatalf("watcherFactory failed: %v", errWatcher)
 	}
+	t.Cleanup(func() { _ = watcherWrapper.Stop() })
+	lastConfigApplied := make(chan struct{}, 1)
+	applyConfig := watcherWrapper.applyConfig
+	watcherWrapper.applyConfig = func(cfg *config.Config) {
+		applyConfig(cfg)
+		if len(cfg.OpenAICompatibility) == 1 && cfg.OpenAICompatibility[0].Name == fmt.Sprintf("compat-%d", iterations-1) {
+			lastConfigApplied <- struct{}{}
+		}
+	}
 	service.watcher = watcherWrapper
 	service.ensureAuthUpdateQueue(ctx)
 	watcherWrapper.SetAuthUpdateQueue(service.authUpdates)
@@ -130,7 +141,6 @@ func TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559(t *testing.T) {
 	}
 	service.registerConfigAPIKeyAuths(ctx, service.cfg)
 
-	const iterations = 10
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -139,9 +149,9 @@ func TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for i := 0; i < iterations; i++ {
-			putBody := fmt.Sprintf(`[{"name":"compat-%d","base-url":"https://compat.example.com/v1","api-key-entries":[{"api-key":"sk-%d"}],"models":[{"name":"model-%d","alias":"alias-%d"}]}]`, i, i, i, i)
+			putBody := fmt.Sprintf(`[{"name":"compat-%d","base-url":"https://compat.example.com/v1","keys":[{"api-key":"sk-%d"}],"models":[{"name":"model-%d","alias":"alias-%d"}]}]`, i, i, i, i)
 			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPut, "/v0/management/openai-compatibility", strings.NewReader(putBody))
+			req := httptest.NewRequest(http.MethodPut, "/v8/management/config/api-keys/openai-compatibility", strings.NewReader(putBody))
 			req.Header.Set("Authorization", "Bearer "+secretKey)
 			req.Header.Set("Content-Type", "application/json")
 			handler.ServeHTTP(rec, req)
@@ -158,7 +168,7 @@ func TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559(t *testing.T) {
 		for i := 0; i < iterations; i++ {
 			patchBody := fmt.Sprintf(`{"name":%q,"prefix":"pfx-%d"}`, fileName, i)
 			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(patchBody))
+			req := httptest.NewRequest(http.MethodPatch, "/v8/management/credentials/fields", strings.NewReader(patchBody))
 			req.Header.Set("Authorization", "Bearer "+secretKey)
 			req.Header.Set("Content-Type", "application/json")
 			handler.ServeHTTP(rec, req)
@@ -172,9 +182,12 @@ func TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	// Ensure the final persisted configuration is reloaded through the watcher pipeline
-	// and verify both the patched auth prefix and final openai-compatibility model are registered.
-	service.reloadConfigFromWatcher()
+	// HTTP saves return before the watcher has applied their captured snapshots.
+	select {
+	case <-lastConfigApplied:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final saved configuration was not applied")
+	}
 	service.registerConfigAPIKeyAuths(ctx, service.currentConfig())
 
 	finalPrefixModel := fmt.Sprintf("pfx-%d/gpt-6-astra", iterations-1)
@@ -196,6 +209,7 @@ func TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559(t *testing.T) {
 }
 
 func TestPutOpenAICompatConcurrentWithConfigReloadAndAuthUpdate_Issue6559(t *testing.T) {
+	const iterations = 10
 	authDir := t.TempDir()
 	fileName := "codex-reload-race-6559.json"
 	filePath := filepath.Join(authDir, fileName)
@@ -207,9 +221,6 @@ func TestPutOpenAICompatConcurrentWithConfigReloadAndAuthUpdate_Issue6559(t *tes
 	}
 
 	configPath := filepath.Join(authDir, "config.yaml")
-	if errWrite := os.WriteFile(configPath, []byte("port: 8317\n"), 0o600); errWrite != nil {
-		t.Fatalf("write config file: %v", errWrite)
-	}
 
 	reg := internalregistry.GetGlobalRegistry()
 	authID := fileName
@@ -222,6 +233,10 @@ func TestPutOpenAICompatConcurrentWithConfigReloadAndAuthUpdate_Issue6559(t *tes
 	hashedSecret, errHash := bcrypt.GenerateFromPassword([]byte(secretKey), bcrypt.MinCost)
 	if errHash != nil {
 		t.Fatalf("bcrypt hash failed: %v", errHash)
+	}
+	initialYAML := fmt.Sprintf("config-version: 8\nserver:\n  port: 8317\noauth:\n  auth-dir: %q\nmanagement:\n  allow-remote: true\n  secret-key: %q\n", filepath.ToSlash(authDir), string(hashedSecret))
+	if errWrite := os.WriteFile(configPath, []byte(initialYAML), 0o600); errWrite != nil {
+		t.Fatalf("write config file: %v", errWrite)
 	}
 
 	buildCfg := func(iter int) *config.Config {
@@ -268,6 +283,14 @@ func TestPutOpenAICompatConcurrentWithConfigReloadAndAuthUpdate_Issue6559(t *tes
 	service.server = server
 	handler := server.Handler()
 	service.coreManager.RegisterExecutor(&syncTestExecutor{})
+	lastConfigApplied := make(chan struct{}, 1)
+	service.updateServerClientsContextFn = func(ctx context.Context, cfg *config.Config) bool {
+		applied := server.UpdateClientsContext(ctx, cfg)
+		if len(cfg.OpenAICompatibility) == 1 && cfg.OpenAICompatibility[0].Name == fmt.Sprintf("compat-%d", iterations-1) {
+			lastConfigApplied <- struct{}{}
+		}
+		return applied
+	}
 
 	auth := &coreauth.Auth{
 		ID:       authID,
@@ -289,7 +312,6 @@ func TestPutOpenAICompatConcurrentWithConfigReloadAndAuthUpdate_Issue6559(t *tes
 		t.Fatalf("register auth: %v", errRegister)
 	}
 
-	const iterations = 10
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -298,9 +320,9 @@ func TestPutOpenAICompatConcurrentWithConfigReloadAndAuthUpdate_Issue6559(t *tes
 		defer wg.Done()
 		<-start
 		for i := 0; i < iterations; i++ {
-			putBody := fmt.Sprintf(`[{"name":"compat-%d","base-url":"https://compat.example.com/v1","api-key-entries":[{"api-key":"sk-%d"}],"models":[{"name":"model-%d","alias":"alias-%d"}]}]`, i, i, i, i)
+			putBody := fmt.Sprintf(`[{"name":"compat-%d","base-url":"https://compat.example.com/v1","keys":[{"api-key":"sk-%d"}],"models":[{"name":"model-%d","alias":"alias-%d"}]}]`, i, i, i, i)
 			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPut, "/v0/management/openai-compatibility", strings.NewReader(putBody))
+			req := httptest.NewRequest(http.MethodPut, "/v8/management/config/api-keys/openai-compatibility", strings.NewReader(putBody))
 			req.Header.Set("Authorization", "Bearer "+secretKey)
 			req.Header.Set("Content-Type", "application/json")
 			handler.ServeHTTP(rec, req)
@@ -317,7 +339,7 @@ func TestPutOpenAICompatConcurrentWithConfigReloadAndAuthUpdate_Issue6559(t *tes
 		for i := 0; i < iterations; i++ {
 			patchBody := fmt.Sprintf(`{"name":%q,"prefix":"pfx-%d"}`, fileName, i)
 			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(patchBody))
+			req := httptest.NewRequest(http.MethodPatch, "/v8/management/credentials/fields", strings.NewReader(patchBody))
 			req.Header.Set("Authorization", "Bearer "+secretKey)
 			req.Header.Set("Content-Type", "application/json")
 			handler.ServeHTTP(rec, req)
@@ -338,6 +360,12 @@ func TestPutOpenAICompatConcurrentWithConfigReloadAndAuthUpdate_Issue6559(t *tes
 
 	close(start)
 	wg.Wait()
+	select {
+	case <-lastConfigApplied:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final saved configuration was not applied")
+	}
+	service.applyConfigUpdateWithAuthSynthesis(context.Background(), buildCfg(iterations), true)
 
 	finalReloadAlias := fmt.Sprintf("alias-reload-%d", iterations)
 	foundReloadModel := false

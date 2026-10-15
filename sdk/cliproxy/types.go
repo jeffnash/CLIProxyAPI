@@ -106,6 +106,7 @@ type WatcherWrapper struct {
 	stop  func() error
 
 	setConfig                    func(cfg *config.Config)
+	applyConfig                  func(cfg *config.Config)
 	snapshotAuths                func() []*coreauth.Auth
 	snapshotAuthFile             func(path string) ([]*coreauth.Auth, error)
 	setUpdateQueue               func(queue chan<- watcher.AuthUpdate)
@@ -138,6 +139,15 @@ func (w *WatcherWrapper) SetConfig(cfg *config.Config) {
 		return
 	}
 	w.setConfig(cfg)
+}
+
+// ApplyConfig reloads clients from the supplied configuration snapshot.
+func (w *WatcherWrapper) ApplyConfig(cfg *config.Config) bool {
+	if w == nil || w.applyConfig == nil {
+		return false
+	}
+	w.applyConfig(cfg)
+	return true
 }
 
 // ReloadConfigIfChanged asks the underlying watcher to reload config from disk.

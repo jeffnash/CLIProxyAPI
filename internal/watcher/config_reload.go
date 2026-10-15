@@ -110,7 +110,16 @@ func (w *Watcher) reloadConfig() bool {
 		log.Errorf("failed to reload config: %v", errLoadConfig)
 		return false
 	}
+	w.ApplyConfig(newConfig)
+	return true
+}
 
+// ApplyConfig reloads clients from a validated config snapshot without rereading a file being saved.
+func (w *Watcher) ApplyConfig(cfg *config.Config) {
+	if w == nil || cfg == nil {
+		return
+	}
+	newConfig := cfg.CloneForRuntime()
 	if w.mirroredAuthDir != "" {
 		newConfig.AuthDir = w.mirroredAuthDir
 	} else {
@@ -156,5 +165,4 @@ func (w *Watcher) reloadConfig() bool {
 
 	log.Infof("config successfully reloaded, triggering client reload")
 	w.reloadClients(authDirChanged, affectedOAuthProviders, forceAuthRefresh)
-	return true
 }

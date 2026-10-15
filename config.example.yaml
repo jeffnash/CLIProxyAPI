@@ -192,6 +192,8 @@ routing:
     # send retry_round=0 for the initial round and increment it for additional rounds;
     # legacy dispatch methods omit the field and keep old semantics.
     # Additional rounds apply to HTTP 403, 408, 429, 500, 502, 503, and 504 failures.
+    # Native Meta also retries HTTP 404 model_not_found without suspending the
+    # model. Explicit retry-policies override this default; 0 disables retries.
     # Individual credential/provider overrides take precedence; 0 disables additional
     # rounds, while an omitted or negative override inherits this global setting.
     request-retry: 3

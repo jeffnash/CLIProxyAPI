@@ -24,6 +24,9 @@ func defaultWatcherFactory(configPath, authDir string, reload func(*config.Confi
 		setConfig: func(cfg *config.Config) {
 			w.SetConfig(cfg)
 		},
+		applyConfig: func(cfg *config.Config) {
+			w.ApplyConfig(cfg)
+		},
 		snapshotAuths: func() []*coreauth.Auth { return w.SnapshotCoreAuths() },
 		snapshotAuthFile: func(path string) ([]*coreauth.Auth, error) {
 			return w.SnapshotAuthFile(path)

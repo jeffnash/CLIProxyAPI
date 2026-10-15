@@ -18,6 +18,11 @@ import (
 )
 
 func TestConfigV8APIKeysExposeAuthIndex_Issue6287(t *testing.T) {
+	// Keep credential fixtures independent of locally configured providers.
+	t.Setenv("CURSOR_API_KEY", "")
+	t.Setenv("CHUTES_API_KEY", "")
+	t.Setenv("MANAGED_PROVIDERS_JSON", "")
+	t.Setenv("PASSTHRU_MODELS_JSON", "")
 	gin.SetMode(gin.TestMode)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

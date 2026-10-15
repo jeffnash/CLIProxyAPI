@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
@@ -179,8 +180,38 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
 	}
-	// Save the validated canonical tree directly: projecting runtime defaults
-	// back onto it loses explicit nulls, empty maps, and opaque plugin settings.
+	// Validate startup's environment overrides before replacing the saved config.
+	validationFile, err := os.CreateTemp("", ".config-v8-*.yaml")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": err.Error()})
+		return
+	}
+	validationPath := validationFile.Name()
+	defer func() {
+		if errRemove := os.Remove(validationPath); errRemove != nil {
+			log.WithError(errRemove).Warn("management: failed to remove configuration validation file")
+		}
+	}()
+	if _, err = validationFile.Write(data); err != nil {
+		_ = validationFile.Close()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": err.Error()})
+		return
+	}
+	if err = validationFile.Close(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": err.Error()})
+		return
+	}
+	next, err = config.LoadConfig(validationPath)
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": err.Error()})
+		return
+	}
+	// Keep canonical presence/comments and any management-key hash from validation.
+	data, err = os.ReadFile(validationPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": err.Error()})
+		return
+	}
 	// WriteConfig retains the inode of a mounted configuration file.
 	if err = WriteConfig(h.configFilePath, data); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": err.Error()})

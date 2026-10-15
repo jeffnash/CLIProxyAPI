@@ -626,6 +626,7 @@ func TestConfigV8JSONTURNSecrets(t *testing.T) {
 
 func TestConfigV8DeletePreservesDocumentPresence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	t.Setenv("CURSOR_API_KEY", "cursor-env-preserved-on-save")
 	file := filepath.Join(t.TempDir(), "config.yaml")
 	raw := `# Keep document comment
 config-version: 8
@@ -754,6 +755,35 @@ plugins:
 		checkReload()
 		request(http.MethodGet, path, http.StatusNotFound, "")
 		request(http.MethodDelete, path, http.StatusNotFound, "")
+	}
+}
+
+func TestConfigV8InvalidRuntimeConfigPreservesSavedConfig(t *testing.T) {
+	t.Setenv("RETRY_POLICIES_JSON", "")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	original := []byte("config-version: 8\nserver: {port: 8317}\n")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: cfg, configFilePath: path}
+	router := gin.New()
+	router.PUT("/v8/management/config/*path", h.ConfigV8)
+	w := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPut, "/v8/management/config/routing/retry/retry-policies", strings.NewReader(`[{"max-retries":1,"delays-seconds":[]}]`))
+	router.ServeHTTP(w, request)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid runtime config: status=%d body=%s", w.Code, w.Body.String())
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(saved) != string(original) || h.cfg != cfg {
+		t.Fatal("rejected update changed saved or runtime config")
 	}
 }
 

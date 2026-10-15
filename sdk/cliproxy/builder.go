@@ -298,8 +298,11 @@ func (b *Builder) Build() (*Service, error) {
 	service.serverOptions = append(service.serverOptions,
 		api.WithPostAuthPersistHook(service.runtimeAuthSyncHook()),
 		api.WithPluginHost(pluginHost),
-		api.WithConfigReloadHook(func(_ context.Context, _ *config.Config) {
-			service.reloadConfigFromWatcher()
+		api.WithConfigReloadHook(func(ctx context.Context, cfg *config.Config) {
+			if w := service.currentWatcher(); w != nil && w.ApplyConfig(cfg) {
+				return
+			}
+			service.applyConfigUpdateWithAuthSynthesis(ctx, cfg, true)
 		}),
 		api.WithModelRefreshHook(func(ctx context.Context, providers []string) int {
 			return service.RefreshFetchedModels(ctx, providers)

@@ -357,10 +357,11 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 }
 
 func (s *Service) managedProviders() []config.ManagedProviderConfig {
-	if s == nil || s.cfg == nil {
+	cfg := s.currentConfig()
+	if cfg == nil {
 		return nil
 	}
-	return config.NormalizeManagedProviders(s.cfg.ManagedProviders)
+	return config.NormalizeManagedProviders(cfg.ManagedProviders)
 }
 
 func (s *Service) managedProviderSet() map[string]bool {

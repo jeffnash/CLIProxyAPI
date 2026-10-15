@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ type retryPolicyState struct {
 	mu         sync.Mutex
 	started    time.Time
 	policy     *config.RetryPolicy
+	explicit   bool
 	authID     string
 	proxyIndex map[string]int
 }
@@ -29,14 +31,14 @@ func withRetryPolicyState(ctx context.Context) context.Context {
 	return context.WithValue(ctx, retryPolicyContextKey{}, &retryPolicyState{started: time.Now(), proxyIndex: make(map[string]int)})
 }
 
-func (m *Manager) retryPolicyFor(auth *Auth, model string) *config.RetryPolicy {
+func (m *Manager) retryPolicyFor(auth *Auth, model string) (*config.RetryPolicy, bool) {
 	// Home owns credential retry budgets and proxy selection remotely.
 	if m.HomeEnabled() || auth == nil {
-		return nil
+		return nil, false
 	}
 	cfg := m.runtimeConfigSnapshot()
 	if cfg == nil {
-		return nil
+		return nil, false
 	}
 	matches := func(values []string, value string) bool {
 		if len(values) == 0 {
@@ -52,10 +54,22 @@ func (m *Manager) retryPolicyFor(auth *Auth, model string) *config.RetryPolicy {
 	for i := range cfg.RetryPolicies {
 		p := &cfg.RetryPolicies[i]
 		if matches(p.Providers, executorKeyFromAuth(auth)) && matches(p.Models, canonicalModelKey(model)) && (p.BaseURL == "" || strings.TrimRight(p.BaseURL, "/") == strings.TrimRight(auth.Attributes["base_url"], "/")) {
-			return p
+			return p, true
 		}
 	}
-	return nil
+	// Meta intermittently rejects available models; retry without suspending them.
+	if strings.EqualFold(executorKeyFromAuth(auth), "meta") {
+		retries := int(m.requestRetry.Load())
+		if override, ok := auth.RequestRetryOverride(); ok {
+			retries = override
+		}
+		return &config.RetryPolicy{
+			MaxRetries:    max(0, retries),
+			DelaysSeconds: []float64{0},
+			Errors:        []config.RetryPolicyError{{Status: http.StatusNotFound, Contains: "model_not_found"}},
+		}, false
+	}
+	return nil, false
 }
 
 func (m *Manager) retryPolicyAuth(ctx context.Context, auth *Auth, model string) *Auth {
@@ -63,10 +77,10 @@ func (m *Manager) retryPolicyAuth(ctx context.Context, auth *Auth, model string)
 	if state == nil {
 		return auth
 	}
-	p := m.retryPolicyFor(auth, model)
+	p, explicit := m.retryPolicyFor(auth, model)
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	state.policy, state.authID = p, auth.ID
+	state.policy, state.explicit, state.authID = p, explicit, auth.ID
 	if p == nil || len(p.ProxyURLs) == 0 {
 		return auth
 	}
@@ -127,11 +141,16 @@ func (m *Manager) policyRetryDecision(ctx context.Context, err error, attempt in
 	if p == nil {
 		return 0, false, false
 	}
-	if ctx.Err() != nil || len(p.DelaysSeconds) == 0 || !retryPolicyMatches(p, err) || attempt >= p.MaxRetries {
+	if !retryPolicyMatches(p, err) {
+		return 0, false, state.explicit
+	}
+	if ctx.Err() != nil || len(p.DelaysSeconds) == 0 || attempt >= p.MaxRetries {
 		return 0, false, true
 	}
 	delay := time.Duration(p.DelaysSeconds[min(attempt, len(p.DelaysSeconds)-1)] * float64(time.Second))
-	if after := retryAfterFromError(err); after != nil && *after > delay {
+	// A matched model-not-found policy owns pacing instead of the availability cooldown.
+	modelNotFound := statusCodeFromError(err) == http.StatusNotFound && isExplicitModelNotFoundError(err, "")
+	if after := retryAfterFromError(err); after != nil && *after > delay && !modelNotFound {
 		delay = *after
 	}
 	delay = jitteredCooldownWait(delay, 0)
@@ -166,7 +185,7 @@ func (m *Manager) policyRoundExclusions(ctx context.Context, round, defaultRetry
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for id, auth := range m.auths {
-		if p := m.retryPolicyFor(auth, model); p != nil {
+		if p, _ := m.retryPolicyFor(auth, model); p != nil {
 			expired := false
 			if state, ok := ctx.Value(retryPolicyContextKey{}).(*retryPolicyState); ok && round > 0 && p.WindowSeconds > 0 {
 				expired = time.Since(state.started) >= time.Duration(p.WindowSeconds*float64(time.Second))
@@ -183,9 +202,13 @@ func (m *Manager) policyRoundExclusions(ctx context.Context, round, defaultRetry
 
 func (m *Manager) policyNeutralResult(result Result) bool {
 	cfg := m.runtimeConfigSnapshot()
-	if cfg == nil || len(cfg.RetryPolicies) == 0 || result.Success || result.Error == nil || result.Error.Code == ErrorCodeForceCooldown {
+	if cfg == nil || result.Success || result.Error == nil || result.Error.Code == ErrorCodeForceCooldown {
 		return false
 	}
 	auth, ok := m.GetByID(result.AuthID)
-	return ok && retryPolicyMatches(m.retryPolicyFor(auth, result.RouteModel), result.Error)
+	if !ok {
+		return false
+	}
+	p, _ := m.retryPolicyFor(auth, result.RouteModel)
+	return retryPolicyMatches(p, result.Error)
 }
