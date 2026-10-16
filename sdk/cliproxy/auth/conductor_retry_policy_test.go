@@ -275,6 +275,8 @@ func TestMetaModelNotFoundDefaultRetryPolicy(t *testing.T) {
 		want bool
 	}{
 		{"model not found", &Error{HTTPStatus: 404, Code: "model_not_found", Message: `{"error":{"code":"model_not_found","message":"The requested model was not found.","type":"invalid_request_error"}}`}, true},
+		{"proxy CONNECT forbidden", &Error{Message: `Post "https://api.meta.ai/v1/responses": Forbidden`}, true},
+		{"upstream forbidden", &Error{HTTPStatus: 403, Message: "Forbidden"}, false},
 		{"endpoint not found", &Error{HTTPStatus: 404, Message: "Not Found"}, false},
 		{"invalid key", &Error{HTTPStatus: 401, Message: "invalid_api_key"}, false},
 		{"quota", &Error{HTTPStatus: 429, Message: "rate_limit_exceeded"}, false},

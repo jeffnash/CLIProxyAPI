@@ -1,10 +1,13 @@
 package cliproxy
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +19,121 @@ import (
 	ex "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
+
+func TestMetaProxyConnectRetryHTTP(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		stream    bool
+		retries   int
+		failures  int32
+		wantCalls int32
+		wantError bool
+	}{
+		{"execute recovery", false, 2, 2, 3, false},
+		{"stream recovery", true, 2, 2, 3, false},
+		{"execute exhausted", false, 2, 3, 3, true},
+		{"stream exhausted", true, 2, 3, 3, true},
+		{"retries disabled", false, 0, 2, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"meta_proxy_ok\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"muse-wonder-full-1.0-contributor\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"META_PROXY_OK\"}]}]}}\n\n")
+			}))
+			defer upstream.Close()
+			var connects atomic.Int32
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodConnect || r.Host != strings.TrimPrefix(upstream.URL, "https://") {
+					t.Errorf("unexpected proxy request: %s %s", r.Method, r.Host)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if connects.Add(1) <= tc.failures {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				origin, errDial := net.Dial("tcp", r.Host)
+				if errDial != nil {
+					t.Error(errDial)
+					w.WriteHeader(http.StatusBadGateway)
+					return
+				}
+				defer origin.Close()
+				client, buffered, errHijack := w.(http.Hijacker).Hijack()
+				if errHijack != nil {
+					t.Error(errHijack)
+					return
+				}
+				defer client.Close()
+				if _, errWrite := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); errWrite != nil {
+					t.Error(errWrite)
+					return
+				}
+				go func() { _, _ = io.Copy(origin, buffered) }()
+				_, _ = io.Copy(client, origin)
+			}))
+			defer proxy.Close()
+			proxyURL, err := url.Parse(proxy.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport := upstream.Client().Transport.(*http.Transport).Clone()
+			transport.Proxy = http.ProxyURL(proxyURL)
+			defer transport.CloseIdleConnections()
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", transport)
+			const model = "muse-wonder-full-1.0-contributor"
+			cfg := &config.Config{RequestRetry: tc.retries}
+			manager := auth.NewManager(nil, nil, nil)
+			manager.SetConfig(cfg)
+			manager.SetRetryConfig(tc.retries, 0, 0)
+			manager.RegisterExecutor(runtimeexecutor.NewMetaExecutor(cfg))
+			id := "meta-proxy-connect-retry"
+			registry.GetGlobalRegistry().RegisterClient(id, "meta", []*registry.ModelInfo{{ID: model}})
+			defer registry.GetGlobalRegistry().UnregisterClient(id)
+			_, err = manager.Register(ctx, &auth.Auth{ID: id, Provider: "meta", Attributes: map[string]string{"base_url": upstream.URL + "/v1", "api_key": "test-only"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte(fmt.Sprintf(`{"model":%q,"input":"hello","stream":%v}`, model, tc.stream))
+			req := ex.Request{Model: model, Payload: payload}
+			opts := ex.Options{SourceFormat: translator.FormatOpenAIResponse, OriginalRequest: payload, Stream: tc.stream}
+			var output []byte
+			if tc.stream {
+				response, errStream := manager.ExecuteStream(ctx, []string{"meta"}, req, opts)
+				err = errStream
+				if response != nil {
+					for chunk := range response.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+						output = append(output, chunk.Payload...)
+					}
+				}
+			} else {
+				response, errExecute := manager.Execute(ctx, []string{"meta"}, req, opts)
+				err = errExecute
+				output = response.Payload
+			}
+			if connects.Load() != tc.wantCalls || (err != nil) != tc.wantError {
+				t.Fatalf("CONNECT attempts=%d, err=%v", connects.Load(), err)
+			}
+			if tc.wantError {
+				if !strings.Contains(err.Error(), "Forbidden") {
+					t.Fatalf("lost proxy error: %v", err)
+				}
+			} else if !strings.Contains(string(output), "META_PROXY_OK") {
+				t.Fatalf("lost response text: %s", output)
+			}
+			credential, _ := manager.GetByID(id)
+			if credential.Unavailable || !credential.NextRetryAfter.IsZero() {
+				t.Fatal("proxy CONNECT failure suspended the Meta credential")
+			}
+			if state := credential.ModelStates[model]; state != nil && (state.Unavailable || !state.NextRetryAfter.IsZero()) {
+				t.Fatal("proxy CONNECT failure cooled down the Meta model")
+			}
+		})
+	}
+}
 
 func TestRetryPolicyClaudeHTTP(t *testing.T) {
 	for _, stream := range []bool{false, true} {
