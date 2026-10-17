@@ -57,16 +57,19 @@ func (m *Manager) retryPolicyFor(auth *Auth, model string) (*config.RetryPolicy,
 			return p, true
 		}
 	}
-	// Meta model misses and pre-response proxy failures must not suspend credentials.
+	// Meta model misses, stream startup timeouts, and proxy failures are retryable.
 	if strings.EqualFold(executorKeyFromAuth(auth), "meta") {
 		retries := int(m.requestRetry.Load())
 		if override, ok := auth.RequestRetryOverride(); ok {
 			retries = override
 		}
 		return &config.RetryPolicy{
-			MaxRetries:       max(0, retries),
-			DelaysSeconds:    []float64{0},
-			Errors:           []config.RetryPolicyError{{Status: http.StatusNotFound, Contains: "model_not_found"}},
+			MaxRetries:    max(0, retries),
+			DelaysSeconds: []float64{0},
+			Errors: []config.RetryPolicyError{
+				{Status: http.StatusNotFound, Contains: "model_not_found"},
+				{Status: http.StatusGatewayTimeout, Contains: "The response stream did not start before the server timeout."},
+			},
 			RetryProxyErrors: true,
 		}, false
 	}

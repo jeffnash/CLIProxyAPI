@@ -201,6 +201,15 @@ func TestRetryPolicyClaudeHTTP(t *testing.T) {
 }
 
 func TestMetaModelNotFoundRetryHTTP(t *testing.T) {
+	testMetaUpstreamRetryHTTP(t, http.StatusNotFound, `{"error":{"code":"model_not_found","message":"The requested model was not found.","param":null,"type":"invalid_request_error"}}`)
+}
+
+func TestMetaStreamStartTimeoutRetryHTTP(t *testing.T) {
+	testMetaUpstreamRetryHTTP(t, http.StatusGatewayTimeout, `{"error":{"code":"gateway_timeout","message":"The response stream did not start before the server timeout.","param":null,"type":"server_error"}}`)
+}
+
+func testMetaUpstreamRetryHTTP(t *testing.T, failureStatus int, failureBody string) {
+	t.Helper()
 	for _, tc := range []struct {
 		name      string
 		stream    bool
@@ -231,8 +240,8 @@ func TestMetaModelNotFoundRetryHTTP(t *testing.T) {
 					t.Errorf("lost model: %s", body)
 				}
 				if calls.Add(1) <= tc.failures {
-					w.WriteHeader(http.StatusNotFound)
-					fmt.Fprint(w, `{"error":{"code":"model_not_found","message":"The requested model was not found.","param":null,"type":"invalid_request_error"}}`)
+					w.WriteHeader(failureStatus)
+					fmt.Fprint(w, failureBody)
 					return
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -276,15 +285,18 @@ func TestMetaModelNotFoundRetryHTTP(t *testing.T) {
 			}
 			if tc.wantError {
 				statusError, ok := err.(interface{ StatusCode() int })
-				if !ok || statusError.StatusCode() != http.StatusNotFound || !strings.Contains(err.Error(), "model_not_found") {
-					t.Fatalf("lost upstream model error: %v", err)
+				if !ok || statusError.StatusCode() != failureStatus || !strings.Contains(err.Error(), failureBody) {
+					t.Fatalf("lost upstream error: %v", err)
 				}
 			} else if !strings.Contains(string(output), "META_RETRY_OK") {
 				t.Fatalf("lost response text: %s", output)
 			}
 			credential, _ := manager.GetByID(id)
 			if credential.Unavailable {
-				t.Fatal("transient Meta model failure suspended credential")
+				t.Fatal("transient Meta failure suspended credential")
+			}
+			if state := credential.ModelStates[model]; state != nil && (state.Unavailable || !state.NextRetryAfter.IsZero()) {
+				t.Fatal("transient Meta failure cooled down the model")
 			}
 		})
 	}

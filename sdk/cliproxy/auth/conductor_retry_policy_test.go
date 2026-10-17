@@ -115,19 +115,28 @@ func TestRetryPolicyExhaustionAndProxyRotation(t *testing.T) {
 	}
 }
 func TestRetryPolicyDoesNotReplayPartialStream(t *testing.T) {
-	e := &policyExecutor{partial: true, err: &Error{HTTPStatus: 404, Message: "Model not found"}}
-	m := newPolicyManager(t, testPolicy(), e)
-	r, err := m.ExecuteStream(t.Context(), []string{"policy-provider"}, ex.Request{Model: "policy-model"}, ex.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var data, failed bool
-	for c := range r.Chunks {
-		data = data || len(c.Payload) > 0
-		failed = failed || c.Err != nil
-	}
-	if !data || !failed || len(e.calls) != 1 {
-		t.Fatalf("data=%v failed=%v calls=%d", data, failed, len(e.calls))
+	for _, failure := range []*Error{
+		{HTTPStatus: 404, Message: "Model not found"},
+		{HTTPStatus: 504, Message: "The response stream did not start before the server timeout."},
+	} {
+		t.Run(failure.Message, func(t *testing.T) {
+			e := &policyExecutor{partial: true, err: failure}
+			p := testPolicy()
+			p.Errors = []config.RetryPolicyError{{Status: failure.HTTPStatus, Contains: failure.Message}}
+			m := newPolicyManager(t, p, e)
+			r, err := m.ExecuteStream(t.Context(), []string{"policy-provider"}, ex.Request{Model: "policy-model"}, ex.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var data, failed bool
+			for c := range r.Chunks {
+				data = data || len(c.Payload) > 0
+				failed = failed || c.Err != nil
+			}
+			if !data || !failed || len(e.calls) != 1 {
+				t.Fatalf("data=%v failed=%v calls=%d", data, failed, len(e.calls))
+			}
+		})
 	}
 }
 func TestRetryPolicyCancellation(t *testing.T) {
@@ -275,6 +284,8 @@ func TestMetaModelNotFoundDefaultRetryPolicy(t *testing.T) {
 		want bool
 	}{
 		{"model not found", &Error{HTTPStatus: 404, Code: "model_not_found", Message: `{"error":{"code":"model_not_found","message":"The requested model was not found.","type":"invalid_request_error"}}`}, true},
+		{"stream start timeout", &Error{HTTPStatus: 504, Message: `{"error":{"code":"gateway_timeout","message":"The response stream did not start before the server timeout.","type":"server_error"}}`}, true},
+		{"other gateway timeout", &Error{HTTPStatus: 504, Message: "upstream gateway timeout"}, false},
 		{"proxy CONNECT forbidden", &Error{Message: `Post "https://api.meta.ai/v1/responses": Forbidden`}, true},
 		{"upstream forbidden", &Error{HTTPStatus: 403, Message: "Forbidden"}, false},
 		{"endpoint not found", &Error{HTTPStatus: 404, Message: "Not Found"}, false},
