@@ -114,3 +114,36 @@ func TestRunConnForwardsAndPings(t *testing.T) {
 		t.Fatalf("runConn did not return after connection close")
 	}
 }
+
+// The deployed Worker sends frame headers as name -> string
+// (Object.fromEntries of the fetch Headers). A regression here breaks every
+// tunneled request, so pin the exact Worker-shaped frame.
+func TestRequestFrameHeadersStringValues(t *testing.T) {
+	payload := []byte(`{"id":"1","method":"POST","path":"/v1/chat/completions","headers":{"Content-Type":"application/json","Authorization":"Bearer x"},"body":"e30="}`)
+	var frame requestFrame
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		t.Fatalf("unmarshal worker-shaped frame: %v", err)
+	}
+	if got := frame.Headers.Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", got, "application/json")
+	}
+	if got := frame.Headers.Get("Authorization"); got != "Bearer x" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer x")
+	}
+	if frame.ID != "1" || frame.Method != "POST" || frame.Path != "/v1/chat/completions" {
+		t.Errorf("frame fields = %+v", frame)
+	}
+}
+
+// The Go http.Header form (name -> []string) must keep working too.
+func TestRequestFrameHeadersArrayValues(t *testing.T) {
+	payload := []byte(`{"id":"2","method":"GET","path":"/v1/models","headers":{"X-Test":["a","b"]}}`)
+	var frame requestFrame
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		t.Fatalf("unmarshal go-shaped frame: %v", err)
+	}
+	values := frame.Headers.Values("X-Test")
+	if len(values) != 2 || values[0] != "a" || values[1] != "b" {
+		t.Errorf("X-Test = %v, want [a b]", values)
+	}
+}

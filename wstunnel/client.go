@@ -24,6 +24,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/textproto"
 	"os"
 	"strings"
 	"sync"
@@ -38,6 +39,36 @@ type requestFrame struct {
 	Path    string      `json:"path"`
 	Headers http.Header `json:"headers,omitempty"`
 	Body    []byte      `json:"body,omitempty"`
+}
+
+// UnmarshalJSON accepts request frames whose headers are encoded either as
+// name -> []string (the Go http.Header form) or as name -> string, which is
+// what the Worker sends (Object.fromEntries of the fetch Headers). Both
+// shapes occur on the wire, so tolerate both here. Regression coverage lives
+// in client_test.go.
+func (f *requestFrame) UnmarshalJSON(data []byte) error {
+	type alias requestFrame
+	var raw struct {
+		alias
+		Headers map[string]json.RawMessage `json:"headers"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*f = requestFrame(raw.alias)
+	f.Headers = make(http.Header, len(raw.Headers))
+	for name, rawValue := range raw.Headers {
+		var list []string
+		if err := json.Unmarshal(rawValue, &list); err != nil {
+			var single string
+			if err := json.Unmarshal(rawValue, &single); err != nil {
+				continue
+			}
+			list = []string{single}
+		}
+		f.Headers[textproto.CanonicalMIMEHeaderKey(name)] = list
+	}
+	return nil
 }
 
 type responseFrame struct {
