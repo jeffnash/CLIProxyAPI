@@ -86,8 +86,24 @@ type tunnelClient struct {
 	httpClient   *http.Client
 }
 
+// normalizeWorkerURL accepts either a full WebSocket URL
+// ("wss://host/tunnel") or a bare Worker host ("host"), which expands to
+// "wss://host/tunnel" — the form accepted before -worker took a verbatim
+// URL. Accepting both keeps existing units and scripts working.
+func normalizeWorkerURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "ws://") || strings.HasPrefix(raw, "wss://") {
+		return raw
+	}
+	host := strings.TrimSuffix(raw, "/")
+	if !strings.Contains(host, "/") {
+		host += "/tunnel"
+	}
+	return "wss://" + host
+}
+
 func main() {
-	worker := flag.String("worker", "", "Worker WebSocket URL (wss://...)")
+	worker := flag.String("worker", "", "Worker WebSocket URL (wss://...) or bare Worker host")
 	target := flag.String("target", "http://127.0.0.1:8317", "local proxy base URL")
 	conns := flag.Int("conns", 4, "number of persistent tunnel connections")
 	pingInterval := flag.Duration("ping-interval", 20*time.Second, "WebSocket keepalive ping interval (0 disables)")
@@ -102,8 +118,9 @@ func main() {
 		os.Exit(2)
 	}
 
+	workerURL := normalizeWorkerURL(*worker)
 	client := &tunnelClient{
-		workerURL:    *worker,
+		workerURL:    workerURL,
 		target:       strings.TrimSuffix(*target, "/"),
 		pingInterval: *pingInterval,
 		// No timeout: proxied generations legitimately run for minutes.
@@ -114,7 +131,7 @@ func main() {
 		},
 	}
 
-	log.Printf("wstunnel-client: %d connection(s) to %s, target %s, ping %s", *conns, *worker, client.target, *pingInterval)
+	log.Printf("wstunnel-client: %d connection(s) to %s, target %s, ping %s", *conns, workerURL, client.target, *pingInterval)
 	var wg sync.WaitGroup
 	for i := 0; i < *conns; i++ {
 		wg.Add(1)

@@ -147,3 +147,22 @@ func TestRequestFrameHeadersArrayValues(t *testing.T) {
 		t.Errorf("X-Test = %v, want [a b]", values)
 	}
 }
+
+func TestNormalizeWorkerURL(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"example.workers.dev", "wss://example.workers.dev/tunnel"},
+		{"example.workers.dev/", "wss://example.workers.dev/tunnel"},
+		{"example.workers.dev/custom", "wss://example.workers.dev/custom"},
+		{"wss://example.workers.dev/tunnel", "wss://example.workers.dev/tunnel"},
+		{"ws://localhost:8787/tunnel", "ws://localhost:8787/tunnel"},
+		{"  example.workers.dev  ", "wss://example.workers.dev/tunnel"},
+	}
+	for _, tc := range cases {
+		if got := normalizeWorkerURL(tc.in); got != tc.want {
+			t.Errorf("normalizeWorkerURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
