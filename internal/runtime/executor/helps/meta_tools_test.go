@@ -76,6 +76,97 @@ func TestSanitizeMetaWebSearchTools_StripsSearchContentTypesFromWebSearch(t *tes
 	}
 }
 
+func TestStripMetaToolSchemaKeywords_RemovesPatternRecursively(t *testing.T) {
+	input := []byte(`{
+		"model": "muse-wonder-full-1.0-contributor",
+		"input": "hello",
+		"tools": [
+			{
+				"name": "lookup",
+				"description": "look up text",
+				"input_schema": {
+					"type": "object",
+					"properties": {
+						"query": {"maxLength":1024,"minLength":1,"pattern":"^[^\\0]*$","type":"string"},
+						"options": {
+							"type": "object",
+							"properties": {
+								"filter": {"type": "string", "pattern": "^[a-z]+$", "enum": ["a", "b"]}
+							},
+							"anyOf": [
+								{"type": "string", "pattern": "^x", "description": "starts with x"},
+								{"type": "integer"}
+							]
+						},
+						"pattern": {"type": "string", "description": "arg named pattern"}
+					},
+					"required": ["query"]
+				}
+			},
+			{
+				"type": "function",
+				"name": "search",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"items": {"type": "array", "items": {"type": "string", "pattern": "^y"}}
+					}
+				}
+			}
+		]
+	}`)
+
+	got := StripMetaToolSchemaKeywords(input)
+
+	assertNoPattern := func(path string) {
+		t.Helper()
+		if gjson.GetBytes(got, path).Exists() {
+			t.Errorf("%s still exists in %s", path, got)
+		}
+	}
+	assertNoPattern("tools.0.input_schema.properties.query.pattern")
+	assertNoPattern("tools.0.input_schema.properties.options.properties.filter.pattern")
+	assertNoPattern("tools.0.input_schema.properties.options.anyOf.0.pattern")
+	assertNoPattern("tools.1.parameters.properties.items.items.pattern")
+
+	// Every other key/value is unchanged.
+	query := gjson.GetBytes(got, "tools.0.input_schema.properties.query")
+	if query.Get("type").String() != "string" || query.Get("minLength").Int() != 1 || query.Get("maxLength").Int() != 1024 {
+		t.Errorf("query schema changed unexpectedly: %s", query.Raw)
+	}
+	filter := gjson.GetBytes(got, "tools.0.input_schema.properties.options.properties.filter")
+	if filter.Get("type").String() != "string" || len(filter.Get("enum").Array()) != 2 {
+		t.Errorf("filter schema changed unexpectedly: %s", filter.Raw)
+	}
+	if d := gjson.GetBytes(got, "tools.0.input_schema.properties.options.anyOf.0.description").String(); d != "starts with x" {
+		t.Errorf("anyOf description changed: %q", d)
+	}
+	// A property NAMED pattern is an argument definition, not the keyword.
+	namedArg := gjson.GetBytes(got, "tools.0.input_schema.properties.pattern")
+	if !namedArg.Exists() || namedArg.Get("type").String() != "string" {
+		t.Errorf("argument named pattern was removed: %s", got)
+	}
+	if m := gjson.GetBytes(got, "model").String(); m != "muse-wonder-full-1.0-contributor" {
+		t.Errorf("model changed: %q", m)
+	}
+}
+
+func TestStripMetaToolSchemaKeywords_NoToolsOrMalformedIsNoOp(t *testing.T) {
+	if got := StripMetaToolSchemaKeywords(nil); len(got) != 0 {
+		t.Fatalf("expected empty output for nil input, got %s", got)
+	}
+	for _, payload := range [][]byte{
+		[]byte(`{"model":"muse-spark-1.3","input":"hello"}`),
+		[]byte(`{"tools":"not-an-array"}`),
+		[]byte(`{"tools":[{"name":"x","input_schema":"not-an-object"}]}`),
+		[]byte(`not json`),
+	} {
+		if got := StripMetaToolSchemaKeywords(payload); string(got) != string(payload) {
+			t.Fatalf("expected unmodified payload %s, got %s", payload, got)
+		}
+	}
+}
+
 func TestSanitizeMetaWebSearchTools_NoToolsOrEmpty(t *testing.T) {
 	if got := SanitizeMetaWebSearchTools(nil); len(got) != 0 {
 		t.Fatalf("expected empty output for nil input, got %s", got)

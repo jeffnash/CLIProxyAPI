@@ -201,6 +201,51 @@ func TestMetaExecutor_ExecuteSuccessAndRateLimit(t *testing.T) {
 	}
 }
 
+func TestMetaExecutor_StripsPatternFromToolSchemas(t *testing.T) {
+	var capturedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/responses" {
+			capturedBody, _ = io.ReadAll(r.Body)
+			writeMetaResponsesOK(w, "ok")
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	exec := NewMetaExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "meta",
+		Attributes: map[string]string{
+			"api_key":  "valid-token",
+			"base_url": server.URL,
+		},
+	}
+	payload := []byte(`{"model":"muse-spark-1.3","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"lookup","description":"look up","input_schema":{"type":"object","properties":{"query":{"maxLength":1024,"minLength":1,"pattern":"^[^\\0]*$","type":"string"}},"required":["query"]}}]}`)
+	req := cliproxyexecutor.Request{Model: "muse-spark-1.3", Payload: payload}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+
+	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if len(capturedBody) == 0 {
+		t.Fatalf("expected upstream request body to be captured")
+	}
+	query := gjson.GetBytes(capturedBody, "tools.0.parameters.properties.query")
+	if !query.Exists() {
+		query = gjson.GetBytes(capturedBody, "tools.0.input_schema.properties.query")
+	}
+	if !query.Exists() {
+		t.Fatalf("translated tool schema missing query property: %s", capturedBody)
+	}
+	if query.Get("pattern").Exists() {
+		t.Errorf("pattern keyword was not stripped: %s", query.Raw)
+	}
+	if query.Get("type").String() != "string" || query.Get("minLength").Int() != 1 || query.Get("maxLength").Int() != 1024 {
+		t.Errorf("other schema keys changed unexpectedly: %s", query.Raw)
+	}
+}
+
 func mapToJSON(m map[string]any) string {
 	b, _ := json.Marshal(m)
 	return string(b)
