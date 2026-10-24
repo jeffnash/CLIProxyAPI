@@ -91,3 +91,22 @@ sidecars/cursor-bridge/.cursor-agent-store/
 # source control; if you need them locally they read CURSOR_API_KEY from env.
 sidecars/cursor-bridge/trace-sdk.cjs
 sidecars/cursor-bridge/trace-sdk2.cjs
+
+# Local deployment/ops state for this fork's self-hosted instance.
+# NEVER commit these: they hold live credentials (provider keys in run/.env,
+# OAuth tokens in run/auths/, production env backups under migration/),
+# local tooling, and build outputs. Owner rule, 2026-10-24: no secrets or
+# personal info in git, ever.
+run/
+migration/
+SETUP.md
+tools/
+systemd/
+wstunnel/.wrangler/
+wstunnel/wstunnel-client
+wstunnel/mock-worker
+wstunnel/*.bak
+wstunnel/DEPLOY.md
+wstunnel/mock-worker.go
+wstunnel/worker.js
+wstunnel/wrangler.jsonc
