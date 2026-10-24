@@ -106,22 +106,38 @@ func resolveCodexAlias(modelName string) (baseModel, effort string, ok bool) {
 	case "gpt-5.4-xhigh":
 		return "gpt-5.4", "xhigh", true
 	default:
-		for _, effort := range []string{"xhigh", "high", "medium", "low", "minimal", "none"} {
-			suffix := "-" + effort
-			if !strings.HasSuffix(modelName, suffix) {
-				continue
-			}
-			baseModel := strings.TrimSuffix(modelName, suffix)
-			if !strings.HasPrefix(baseModel, "gpt-5") {
-				continue
-			}
-			if registry.LookupModelInfo(modelName) == nil {
-				continue
-			}
-			return baseModel, effort, true
-		}
-		return "", "", false
+		return resolveGenericCodexAlias(modelName)
 	}
+}
+
+// codexEffortLevels are the thinking level names the catalog alias generator
+// appends to model IDs (see registry.expandReasoningAliases).
+var codexEffortLevels = []string{"xhigh", "minimal", "medium", "high", "low", "none", "max"}
+
+// resolveGenericCodexAlias resolves an effort-suffixed alias generically: the
+// ID must end in "-<level>", the remaining prefix must be a registered model,
+// and that model's declared thinking levels must include the level.
+func resolveGenericCodexAlias(modelName string) (baseModel, effort string, ok bool) {
+	for _, level := range codexEffortLevels {
+		suffix := "-" + level
+		if !strings.HasSuffix(modelName, suffix) {
+			continue
+		}
+		prefix := strings.TrimSuffix(modelName, suffix)
+		if prefix == "" {
+			continue
+		}
+		info := registry.LookupModelInfo(prefix)
+		if info == nil || info.Thinking == nil {
+			continue
+		}
+		for _, declared := range info.Thinking.Levels {
+			if strings.EqualFold(strings.TrimSpace(declared), level) {
+				return prefix, level, true
+			}
+		}
+	}
+	return "", "", false
 }
 func setReasoningEffortByAlias(payload []byte, baseModel string, effort string) []byte {
 	if strings.TrimSpace(baseModel) != "" {

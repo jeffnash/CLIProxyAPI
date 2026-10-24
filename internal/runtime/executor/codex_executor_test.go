@@ -179,6 +179,43 @@ func TestResolveCodexAlias(t *testing.T) {
 			wantEffort:    "",
 			wantOk:        false,
 		},
+		// Generic resolution: registered base model whose declared thinking
+		// levels include the dash suffix (catalog aliases beyond gpt-5.x).
+		{
+			name:          "gpt-6-astra-xhigh (generic)",
+			modelName:     "gpt-6-astra-xhigh",
+			wantBaseModel: "gpt-6-astra",
+			wantEffort:    "xhigh",
+			wantOk:        true,
+		},
+		{
+			name:          "gpt-6.1-sol-xhigh (generic)",
+			modelName:     "gpt-6.1-sol-xhigh",
+			wantBaseModel: "gpt-6.1-sol",
+			wantEffort:    "xhigh",
+			wantOk:        true,
+		},
+		{
+			name:          "gpt-6-astra-max (generic)",
+			modelName:     "gpt-6-astra-max",
+			wantBaseModel: "gpt-6-astra",
+			wantEffort:    "max",
+			wantOk:        true,
+		},
+		{
+			name:          "undeclared level is not stripped",
+			modelName:     "gpt-6-astra-minimal",
+			wantBaseModel: "",
+			wantEffort:    "",
+			wantOk:        false,
+		},
+		{
+			name:          "unregistered base is untouched",
+			modelName:     "gpt-9-nonexistent-xhigh",
+			wantBaseModel: "",
+			wantEffort:    "",
+			wantOk:        false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -194,6 +231,20 @@ func TestResolveCodexAlias(t *testing.T) {
 				t.Errorf("resolveCodexAlias(%q) ok = %v, want %v", tt.modelName, gotOk, tt.wantOk)
 			}
 		})
+	}
+}
+
+func TestResolveCodexUpstreamModelGenericAlias(t *testing.T) {
+	// The codex- prefix is stripped before alias resolution.
+	_, modelForUpstream, aliasEffort := resolveCodexUpstreamModel(nil, "codex-gpt-6-astra-xhigh")
+	if modelForUpstream != "gpt-6-astra" || aliasEffort != "xhigh" {
+		t.Errorf("codex- prefix: model=%q effort=%q, want gpt-6-astra/xhigh", modelForUpstream, aliasEffort)
+	}
+
+	// A suffixed ID with an unregistered base passes through untouched.
+	_, modelForUpstream, aliasEffort = resolveCodexUpstreamModel(nil, "gpt-9-nonexistent-xhigh")
+	if modelForUpstream != "gpt-9-nonexistent-xhigh" || aliasEffort != "" {
+		t.Errorf("unregistered base: model=%q effort=%q, want untouched", modelForUpstream, aliasEffort)
 	}
 }
 
