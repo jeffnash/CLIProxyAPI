@@ -1234,6 +1234,7 @@ func managedProviderFilterSet(values []string, prefix string) map[string]bool {
 
 func resolveManagedProviderModel(providerName, prefix, modelID string) string {
 	stripped := modelID
+	hadProtocolPrefix := false
 	for _, protocolPrefix := range []string{
 		registry.ManagedProviderOpenAIResponsesProtocolPrefix,
 		registry.ManagedProviderOpenAICompletionsProtocolPrefix,
@@ -1242,28 +1243,52 @@ func resolveManagedProviderModel(providerName, prefix, modelID string) string {
 	} {
 		if strings.HasPrefix(stripped, protocolPrefix) {
 			stripped = strings.TrimPrefix(stripped, protocolPrefix)
+			hadProtocolPrefix = true
 			break
 		}
 	}
-	if prefix != "" {
-		stripped = strings.TrimPrefix(stripped, prefix)
+
+	lookup := func(candidate string) (string, bool) {
+		managedProviderAliasMapMu.RLock()
+		if aliases := managedProviderAliasMap[providerName]; len(aliases) > 0 {
+			if apiID, ok := aliases[candidate]; ok {
+				managedProviderAliasMapMu.RUnlock()
+				return apiID, true
+			}
+		}
+		managedProviderAliasMapMu.RUnlock()
+		if info := registry.LookupModelInfo(candidate, providerName); info != nil && strings.TrimSpace(info.UpstreamID) != "" {
+			return strings.TrimSpace(info.UpstreamID), true
+		}
+		return "", false
 	}
 
-	managedProviderAliasMapMu.RLock()
-	if aliases := managedProviderAliasMap[providerName]; len(aliases) > 0 {
-		if apiID, ok := aliases[stripped]; ok {
-			managedProviderAliasMapMu.RUnlock()
-			return apiID
-		}
-		if apiID, ok := aliases[modelID]; ok {
-			managedProviderAliasMapMu.RUnlock()
-			return apiID
-		}
+	// The protocol-stripped form may already be the upstream model ID (or a
+	// known alias for it): the routing layer passes managed-provider models
+	// in exactly that form. Resolve it before removing the provider prefix.
+	if resolved, ok := lookup(stripped); ok {
+		return resolved
 	}
-	managedProviderAliasMapMu.RUnlock()
-
-	if info := registry.LookupModelInfo(stripped, providerName); info != nil && strings.TrimSpace(info.UpstreamID) != "" {
-		return strings.TrimSpace(info.UpstreamID)
+	if resolved, ok := lookup(modelID); ok {
+		return resolved
+	}
+	if prefix != "" && strings.HasPrefix(stripped, prefix) {
+		candidate := strings.TrimPrefix(stripped, prefix)
+		if resolved, ok := lookup(candidate); ok {
+			return resolved
+		}
+		if hadProtocolPrefix {
+			// Full public address form (protocol + provider prefix) for a
+			// model the provider never listed: stripping is the documented
+			// behavior for such manually addressed models.
+			return candidate
+		}
+		// No protocol prefix: the caller handed us the routing form, which
+		// is already the upstream model ID. It may itself begin with the
+		// provider prefix text — Cline Pass slugs ("cline-pass/...") live
+		// under a provider whose prefix is "cline-" — and stripping here
+		// would mangle it into a model the upstream has never heard of.
+		return stripped
 	}
 	return stripped
 }

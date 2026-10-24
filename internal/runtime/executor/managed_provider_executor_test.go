@@ -366,6 +366,31 @@ func TestManagedProviderExecutorFetchModelsGeneratesExplicitAliases(t *testing.T
 	}
 }
 
+// An upstream model ID can itself begin with the provider's prefix text
+// (Cline Pass slugs "cline-pass/..." under a provider prefixed "cline-").
+// The routing layer hands the executor the already-unprefixed upstream ID;
+// resolveManagedProviderModel must not strip the prefix a second time and
+// mangle it into a model the upstream has never heard of.
+func TestResolveManagedProviderModelKeepsUpstreamIDStartingWithPrefix(t *testing.T) {
+	clearManagedProviderStateForTest(t)
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// Routing form: already the upstream ID, no protocol prefix.
+		{"cline-pass/glm-5.3-flash", "cline-pass/glm-5.3-flash"},
+		// Full public address form: protocol + provider prefix still strip.
+		{"openai-cline-cline-pass/glm-5.3-flash", "cline-pass/glm-5.3-flash"},
+		// Bare undiscovered models pass through untouched.
+		{"some-model", "some-model"},
+	}
+	for _, tc := range cases {
+		if got := resolveManagedProviderModel("cline", "cline-", tc.in); got != tc.want {
+			t.Errorf("resolveManagedProviderModel(%q)=%q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestManagedProviderExecutorResponsesAliasSkipsIncompatibleOpenAIChatFallback(t *testing.T) {
 	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
