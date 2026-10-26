@@ -1180,6 +1180,107 @@ function buildWriteSuccess(c, s) {
   return r;
 }
 
+// Native grep routing: the SDK's GrepResult success is STRUCTURED (agent.v1.GrepSuccess, verified against
+// the patched bundle's fromJson seam — see selfTestResultSerialization): { pattern, path, outputMode,
+// workspaceResults: { <root>: <union> } }, where the union is one of
+//   content: { matches: [{ file, matches: [{ lineNumber, content, contentTruncated, isContextLine }] }],
+//              totalLines, totalMatchedLines, clientTruncated, ripgrepTruncated }
+//   count:   { counts: [{ file, count }], totalFiles, totalMatches, clientTruncated, ripgrepTruncated }
+//   files:   { files: [<path>], totalFiles, clientTruncated, ripgrepTruncated }
+// The client's grep tool returns rg-style TEXT, so buildGrepResult parses it back into that structure:
+//   match line   "file:123:text"  (colon separators)  -> a content match (isContextLine false)
+//   context line "file-123-text"  (dash separators)   -> a content match (isContextLine true)
+//   count line   "file:123"      (whole line)         -> a per-file count
+//   bare path line (files mode only)                  -> a matched file
+// HONESTY RULES (same spirit as buildReadSuccess): a "no matches" text yields a truthful EMPTY success; a
+// non-empty text with NO parseable structure is NOT dressed up as a success — it degrades to the typed
+// error variant carrying the raw output (capped), so the model still sees the results, as a failure shape.
+const GREP_MATCH_LINE_RE = /^(.+?):(\d+):[ \t]?(.*)$/;
+const GREP_CONTEXT_LINE_RE = /^(.+?)-(\d+)-[ \t]?(.*)$/;
+const GREP_COUNT_LINE_RE = /^(.+?):(\d+)$/;
+const GREP_NO_MATCHES_RE = /^\s*(no matches( found)?|no results( found)?|0 matches|no files? (found|matched)|nothing found)\b/i;
+const GREP_TRUNCATED_MARKER_RE = /^\W*(results|output|matches)?\W*truncated\b/i;
+
+function grepOutputMode(s) {
+  const raw = String((s && s.outputMode) || "").toLowerCase();
+  if (raw.includes("count")) return "count";
+  if (raw.includes("file")) return "files";
+  return "content";
+}
+
+function parseGrepText(text) {
+  const files = new Map(); // file -> [{ lineNumber, content, isContextLine }] (content order preserved)
+  const counts = new Map(); // file -> count
+  const barePaths = [];
+  let structured = false;
+  let truncated = false;
+  for (const line of String(text || "").split("\n")) {
+    if (!line.trim()) continue;
+    let m = GREP_MATCH_LINE_RE.exec(line);
+    if (m) {
+      if (!files.has(m[1])) files.set(m[1], []);
+      files.get(m[1]).push({ lineNumber: Number(m[2]), content: m[3], isContextLine: false });
+      structured = true;
+      continue;
+    }
+    m = GREP_CONTEXT_LINE_RE.exec(line);
+    if (m) {
+      if (!files.has(m[1])) files.set(m[1], []);
+      files.get(m[1]).push({ lineNumber: Number(m[2]), content: m[3], isContextLine: true });
+      structured = true;
+      continue;
+    }
+    m = GREP_COUNT_LINE_RE.exec(line);
+    if (m) { counts.set(m[1], Number(m[2])); structured = true; continue; }
+    if (GREP_TRUNCATED_MARKER_RE.test(line)) { truncated = true; continue; }
+    // Bare path candidates (files mode): path-looking lines only — a "/" or a file extension, no spaces
+    // before the extension, and not a prose/header line ("Found 3 files" has spaces and no extension).
+    if (!/\s/.test(line.trim()) && (line.includes("/") || /\.[A-Za-z0-9]{1,10}$/.test(line.trim()))) barePaths.push(line.trim());
+  }
+  return { files, counts, barePaths, structured, truncated };
+}
+
+function buildGrepResult(c, s, isError, ctx) {
+  // GrepError carries NO path field (see fsErrorResult note below) — message only.
+  if (isError) return fsErrorResult(ccErrorMessageText(c, "grep failed"));
+  const text = c == null ? "" : String(c);
+  const mode = grepOutputMode(s);
+  const parsed = parseGrepText(text);
+  const root = (s && typeof s.path === "string" && s.path) || (ctx && ctx.cwd) || "";
+  const success = { pattern: (s && s.pattern) || "", path: (s && s.path) || "", outputMode: mode, workspaceResults: {} };
+  // Bare path lines only count as structure in files mode (elsewhere they are just unparseable prose).
+  const hasStructure = parsed.structured || (mode === "files" && parsed.barePaths.length > 0);
+  const noMatches = !hasStructure && (text.trim() === "" || GREP_NO_MATCHES_RE.test(text.trim()));
+  if (!hasStructure && !noMatches) {
+    const raw = text.length > 4000 ? text.slice(0, 4000) + "\n[raw output truncated]" : text;
+    return fsErrorResult("the client grep result was not in a recognized structured format; raw output follows:\n" + raw);
+  }
+  if (mode === "count") {
+    const counts = new Map(parsed.counts);
+    if (!counts.size) for (const [file, lines] of parsed.files) counts.set(file, lines.filter((l) => !l.isContextLine).length);
+    const list = [...counts.entries()].map(([file, count]) => ({ file, count }));
+    const totalMatches = list.reduce((sum, e) => sum + e.count, 0);
+    success.workspaceResults[root] = { count: { counts: list, totalFiles: list.length, totalMatches, clientTruncated: parsed.truncated, ripgrepTruncated: false } };
+    return { success };
+  }
+  if (mode === "files") {
+    const names = new Set(parsed.barePaths);
+    for (const file of parsed.files.keys()) names.add(file);
+    for (const file of parsed.counts.keys()) names.add(file);
+    const list = [...names];
+    success.workspaceResults[root] = { files: { files: list, totalFiles: list.length, clientTruncated: parsed.truncated, ripgrepTruncated: false } };
+    return { success };
+  }
+  const matches = [...parsed.files.entries()].map(([file, lines]) => ({
+    file,
+    matches: lines.map((l) => ({ lineNumber: l.lineNumber, content: l.content, isContextLine: l.isContextLine })),
+  }));
+  let totalLines = 0, totalMatchedLines = 0;
+  for (const lines of parsed.files.values()) for (const l of lines) { totalLines++; if (!l.isContextLine) totalMatchedLines++; }
+  success.workspaceResults[root] = { content: { matches, totalLines, totalMatchedLines, clientTruncated: parsed.truncated, ripgrepTruncated: false } };
+  return { success };
+}
+
 // agent.v1.{Read,Write,Delete,Ls,Grep,Fetch,...}Error all share a `result.error` oneof member of shape
 // { error: <message string>, ...optional context }. The failure text goes in the field literally named
 // `error` — there is NO `message` field and NO generic agent.v1.Error{message} in @cursor/sdk 1.0.14
@@ -1222,7 +1323,10 @@ const CC_CASES = {
   // ADD-57: report ctx.cwd (the session's real processWorkingDirectory) in workingDirectory / exit.cwd.
   shellArgs:       { ccTool: "shell", stream: false, buildResult: (c, s, isError, ctx) => { const r = parseShellContent(c); const code = isError && r.exitCode === 0 ? 1 : r.exitCode; return { success: { command: s && s.command, workingDirectory: (ctx && ctx.cwd) || "", exitCode: code, stdout: r.stdout, stderr: r.stderr } }; } },
   shellStreamArgs: { ccTool: "shell", stream: true,  buildChunks: (c, isError, ctx) => { const r = parseShellContent(c); const code = isError && r.exitCode === 0 ? 1 : r.exitCode; const aborted = isError ? true : r.aborted; const out = [{ stdout: { data: r.stdout } }]; if (r.stderr) out.push({ stderr: { data: r.stderr } }); out.push({ exit: { code, cwd: (ctx && ctx.cwd) || "", aborted, localExecutionTimeMs: 1 } }); return out; } },
-  // grep/ls: routed via TYPED_UNAVAILABLE_U in unaryExecPreflight (not CC_CASES).
+  // grep: routed to the client's grep tool; buildGrepResult parses its rg-style text output back into the
+  // structured GrepResult (see above). ls: still routed via TYPED_UNAVAILABLE_U in unaryExecPreflight —
+  // LsSuccess needs a directory-tree structure the client's text output cannot honestly supply.
+  grepArgs:        { ccTool: "grep", stream: false, buildResult: (c, s, isError, ctx) => buildGrepResult(c, s, isError, ctx) },
 };
 // Control-flow exec cases the server may send: answer with a typed "allow" so the run proceeds (a bare
 // error reject can deny the action / desync). allowlisted is a bool.
@@ -1251,7 +1355,8 @@ const CONTROL_TYPED = { diagnosticsArgs: { rejected: {} }, canvasDiagnosticsArgs
 // maps to its <X>Result via the SDK's <X>Args -> <X>Result convention; if a mapping were wrong, fromJson
 // throws and it degrades to the same exec error as the old reject (no worse).
 const TYPED_UNAVAILABLE_U = new Set([
-  "grepArgs",                 // GrepResult.error                 (model falls back to shell rg)
+  // NOTE: grepArgs is deliberately NOT here — it is routed to the client's grep tool via CC_CASES
+  // (buildGrepResult). It was H17 until the routing landed; lsArgs stays H17 (see CC_CASES note).
   "lsArgs",                   // LsResult.error                   (model falls back to shell ls)
   "fetchArgs",                // FetchResult.error
   "backgroundShellSpawnArgs", // BackgroundShellSpawnResult.error
@@ -1320,6 +1425,22 @@ function ccArgsFor(cas, s) {
     case "shellArgs": case "shellStreamArgs": return { command: s && s.command, cwd: (s && s.workingDirectory) || undefined };
     case "writeArgs": return { path: s && s.path, content: s && s.fileText };
     case "deleteArgs": return { path: s && s.path };
+    // Native GrepArgs -> client grep input. Keys the advertised harness schema does not know are dropped
+    // by normalization (each harness spells grep differently). `context` fans out to contextBefore/
+    // contextAfter when the SDK did not split them. SDK-only knobs with no client counterpart
+    // (outputMode, caseInsensitive, multiline, type, sort) are not forwarded — the client's grep applies
+    // its own semantics for those. `glob` is deliberately NOT forwarded: the adapter's alias lexicon maps
+    // glob/include onto `pattern` whenever a harness schema has no include-style property of its own, and
+    // a conflicting alias next to the exact pattern is a hard ambiguous_alias normalization error — the
+    // whole call would fail. An unfiltered result set is a truthful superset of the requested one; a
+    // failed call is strictly worse.
+    case "grepArgs": return {
+      pattern: s && s.pattern,
+      path: s && s.path,
+      contextBefore: s && (s.contextBefore ?? s.context),
+      contextAfter: s && (s.contextAfter ?? s.context),
+      limit: s && s.headLimit,
+    };
     default: return s;
   }
 }
@@ -1408,6 +1529,9 @@ function syntheticArtifactFailure(decision) {
 const NATIVE_TOOL_DISABLED_MSG = "tool disabled for this turn by tool_choice policy";
 function blockedNativeResult(cas, s, cwd = "") {
   switch (cas) {
+    case "grepArgs":
+      // GrepError has no `path` field (unlike the fs *Error types) — message only, or fromJson rejects it.
+      return { __ccJson: fsErrorResult(NATIVE_TOOL_DISABLED_MSG) };
     case "shellArgs":
       // ADD-57: report the session's real cwd here too (cosmetic — nothing executed — but consistent).
       return { __ccJson: { success: { command: s && s.command, workingDirectory: cwd, exitCode: 1, stdout: "", stderr: NATIVE_TOOL_DISABLED_MSG } } };
@@ -1429,11 +1553,14 @@ function unaryExecPreflight(cas, store) {
   if (CONTROL_TYPED[cas]) return Promise.resolve({ __ccJson: CONTROL_TYPED[cas] });
   // H17: cases we don't implement but whose result type has a typed `error` variant -> a MODEL-VISIBLE typed
   // unavailable result (the model picks another path) instead of fail-closing the whole run. Checked BEFORE
-  // the CC_CASES reject so grep/ls (which carry buildResult:null) also degrade to a typed result rather than a
+  // the CC_CASES reject so ls (which carries buildResult:null) also degrades to a typed result rather than a
   // stream error. (Subagent/computerUse/etc. without a safe result shape still fall through to the reject.)
+  // The rejection is journaled with countTowardBound=false: an unavailable answer is the bridge's designed
+  // response to a valid call, not a model contract violation — counting identical H17 answers toward the
+  // loop bound cancelled entire turns when a model retried native grep instead of falling back to shell.
   if (TYPED_UNAVAILABLE_U.has(cas)) {
     dbg("__CC_EXEC_U typed-unavailable result (H17)", "session=" + (store && store.session && store.session.id), "cas=" + cas);
-    if (store && store.session) store.session.recordInternalToolRejection("typed-unavailable", cas, { settleAnnounced: true });
+    if (store && store.session) store.session.recordInternalToolRejection("typed-unavailable", cas, { settleAnnounced: true, countTowardBound: false });
     return Promise.resolve(typedUnavailableResult(cas));
   }
   return null;
@@ -4821,10 +4948,21 @@ class Session {
     errors = [],
     transforms = [],
     input = undefined,
+    countTowardBound = true,
   } = {}) {
     if (this.loopTripped) return true;
     if (settleAnnounced) this.settleAnnouncedToolAttempt();
     const attempt = recordSanitizedInternalAttempt(this, { kind, toolName, detail, errors, transforms, input });
+    // countTowardBound=false: the attempt is still journaled for observability, but it must NOT feed the
+    // malformed-call loop bound. Used for H17 typed-unavailable answers (see unaryExecPreflight): those are
+    // the bridge's own designed response to a VALID native call it does not implement — the model cannot
+    // correct them, only route around them — so counting them as invalid calls killed whole turns when a
+    // model retried an unavailable native tool (grep) instead of falling back.
+    if (!countTowardBound) {
+      dbg("internal client-tool rejection (not counted toward loop bound)", "session=" + this.id, "kind=" + kind,
+        "detail=" + detail, "total=" + this.invalidToolCalls);
+      return false;
+    }
     this.invalidToolCalls++;
     const categoryCount = (this.internalRejectionCounts.get(kind) || 0) + 1;
     this.internalRejectionCounts.set(kind, categoryCount);
@@ -11297,18 +11435,30 @@ async function selfTestResultSerialization() {
   const add = (rc, label, ccJson) => checks.push({ case: rc, label, ccJson });
 
   // 1) Every unary CC_CASES builder: success AND error variant (fs tools build a real failure; shell encodes
-  //    failure via exitCode so isError just flips it). grep/ls carry buildResult:null (handled via H17 below).
+  //    failure via exitCode so isError just flips it). ls carries buildResult:null (handled via H17 below).
+  //    The generic sample text is unstructured for grep, so its :success sample exercises the honest
+  //    error-degrade shape; the PARSED grep success shapes (content/count/files) are pinned explicitly in
+  //    check 1b below with realistic rg-style text.
   for (const [cas, spec] of Object.entries(CC_CASES)) {
     if (spec.stream || typeof spec.buildResult !== "function") continue;
     const rc = resultCaseFor(cas);
     add(rc, cas + ":success", spec.buildResult("alpha\nbeta", st, false, ctx));
     add(rc, cas + ":error", spec.buildResult("the tool failed", st, true, ctx));
   }
+  // 1b) grep parsed success shapes per output mode, built by the SAME builder the live dispatch uses.
+  {
+    const grepSpec = CC_CASES.grepArgs;
+    const grepArgsSample = { pattern: "alpha", path: "/sdk-selftest", toolCallId: "selftest-grep" };
+    add("grepResult", "grepArgs:parsed-content", grepSpec.buildResult("/sdk-selftest/a.txt:1:alpha\n/sdk-selftest/a.txt-2-beta\n/sdk-selftest/b.txt:5:alpha two", grepArgsSample, false, ctx));
+    add("grepResult", "grepArgs:parsed-count", grepSpec.buildResult("/sdk-selftest/a.txt:2\n/sdk-selftest/b.txt:1", { ...grepArgsSample, outputMode: "count" }, false, ctx));
+    add("grepResult", "grepArgs:parsed-files", grepSpec.buildResult("/sdk-selftest/a.txt\n/sdk-selftest/b.txt", { ...grepArgsSample, outputMode: "files_with_matches" }, false, ctx));
+    add("grepResult", "grepArgs:no-matches", grepSpec.buildResult("No matches found", grepArgsSample, false, ctx));
+  }
   // 2) Shell STREAM chunks (stdout/stderr/exit) serialize as the `shellStream` case — success + aborted/error.
   for (const chunk of CC_CASES.shellStreamArgs.buildChunks("output line\n", false, ctx)) add("shellStream", "shellStream:ok", chunk);
   for (const chunk of CC_CASES.shellStreamArgs.buildChunks("boom", true, ctx)) add("shellStream", "shellStream:err", chunk);
   // 3) blockedNativeResult (H08) for every native case the gate can block.
-  for (const cas of ["readArgs", "redactedReadArgs", "writeArgs", "deleteArgs", "shellArgs"]) add(resultCaseFor(cas), "blocked:" + cas, blockedNativeResult(cas, st, "/sdk-selftest").__ccJson);
+  for (const cas of ["readArgs", "redactedReadArgs", "writeArgs", "deleteArgs", "shellArgs", "grepArgs"]) add(resultCaseFor(cas), "blocked:" + cas, blockedNativeResult(cas, st, "/sdk-selftest").__ccJson);
   // 4) CONTROL_ALLOW precheck cases answer { allowlisted: true }.
   for (const cas of Object.keys(CONTROL_ALLOW)) add(resultCaseFor(cas), "allow:" + cas, { allowlisted: true });
   // 5) CONTROL_TYPED proactive cases answer a typed value (e.g. { rejected: {} }).
@@ -11412,7 +11562,7 @@ if (RUN_AS_MAIN) {
 }
 
 export { runDurableMaintenance, runDurableFileMaintenance, runDurableMaintenanceInWorker, scheduleDurableMaintenance, runSdkAgentMaintenance, sdkAgentGCRoots, sdkAgentGCCensus, readAuthoritativeSdkAgentRoots, continuationAdmissionPriority, lifecycleEvent, crashPoint, backfillTombstonesTick, reserveUnresolvedReceipt, resizeUnresolvedReceipt, releaseUnresolvedReceipt, reclaimTombstonedDurableFiles };
-export { CC_CASES, composerModelSelection, turnFailureMetadata, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, platformScopeForSession, platformStateRootForSession, validateSessionAuthRecoveryRequest, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, readSessionAuthFailureReceipt, validSessionAuthFailureReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, isCursorSessionAuthExpired, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
+export { CC_CASES, composerModelSelection, turnFailureMetadata, headlessRequestContext, headlessMcpState, Session, AdvertisedToolRegistry, reconcileExport, toSdkImages, constraintInstructions, effectiveAdvertise, forcedToolUnavailable, nativeToolBlockedByChoice, toolManifest, toolManifestRule, blockedNativeResult, blockedSyntheticNativeExecIfNeeded, typedUnavailableResult, mcpDispatchResult, TYPED_UNAVAILABLE_U, parseShellContent, buildGrepResult, parseGrepText, grepOutputMode, streamCallbacks, ccToolId, authorizeRequest, authorizeRequestWith, platformHasSession, platformScopeForSession, platformStateRootForSession, validateSessionAuthRecoveryRequest, keyHash, loadSdk, selfTestNativeUnreachable, selfTestBundleSeam, selfTestResultSerialization, handleTurn, handleContinue, handleHttpRequestSafely, buildRestartRecoveryInput, continuationTenantMismatch, completedTurnRequestHash, validCompletedTurnReceipt, sdkSendIdempotencyKey, turnInvocationIdentity, cleanupCompletedTurnReceipts, readFreshDeliveryReceipt, writeFreshDeliveryReceipt, transitionFreshAttemptState, writeCompletedTurnReceipt, readSessionAuthFailureReceipt, validSessionAuthFailureReceipt, stateRootDiskStatus, sessions, liveToolRounds, completedTurnReceipts, isClosedInputStreamError, isSdkIteratorClosedError, isUpstreamRateLimit, isUpstreamUnauthenticated, isCursorSessionAuthExpired, recyclePlatform, terminalizePoisonedPlatformSessions, tripBreaker, breakerOpen, breakerRetryAfterMs, closeBreaker, breakerBackoffMs, soleStreamingSession, rateLimitedKeyToRecycle, upstreamBreaker, platforms, collectToolResultImages, isConversationTooLong, ensureAgent, buildMcpServers, mcpServerKeyForTool, mcpToolsForServer, mcpDescriptorsForServer, mcpDispatch, dispatchMcpBatch, handleMcp, MCP_GROUPING, MCP_SHIM_ENABLED, CLIENT_TOOL_PROVIDER_ID, DEFAULT_MCP_SERVER_KEY, readBodyBounded, PayloadTooLargeError, MAX_AGENT_TURN_BYTES, MAX_SSE_FRAME_BYTES, sseFrameSizeError, envInt, composerWorkspaceCwd, buildReadSuccess, buildWriteSuccess, healthBody, readinessBody, isLoopbackRemote, classifyMcpRoute, getPlatform, keyFingerprint, PlatformKeyCollisionError, MAX_SESSIONS, MAX_PLATFORMS, wrapToolInput, truncateLiveToolResult, validateBindHost, resolveBridgeHost, bindHostIsLoopback, syntheticAgentArtifactRequest, syntheticAgentArtifactFailure, COMPOSER_LIVE_TOOL_RESULT_MAX_BYTES, COMPOSER_SCHEMA_INLINE_MAX_BYTES, COMPOSER_OUT_QUEUE_MAX_BYTES, COMPOSER_MAX_TOOL_ROUNDS, COMPOSER_MAX_REPEAT_TOOL, COMPOSER_MAX_INVALID_TOOL_CALLS, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS, augmentUnderspecifiedToolSchema, normalizeToolArgsToSchema, extractScalarFromWrapper, argContractFor, augmentToolDescription, augmentWorkflowResultOnFailure, augmentBackgroundLaunchResult, snapWorkflowAgentTypes, appendRulesReminder, prepareAdvertisedToolRegistry, refreshSessionFromBody, sdkAdvertisedTools, mcpImageResultsEnabled, normalizeSystemBlocks, systemContextPlan, toolResultRecoveryPlan, runBoundedShutdownTasks, isSdkAbortError, noteExpectedSdkAbort, consumeExpectedSdkAbort, consumeExpectedSdkLifecycleClosure, replayMemoryBudget, mutateTurnReceipt };
 export {
   TURN_RECEIPT_VERSION,
   ACCEPTANCE_PHASE,

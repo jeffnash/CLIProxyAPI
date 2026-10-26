@@ -63,6 +63,7 @@ const {
   blockedNativeResult,
   blockedSyntheticNativeExecIfNeeded,
   breakerOpen,
+  buildGrepResult,
   buildMcpServers,
   buildReadSuccess,
   buildRestartRecoveryInput,
@@ -7348,6 +7349,121 @@ test("MCP result builder preserves images, errors, and structured content", () =
   assert.ok(result.success.content.some((part) => part.image));
   const unavailable = typedUnavailableResult("grepArgs");
   assert.match(JSON.stringify(unavailable), /not available|unavailable/i);
+});
+
+test("grep result builder parses rg-style text into the structured GrepResult per output mode", () => {
+  const args = { pattern: "needle", path: "/repo" };
+  const content = buildGrepResult(
+    "/repo/a.ts:3:const needle = 1;\n/repo/a.ts-2-import x\n/repo/b.ts:7:needle again",
+    args, false, { cwd: "/repo" });
+  const union = content.success.workspaceResults["/repo"].content;
+  assert.equal(content.success.pattern, "needle");
+  assert.equal(content.success.outputMode, "content");
+  assert.equal(union.matches.length, 2);
+  assert.deepEqual(union.matches[0], {
+    file: "/repo/a.ts",
+    matches: [
+      { lineNumber: 3, content: "const needle = 1;", isContextLine: false },
+      { lineNumber: 2, content: "import x", isContextLine: true },
+    ],
+  });
+  assert.equal(union.totalMatchedLines, 2);
+  assert.equal(union.totalLines, 3);
+
+  const counted = buildGrepResult("/repo/a.ts:2\n/repo/b.ts:1", { ...args, outputMode: "count" }, false, { cwd: "/repo" });
+  assert.deepEqual(counted.success.workspaceResults["/repo"].count.counts, [
+    { file: "/repo/a.ts", count: 2 },
+    { file: "/repo/b.ts", count: 1 },
+  ]);
+  assert.equal(counted.success.workspaceResults["/repo"].count.totalMatches, 3);
+  // Count mode derives per-file counts from match lines when the client returned content instead.
+  const derived = buildGrepResult("/repo/a.ts:1:x\n/repo/a.ts:2:y", { ...args, outputMode: "count" }, false, { cwd: "/repo" });
+  assert.deepEqual(derived.success.workspaceResults["/repo"].count.counts, [{ file: "/repo/a.ts", count: 2 }]);
+
+  const files = buildGrepResult("/repo/a.ts\n/repo/b.ts", { ...args, outputMode: "files_with_matches" }, false, { cwd: "/repo" });
+  assert.deepEqual(files.success.workspaceResults["/repo"].files.files, ["/repo/a.ts", "/repo/b.ts"]);
+  assert.equal(files.success.workspaceResults["/repo"].files.totalFiles, 2);
+
+  const none = buildGrepResult("No matches found", args, false, { cwd: "/repo" });
+  assert.deepEqual(none.success.workspaceResults["/repo"].content.matches, []);
+  assert.equal(none.success.workspaceResults["/repo"].content.totalMatchedLines, 0);
+
+  // Unstructured non-empty output is never dressed up as a success: it degrades to the typed error
+  // variant carrying the raw text, and GrepError carries no path field.
+  const raw = buildGrepResult("some prose the client invented\nwith no structure at all", args, false, { cwd: "/repo" });
+  assert.ok(raw.error);
+  assert.match(raw.error.error, /not in a recognized structured format/);
+  assert.match(raw.error.error, /some prose the client invented/);
+  assert.equal(raw.error.path, undefined);
+
+  const failed = buildGrepResult("permission denied", args, true, { cwd: "/repo" });
+  assert.equal(failed.error.error, "permission denied");
+  assert.equal(failed.error.path, undefined);
+});
+
+test("H17 typed-unavailable answers are journaled but never feed the loop bound", () => {
+  const { session } = seedSession("h17-not-counted", "key", []);
+  const sessionHash = createHash("sha256").update(session.id).digest("hex");
+  const attemptsFile = path.join(TEST_STATE_ROOT, "internal-tool-attempts.jsonl");
+  const before = existsSync(attemptsFile)
+    ? readFileSync(attemptsFile, "utf8").trim().split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line)).filter((a) => a.sessionIdHash === sessionHash).length
+    : 0;
+  for (let i = 0; i < COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS + 4; i++) {
+    const tripped = session.recordInternalToolRejection("typed-unavailable", "lsArgs", {
+      settleAnnounced: true,
+      countTowardBound: false,
+    });
+    assert.equal(tripped, false);
+  }
+  assert.equal(session.invalidToolCalls, 0);
+  assert.equal(session.loopTripped, false);
+  assert.equal(session.internalRejectionCounts.size, 0);
+  const attempts = readFileSync(attemptsFile, "utf8").trim().split("\n")
+    .map((line) => JSON.parse(line)).filter((a) => a.sessionIdHash === sessionHash);
+  assert.equal(attempts.length - before, COMPOSER_MAX_IDENTICAL_INVALID_TOOL_CALLS + 4);
+  assert.ok(attempts.every((a) => a.category === "typed-unavailable" && a.executed === false));
+  sessions.delete(session.id);
+});
+
+test("native grep dispatches to the client grep tool and returns structured results", async () => {
+  const { session } = seedSession("native-grep-dispatch", "key", [{
+    name: "grep",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string" },
+        path: { type: "string" },
+        include: { type: "string" },
+        context_before: { type: "number" },
+        context_after: { type: "number" },
+        limit: { type: "number" },
+      },
+      required: ["pattern"],
+    },
+  }]);
+  const promise = session.dispatchUnary("grepArgs", CC_CASES.grepArgs, {
+    pattern: "needle", path: "/repo", contextBefore: 1, contextAfter: 2, headLimit: 5,
+    toolCallId: "native-grep",
+  });
+  promise.catch(() => {});
+  await waitFor(() => session.currentRound && session.currentRound.fifo.length === 1, "grep ToolRound");
+  const round = session.currentRound;
+  const call = round.calls.get(round.fifo[0]);
+  assert.equal(call.name, "grep");
+  assert.deepEqual(call.input, {
+    pattern: "needle", path: "/repo", context_before: 1, context_after: 2, limit: 5,
+  });
+  round.markAwaitingResults();
+  round.applyResults([{ toolCallId: call.wireId, content: "/repo/a.ts:3:const needle = 1;", isError: false }]);
+  const result = await promise;
+  const union = result.__ccJson.success.workspaceResults["/repo"].content;
+  assert.deepEqual(union.matches, [{
+    file: "/repo/a.ts",
+    matches: [{ lineNumber: 3, content: "const needle = 1;", isContextLine: false }],
+  }]);
+  assert.equal(session.invalidToolCalls, 0);
+  sessions.delete(session.id);
 });
 
 test("inline MCP result images are opt-in because serialization does not prove model-route support", () => {
