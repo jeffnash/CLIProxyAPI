@@ -13,7 +13,9 @@ type Config = internalconfig.Config
 type ModelCatalogs = internalconfig.ModelCatalogs
 
 type ClientConfig = internalconfig.ClientConfig
+type ClaudeClientConfig = internalconfig.ClaudeClientConfig
 type CodexClientConfig = internalconfig.CodexClientConfig
+type CodexWebSearchResultCacheConfig = internalconfig.CodexWebSearchResultCacheConfig
 type StreamingConfig = internalconfig.StreamingConfig
 type ClaudeCodeConfig = internalconfig.ClaudeCodeConfig
 type TLSConfig = internalconfig.TLSConfig
@@ -30,6 +32,7 @@ type ManagedProviderConfig = internalconfig.ManagedProviderConfig
 type ManagedProviderModelDiscoveryConfig = internalconfig.ManagedProviderModelDiscoveryConfig
 type ManagedProviderRouteHealthConfig = internalconfig.ManagedProviderRouteHealthConfig
 
+type ProxyConnectionPoolConfig = internalconfig.ProxyConnectionPoolConfig
 type GeminiKey = internalconfig.GeminiKey
 type CodexKey = internalconfig.CodexKey
 type XAIKey = internalconfig.XAIKey

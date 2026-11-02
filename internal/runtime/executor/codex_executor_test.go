@@ -332,7 +332,7 @@ func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministicForStructuredSession(
 	key := helps.CodexPromptCacheKey(req.Model, "claude:u1")
 	helps.DeleteCodexCache(key)
 
-	httpReq1, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
+	httpReq1, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw, nil)
 	if err != nil {
 		t.Fatalf("cacheHelper #1 error: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestCodexCacheHelper_ClaudePromptCacheKeyDeterministicForStructuredSession(
 	// Simulate a cache miss (e.g., restart/eviction) and ensure the ID is still stable.
 	helps.DeleteCodexCache(key)
 
-	httpReq2, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw)
+	httpReq2, _, err := e.cacheHelper(ctx, sdktranslator.FormatClaude, url, req, raw, nil)
 	if err != nil {
 		t.Fatalf("cacheHelper #2 error: %v", err)
 	}

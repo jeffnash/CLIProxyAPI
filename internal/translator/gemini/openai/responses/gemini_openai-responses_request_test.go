@@ -2,6 +2,8 @@ package responses
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -440,7 +442,8 @@ func TestConvertOpenAIResponsesRequestToGemini_DoesNotRetargetExtraPreviousCarri
 				return `[{"type":"reasoning","encrypted_content":"` + first + `","summary":[]},{"type":"function_call","call_id":"call-1","name":"run_command","arguments":"{}"},{"type":"reasoning","encrypted_content":"` + extra + `","summary":[]},{"type":"function_call","call_id":"call-2","name":"run_command","arguments":"{}"}]`
 			},
 			assert: func(t *testing.T, parts []gjson.Result) {
-				if len(parts) != 3 || parts[0].Get("functionCall.id").String() != "call-1" || parts[0].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature || !parts[1].Get("text").Exists() || parts[1].Get("text").String() != "" || parts[1].Get("thoughtSignature").String() != signature2 || parts[2].Get("functionCall.id").String() != "call-2" || parts[2].Get("thoughtSignature").String() != "" {
+				if len(parts) != 3 || parts[0].Get("functionCall.id").String() != "call-1" || parts[0].Get("thoughtSignature").String() != testResponsesGeminiThoughtSignature || !parts[1].Get("text").Exists() || parts[1].Get("text").String() != "" || parts[1].Get("thoughtSignature").String() != signature2 || parts[2].Get("functionCall.id").String() != "call-2" || parts[2].Get("thoughtSignature").String() != "skip_thought_signature_validator" {
+					// call-2 follows a text part, so it gets the bypass sentinel rather than signature2.
 					t.Fatalf("extra previous function carrier retargeted: %v", parts)
 				}
 			},
@@ -3579,5 +3582,110 @@ func TestConvertOpenAIResponsesRequestToGemini_UnsignedModelTextDoesNotSynthesiz
 	}
 	if sanitizedParts[1].Get("thoughtSignature").Exists() {
 		t.Fatalf("sanitizer left unexpected thoughtSignature on text part: %s", sanitizedParts[1].Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToGemini_ParallelOutputsAcrossNotices(t *testing.T) {
+	for _, role := range []string{"developer", "system"} {
+		for _, image := range []bool{false, true} {
+			for _, reverse := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/image=%t/reverse=%t", role, image, reverse), func(t *testing.T) {
+					items := []map[string]any{{"type": "message", "role": "user", "content": "Inspect files."}}
+					for i := 0; i < 4; i++ {
+						items = append(items, map[string]any{"type": "function_call", "call_id": fmt.Sprintf("call-%d", i), "name": "view_image", "arguments": "{}"})
+					}
+					for i := 0; i < 4; i++ {
+						id := i
+						if reverse {
+							id = 3 - i
+						}
+						var output any = fmt.Sprintf("result-%d", id)
+						if image {
+							output = []map[string]any{
+								{"type": "input_text", "text": fmt.Sprintf("result-%d", id)},
+								{"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+							}
+						}
+						items = append(items, map[string]any{"type": "function_call_output", "call_id": fmt.Sprintf("call-%d", id), "output": output})
+						// Codex also emits role-only messages without an explicit type.
+						note := map[string]any{"role": role, "content": fmt.Sprintf("<image_resize_notice>notice-%d</image_resize_notice>", i)}
+						if i%2 == 0 {
+							note["type"] = "message"
+						}
+						items = append(items, note)
+					}
+					input, errMarshal := json.Marshal(map[string]any{"model": "gemini-4-argon", "input": items})
+					if errMarshal != nil {
+						t.Fatal(errMarshal)
+					}
+					result, errConvert := ConvertOpenAIResponsesRequestToGemini("gemini-4-argon", input, false)
+					if errConvert != nil {
+						t.Fatal(errConvert)
+					}
+					if errValidate := internalsignature.ValidateGeminiFunctionCallPairing(result); errValidate != nil {
+						t.Fatalf("invalid parallel results: %v; result=%s", errValidate, result)
+					}
+					contents := gjson.GetBytes(result, "contents").Array()
+					if len(contents) != 4 {
+						t.Fatalf("got %d turns, want user/calls/results/notices; result=%s", len(contents), result)
+					}
+					results := contents[2].Get("parts").Array()
+					if len(results) != 4 {
+						t.Fatalf("got %d responses, want 4", len(results))
+					}
+					for i, part := range results {
+						response := part.Get("functionResponse")
+						if got := response.Get("id").String(); got != fmt.Sprintf("call-%d", i) {
+							t.Fatalf("response %d has id %q", i, got)
+						}
+						if got := response.Get("response.result").String(); got != fmt.Sprintf("result-%d", i) {
+							t.Fatalf("response %d lost its text: %q", i, got)
+						}
+						if image && response.Get("parts.0.inlineData.data").String() != "aGVsbG8=" {
+							t.Fatalf("response %d lost its image: %s", i, part.Raw)
+						}
+					}
+					for i := 0; i < 4; i++ {
+						if strings.Count(contents[3].Raw, fmt.Sprintf("notice-%d", i)) != 1 {
+							t.Fatalf("notice %d missing or duplicated: %s", i, contents[3].Raw)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCollectOpenAIResponsesFunctionCallOutputs_PreservesTurnBoundaries(t *testing.T) {
+	for _, boundary := range []string{
+		`{"type":"message","role":"user","content":"new request"}`,
+		`{"type":"message","role":"assistant","content":"next response"}`,
+		`{"type":"function_call","call_id":"new","name":"next","arguments":"{}"}`,
+		`{"type":"reasoning","summary":[]}`,
+	} {
+		items := gjson.Parse(`[
+			{"type":"function_call_output","call_id":"one","output":"first"},
+			{"type":"message","role":"developer","content":"notice"},
+			` + boundary + `,
+			{"type":"function_call_output","call_id":"two","output":"second"}
+		]`).Array()
+		outputs, consumed, remaining := collectOpenAIResponsesFunctionCallOutputs(items, 0, []string{"one", "two"})
+		if len(outputs) != 1 || len(consumed) != 1 || !consumed[0] || len(remaining) != 1 || remaining[0] != "two" {
+			t.Fatalf("crossed boundary %s: outputs=%v consumed=%v remaining=%v", boundary, outputs, consumed, remaining)
+		}
+	}
+}
+
+func TestCollectOpenAIResponsesFunctionCallOutputs_DoesNotMoveOrphansAcrossNotices(t *testing.T) {
+	items := gjson.Parse(`[
+		{"type":"function_call_output","call_id":"one","output":"first"},
+		{"type":"message","role":"developer","content":"notice"},
+		{"type":"function_call_output","call_id":"orphan","output":"unrelated"}
+	]`).Array()
+	for _, pending := range [][]string{{"one"}, nil} {
+		outputs, consumed, remaining := collectOpenAIResponsesFunctionCallOutputs(items, 0, pending)
+		if len(outputs) != 1 || len(consumed) != 1 || !consumed[0] || len(remaining) != 0 {
+			t.Fatalf("moved orphan across notice: outputs=%v consumed=%v remaining=%v", outputs, consumed, remaining)
+		}
 	}
 }

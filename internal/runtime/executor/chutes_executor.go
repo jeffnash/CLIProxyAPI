@@ -321,7 +321,7 @@ func (e *ChutesExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			// Optional: respect upstream Retry-After, but cap to a short cooldown to avoid
 			// punishing other models when one is overloaded.
 			if resp.StatusCode == http.StatusTooManyRequests {
-				if ra := parseRetryAfterHeader(resp.Header); ra != nil {
+				if ra := parseRetryAfterHeader(resp.Header, time.Now()); ra != nil {
 					cap := 5 * time.Second
 					wait := minPositiveDuration(*ra, cap)
 					log.WithFields(log.Fields{
@@ -928,25 +928,6 @@ func chutesWaitForRetry(ctx context.Context, cfg *config.Config, attempt int, mo
 	case <-timer.C:
 		return nil
 	}
-}
-
-func parseRetryAfterHeader(h http.Header) *time.Duration {
-	if h == nil {
-		return nil
-	}
-	raw := strings.TrimSpace(h.Get("Retry-After"))
-	if raw == "" {
-		return nil
-	}
-	// Retry-After can be seconds or an HTTP-date, but we only support seconds here.
-	if seconds, err := strconv.Atoi(raw); err == nil {
-		if seconds < 0 {
-			seconds = 0
-		}
-		d := time.Duration(seconds) * time.Second
-		return &d
-	}
-	return nil
 }
 
 func minPositiveDuration(a, b time.Duration) time.Duration {

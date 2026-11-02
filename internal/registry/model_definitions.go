@@ -21,6 +21,7 @@ const (
 	xaiBuiltinVideo15ModelID           = "grok-imagine-video-1.5"
 	xaiBuiltinVideo15PreviewModelID    = "grok-imagine-video-1.5-preview"
 	xaiBuiltinVideo15PreviewID         = "grok-imagine-video-1.5-preview"
+	xaiBuiltinVideo15LiteModelID       = "grok-imagine-video-1.5-lite"
 	xaiBuiltinSpeechModelID            = "grok-tts"
 	xaiBuiltinSpeechVoiceModelID       = "grok-voice-tts-1.0"
 )
@@ -372,7 +373,7 @@ func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
 // not depend on remote models.json updates.
 func WithXAIBuiltins(models []*ModelInfo) []*ModelInfo {
 	extras := expandReasoningAliases([]*ModelInfo{xaiBuiltinGrok46ModelInfo(), xaiBuiltinGrok47ModelInfo()}, "high", "xhigh")
-	extras = append(extras, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo(), xaiBuiltinSpeechModelInfo(), xaiBuiltinSpeechVoiceModelInfo())
+	extras = append(extras, xaiBuiltinImageModelInfo(), xaiBuiltinImageQualityModelInfo(), xaiBuiltinImage20ModelInfo(), xaiBuiltinVideoModelInfo(), xaiBuiltinVideo15ModelInfo(), xaiBuiltinVideo15PreviewModelInfo(), xaiBuiltinVideo15LiteModelInfo(), xaiBuiltinSpeechModelInfo(), xaiBuiltinSpeechVoiceModelInfo())
 	extras = append(extras, xaiComposerReasoningAliases()...)
 	return upsertModelInfos(models, extras...)
 }
@@ -585,6 +586,21 @@ func xaiBuiltinVideo15PreviewModelInfo() *ModelInfo {
 	}
 }
 
+func xaiBuiltinVideo15LiteModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                        xaiBuiltinVideo15LiteModelID,
+		Object:                    "model",
+		Created:                   1787702400, // 2026-08-26
+		OwnedBy:                   "xai",
+		Type:                      "xai",
+		DisplayName:               "Grok Imagine Video 1.5 Lite",
+		Name:                      xaiBuiltinVideo15LiteModelID,
+		Description:               "xAI Grok Imagine Video 1.5 Lite supports text-to-video and image-to-video generation. Output pricing per second: $0.02 at 480p, $0.03 at 720p, and $0.14 at 1080p.",
+		SupportedInputModalities:  []string{"text", "image"},
+		SupportedOutputModalities: []string{"video"},
+	}
+}
+
 func xaiBuiltinSpeechModelInfo() *ModelInfo {
 	return &ModelInfo{
 		ID:          xaiBuiltinSpeechModelID,
@@ -727,9 +743,19 @@ func LookupStaticModelInfoByChannel(modelID, channel string) *ModelInfo {
 	if modelID == "" {
 		return nil
 	}
-	for _, model := range GetStaticModelDefinitionsByChannel(channel) {
+	models := GetStaticModelDefinitionsByChannel(channel)
+	for _, model := range models {
 		if model != nil && model.ID == modelID {
 			return cloneModelInfo(model)
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(channel), "claude") {
+		for _, familyID := range claudeFamilyModelIDs(modelID) {
+			for _, model := range models {
+				if model != nil && model.ID == familyID {
+					return cloneModelInfo(model)
+				}
+			}
 		}
 	}
 	return nil
@@ -777,5 +803,45 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		}
 	}
 
+	// Dated and bracketed Claude variants (claude-sonnet-5-5-20261001,
+	// claude-opus-5-5[1m]) share the capabilities of their catalog entry.
+	for _, familyID := range claudeFamilyModelIDs(modelID) {
+		for _, m := range data.Claude {
+			if m != nil && m.ID == familyID {
+				return cloneModelInfo(m)
+			}
+		}
+	}
+
 	return nil
+}
+
+// claudeFamilyModelIDs returns the catalog IDs a Claude model variant may belong
+// to: without a "[...]" context suffix, then also without a "-YYYYMMDD" date.
+func claudeFamilyModelIDs(modelID string) []string {
+	if !strings.HasPrefix(modelID, "claude-") {
+		return nil
+	}
+	var ids []string
+	base := modelID
+	if i := strings.IndexByte(base, '['); i > 0 && strings.HasSuffix(base, "]") {
+		base = base[:i]
+		ids = append(ids, base)
+	}
+	if n := len(base); n > 9 && base[n-9] == '-' && isEightDigits(base[n-8:]) {
+		ids = append(ids, base[:n-9])
+	}
+	return ids
+}
+
+func isEightDigits(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }

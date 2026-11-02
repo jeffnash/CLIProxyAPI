@@ -4,6 +4,7 @@ package executor
 
 import (
 	"bytes"
+	"compress/flate"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -517,10 +518,10 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		}
 		prepared.body = idMapper.upstreamRequestPayload(prepared.body)
 	}
-	reporter.SetTranslatedReasoningEffort(prepared.body, e.Identifier())
-
+	prepared.body = sanitizeXAIInputEncryptedContentForBaseURL(prepared.body, baseURL)
 	wsHeaders := applyXAIWebsocketHeaders(ctx, http.Header{}, auth, token, prepared.sessionID, opts.Headers)
 	wsReqBody := buildXAIWebsocketRequestBody(prepared.body, prepared.finalizePayload)
+	reporter.SetTranslatedReasoningEffort(wsReqBody, e.Identifier())
 	requestType := strings.TrimSpace(gjson.GetBytes(req.Payload, "type").String())
 	transcriptReset := strings.TrimSpace(gjson.GetBytes(wsReqBody, "previous_response_id").String()) == "" &&
 		(requestType != "response.append" || (idMapper != nil && idMapper.replayedCompactedTranscript))
@@ -807,6 +808,9 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			}
 
 			for _, payload := range xaiNormalizeReasoningSummaryDataEvents(payload) {
+				if rawEventType := gjson.GetBytes(payload, "type").String(); rawEventType == "response.output_item.done" || rawEventType == "response.completed" || rawEventType == "response.incomplete" || rawEventType == "response.done" {
+					streamUsage.ObserveResponsesStream(payload)
+				}
 				prepared.applyPatch.RememberDispatcherEvent(payload)
 				payload = namespaceRestorer.restore(payload)
 				if prepared.webSearchAlias != "" {
@@ -851,9 +855,6 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 						xaiCollectOutputItemDone(payload, outputItemsByIndex, &outputItemsFallback)
 					case "response.completed":
 						logXAIWebsocketTerminalResponse(executionSessionID, authID, wsURL, eventType, payload)
-						if detail, ok := helps.ParseCodexUsage(payload); ok {
-							streamUsage.Observe(detail, true)
-						}
 						payload = xaiPatchCompletedOutput(payload, outputItemsByIndex, outputItemsFallback)
 						payload = xaiNormalizeReasoningSummaryData(payload)
 						cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, payload)
@@ -863,9 +864,6 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 						}
 					case "response.done":
 						logXAIWebsocketTerminalResponse(executionSessionID, authID, wsURL, eventType, payload)
-						if detail, ok := helps.ParseCodexUsage(payload); ok {
-							streamUsage.Observe(detail, true)
-						}
 						if !warmupRequest && idMapper != nil && idMapper.state != nil && !recordedTranscript {
 							idMapper.state.recordTranscriptTurn(wsReqBody, payload, transcriptReset)
 							recordedTranscript = true
@@ -1167,8 +1165,14 @@ func (e *XAIWebsocketsExecutor) dialXAIWebsocket(ctx context.Context, auth *clip
 	}
 	closer := newWebsocketConnectionCloser(conn)
 	if conn != nil {
-		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
-		conn.EnableWriteCompression(false)
+		enabled := e.cfg == nil || e.cfg.Codex.WebsocketCompressionEnabled()
+		conn.EnableWriteCompression(enabled)
+		if enabled {
+			// Match Codex's stable flate level and shared compression escape hatch.
+			if errSetCompressionLevel := conn.SetCompressionLevel(flate.DefaultCompression); errSetCompressionLevel != nil {
+				log.Errorf("set xAI websocket compression level: %v", errSetCompressionLevel)
+			}
+		}
 	}
 	return conn, closer, resp, err
 }
@@ -1668,6 +1672,7 @@ func applyXAIWebsocketHeaders(ctx context.Context, headers http.Header, auth *cl
 	} else {
 		req = &http.Request{Header: headers}
 	}
+	ensureXAIUserAgent(req, clientHeaders...)
 	util.ApplyCustomHeadersFromAttrs(req, attrs, clientHeaders...)
 	return headers
 }

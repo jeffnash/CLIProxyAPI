@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -27,8 +28,12 @@ import (
 )
 
 const (
-	homeCertificateRequestTimeout     = 30 * time.Second
-	homeCertificateMaxRESPBulkPayload = 1 << 20
+	homeCertificateRequestTimeout = 30 * time.Second
+	maxHomeCertificateRESPBulkLen = 1 << 20  // 1 MiB
+	maxHomeCertificateRESPLineLen = 64 << 10 // 64 KiB
+	// homeCertificateMaxRESPBulkPayload is the fork name for the same limit;
+	// kept so existing fork tests and callers keep compiling.
+	homeCertificateMaxRESPBulkPayload = maxHomeCertificateRESPBulkLen
 )
 
 type homeJWTClaims struct {
@@ -391,7 +396,7 @@ func readRESPBulk(reader *bufio.Reader) ([]byte, error) {
 	}
 	switch prefix {
 	case '$':
-		line, errLine := reader.ReadString('\n')
+		line, errLine := readHomeCertificateRESPLine(reader)
 		if errLine != nil {
 			return nil, errLine
 		}
@@ -399,25 +404,61 @@ func readRESPBulk(reader *bufio.Reader) ([]byte, error) {
 		if errSize != nil {
 			return nil, errSize
 		}
+		if size < -1 {
+			return nil, fmt.Errorf("home certificate response has invalid bulk length")
+		}
 		if size < 0 {
 			return nil, fmt.Errorf("home certificate request returned nil")
 		}
-		if size > homeCertificateMaxRESPBulkPayload {
+		if size > maxHomeCertificateRESPBulkLen {
 			return nil, fmt.Errorf("home certificate request response too large: %d bytes", size)
 		}
 		payload := make([]byte, size+2)
 		if _, errFull := io.ReadFull(reader, payload); errFull != nil {
 			return nil, errFull
 		}
+		if payload[size] != '\r' || payload[size+1] != '\n' {
+			return nil, fmt.Errorf("home certificate response has invalid terminator")
+		}
 		return payload[:size], nil
 	case '-':
-		line, errLine := reader.ReadString('\n')
+		line, errLine := readHomeCertificateRESPLine(reader)
 		if errLine != nil {
 			return nil, errLine
 		}
 		return nil, fmt.Errorf("%s", strings.TrimSpace(line))
 	default:
 		return nil, fmt.Errorf("home certificate request returned unsupported resp prefix %q", prefix)
+	}
+}
+
+func readHomeCertificateRESPLine(reader *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		fragment, errRead := reader.ReadSlice('\n')
+		if len(buf)+len(fragment) > maxHomeCertificateRESPLineLen+2 {
+			return "", fmt.Errorf("home certificate response line is too long")
+		}
+		if errRead == nil {
+			var line string
+			if len(buf) == 0 {
+				line = string(fragment)
+			} else {
+				buf = append(buf, fragment...)
+				line = string(buf)
+			}
+			line = strings.TrimSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\r")
+			if len(line) > maxHomeCertificateRESPLineLen {
+				return "", fmt.Errorf("home certificate response line is too long")
+			}
+			return line, nil
+		}
+		if errors.Is(errRead, bufio.ErrBufferFull) {
+			buf = append(buf, fragment...)
+			continue
+		}
+		return "", errRead
 	}
 }
 

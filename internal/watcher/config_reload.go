@@ -17,6 +17,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var loadConfigFileFunc = config.LoadConfig
+
 func (w *Watcher) stopConfigReloadTimer() {
 	w.configReloadMu.Lock()
 	if w.configReloadTimer != nil {
@@ -49,8 +51,13 @@ func (w *Watcher) ReloadConfigIfChanged() {
 }
 
 func (w *Watcher) reloadConfigIfChanged() {
-	// The file can change again while a reload is being applied. Only record
-	// a hash as seen once the file is stable across the whole reload;
+	// File events and post-save reloads may arrive together; an older read must
+	// not apply after a newer one.
+	w.configApplyMu.Lock()
+	defer w.configApplyMu.Unlock()
+
+	// The file can change again while a reload is being applied. Only treat a
+	// reload as settled once the file is stable across the whole reload;
 	// otherwise loop so the newest content is applied instead of being
 	// marked as already loaded.
 	const maxReloadPasses = 10
@@ -79,22 +86,27 @@ func (w *Watcher) reloadConfigIfChanged() {
 		if !w.reloadConfig() {
 			return
 		}
+		// Record the bytes the reload actually parsed, not the change-check read or a
+		// later re-read: a write landing between them must not count as applied. A
+		// write-back during load only costs one extra pass.
+		w.clientsMutex.Lock()
+		appliedHash := newHash
+		if w.config != nil && w.config.SourceHash != "" {
+			appliedHash = w.config.SourceHash
+		}
+		w.lastConfigHash = appliedHash
+		w.clientsMutex.Unlock()
+
 		updatedData, errRead := os.ReadFile(w.configPath)
 		if errRead != nil {
 			log.WithError(errRead).Debug("failed to compute updated config hash after reload")
-			w.clientsMutex.Lock()
-			w.lastConfigHash = newHash
-			w.clientsMutex.Unlock()
 			w.persistConfigAsync()
 			return
 		}
 		sumUpdated := sha256.Sum256(updatedData)
-		if hex.EncodeToString(sumUpdated[:]) != newHash {
+		if hex.EncodeToString(sumUpdated[:]) != appliedHash {
 			continue
 		}
-		w.clientsMutex.Lock()
-		w.lastConfigHash = newHash
-		w.clientsMutex.Unlock()
 		w.persistConfigAsync()
 		return
 	}
@@ -105,7 +117,7 @@ func (w *Watcher) reloadConfig() bool {
 	log.Debug("=========================== CONFIG RELOAD ============================")
 	log.Debugf("starting config reload from: %s", w.configPath)
 
-	newConfig, errLoadConfig := config.LoadConfig(w.configPath)
+	newConfig, errLoadConfig := loadConfigFileFunc(w.configPath)
 	if errLoadConfig != nil {
 		log.Errorf("failed to reload config: %v", errLoadConfig)
 		return false

@@ -816,6 +816,113 @@ func TestConvertClaudeRequestToCodex_AssistantGrokSignatureToReasoningItem(t *te
 	}
 }
 
+func testMetaClaudeSignature() string {
+	// Shape-valid synthetic Meta envelope; no captured value is embedded.
+	signature := "Q-PaDgE"
+	for len(signature) < 1426 {
+		signature += "A"
+	}
+	return signature
+}
+
+func TestConvertClaudeRequestToCodex_AssistantMetaSignatureToReasoningItem(t *testing.T) {
+	signature := testMetaClaudeSignature()
+	payload := []byte(`{"model":"muse-spark-1.3","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	payload, _ = sjson.SetBytes(payload, "messages.0.content.0.signature", signature)
+
+	out, _ := ConvertClaudeRequestToCodex("muse-spark-1.3", payload, false)
+	reasoning := gjson.GetBytes(out, "input.0")
+	if reasoning.Get("type").String() != "reasoning" {
+		t.Fatalf("input.0 type = %q, want reasoning; output=%s", reasoning.Get("type").String(), out)
+	}
+	if got := reasoning.Get("encrypted_content").String(); got != signature {
+		t.Fatalf("encrypted_content = %q, want Meta signature", got)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_IgnoresMetaSignatureForNonMetaTargets(t *testing.T) {
+	signature := testMetaClaudeSignature()
+	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	payload, _ = sjson.SetBytes(payload, "messages.0.content.0.signature", signature)
+
+	for _, modelName := range []string{"gpt-5.4", "claude-sonnet-4-6", "grok-4.5"} {
+		t.Run(modelName, func(t *testing.T) {
+			out, _ := ConvertClaudeRequestToCodex(modelName, payload, false)
+			if got := countRequestInputItemsByType(out, "reasoning"); got != 0 {
+				t.Fatalf("got %d reasoning items for non-Meta target, want 0; output=%s", got, out)
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem(t *testing.T) {
+	// OpenRouter serves Meta Muse models and appends a dot-delimited
+	// alphanumeric suffix to the native envelope; the full value must replay
+	// verbatim.
+	signature := testMetaClaudeSignature() + "." + strings.Repeat("Ab3", 23)[:67]
+	payload := []byte(`{"model":"meta/muse-wonder","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	payload, _ = sjson.SetBytes(payload, "messages.0.content.0.signature", signature)
+
+	out, _ := ConvertClaudeRequestToCodex("meta/muse-wonder", payload, false)
+	reasoning := gjson.GetBytes(out, "input.0")
+	if reasoning.Get("type").String() != "reasoning" {
+		t.Fatalf("input.0 type = %q, want reasoning; output=%s", reasoning.Get("type").String(), out)
+	}
+	if got := reasoning.Get("encrypted_content").String(); got != signature {
+		t.Fatalf("encrypted_content = %q, want routed Meta signature verbatim", got)
+	}
+
+	out, _ = ConvertClaudeRequestToCodex("gpt-5.4", payload, false)
+	if got := countRequestInputItemsByType(out, "reasoning"); got != 0 {
+		t.Fatalf("got %d reasoning items for non-Meta target, want 0; output=%s", got, out)
+	}
+
+	// A foreign GPT signature must not be replayed when the target is a Meta Muse model.
+	gptPayload := []byte(`{"model":"muse-spark-1.3","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	gptPayload, _ = sjson.SetBytes(gptPayload, "messages.0.content.0.signature", validCodexReasoningSignature())
+	out, _ = ConvertClaudeRequestToCodex("muse-spark-1.3", gptPayload, false)
+	if got := countRequestInputItemsByType(out, "reasoning"); got != 0 {
+		t.Fatalf("got %d reasoning items for GPT signature on Meta target, want 0; output=%s", got, out)
+	}
+
+	// When modelName is an unmapped upstream deployment alias, the client-requested
+	// Meta Muse model in the payload preserves Meta signatures.
+	aliasOut, _ := ConvertClaudeRequestToCodex("deployment-123", payload, false)
+	if got := countRequestInputItemsByType(aliasOut, "reasoning"); got != 1 {
+		t.Fatalf("got %d reasoning items for aliased Meta target, want 1; output=%s", got, aliasOut)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_ResolvesReplayTargetModelOncePerRequest(t *testing.T) {
+	if raceDetectorEnabled {
+		t.Skip("allocation budgets are not meaningful with race detector instrumentation")
+	}
+
+	const thinkingBlocks = 64
+	var body strings.Builder
+	body.WriteString(`{"messages":[{"role":"assistant","content":[`)
+	for i := 0; i < thinkingBlocks; i++ {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(`{"type":"thinking","thinking":"step","signature":"x"}`)
+	}
+	body.WriteString(`,{"type":"text","text":"done"}]}],"model":"MY-DEPLOYMENT"}`)
+	payload := []byte(body.String())
+
+	mappedAllocs := testing.AllocsPerRun(20, func() {
+		_, _ = ConvertClaudeRequestToCodex("gpt-5", payload, false)
+	})
+	unmappedAllocs := testing.AllocsPerRun(20, func() {
+		_, _ = ConvertClaudeRequestToCodex("my-deployment", payload, false)
+	})
+
+	extraAllocs := unmappedAllocs - mappedAllocs
+	if extraAllocs > 4 {
+		t.Fatalf("unmapped model allocated %v more times than mapped model across %d thinking blocks (unmapped=%v, mapped=%v); expected O(1) target model resolution per request", extraAllocs, thinkingBlocks, unmappedAllocs, mappedAllocs)
+	}
+}
+
 func TestConvertClaudeRequestToCodex_IgnoresGrokSignatureForNonGrokTargets(t *testing.T) {
 	signature := "HmlYdr2aCAqCYP/m9mr8PS6KOsdMs72FGDigmydR+Jsmuv8KX97yWPlbOwmXJgWn0CbHaCacdQD3+n5EvpgLfPNmafS3kdICBjRuDf4bzHy7uBiUhNVhqPtp/ee1y9q4imPE4LYgD1VZ4J+bp9mTeqA1+nC9Oue58CiNEMV9SVaGenCD+aBnVuSTzQhD32Y+68i6HLJW0Dx6ifaRfb8hxYtA/sPM+/FTvAMW11nRho5a2BBSkpnzfqqAz/e/vGJ77/bygpXM823QA9wL9i0X"
 	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
@@ -1000,7 +1107,6 @@ func TestConvertClaudeRequestToCodex_OutputConfigFormat(t *testing.T) {
 	t.Run("output_config with effort only", func(t *testing.T) {
 		payload := []byte(`{
 			"model": "gpt-5.4",
-			"thinking": {"type": "adaptive"},
 			"output_config": {"effort": "high"},
 			"messages": [
 				{"role": "user", "content": "hello"}
@@ -1400,5 +1506,156 @@ func TestConvertClaudeRequestToCodex_StripsPatternPropertiesIncompatibleKeys(t *
 	}
 	if _, exists := patternProps[`^[a-z]+$`]; !exists {
 		t.Errorf("expected patternProperties key '^[a-z]+$' to be preserved, got: %s", params.Get("patternProperties").Raw)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_MidConversationToolAdditions(t *testing.T) {
+	longMCPTool := "mcp__very_long_server_name_for_testing__deliver_final_subagent_handback_report"
+	inputJSON := `{
+		"model": "gpt-6.1-sol",
+		"tools": [
+			{
+				"name": "Read",
+				"description": "Read a file",
+				"input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+			},
+			{
+				"name": "deferred_lookup",
+				"description": "Look up deferred notes",
+				"defer_loading": true,
+				"input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+			}
+		],
+		"messages": [
+			{"role": "user", "content": "Start task"},
+			{
+				"role": "system",
+				"content": [
+					{"type": "text", "text": "<system-reminder>SubagentHandback is now available</system-reminder>"},
+					{
+						"type": "tool_addition",
+						"tool": {
+							"type": "tool_definition",
+							"definition": {
+								"name": "SubagentHandback",
+								"description": "Deliver subagent report",
+								"input_schema": {
+									"$schema": "https://json-schema.org/draft/2020-12/schema",
+									"type": "object",
+									"properties": {"summary": {"type": "string"}},
+									"required": ["summary"]
+								}
+							}
+						}
+					},
+					{
+						"type": "tool_addition",
+						"tool": {"type": "tool_reference", "name": "deferred_lookup"}
+					},
+					{
+						"type": "tool_removal",
+						"tool": {"type": "tool_reference", "name": "Read"}
+					}
+				]
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "README.md"}}
+				]
+			},
+			{
+				"role": "system",
+				"content": [
+					{
+						"type": "tool_addition",
+						"tool": {
+							"type": "tool_definition",
+							"definition": {
+								"name": "` + longMCPTool + `",
+								"description": "Long MCP handback tool",
+								"input_schema": {"type": "object"}
+							}
+						}
+					}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "call_1", "content": "file contents"},
+					{"type": "text", "text": "Finish up"}
+				]
+			}
+		]
+	}`
+
+	translated, err := ConvertClaudeRequestToCodex("gpt-6.1-sol", []byte(inputJSON), false)
+	if err != nil {
+		t.Fatalf("ConvertClaudeRequestToCodex returned error: %v", err)
+	}
+
+	// Top-level tools[] must remain untouched (2 tools: Read and deferred_lookup) to preserve the prompt cache prefix.
+	topTools := gjson.GetBytes(translated, "tools").Array()
+	if len(topTools) != 2 {
+		t.Fatalf("expected 2 top-level tools, got %d: %s", len(topTools), gjson.GetBytes(translated, "tools").Raw)
+	}
+	if topTools[0].Get("name").String() != "Read" || topTools[1].Get("name").String() != "deferred_lookup" {
+		t.Fatalf("unexpected top-level tool names: %q, %q", topTools[0].Get("name").String(), topTools[1].Get("name").String())
+	}
+
+	// Expected input items:
+	// 0: message (user: "Start task")
+	// 1: message (user: "<system-reminder>...")
+	// 2: additional_tools (developer: SubagentHandback, deferred_lookup)
+	// 3: function_call (call_1)
+	// 4: function_call_output (call_1)
+	// 5: additional_tools (developer: shortened longMCPTool, deferred after function_call_output)
+	// 6: message (user: "Finish up")
+	inputs := gjson.GetBytes(translated, "input").Array()
+	if len(inputs) != 7 {
+		t.Fatalf("expected 7 input items, got %d: %s", len(inputs), gjson.GetBytes(translated, "input").Raw)
+	}
+
+	addTools1 := inputs[2]
+	if got := addTools1.Get("type").String(); got != "additional_tools" {
+		t.Fatalf("inputs[2].type = %q, want additional_tools: %s", got, addTools1.Raw)
+	}
+	if got := addTools1.Get("role").String(); got != "developer" {
+		t.Fatalf("inputs[2].role = %q, want developer: %s", got, addTools1.Raw)
+	}
+	addTools1List := addTools1.Get("tools").Array()
+	if len(addTools1List) != 2 {
+		t.Fatalf("expected 2 tools in first additional_tools, got %d: %s", len(addTools1List), addTools1.Raw)
+	}
+	if addTools1List[0].Get("type").String() != "function" || addTools1List[0].Get("name").String() != "SubagentHandback" {
+		t.Fatalf("unexpected first additional tool: %s", addTools1List[0].Raw)
+	}
+	if addTools1List[0].Get("strict").Type != gjson.False {
+		t.Fatalf("expected strict=false on SubagentHandback, got: %s", addTools1List[0].Raw)
+	}
+	if addTools1List[0].Get("input_schema").Exists() || addTools1List[0].Get("parameters.$schema").Exists() {
+		t.Fatalf("expected input_schema and parameters.$schema to be stripped: %s", addTools1List[0].Raw)
+	}
+	if addTools1List[0].Get("parameters.properties.summary.type").String() != "string" {
+		t.Fatalf("expected normalized parameters on SubagentHandback, got: %s", addTools1List[0].Raw)
+	}
+	if addTools1List[1].Get("type").String() != "function" || addTools1List[1].Get("name").String() != "deferred_lookup" {
+		t.Fatalf("unexpected second additional tool (resolved tool_reference): %s", addTools1List[1].Raw)
+	}
+	if addTools1List[1].Get("defer_loading").Exists() {
+		t.Fatalf("expected defer_loading to be stripped on resolved tool_reference: %s", addTools1List[1].Raw)
+	}
+
+	if inputs[3].Get("type").String() != "function_call" || inputs[4].Get("type").String() != "function_call_output" {
+		t.Fatalf("expected function_call (3) followed by function_call_output (4), got %q and %q", inputs[3].Get("type").String(), inputs[4].Get("type").String())
+	}
+	addTools2 := inputs[5]
+	if got := addTools2.Get("type").String(); got != "additional_tools" {
+		t.Fatalf("inputs[5].type = %q, want additional_tools: %s", got, addTools2.Raw)
+	}
+	shortLongName := addTools2.Get("tools.0.name").String()
+	if shortLongName == "" || shortLongName == longMCPTool || len(shortLongName) > 64 {
+		t.Fatalf("expected shortened MCP tool name <= 64 chars, got %q (len=%d)", shortLongName, len(shortLongName))
 	}
 }

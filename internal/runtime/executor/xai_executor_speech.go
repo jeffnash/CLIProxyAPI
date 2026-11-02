@@ -92,6 +92,7 @@ func (e *XAIExecutor) executeSpeech(ctx context.Context, auth *cliproxyauth.Auth
 
 	// Payload rules target the "openai" protocol, matching xAI image/video and config.example.yaml.
 	payload := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), model, "openai", "", req.Payload, req, opts)(req.Payload)
+	reporter.SetTranslatedRequestMetadata(payload, "openai")
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(payload))
 	if err != nil {
 		return resp, err
@@ -128,6 +129,6 @@ func (e *XAIExecutor) executeSpeech(ctx context.Context, auth *cliproxyauth.Auth
 		return resp, err
 	}
 
-	reporter.EnsurePublished(ctx)
+	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
 }

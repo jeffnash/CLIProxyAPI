@@ -296,9 +296,10 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				// message keeps its elevated role (downstream folds it into
 				// the system prompt); never downgrade it to `user`.
 				role := item.Get("role").String()
-				// Only a real user turn can be refused for dropped parts; a
-				// developer turn keeps its elevated role downstream and
-				// never counts as the user's own turn.
+				// Chat Completions supports developer messages. Preserve their role and
+				// position so mid-session instructions retain their original authority;
+				// a developer turn never counts as the user's own turn, so only a real
+				// user turn can be refused for dropped parts.
 				isUserTurn := role == "user"
 				mergeableAssistantIndex = -1
 				if role != "assistant" {

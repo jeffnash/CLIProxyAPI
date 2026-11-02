@@ -190,7 +190,7 @@ func TestConductorCodeBuddyRetryAfterPreserved(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	var withDelay interface{ RetryAfter() *time.Duration }
-	if !errors.As(err, &withDelay) || withDelay.RetryAfter() == nil || *withDelay.RetryAfter() != 3*time.Second {
+	if !errors.As(err, &withDelay) || withDelay.RetryAfter() == nil || *withDelay.RetryAfter() > 3*time.Second || *withDelay.RetryAfter() < 2*time.Second {
 		t.Fatalf("retry-after lost: %v", err)
 	}
 }
