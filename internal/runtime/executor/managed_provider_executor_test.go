@@ -391,6 +391,63 @@ func TestResolveManagedProviderModelKeepsUpstreamIDStartingWithPrefix(t *testing
 	}
 }
 
+// A slug minted by one provider's alias generation ("alpha-" + "beta-model-pro")
+// can route to a different provider whose own prefix also matches
+// ("alpha-beta-"). The routing provider's own alias map has no entry for it,
+// so the resolver must consult other providers' maps instead of sending
+// the stripped guess ("model-pro") upstream.
+func TestResolveManagedProviderModelFallsBackToOtherProviderAlias(t *testing.T) {
+	clearManagedProviderStateForTest(t)
+	managedProviderAliasMapMu.Lock()
+	managedProviderAliasMap["alpha"] = map[string]string{
+		"beta-model-pro":       "beta-model-pro",
+		"alpha-beta-model-pro": "beta-model-pro",
+	}
+	managedProviderAliasMapMu.Unlock()
+	for _, in := range []string{"openai-alpha-beta-model-pro", "alpha-beta-model-pro"} {
+		if got := resolveManagedProviderModel("alpha-beta", "alpha-beta-", in); got != "beta-model-pro" {
+			t.Errorf("resolveManagedProviderModel(%q)=%q, want beta-model-pro", in, got)
+		}
+	}
+}
+
+// The router strips the matched provider prefix before the executor runs,
+// so live the executor receives only the remainder ("model-pro"), not the
+// full slug. When the routing provider's prefix extends another provider's
+// prefix ("alpha-beta-" extends "alpha-"), that remainder is ambiguous: the slug
+// was minted by the shorter-prefix provider ("alpha-" + "beta-model-pro").
+// The resolver must rebuild the parent-prefix candidate and resolve it,
+// instead of sending the bare remainder upstream.
+func TestResolveManagedProviderModelRecoversParentPrefixModel(t *testing.T) {
+	clearManagedProviderStateForTest(t)
+	managedProviderAliasMapMu.Lock()
+	managedProviderAliasMap["alpha"] = map[string]string{
+		"beta-model-pro": "beta-model-pro",
+		"beta-model":     "beta-model",
+	}
+	managedProviderAliasMap["alpha-beta"] = map[string]string{
+		"beta-model": "beta-model",
+	}
+	managedProviderAliasMapMu.Unlock()
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// Remainder of an alpha-minted slug routed to alpha-beta.
+		{"model-pro", "beta-model-pro"},
+		{"model", "beta-model"},
+		// The routing provider's own model still wins over a parent candidate.
+		{"beta-model", "beta-model"},
+		// Unknown remainders pass through untouched.
+		{"some-model", "some-model"},
+	}
+	for _, tc := range cases {
+		if got := resolveManagedProviderModel("alpha-beta", "alpha-beta-", tc.in); got != tc.want {
+			t.Errorf("resolveManagedProviderModel(%q)=%q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestManagedProviderExecutorResponsesAliasSkipsIncompatibleOpenAIChatFallback(t *testing.T) {
 	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

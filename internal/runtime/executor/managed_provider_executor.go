@@ -1272,9 +1272,24 @@ func resolveManagedProviderModel(providerName, prefix, modelID string) string {
 	if resolved, ok := lookup(modelID); ok {
 		return resolved
 	}
+	// A slug minted by one provider's alias generation (provider prefix +
+	// remote model ID, e.g. "alpha-" + "beta-model-pro") can route to a different
+	// provider whose own prefix also matches it (e.g. "alpha-beta-"). That
+	// provider's own alias map has no entry for it, so consult every other
+	// provider's alias map and the global registry before falling back to
+	// the stripped guess, which the upstream has never heard of.
+	if resolved, ok := lookupGlobalManagedProviderModel(providerName, stripped); ok {
+		return resolved
+	}
+	if resolved, ok := lookupGlobalManagedProviderModel(providerName, modelID); ok {
+		return resolved
+	}
 	if prefix != "" && strings.HasPrefix(stripped, prefix) {
 		candidate := strings.TrimPrefix(stripped, prefix)
 		if resolved, ok := lookup(candidate); ok {
+			return resolved
+		}
+		if resolved, ok := lookupGlobalManagedProviderModel(providerName, candidate); ok {
 			return resolved
 		}
 		if hadProtocolPrefix {
@@ -1290,7 +1305,65 @@ func resolveManagedProviderModel(providerName, prefix, modelID string) string {
 		// would mangle it into a model the upstream has never heard of.
 		return stripped
 	}
+	// The router strips the matched provider prefix before the executor
+	// runs, so the executor normally receives only the remainder. When
+	// this provider's prefix extends another provider's prefix (e.g.
+	// "alpha-beta-" extends "alpha-"), the remainder alone is ambiguous: the
+	// slug may have been minted by the shorter-prefix provider ("alpha-" +
+	// "beta-model-pro"), and sending the bare remainder ("model-pro")
+	// upstream fails. Rebuild those parent-prefix candidates (the part of
+	// this prefix after the parent prefix, plus the remainder) and resolve
+	// them through the other providers' alias maps and the global
+	// registry. This only runs on the fall-through path, after the routing
+	// provider's own map has missed, so a provider's own model (e.g.
+	// "beta-model" for "alpha-beta-") always wins over a parent candidate.
+	if prefix != "" {
+		for _, parent := range managedProviderParentPrefixes(prefix) {
+			candidate := prefix[len(parent):] + stripped
+			if resolved, ok := lookupGlobalManagedProviderModel(providerName, candidate); ok {
+				return resolved
+			}
+		}
+	}
 	return stripped
+}
+
+// managedProviderParentPrefixes returns the dash-boundary proper prefixes
+// of prefix, longest first (e.g. "alpha-beta-" yields ["alpha-"], "a-b-c-"
+// yields ["a-b-", "a-"]). The full prefix itself is never included.
+func managedProviderParentPrefixes(prefix string) []string {
+	var out []string
+	for i := 0; i < len(prefix); i++ {
+		if prefix[i] == '-' && i+1 < len(prefix) {
+			out = append(out, prefix[:i+1])
+		}
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
+
+// lookupGlobalManagedProviderModel resolves a model ID through alias maps
+// owned by providers other than the routing provider, plus the global model
+// registry. It only runs after the routing provider's own map misses, so it
+// never overrides a provider's own mapping; it only replaces the stripped
+// guess the resolver would otherwise send upstream.
+func lookupGlobalManagedProviderModel(providerName, candidate string) (string, bool) {
+	if info := registry.LookupModelInfo(candidate); info != nil && strings.TrimSpace(info.UpstreamID) != "" {
+		return strings.TrimSpace(info.UpstreamID), true
+	}
+	managedProviderAliasMapMu.RLock()
+	defer managedProviderAliasMapMu.RUnlock()
+	for name, aliases := range managedProviderAliasMap {
+		if name == providerName {
+			continue
+		}
+		if apiID, ok := aliases[candidate]; ok && strings.TrimSpace(apiID) != "" {
+			return strings.TrimSpace(apiID), true
+		}
+	}
+	return "", false
 }
 
 func addManagedProviderProtocolAliases(aliases map[string]string, providerPrefix string, protocolPrefixes ...string) {
