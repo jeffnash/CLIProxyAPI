@@ -502,10 +502,31 @@ func validateCatalog(catalog Catalog) error {
 	return nil
 }
 
+// PreferredHY4Model picks the default HY4 tier for bare "hy4" requests:
+// the free GA tier first, then standard GA, then preview SKUs, then any
+// remaining HY4 model in catalog order.
+func PreferredHY4Model(models []Model) (Model, bool) {
+	for _, want := range []string{"hy4free", "hy4std", "hy4-preview", "hy4-preview-f"} {
+		for _, model := range models {
+			if model.ID == want {
+				return model, true
+			}
+		}
+	}
+	for _, model := range models {
+		if IsHY4Model(model.ID) && model.ID != "hy4" {
+			return model, true
+		}
+	}
+	return Model{}, false
+}
+
 // RegistryModels projects the account snapshot to registry entries. Only HY4
 // models are projected with exact native UpstreamIDs and observed display and
 // limits. Tools are advertised only when supportsToolCall is explicitly true;
-// images are never advertised by this text-only implementation.
+// images are never advertised by this text-only implementation. Unless the
+// catalog serves a bare "hy4" model, a leading bare-hy4 alias entry routes
+// to PreferredHY4Model (free tier first).
 func RegistryModels(credentials Credentials, catalog Catalog) []*registry.ModelInfo {
 	models := []*registry.ModelInfo{}
 	for _, model := range catalog.Models {
@@ -541,6 +562,31 @@ func RegistryModels(credentials Credentials, catalog Catalog) []*registry.ModelI
 			}
 		}
 		models = append(models, info)
+	}
+	if preferred, ok := PreferredHY4Model(catalog.Models); ok {
+		hasBare := false
+		var preferredInfo *registry.ModelInfo
+		for _, info := range models {
+			if info.UpstreamID == "hy4" {
+				hasBare = true
+			}
+			if info.UpstreamID == preferred.ID {
+				preferredInfo = info
+			}
+		}
+		if !hasBare && preferredInfo != nil {
+			alias := *preferredInfo
+			alias.ID = PublicModelID(credentials.Realm, "hy4")
+			alias.SupportedParameters = append([]string(nil), preferredInfo.SupportedParameters...)
+			alias.SupportedInputModalities = append([]string(nil), preferredInfo.SupportedInputModalities...)
+			alias.SupportedOutputModalities = append([]string(nil), preferredInfo.SupportedOutputModalities...)
+			if preferredInfo.Thinking != nil {
+				thinking := *preferredInfo.Thinking
+				thinking.Levels = append([]string(nil), preferredInfo.Thinking.Levels...)
+				alias.Thinking = &thinking
+			}
+			models = append([]*registry.ModelInfo{&alias}, models...)
+		}
 	}
 	return models
 }

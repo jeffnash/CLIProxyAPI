@@ -41,18 +41,35 @@ func ResolveCodeBuddyModel(auth *cliproxyauth.Auth, req cliproxyexecutor.Request
 		return codebuddy.Model{}, requestScopedCodeBuddyError("invalid codebuddy catalog snapshot: " + err.Error())
 	}
 	base := thinking.ParseSuffix(req.Model).ModelName
+	// Bare HY4 alias: codebuddy-<realm>-hy4 routes to the preferred tier
+	// (free GA first) unless the catalog serves a bare hy4 model itself.
+	bareAlias := codebuddy.PublicModelID(credentials.Realm, "hy4")
 	if modelInfo, ok := cliproxyauth.ResolvedModelInfo(req); ok && modelInfo != nil && strings.TrimSpace(modelInfo.UpstreamID) != "" {
 		upstream := strings.TrimSpace(modelInfo.UpstreamID)
 		for _, model := range catalog.Models {
 			if model.ID != upstream {
 				continue
 			}
-			if strings.HasPrefix(base, codebuddy.Provider+"-") && base != codebuddy.PublicModelID(credentials.Realm, model.ID) {
+			if strings.HasPrefix(base, codebuddy.Provider+"-") && base != codebuddy.PublicModelID(credentials.Realm, model.ID) && base != bareAlias {
 				return codebuddy.Model{}, modelNotFoundCodeBuddyError(base)
 			}
 			return model, nil
 		}
 		return codebuddy.Model{}, modelNotFoundCodeBuddyError(base)
+	}
+	if base == bareAlias {
+		hasBare := false
+		for _, model := range catalog.Models {
+			if model.ID == "hy4" {
+				hasBare = true
+				break
+			}
+		}
+		if !hasBare {
+			if preferred, ok := codebuddy.PreferredHY4Model(catalog.Models); ok {
+				return preferred, nil
+			}
+		}
 	}
 	for _, model := range catalog.Models {
 		if codebuddy.PublicModelID(credentials.Realm, model.ID) == base {

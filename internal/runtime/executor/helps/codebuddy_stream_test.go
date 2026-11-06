@@ -219,6 +219,24 @@ func TestCodeBuddyStreamModelIdentity(t *testing.T) {
 	}
 }
 
+// Tencent catalogs GA tiers undashed (hy4free/hy4std) but stamps stream
+// events canonically: hy4free answers as hy4-free, hy4std as bare hy4.
+func TestCodeBuddyStreamAcceptsDashedHY4Alias(t *testing.T) {
+	for _, tc := range []struct{ requested, returned string }{
+		{"hy4free", "hy4-free"},
+		{"hy4std", "hy4"},
+	} {
+		raw := "data: {\"model\":\"" + tc.returned + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+		got, err := AggregateCodeBuddyStream(NewCodeBuddyStream(strings.NewReader(raw), tc.requested))
+		if err != nil {
+			t.Fatalf("%s/%s: %v", tc.requested, tc.returned, err)
+		}
+		if gjson.GetBytes(got, "choices.0.message.content").String() != "ok" {
+			t.Fatalf("%s/%s content = %s", tc.requested, tc.returned, got)
+		}
+	}
+}
+
 func TestCodeBuddyStreamToolIdentity(t *testing.T) {
 	t.Run("fragmented parallel tools", func(t *testing.T) {
 		raw := readCodeBuddyStreamFixture(t, "tools.sse")

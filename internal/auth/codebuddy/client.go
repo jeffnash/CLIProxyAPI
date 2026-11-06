@@ -40,9 +40,11 @@ const LoginLifetime = 15 * time.Minute
 // Observed client version constants. These are compatibility values observed
 // in official clients, not assertions that CLIProxyAPI is the official app.
 const (
-	cnUserAgent        = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
-	workbuddyUserAgent = "WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1"
-	codebuddyUserAgent = "CodeBuddy/2.143.0 CLI/2.143.0"
+	codebuddyClientVersion = "2.180.0"
+	workbuddyAppVersion    = "5.5.4"
+	cnUserAgent            = "WorkBuddy/" + workbuddyAppVersion + " WorkBuddy/" + workbuddyAppVersion + " CLI/" + codebuddyClientVersion
+	workbuddyUserAgent     = "WorkBuddy/" + workbuddyAppVersion + " WorkBuddy AI/" + workbuddyAppVersion + " CLI/" + codebuddyClientVersion
+	codebuddyUserAgent     = "CLI/" + codebuddyClientVersion + " CodeBuddy/" + codebuddyClientVersion
 )
 
 // Client performs CodeBuddy account HTTP operations against realm endpoints.
@@ -669,6 +671,70 @@ func applyChatHeaders(req *http.Request, credentials Credentials, requestID, tra
 	header.Set("X-Request-ID", requestID)
 	header.Set("X-Conversation-Message-ID", requestID)
 	header.Set("X-Trace-ID", traceID)
+	applyChannelFingerprintHeaders(header, credentials, traceID)
+}
+
+// applyChannelFingerprintHeaders adds the client-identity headers current
+// official clients send on chat requests. Tencent channel verification
+// rejects chat calls without them (code 11128, "request illegal").
+func applyChannelFingerprintHeaders(header http.Header, credentials Credentials, traceID string) {
+	ideVersion := codebuddyClientVersion
+	if credentials.Realm != RealmGlobal {
+		ideVersion = workbuddyAppVersion
+	}
+	header.Set("X-Product", "SaaS")
+	header.Set("X-IDE-Type", "CLI")
+	header.Set("X-IDE-Name", "CLI")
+	header.Set("X-IDE-Version", ideVersion)
+	header.Set("X-Agent-Intent", "craft")
+	header.Set("X-Agent-Runtime", "other")
+	header.Set("X-Agent-Purpose", "conversation")
+	header.Set("X-Agent-Type", "main")
+	header.Set("X-Private-Data", "false")
+	if conversationID, err := randomUUID(); err == nil {
+		header.Set("X-Conversation-ID", conversationID)
+	}
+	if rootRequestID, err := randomHexID(); err == nil {
+		header.Set("X-Conversation-Request-ID", rootRequestID)
+		header.Set("X-Root-Request-ID", rootRequestID)
+	}
+	if isHex32(traceID) {
+		if span, err := randomHexID(); err == nil {
+			spanID := span[:16]
+			parentSpanID := span[16:]
+			header.Set("Traceparent", "00-"+traceID+"-"+spanID+"-01")
+			header.Set("B3", traceID+"-"+spanID+"-1-"+parentSpanID)
+			header.Set("X-B3-TraceId", traceID)
+			header.Set("X-B3-SpanId", spanID)
+			header.Set("X-B3-ParentSpanId", parentSpanID)
+			header.Set("X-B3-Sampled", "1")
+		}
+	}
+}
+
+// isHex32 reports whether value is a 32-character lowercase/uppercase hex ID.
+func isHex32(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// randomUUID generates a dashed random UUID-shaped identifier.
+func randomUUID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x70
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(raw[:])
+	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:], nil
 }
 
 // RealmHost returns the exact API hostname for a realm, or "" when unknown.

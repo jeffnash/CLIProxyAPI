@@ -51,6 +51,20 @@ func (s *CodeBuddyStream) ObservedModel() (string, bool) {
 	return s.observedModel, true
 }
 
+// codeBuddySameHY4Model reports whether two HY4 identifiers name the same
+// upstream SKU under Tencent's canonical response spelling: catalog
+// hy4free answers as hy4-free, and catalog hy4std answers as bare hy4.
+func codeBuddySameHY4Model(a, b string) bool {
+	if !codebuddy.IsHY4Model(a) || !codebuddy.IsHY4Model(b) {
+		return false
+	}
+	strip := func(id string) string { return strings.ReplaceAll(id, "-", "") }
+	if strip(a) == strip(b) {
+		return true
+	}
+	return (a == "hy4" && b == "hy4std") || (a == "hy4std" && b == "hy4")
+}
+
 // codeBuddyToolState accumulates one tool call across fragmented deltas.
 type codeBuddyToolState struct {
 	ID        string
@@ -234,7 +248,7 @@ func (s *CodeBuddyStream) processEvent(event []byte) (chunk []byte, skip bool, e
 		return nil, false, fmt.Errorf("codebuddy: data after DONE")
 	}
 	if model, ok := parsed["model"].(string); ok && model != "" {
-		if s.expectedModel != "" && model != s.expectedModel {
+		if s.expectedModel != "" && model != s.expectedModel && !codeBuddySameHY4Model(model, s.expectedModel) {
 			return nil, false, &CodeBuddyError{Status: http.StatusBadGateway, Code: "model_mismatch", Message: fmt.Sprintf("codebuddy returned model %q for requested %q", model, s.expectedModel)}
 		}
 		s.observedModel, s.hasObservedModel = model, true

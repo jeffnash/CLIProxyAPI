@@ -461,6 +461,27 @@ func TestChatHeaders(t *testing.T) {
 	if header.Get("X-Request-Id") != header.Get("X-Conversation-Message-Id") {
 		t.Fatal("request and message ids differ")
 	}
+	// Channel-verification fingerprint current official clients send.
+	for key, want := range map[string]string{
+		"X-Product":      "SaaS",
+		"X-Ide-Type":     "CLI",
+		"X-Ide-Name":     "CLI",
+		"X-Agent-Intent": "craft",
+		"X-Agent-Type":   "main",
+		"X-Private-Data": "false",
+	} {
+		if got := header.Get(key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+	for _, key := range []string{"X-Ide-Version", "X-Conversation-Id", "X-Conversation-Request-Id", "X-Root-Request-Id", "Traceparent", "B3", "X-B3-Traceid"} {
+		if header.Get(key) == "" {
+			t.Fatalf("chat missing channel header %s", key)
+		}
+	}
+	if header.Get("X-Conversation-Request-Id") != header.Get("X-Root-Request-Id") {
+		t.Fatal("conversation request and root request ids differ")
+	}
 
 	global := base
 	global.Realm = RealmGlobal

@@ -274,8 +274,11 @@ func TestCatalogAccountIsolation(t *testing.T) {
 	}
 	modelsA := RegistryModels(credsA, catalogA)
 	modelsB := RegistryModels(credsB, catalogB)
-	if modelsA[0].ID != "codebuddy-cn-hy4-preview" || modelsB[0].ID != "codebuddy-cn-hy4-preview-f" {
-		t.Fatalf("A=%s B=%s", modelsA[0].ID, modelsB[0].ID)
+	// Leading bare-hy4 alias is shared; its upstream stays account-scoped.
+	if modelsA[0].ID != "codebuddy-cn-hy4" || modelsA[0].UpstreamID != "hy4-preview" ||
+		modelsB[0].ID != "codebuddy-cn-hy4" || modelsB[0].UpstreamID != "hy4-preview-f" ||
+		modelsA[1].ID != "codebuddy-cn-hy4-preview" || modelsB[1].ID != "codebuddy-cn-hy4-preview-f" {
+		t.Fatalf("A=%s/%s B=%s/%s", modelsA[0].ID, modelsA[0].UpstreamID, modelsB[0].ID, modelsB[0].UpstreamID)
 	}
 }
 
@@ -354,10 +357,13 @@ func TestRegistryModels(t *testing.T) {
 		{ID: "other-model"},
 	}}
 	models := RegistryModels(creds, catalog)
-	if len(models) != 2 {
+	if len(models) != 3 {
 		t.Fatalf("models = %d", len(models))
 	}
-	first := models[0]
+	if models[0].ID != "codebuddy-workbuddy-global-hy4" || models[0].UpstreamID != "hy4-preview" {
+		t.Fatalf("alias = %s / %s", models[0].ID, models[0].UpstreamID)
+	}
+	first := models[1]
 	if first.ID != "codebuddy-workbuddy-global-hy4-preview" || first.UpstreamID != "hy4-preview" {
 		t.Fatalf("identity = %s / %s", first.ID, first.UpstreamID)
 	}
@@ -382,7 +388,7 @@ func TestRegistryModels(t *testing.T) {
 	if !hasTools {
 		t.Fatalf("tools not advertised: %v", first.SupportedParameters)
 	}
-	second := models[1]
+	second := models[2]
 	for _, param := range second.SupportedParameters {
 		if param == "tools" {
 			t.Fatal("tools advertised without capability")
@@ -426,5 +432,45 @@ func TestCatalogFromMetadataValidation(t *testing.T) {
 		if _, err := CatalogFromMetadata(metadata); err == nil {
 			t.Fatalf("case %d accepted", i)
 		}
+	}
+}
+
+func TestIsHY4Model(t *testing.T) {
+	for _, id := range []string{"hy4", "hy4-preview", "hy4-preview-f", "hy4free", "hy4std", "hy4-free-trial-202608"} {
+		if !IsHY4Model(id) {
+			t.Fatalf("IsHY4Model(%q) = false, want true", id)
+		}
+	}
+	for _, id := range []string{"", "hy3", "hy40", "hy5", "other-model", "gpt-5.5"} {
+		if IsHY4Model(id) {
+			t.Fatalf("IsHY4Model(%q) = true, want false", id)
+		}
+	}
+}
+
+// GA tiers (hy4free/hy4std, display name "Hy4") are served only by the
+// enterprise source; v3 still lists hy4-preview. Both must surface.
+func TestFetchCatalogGlobalIncludesGAModels(t *testing.T) {
+	var seen []*http.Request
+	client := testClient(catalogRouter(t, map[string]roundTripFunc{
+		"www.codebuddy.ai/v3/config": func(req *http.Request) (*http.Response, error) {
+			return fakeJSONResponse(200, `{"code":0,"data":{"models":[{"id":"hy4-preview","name":"Hy4 Preview"}]}}`), nil
+		},
+		"www.codebuddy.ai/v2/enterprises/personal/models": func(req *http.Request) (*http.Response, error) {
+			return fakeJSONResponse(200, `{"code":0,"data":{"models":[{"id":"hy4free","name":"Hy4"},{"id":"hy4std","name":"Hy4"},{"id":"hy3","name":"Hy3"}]}}`), nil
+		},
+	}, &seen))
+	catalog, err := client.FetchCatalog(context.Background(), catalogTestCreds(RealmGlobal))
+	if err != nil {
+		t.Fatalf("FetchCatalog: %v", err)
+	}
+	if got := strings.Join(modelIDs(catalog.Models), ","); got != "hy4-preview,hy4free,hy4std" {
+		t.Fatalf("models = %s, want hy4-preview,hy4free,hy4std", got)
+	}
+	models := RegistryModels(catalogTestCreds(RealmGlobal), catalog)
+	if len(models) != 4 || models[0].ID != "codebuddy-global-hy4" || models[0].UpstreamID != "hy4free" ||
+		models[2].ID != "codebuddy-global-hy4free" || models[2].UpstreamID != "hy4free" ||
+		models[3].ID != "codebuddy-global-hy4std" || models[3].UpstreamID != "hy4std" {
+		t.Fatalf("registry models = %+v", models)
 	}
 }

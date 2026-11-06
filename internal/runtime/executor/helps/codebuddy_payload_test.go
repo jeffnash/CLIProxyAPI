@@ -306,3 +306,29 @@ func TestResolveCodeBuddyModelRejectsOtherAccountAndRealm(t *testing.T) {
 		t.Fatalf("alias resolve: %v", err)
 	}
 }
+
+// Bare codebuddy-<realm>-hy4 prefers the free GA tier over standard and
+// preview; explicit tier IDs still resolve to themselves.
+func TestResolveCodeBuddyModelBareAliasPrefersFree(t *testing.T) {
+	creds := codebuddy.Credentials{
+		Realm: codebuddy.RealmGlobal, AccessToken: "A", RefreshToken: "R", UID: "u",
+		Expired: time.Now().Add(time.Hour),
+	}
+	catalog := codebuddy.Catalog{Models: []codebuddy.Model{{ID: "hy4-preview"}, {ID: "hy4std"}, {ID: "hy4free"}}}
+	auth := &cliproxyauth.Auth{ID: "a", Provider: "codebuddy", Metadata: codebuddy.Metadata(creds, catalog, time.Now())}
+	got, err := ResolveCodeBuddyModel(auth, cliproxyexecutor.Request{Model: "codebuddy-global-hy4"})
+	if err != nil || got.ID != "hy4free" {
+		t.Fatalf("bare resolve = %+v %v, want hy4free", got, err)
+	}
+	got, err = ResolveCodeBuddyModel(auth, cliproxyexecutor.Request{Model: "codebuddy-global-hy4std"})
+	if err != nil || got.ID != "hy4std" {
+		t.Fatalf("explicit std resolve = %+v %v, want hy4std", got, err)
+	}
+	// Without the free tier the alias falls back to standard, then preview.
+	catalog.Models = catalog.Models[:2]
+	auth.Metadata = codebuddy.Metadata(creds, catalog, time.Now())
+	got, err = ResolveCodeBuddyModel(auth, cliproxyexecutor.Request{Model: "codebuddy-global-hy4"})
+	if err != nil || got.ID != "hy4std" {
+		t.Fatalf("bare fallback resolve = %+v %v, want hy4std", got, err)
+	}
+}

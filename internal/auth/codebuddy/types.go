@@ -169,8 +169,19 @@ func PublicModelID(realm Realm, upstreamID string) string {
 }
 
 // IsHY4Model reports whether id is an in-scope HY4 model identifier.
+// GA SKUs append the tier directly (hy4free, hy4std) instead of using the
+// dashed preview form (hy4-preview, hy4-preview-f).
 func IsHY4Model(id string) bool {
-	return id == "hy4" || strings.HasPrefix(id, "hy4-")
+	rest, ok := strings.CutPrefix(id, "hy4")
+	if !ok {
+		return false
+	}
+	if rest == "" || rest[0] == '-' {
+		return true
+	}
+	// Tier suffixes are letters (free/std); a digit would be a different
+	// generation (e.g. hy40), not HY4.
+	return rest[0] >= 'a' && rest[0] <= 'z' || rest[0] >= 'A' && rest[0] <= 'Z'
 }
 
 // Validate checks the credential fields required for stable account identity.

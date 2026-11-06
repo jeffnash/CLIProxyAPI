@@ -84,7 +84,9 @@ func TestServiceCodeBuddyRegistration(t *testing.T) {
 		t.Fatal("model not registered for client")
 	}
 	infos := reg.GetModelsForClient(auth.ID)
-	if len(infos) != 1 || infos[0].UpstreamID != "hy4-preview" || infos[0].Type != "codebuddy" {
+	// Alias (bare hy4 -> preferred tier) plus the exact model entry.
+	if len(infos) != 2 || infos[0].ID != "codebuddy-global-hy4" || infos[0].UpstreamID != "hy4-preview" ||
+		infos[1].UpstreamID != "hy4-preview" || infos[1].Type != "codebuddy" {
 		t.Fatalf("infos = %+v", infos)
 	}
 }
