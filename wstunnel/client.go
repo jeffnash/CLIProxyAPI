@@ -1,14 +1,28 @@
 // Command wstunnel-client exposes a local CLIProxyAPI instance through a
-// Cloudflare Worker + Durable Object. The Durable Object accepts client HTTP
-// requests and forwards each one as a JSON frame over a persistent WebSocket
-// connection held by this client; the client calls the local proxy and
-// returns the whole response as one frame.
+// Cloudflare Worker + Durable Object. The Durable Object accepts client
+// HTTP requests and forwards each one as a JSON frame over a persistent
+// WebSocket connection held by this client; the client calls the local
+// proxy and returns the response.
 //
 // Frame protocol (one JSON object per text message):
 //
-//	request:  {"id":"...","method":"POST","path":"/v1/...","headers":{...},"body":"<base64>"}
-//	response: {"id":"...","status":200,"headers":{...},"body":"<base64>"}
-//	          {"id":"...","error":"..."}
+//	request:  {"id":"...","proto":2,"method":"POST","path":"/v1/...","headers":{...},"body":"<base64>"}
+//	response (protocol v1, request carried no proto):
+//	          {"id":"...","status":200,"headers":{...},"body":"<base64>"}
+//	response (protocol v2, streamed):
+//	          {"id":"...","type":"head","status":200,"headers":{...}}
+//	          {"id":"...","type":"chunk","body":"<base64>"}   (zero or more)
+//	          {"id":"...","type":"end"}
+//	failure:  {"id":"...","error":"..."}  (before the head)
+//	          {"id":"...","type":"error","error":"..."}  (mid-stream)
+//	cancel:   {"id":"...","type":"cancel"}  (Worker -> client: the caller
+//	          went away; abort the local request)
+//
+// The per-request protocol is chosen from the request frame itself: a
+// Worker that understands streaming marks its requests "proto":2 and the
+// client answers with head/chunk/end frames; an older Worker sends no
+// proto field and the client answers with the single v1 frame. Either
+// side can therefore be deployed first.
 //
 // Long generations leave the socket silent for minutes while the local
 // response streams in, so each connection sends WebSocket pings on an
@@ -18,6 +32,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -33,8 +48,17 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// streamProtoVersion is the newest frame protocol this client speaks. The
+// Worker stamps it onto each request frame it forwards; see the package
+// comment for how the per-request protocol is negotiated.
+const streamProtoVersion = 2
+
+// streamChunkSize bounds one chunk frame's raw (pre-base64) payload.
+const streamChunkSize = 32 * 1024
+
 type requestFrame struct {
 	ID      string      `json:"id"`
+	Proto   int         `json:"proto,omitempty"`
 	Method  string      `json:"method"`
 	Path    string      `json:"path"`
 	Headers http.Header `json:"headers,omitempty"`
@@ -73,10 +97,51 @@ func (f *requestFrame) UnmarshalJSON(data []byte) error {
 
 type responseFrame struct {
 	ID      string      `json:"id"`
+	Type    string      `json:"type,omitempty"` // "", "head", "chunk", "end", "error"
 	Status  int         `json:"status,omitempty"`
 	Headers http.Header `json:"headers,omitempty"`
 	Body    []byte      `json:"body,omitempty"`
 	Error   string      `json:"error,omitempty"`
+}
+
+// controlFrame is the Worker -> client envelope probed before a payload is
+// treated as a request: cancel frames carry a type and no method/path.
+type controlFrame struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+}
+
+// inflightRequests tracks the cancel func of every request being proxied
+// on one connection, so a Worker cancel frame can abort exactly the local
+// request it names.
+type inflightRequests struct {
+	mu sync.Mutex
+	m  map[string]context.CancelFunc
+}
+
+func newInflightRequests() *inflightRequests {
+	return &inflightRequests{m: make(map[string]context.CancelFunc)}
+}
+
+func (r *inflightRequests) add(id string, cancel context.CancelFunc) {
+	r.mu.Lock()
+	r.m[id] = cancel
+	r.mu.Unlock()
+}
+
+func (r *inflightRequests) remove(id string) {
+	r.mu.Lock()
+	delete(r.m, id)
+	r.mu.Unlock()
+}
+
+func (r *inflightRequests) cancel(id string) {
+	r.mu.Lock()
+	cancel, ok := r.m[id]
+	r.mu.Unlock()
+	if ok {
+		cancel()
+	}
 }
 
 type tunnelClient struct {
@@ -202,6 +267,7 @@ func (c *tunnelClient) runConn(id int, conn *websocket.Conn) {
 	if c.pingInterval > 0 {
 		go pingLoop(id, conn, &writeMu, done, c.pingInterval)
 	}
+	inflight := newInflightRequests()
 
 	for {
 		_, payload, err := conn.ReadMessage()
@@ -209,12 +275,19 @@ func (c *tunnelClient) runConn(id int, conn *websocket.Conn) {
 			log.Printf("conn %d: read: %v", id, err)
 			return
 		}
+		var control controlFrame
+		if err := json.Unmarshal(payload, &control); err == nil && control.Type == "cancel" {
+			// The caller went away; abort the local request. Cancel frames
+			// are only ever sent for streamed (proto 2) requests.
+			inflight.cancel(control.ID)
+			continue
+		}
 		var frame requestFrame
 		if err := json.Unmarshal(payload, &frame); err != nil {
 			log.Printf("conn %d: bad request frame: %v", id, err)
 			continue
 		}
-		go c.handleRequest(id, conn, &writeMu, frame)
+		go c.handleRequest(id, conn, &writeMu, inflight, frame)
 	}
 }
 
@@ -244,9 +317,10 @@ func pingLoop(id int, conn *websocket.Conn, writeMu *sync.Mutex, done <-chan str
 	}
 }
 
-// handleRequest forwards one request frame to the local proxy and writes the
-// whole response back as one frame.
-func (c *tunnelClient) handleRequest(id int, conn *websocket.Conn, writeMu *sync.Mutex, frame requestFrame) {
+// handleRequest forwards one request frame to the local proxy and returns
+// its response: streamed as head/chunk/end frames when the request frame
+// carries proto >= streamProtoVersion, otherwise as one buffered frame.
+func (c *tunnelClient) handleRequest(id int, conn *websocket.Conn, writeMu *sync.Mutex, inflight *inflightRequests, frame requestFrame) {
 	resp := responseFrame{ID: frame.ID}
 
 	path := frame.Path
@@ -261,7 +335,14 @@ func (c *tunnelClient) handleRequest(id int, conn *websocket.Conn, writeMu *sync
 		method = http.MethodGet
 	}
 
-	req, err := http.NewRequest(method, c.target+path, bytes.NewReader(frame.Body))
+	// A Worker cancel frame (caller gone, stream stalled) aborts the local
+	// request through this context.
+	ctx, cancel := context.WithCancel(context.Background())
+	inflight.add(frame.ID, cancel)
+	defer inflight.remove(frame.ID)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, method, c.target+path, bytes.NewReader(frame.Body))
 	if err != nil {
 		resp.Error = fmt.Sprintf("build request: %v", err)
 		c.writeResponse(id, conn, writeMu, resp)
@@ -285,6 +366,11 @@ func (c *tunnelClient) handleRequest(id int, conn *websocket.Conn, writeMu *sync
 		}
 	}()
 
+	if frame.Proto >= streamProtoVersion {
+		c.streamResponse(id, conn, writeMu, ctx, frame.ID, httpResp)
+		return
+	}
+
 	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		resp.Error = fmt.Sprintf("read local response: %v", err)
@@ -298,16 +384,63 @@ func (c *tunnelClient) handleRequest(id int, conn *websocket.Conn, writeMu *sync
 	c.writeResponse(id, conn, writeMu, resp)
 }
 
-func (c *tunnelClient) writeResponse(id int, conn *websocket.Conn, writeMu *sync.Mutex, resp responseFrame) {
+// streamResponse sends a local response the protocol-v2 way: a head frame
+// the moment the local service has produced its status and headers, then
+// one chunk frame per read, then an end frame. A cancelled context (the
+// Worker said the caller is gone) stops the stream silently — the Worker
+// has already dropped the request, so there is nobody to report to.
+func (c *tunnelClient) streamResponse(id int, conn *websocket.Conn, writeMu *sync.Mutex, ctx context.Context, frameID string, httpResp *http.Response) {
+	head := responseFrame{
+		ID:      frameID,
+		Type:    "head",
+		Status:  httpResp.StatusCode,
+		Headers: httpResp.Header.Clone(),
+	}
+	head.Headers.Del("Content-Length")
+	if !c.writeResponse(id, conn, writeMu, head) {
+		return
+	}
+
+	buf := make([]byte, streamChunkSize)
+	for {
+		n, err := httpResp.Body.Read(buf)
+		if n > 0 {
+			chunk := responseFrame{ID: frameID, Type: "chunk", Body: append([]byte(nil), buf[:n]...)}
+			if !c.writeResponse(id, conn, writeMu, chunk) {
+				return
+			}
+		}
+		switch {
+		case err == io.EOF:
+			c.writeResponse(id, conn, writeMu, responseFrame{ID: frameID, Type: "end"})
+			return
+		case err != nil:
+			if ctx.Err() != nil {
+				return // cancelled by the Worker; stay silent
+			}
+			c.writeResponse(id, conn, writeMu, responseFrame{
+				ID: frameID, Type: "error",
+				Error: fmt.Sprintf("read local response: %v", err),
+			})
+			return
+		}
+	}
+}
+
+// writeResponse marshals and sends one frame, reporting whether the write
+// succeeded. Frame writes on a connection are serialized through writeMu.
+func (c *tunnelClient) writeResponse(id int, conn *websocket.Conn, writeMu *sync.Mutex, resp responseFrame) bool {
 	payload, err := json.Marshal(resp)
 	if err != nil {
 		log.Printf("conn %d: marshal response %s: %v", id, resp.ID, err)
-		return
+		return false
 	}
 	writeMu.Lock()
 	err = conn.WriteMessage(websocket.TextMessage, payload)
 	writeMu.Unlock()
 	if err != nil {
 		log.Printf("conn %d: write response %s: %v", id, resp.ID, err)
+		return false
 	}
+	return true
 }
