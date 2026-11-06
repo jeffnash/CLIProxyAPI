@@ -84,6 +84,9 @@ type tunnelClient struct {
 	target       string
 	pingInterval time.Duration
 	httpClient   *http.Client
+	// secret, when non-empty, is sent as the X-Tunnel-Secret header on every
+	// dial; the Worker refuses tunnel connections without it.
+	secret string
 }
 
 // normalizeWorkerURL accepts either a full WebSocket URL
@@ -107,6 +110,7 @@ func main() {
 	target := flag.String("target", "http://127.0.0.1:8317", "local proxy base URL")
 	conns := flag.Int("conns", 4, "number of persistent tunnel connections")
 	pingInterval := flag.Duration("ping-interval", 20*time.Second, "WebSocket keepalive ping interval (0 disables)")
+	secretFile := flag.String("secret-file", "", "file containing the tunnel admission secret, sent as X-Tunnel-Secret on dial")
 	flag.Parse()
 
 	if strings.TrimSpace(*worker) == "" {
@@ -118,11 +122,26 @@ func main() {
 		os.Exit(2)
 	}
 
+	secret := ""
+	if strings.TrimSpace(*secretFile) != "" {
+		raw, err := os.ReadFile(*secretFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "wstunnel-client: read secret file: %v\n", err)
+			os.Exit(2)
+		}
+		secret = strings.TrimSpace(string(raw))
+		if secret == "" {
+			fmt.Fprintln(os.Stderr, "wstunnel-client: secret file is empty")
+			os.Exit(2)
+		}
+	}
+
 	workerURL := normalizeWorkerURL(*worker)
 	client := &tunnelClient{
 		workerURL:    workerURL,
 		target:       strings.TrimSuffix(*target, "/"),
 		pingInterval: *pingInterval,
+		secret:       secret,
 		// No timeout: proxied generations legitimately run for minutes.
 		httpClient: &http.Client{
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -148,7 +167,11 @@ func main() {
 func (c *tunnelClient) runConnLoop(id int) {
 	backoff := time.Second
 	for {
-		conn, _, err := websocket.DefaultDialer.Dial(c.workerURL, nil)
+		var headers http.Header
+		if c.secret != "" {
+			headers = http.Header{"X-Tunnel-Secret": []string{c.secret}}
+		}
+		conn, _, err := websocket.DefaultDialer.Dial(c.workerURL, headers)
 		if err != nil {
 			log.Printf("conn %d: dial: %v (retry in %s)", id, err, backoff)
 			time.Sleep(backoff)
