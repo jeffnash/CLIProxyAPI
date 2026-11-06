@@ -53,19 +53,29 @@ type Client struct {
 	now        func() time.Time
 }
 
-// NewClient builds a provider client over the supplied HTTP client. The client
-// value is cloned so the no-redirect policy never mutates the caller's client;
-// the transport pointer is kept for connection reuse. Production callers pass
-// a proxy-aware zero-timeout client.
-func NewClient(httpClient *http.Client) *Client {
+// PrepareHTTPClient returns a clone of the supplied HTTP client with the
+// provider's no-redirect policy and a DoH-dialing transport (see doh_dial.go),
+// memoized per source transport so connection reuse is preserved. Callers
+// that execute CodeBuddy requests without going through NewClient — the
+// executor's tracked chat client and its generic HttpRequest path — prepare
+// their client here so every construction path dials the same way.
+func PrepareHTTPClient(httpClient *http.Client) *http.Client {
 	if httpClient == nil {
-		panic("codebuddy: NewClient requires a non-nil HTTP client")
+		panic("codebuddy: PrepareHTTPClient requires a non-nil HTTP client")
 	}
 	clone := *httpClient
 	clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	return &Client{httpClient: &clone, now: time.Now}
+	clone.Transport = dohWrapTransport(clone.Transport)
+	return &clone
+}
+
+// NewClient builds a provider client over the supplied HTTP client, prepared
+// by PrepareHTTPClient. Production callers pass a proxy-aware zero-timeout
+// client.
+func NewClient(httpClient *http.Client) *Client {
+	return &Client{httpClient: PrepareHTTPClient(httpClient), now: time.Now}
 }
 
 func (c *Client) currentTime() time.Time {

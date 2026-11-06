@@ -47,7 +47,7 @@ func (e *CodeBuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		return resp, err
 	}
 	reporter.SetTranslatedReasoningEffort(prepared.Body, e.Identifier())
-	httpClient := reporter.TrackHTTPClient(helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0))
+	httpClient := reporter.TrackHTTPClient(codebuddy.PrepareHTTPClient(helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)))
 	client := codebuddy.NewClient(httpClient)
 	recordCodeBuddyRequest(ctx, e.cfg, auth, prepared.Credentials.Realm, prepared.Body)
 	httpResp, err := client.OpenChat(ctx, prepared.Credentials, prepared.Body, codeBuddyUpstreamHeaders(auth, opts))
@@ -103,7 +103,7 @@ func (e *CodeBuddyExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		return nil, err
 	}
 	reporter.SetTranslatedReasoningEffort(prepared.Body, e.Identifier())
-	httpClient := reporter.TrackHTTPClient(helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0))
+	httpClient := reporter.TrackHTTPClient(codebuddy.PrepareHTTPClient(helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)))
 	client := codebuddy.NewClient(httpClient)
 	recordCodeBuddyRequest(ctx, e.cfg, auth, prepared.Credentials.Realm, prepared.Body)
 	httpResp, err := client.OpenChat(ctx, prepared.Credentials, prepared.Body, codeBuddyUpstreamHeaders(auth, opts))
@@ -291,12 +291,8 @@ func (e *CodeBuddyExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.
 	if err := codebuddy.InjectHeadersForRequest(cloned, credentials); err != nil {
 		return nil, err
 	}
-	baseClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	noRedirect := *baseClient
-	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-	resp, err := noRedirect.Do(cloned)
+	preparedClient := codebuddy.PrepareHTTPClient(helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0))
+	resp, err := preparedClient.Do(cloned)
 	if err != nil {
 		return nil, err
 	}
