@@ -56,6 +56,15 @@ const streamProtoVersion = 2
 // streamChunkSize bounds one chunk frame's raw (pre-base64) payload.
 const streamChunkSize = 32 * 1024
 
+// streamCoalesceWindow is how long streamed body bytes may accumulate
+// before a partial chunk frame is flushed. Streamed responses (SSE above
+// all) arrive as many tiny reads; sending one WebSocket frame per read
+// multiplies the Durable Object request count, which the account's daily
+// free-tier cap counts per message. Coalescing trades at most this much
+// added latency on later chunks for an order-of-magnitude fewer frames.
+// The first chunk is never delayed, so time-to-first-byte is unchanged.
+const streamCoalesceWindow = 40 * time.Millisecond
+
 type requestFrame struct {
 	ID      string      `json:"id"`
 	Proto   int         `json:"proto,omitempty"`
@@ -386,9 +395,13 @@ func (c *tunnelClient) handleRequest(id int, conn *websocket.Conn, writeMu *sync
 
 // streamResponse sends a local response the protocol-v2 way: a head frame
 // the moment the local service has produced its status and headers, then
-// one chunk frame per read, then an end frame. A cancelled context (the
-// Worker said the caller is gone) stops the stream silently — the Worker
-// has already dropped the request, so there is nobody to report to.
+// chunk frames as the body arrives, then an end frame. After the first
+// chunk (sent immediately, preserving time-to-first-byte), body bytes are
+// coalesced: a chunk frame goes out when the pending buffer reaches
+// streamChunkSize, when streamCoalesceWindow elapses, or at end of body.
+// A cancelled context (the Worker said the caller is gone) stops the
+// stream silently — the Worker has already dropped the request, so there
+// is nobody to report to.
 func (c *tunnelClient) streamResponse(id int, conn *websocket.Conn, writeMu *sync.Mutex, ctx context.Context, frameID string, httpResp *http.Response) {
 	head := responseFrame{
 		ID:      frameID,
@@ -401,28 +414,108 @@ func (c *tunnelClient) streamResponse(id int, conn *websocket.Conn, writeMu *syn
 		return
 	}
 
-	buf := make([]byte, streamChunkSize)
-	for {
-		n, err := httpResp.Body.Read(buf)
-		if n > 0 {
-			chunk := responseFrame{ID: frameID, Type: "chunk", Body: append([]byte(nil), buf[:n]...)}
-			if !c.writeResponse(id, conn, writeMu, chunk) {
+	// Reads block, so they run on their own goroutine and the loop below
+	// can watch the coalesce timer and the cancel context between them.
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	reads := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, streamChunkSize)
+		for {
+			n, err := httpResp.Body.Read(buf)
+			var data []byte
+			if n > 0 {
+				data = append([]byte(nil), buf[:n]...)
+			}
+			select {
+			case reads <- readResult{data: data, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
 				return
 			}
 		}
-		switch {
-		case err == io.EOF:
-			c.writeResponse(id, conn, writeMu, responseFrame{ID: frameID, Type: "end"})
-			return
-		case err != nil:
-			if ctx.Err() != nil {
-				return // cancelled by the Worker; stay silent
+	}()
+
+	flush := func(pending []byte) bool {
+		if len(pending) == 0 {
+			return true
+		}
+		return c.writeResponse(id, conn, writeMu, responseFrame{ID: frameID, Type: "chunk", Body: pending})
+	}
+
+	var pending []byte
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	stopTimer := func() {
+		if timer != nil {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
-			c.writeResponse(id, conn, writeMu, responseFrame{
-				ID: frameID, Type: "error",
-				Error: fmt.Sprintf("read local response: %v", err),
-			})
-			return
+			timer, timerC = nil, nil
+		}
+	}
+	defer stopTimer()
+	sentFirst := false
+
+	for {
+		select {
+		case r := <-reads:
+			if len(r.data) > 0 {
+				if !sentFirst {
+					sentFirst = true
+					if !flush(r.data) {
+						return
+					}
+				} else {
+					pending = append(pending, r.data...)
+					switch {
+					case len(pending) >= streamChunkSize:
+						if !flush(pending) {
+							return
+						}
+						pending = nil
+						stopTimer()
+					case timer == nil:
+						timer = time.NewTimer(streamCoalesceWindow)
+						timerC = timer.C
+					}
+				}
+			}
+			switch {
+			case r.err == io.EOF:
+				if !flush(pending) {
+					return
+				}
+				c.writeResponse(id, conn, writeMu, responseFrame{ID: frameID, Type: "end"})
+				return
+			case r.err != nil:
+				if ctx.Err() != nil {
+					return // cancelled by the Worker; stay silent
+				}
+				if !flush(pending) {
+					return
+				}
+				c.writeResponse(id, conn, writeMu, responseFrame{
+					ID: frameID, Type: "error",
+					Error: fmt.Sprintf("read local response: %v", r.err),
+				})
+				return
+			}
+		case <-timerC:
+			timer, timerC = nil, nil
+			if !flush(pending) {
+				return
+			}
+			pending = nil
+		case <-ctx.Done():
+			return // cancelled by the Worker; stay silent
 		}
 	}
 }

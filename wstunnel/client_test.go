@@ -269,6 +269,110 @@ loop:
 	}
 }
 
+// TestRunConnStreamingCoalesces verifies that a rapid trickle of tiny
+// body writes is coalesced into far fewer chunk frames than writes, while
+// the reassembled body stays byte-exact. This is the Durable Object
+// request-count fix: one frame per read would send 20 chunk frames here.
+func TestRunConnStreamingCoalesces(t *testing.T) {
+	const writes = 20
+	const piece = "0123456789"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("target ResponseWriter cannot flush")
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < writes; i++ {
+			_, _ = w.Write([]byte(piece))
+			flusher.Flush()
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	defer target.Close()
+
+	frames := make(chan responseFrame, 64)
+	upgrader := websocket.Upgrader{}
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		frame, err := json.Marshal(requestFrame{
+			ID: "req-coalesce", Proto: streamProtoVersion, Method: "GET", Path: "/trickle",
+		})
+		if err != nil {
+			t.Errorf("marshal request: %v", err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+			t.Errorf("write request: %v", err)
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				t.Errorf("read frame: %v", err)
+				return
+			}
+			var resp responseFrame
+			if err := json.Unmarshal(payload, &resp); err != nil {
+				t.Errorf("unmarshal frame: %v", err)
+				return
+			}
+			frames <- resp
+			if resp.Type == "end" || resp.Error != "" {
+				return
+			}
+		}
+	}))
+	defer worker.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(worker.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial worker: %v", err)
+	}
+	client := &tunnelClient{target: target.URL, pingInterval: 0, httpClient: &http.Client{}}
+	go client.runConn(0, conn)
+	defer func() { _ = conn.Close() }()
+
+	var body []byte
+	chunks := 0
+	timeout := time.After(5 * time.Second)
+loop:
+	for {
+		select {
+		case resp := <-frames:
+			switch resp.Type {
+			case "chunk":
+				chunks++
+				body = append(body, resp.Body...)
+			case "end":
+				break loop
+			case "error":
+				t.Fatalf("unexpected error frame: %s", resp.Error)
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for end frame (chunks so far: %d)", chunks)
+		}
+	}
+
+	if want := strings.Repeat(piece, writes); string(body) != want {
+		t.Errorf("reassembled body = %q, want %q", body, want)
+	}
+	// Still streamed (not one buffered frame), but nowhere near one frame
+	// per write: first chunk immediate + ~40ms windows over ~200ms of
+	// trickle lands around 5; 10 leaves generous scheduling slack.
+	if chunks < 2 || chunks > 10 {
+		t.Errorf("chunk frames = %d, want 2..10 (writes: %d)", chunks, writes)
+	}
+}
+
 // TestRunConnCancel verifies that a Worker cancel frame aborts the
 // in-flight local request: the local handler must observe its request
 // context being cancelled.
