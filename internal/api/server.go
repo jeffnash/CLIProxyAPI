@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/secretdlp"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
@@ -89,6 +90,9 @@ type Server struct {
 
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
+
+	// secretDLP protects outbound provider traffic from client-supplied secrets.
+	secretDLP *secretdlp.Service
 
 	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
 	managementRoutesRegistered atomic.Bool
@@ -156,6 +160,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	envAdminPassword = strings.TrimSpace(envAdminPassword)
 	envManagementSecret := envAdminPasswordSet && envAdminPassword != ""
 
+	secretDLP, errSecretDLP := secretdlp.NewFromEnvWithProviderPolicy(cfg.SecretDLP.DefaultProviderPolicy, cfg.SecretDLP.ProviderOverrides)
+	if errSecretDLP != nil {
+		log.Warnf("secret dlp disabled because initialization failed: %v", errSecretDLP)
+	}
+
 	// Create server instance
 	s := &Server{
 		engine:                       engine,
@@ -167,6 +176,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		envManagementSecret:          envManagementSecret,
 		wsRoutes:                     make(map[string]struct{}),
 		pluginHost:                   optionState.pluginHost,
+		secretDLP:                    secretDLP,
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
 
@@ -175,6 +185,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	engine.Use(logging.GinLogrusRecovery())
 	engine.Use(logging.CPATraceIDMiddleware())
 	engine.Use(s.maxRequestBodyBytesMiddleware())
+	// Secret-DLP intentionally runs before caller-supplied extraMiddleware so it can
+	// normalize encodings and install response log transforms before provider egress.
+	// Provider redaction itself runs after auth selection.
+	if secretDLP != nil && secretDLP.Enabled() {
+		engine.Use(secretdlp.Middleware(secretDLP))
+		log.Info("secret dlp middleware enabled")
+	}
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
 	}
@@ -203,6 +220,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
 	s.handlers.SetPluginHost(optionState.pluginHost)
+	s.handlers.SetSecretDLP(secretDLP)
 	if optionState.pluginHost != nil {
 		optionState.pluginHost.SetModelExecutor(s.handlers)
 		optionState.pluginHost.SetAuthManager(authManager)
@@ -446,6 +464,10 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 
+	if s.secretDLP != nil {
+		s.secretDLP.StartDrain()
+	}
+
 	// Close the HTTP server immediately without graceful draining.
 	var errCloseServer error
 	if s.server != nil {
@@ -457,6 +479,24 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.codexLiveHandler != nil {
 		s.codexLiveHandler.Close()
 	}
+
+	// Drain and close Secret-DLP before the close-error return below, so a
+	// failed HTTP close cannot skip DLP shutdown.
+	if s.secretDLP != nil {
+		drainCtx := ctx
+		cancel := func() {}
+		if timeout := s.secretDLP.DrainTimeout(); timeout > 0 {
+			drainCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		if errDrain := s.secretDLP.Drain(drainCtx); errDrain != nil {
+			log.Warnf("secret dlp drain did not complete cleanly: %v", errDrain)
+		}
+		cancel()
+		if errCloseDLP := s.secretDLP.Close(); errCloseDLP != nil {
+			log.Warnf("secret dlp close failed: %v", errCloseDLP)
+		}
+	}
+
 	if errCloseServer != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)
 	}
