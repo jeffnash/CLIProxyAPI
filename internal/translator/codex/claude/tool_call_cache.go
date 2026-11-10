@@ -7,8 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/MoeForge/moego/ojson"
 )
 
 const (
@@ -30,23 +29,23 @@ var codexClaudeToolCallCache = struct {
 	items: make(map[string]cachedCodexClaudeToolCallEntry),
 }
 
-func rememberCodexClaudeToolCall(scope, callID string, item gjson.Result) {
+func rememberCodexClaudeToolCall(scope, callID string, item ojson.Result) {
 	if callID == "" || !item.Exists() {
 		return
 	}
 	key := codexClaudeToolCallCacheKey(scope, callID)
 
 	raw := []byte(`{"type":"function_call","call_id":"","name":"","arguments":{}}`)
-	raw, _ = sjson.SetBytes(raw, "call_id", callID)
-	raw, _ = sjson.SetBytes(raw, "name", item.Get("name").String())
+	raw, _ = ojson.SetBytes(raw, "call_id", callID)
+	raw, _ = ojson.SetBytes(raw, "name", item.Get("name").String())
 	if args := item.Get("arguments"); args.Exists() {
-		raw, _ = sjson.SetRawBytes(raw, "arguments", []byte(args.Raw))
+		raw, _ = ojson.SetRawBytes(raw, "arguments", []byte(args.Raw))
 	}
 	if id := item.Get("id"); id.Exists() {
-		raw, _ = sjson.SetRawBytes(raw, "id", []byte(id.Raw))
+		raw, _ = ojson.SetRawBytes(raw, "id", []byte(id.Raw))
 	}
 	if status := item.Get("status"); status.Exists() {
-		raw, _ = sjson.SetRawBytes(raw, "status", []byte(status.Raw))
+		raw, _ = ojson.SetRawBytes(raw, "status", []byte(status.Raw))
 	}
 
 	codexClaudeToolCallCache.Lock()
@@ -96,7 +95,7 @@ func codexClaudeToolCallCacheKey(scope, callID string) string {
 }
 
 func codexClaudeToolCallScope(rawJSON []byte) string {
-	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+	if len(rawJSON) == 0 || !ojson.ValidBytes(rawJSON) {
 		return codexClaudeDefaultCacheScope
 	}
 	for _, paths := range [][]string{
@@ -121,7 +120,7 @@ func codexClaudeToolCallScopeFromPaths(rawJSON []byte, paths []string) string {
 	h := sha256.New()
 	wrote := false
 	for _, path := range paths {
-		value := gjson.GetBytes(rawJSON, path)
+		value := ojson.GetBytes(rawJSON, path)
 		if !value.Exists() {
 			continue
 		}

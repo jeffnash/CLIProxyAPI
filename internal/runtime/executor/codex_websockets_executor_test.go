@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -24,7 +26,6 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 var benchmarkBuildCodexWebsocketRequestBodyOutput []byte
@@ -34,16 +35,16 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 
 	wsReqBody := buildCodexWebsocketRequestBody(body)
 
-	if got := gjson.GetBytes(wsReqBody, "type").String(); got != "response.create" {
+	if got := ojson.GetBytes(wsReqBody, "type").String(); got != "response.create" {
 		t.Fatalf("type = %s, want response.create", got)
 	}
-	if got := gjson.GetBytes(wsReqBody, "previous_response_id").String(); got != "resp-1" {
+	if got := ojson.GetBytes(wsReqBody, "previous_response_id").String(); got != "resp-1" {
 		t.Fatalf("previous_response_id = %s, want resp-1", got)
 	}
-	if gjson.GetBytes(wsReqBody, "input.0.id").String() != "msg-1" {
+	if ojson.GetBytes(wsReqBody, "input.0.id").String() != "msg-1" {
 		t.Fatalf("input item id mismatch")
 	}
-	if got := gjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
+	if got := ojson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
 		t.Fatalf("unexpected websocket request type: %s", got)
 	}
 }
@@ -67,15 +68,15 @@ func TestBuildCodexWebsocketRequestBodySanitizesOverlongInputItemIDs(t *testing.
 	first := buildCodexWebsocketRequestBody(body)
 	second := buildCodexWebsocketRequestBody(body)
 
-	if input := gjson.GetBytes(first, "input").Array(); len(input) != 3 {
+	if input := ojson.GetBytes(first, "input").Array(); len(input) != 3 {
 		t.Fatalf("input length = %d, want 3: %s", len(input), first)
 	}
-	if gotType := gjson.GetBytes(first, "input.0.type").String(); gotType != "function_call" {
+	if gotType := ojson.GetBytes(first, "input.0.type").String(); gotType != "function_call" {
 		t.Fatalf("input.0.type = %q, want function_call: %s", gotType, first)
 	}
 
-	shortCallItemID := gjson.GetBytes(first, "input.0.id").String()
-	shortOutputItemID := gjson.GetBytes(first, "input.1.id").String()
+	shortCallItemID := ojson.GetBytes(first, "input.0.id").String()
+	shortOutputItemID := ojson.GetBytes(first, "input.1.id").String()
 	if len([]rune(shortCallItemID)) > 64 || shortCallItemID == longCallItemID {
 		t.Fatalf("input.0.id was not shortened to at most 64 characters: %q", shortCallItemID)
 	}
@@ -85,16 +86,16 @@ func TestBuildCodexWebsocketRequestBodySanitizesOverlongInputItemIDs(t *testing.
 	if shortCallItemID == shortOutputItemID {
 		t.Fatalf("distinct long IDs produced the same shortened ID: %q", shortCallItemID)
 	}
-	if got := gjson.GetBytes(second, "input.0.id").String(); got != shortCallItemID {
+	if got := ojson.GetBytes(second, "input.0.id").String(); got != shortCallItemID {
 		t.Fatalf("input item ID shortening is not deterministic: first=%q second=%q", shortCallItemID, got)
 	}
-	if got := gjson.GetBytes(first, "input.0.call_id").String(); got != "call-1" {
+	if got := ojson.GetBytes(first, "input.0.call_id").String(); got != "call-1" {
 		t.Fatalf("function call_id = %q, want call-1", got)
 	}
-	if got := gjson.GetBytes(first, "input.1.call_id").String(); got != "call-1" {
+	if got := ojson.GetBytes(first, "input.1.call_id").String(); got != "call-1" {
 		t.Fatalf("function call output call_id = %q, want call-1", got)
 	}
-	if got := gjson.GetBytes(first, "input.2.id").String(); got != "msg_item_74ec40c883248ebb4885ec84" {
+	if got := ojson.GetBytes(first, "input.2.id").String(); got != "msg_item_74ec40c883248ebb4885ec84" {
 		t.Fatalf("message input item ID was not normalized: %q", got)
 	}
 }
@@ -157,7 +158,7 @@ func TestCodexWebsocketsExecuteRestoresClaudeAgentReasoningReplay(t *testing.T) 
 
 	select {
 	case payload := <-capturedPayload:
-		input := gjson.GetBytes(payload, "input").Array()
+		input := ojson.GetBytes(payload, "input").Array()
 		if len(input) != 4 {
 			t.Fatalf("upstream input length = %d, want 4; payload=%s", len(input), payload)
 		}
@@ -234,19 +235,19 @@ func TestCodexWebsocketsExecuteResponsesLiteDoesNotInjectImageGenerationTool(t *
 
 	select {
 	case payload := <-capturedPayload:
-		if instructions := gjson.GetBytes(payload, "instructions"); instructions.Exists() {
+		if instructions := ojson.GetBytes(payload, "instructions"); instructions.Exists() {
 			t.Errorf("unexpected instructions in responses-lite upstream payload: %s", payload)
 		}
-		if tools := gjson.GetBytes(payload, "tools"); tools.Exists() {
+		if tools := ojson.GetBytes(payload, "tools"); tools.Exists() {
 			t.Fatalf("unexpected tools in responses-lite upstream payload: %s", tools.Raw)
 		}
-		if got := gjson.GetBytes(payload, "input.0.type").String(); got != "additional_tools" {
+		if got := ojson.GetBytes(payload, "input.0.type").String(); got != "additional_tools" {
 			t.Fatalf("input.0.type = %q, want additional_tools; payload=%s", got, payload)
 		}
-		if got := gjson.GetBytes(payload, "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite").String(); got != "true" {
+		if got := ojson.GetBytes(payload, "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite").String(); got != "true" {
 			t.Fatalf("responses-lite metadata = %q, want true; payload=%s", got, payload)
 		}
-		parallelToolCalls := gjson.GetBytes(payload, "parallel_tool_calls")
+		parallelToolCalls := ojson.GetBytes(payload, "parallel_tool_calls")
 		if !parallelToolCalls.Exists() || parallelToolCalls.Bool() {
 			t.Fatalf("responses-lite parallel_tool_calls should be false: %s", payload)
 		}
@@ -317,7 +318,7 @@ func TestCodexWebsocketsExecuteStreamResponsesLiteForcesParallelToolCallsFalse(t
 
 	select {
 	case payload := <-capturedPayload:
-		parallelToolCalls := gjson.GetBytes(payload, "parallel_tool_calls")
+		parallelToolCalls := ojson.GetBytes(payload, "parallel_tool_calls")
 		if !parallelToolCalls.Exists() || parallelToolCalls.Bool() {
 			t.Fatalf("responses-lite parallel_tool_calls should be false: %s", payload)
 		}
@@ -369,10 +370,10 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 
 	select {
 	case payload := <-capturedPayload:
-		if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
+		if got := ojson.GetBytes(payload, "type").String(); got != "response.create" {
 			t.Fatalf("upstream type = %s, want response.create; payload=%s", got, payload)
 		}
-		if got := gjson.GetBytes(payload, "previous_response_id").String(); got != "resp-1" {
+		if got := ojson.GetBytes(payload, "previous_response_id").String(); got != "resp-1" {
 			t.Fatalf("upstream previous_response_id = %s, want resp-1; payload=%s", got, payload)
 		}
 	case <-time.After(5 * time.Second):
@@ -545,7 +546,7 @@ func TestCodexAutoExecutorRequiredUpstreamWebsocketRejectsHTTPFallback(t *testin
 	if !ok || statusErr.StatusCode() != http.StatusUpgradeRequired {
 		t.Fatalf("ExecuteStream() error = %T %v, want status 426", errExecute, errExecute)
 	}
-	if got := gjson.Get(errExecute.Error(), "error.code").String(); got != "upstream_http_replay_required" {
+	if got := ojson.Get(errExecute.Error(), "error.code").String(); got != "upstream_http_replay_required" {
 		t.Fatalf("ExecuteStream() error code = %q, want upstream_http_replay_required", got)
 	}
 	requestScoped, ok := errExecute.(cliproxyexecutor.RequestScopedError)
@@ -717,10 +718,10 @@ func TestCodexWebsocketsExecuteStreamPassesThroughUpstreamWebsocketPayloadForDow
 
 	select {
 	case payload := <-capturedPayload:
-		if got := gjson.GetBytes(payload, "model").String(); got != "gpt-5-codex" {
+		if got := ojson.GetBytes(payload, "model").String(); got != "gpt-5-codex" {
 			t.Fatalf("upstream model = %s, want gpt-5-codex; payload=%s", got, payload)
 		}
-		parallelToolCalls := gjson.GetBytes(payload, "parallel_tool_calls")
+		parallelToolCalls := ojson.GetBytes(payload, "parallel_tool_calls")
 		if !parallelToolCalls.Exists() || !parallelToolCalls.Bool() {
 			t.Fatalf("non-lite parallel_tool_calls should be preserved: %s", payload)
 		}
@@ -1012,7 +1013,7 @@ func TestCodexWebsocketsExecuteStreamMapsMessageTooBigClose(t *testing.T) {
 		if got := statusErr.StatusCode(); got != http.StatusRequestEntityTooLarge {
 			t.Fatalf("status = %d, want %d", got, http.StatusRequestEntityTooLarge)
 		}
-		if got := gjson.Get(chunk.Err.Error(), "error.code").String(); got != "message_too_big" {
+		if got := ojson.Get(chunk.Err.Error(), "error.code").String(); got != "message_too_big" {
 			t.Fatalf("error code = %q, want message_too_big; err=%v", got, chunk.Err)
 		}
 		requestErr, ok := chunk.Err.(interface{ IsRequestScoped() bool })
@@ -1492,7 +1493,7 @@ func TestApplyCodexPromptCacheHeadersUsesDerivedSessionUUID(t *testing.T) {
 		Metadata: map[string]any{cliproxyexecutor.DerivedSessionIDMetadataKey: "ctx:v1:derived-root"},
 	}
 	body, headers := applyCodexPromptCacheHeaders(sdktranslator.FormatInteractions, req, []byte(`{"model":"gpt-5-codex"}`))
-	cacheKey := gjson.GetBytes(body, "prompt_cache_key").String()
+	cacheKey := ojson.GetBytes(body, "prompt_cache_key").String()
 	if _, errParse := uuid.Parse(cacheKey); errParse != nil {
 		t.Fatalf("prompt_cache_key %q is not a UUID: %v", cacheKey, errParse)
 	}
@@ -1525,8 +1526,8 @@ func TestApplyCodexPromptCacheHeadersKeepsExecutionSessionAcrossIncrementalRoots
 	}
 	firstBody, _ := applyCodexPromptCacheHeaders(sdktranslator.FormatOpenAIResponse, firstReq, []byte(`{"model":"gpt-5-codex"}`))
 	secondBody, _ := applyCodexPromptCacheHeaders(sdktranslator.FormatOpenAIResponse, secondReq, []byte(`{"model":"gpt-5-codex"}`))
-	firstKey := gjson.GetBytes(firstBody, "prompt_cache_key").String()
-	secondKey := gjson.GetBytes(secondBody, "prompt_cache_key").String()
+	firstKey := ojson.GetBytes(firstBody, "prompt_cache_key").String()
+	secondKey := ojson.GetBytes(secondBody, "prompt_cache_key").String()
 	if firstKey == "" || firstKey != secondKey {
 		t.Fatalf("incremental websocket roots changed prompt cache key: first=%q second=%q", firstKey, secondKey)
 	}
@@ -1551,8 +1552,8 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	firstBody, firstHeaders := applyCodexPromptCacheHeaders("claude", firstReq, []byte(`{"model":"gpt-5-codex"}`))
 	secondBody, secondHeaders := applyCodexPromptCacheHeaders("claude", secondReq, []byte(`{"model":"gpt-5-codex"}`))
 
-	firstKey := gjson.GetBytes(firstBody, "prompt_cache_key").String()
-	secondKey := gjson.GetBytes(secondBody, "prompt_cache_key").String()
+	firstKey := ojson.GetBytes(firstBody, "prompt_cache_key").String()
+	secondKey := ojson.GetBytes(secondBody, "prompt_cache_key").String()
 	if firstKey == "" {
 		t.Fatalf("first prompt_cache_key is empty; body=%s", string(firstBody))
 	}
@@ -1575,7 +1576,7 @@ func TestApplyCodexPromptCacheHeadersClaudeRejectsBareUserID(t *testing.T) {
 
 	body, headers := applyCodexPromptCacheHeaders("claude", req, []byte(`{"model":"gpt-5-codex"}`))
 
-	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "" {
+	if got := ojson.GetBytes(body, "prompt_cache_key").String(); got != "" {
 		t.Fatalf("bare metadata.user_id must not create websocket prompt_cache_key, got %q; body=%s", got, string(body))
 	}
 	if got := headers["session_id"]; len(got) != 0 {
@@ -1644,7 +1645,7 @@ func TestParseCodexWebsocketErrorPreservesWrappedBodyAndHeaders(t *testing.T) {
 		t.Fatalf("expected websocket error")
 	}
 
-	parsed := gjson.Parse(err.Error())
+	parsed := ojson.Parse(err.Error())
 	if got := parsed.Get("status").Int(); got != http.StatusTooManyRequests {
 		t.Fatalf("wrapped status = %d, want 429; payload=%s", got, err.Error())
 	}
@@ -2641,14 +2642,18 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	serverPongCh := make(chan string, 1)
 	inWriteHook := make(chan struct{})
+	var inWriteHookOnce sync.Once
 	pongDeliveredDuringWrite := make(chan struct{})
+	var pongDeliveredOnce sync.Once
+	serverDone := make(chan struct{})
+	defer close(serverDone)
 
 	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
-		close(inWriteHook)
+		inWriteHookOnce.Do(func() { close(inWriteHook) })
 		// Wait until server confirms pong was received before allowing write to finish.
 		select {
 		case <-pongDeliveredDuringWrite:
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 			t.Error("timed out waiting for pong delivery while payload write was held in hook")
 		}
 	}
@@ -2669,11 +2674,17 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 
 		// Start server reader loop so server processes control frames.
 		readErrCh := make(chan error, 1)
+		payloadReceived := make(chan struct{})
 		go func() {
+			signaled := false
 			for {
 				if _, _, errRead := conn.ReadMessage(); errRead != nil {
 					readErrCh <- errRead
 					return
+				}
+				if !signaled {
+					signaled = true
+					close(payloadReceived)
 				}
 			}
 		}()
@@ -2681,13 +2692,13 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 		// Wait until client has entered writeMessage and is actively holding writeMu.
 		select {
 		case <-inWriteHook:
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 			t.Errorf("timed out waiting for client write hook")
 			return
 		}
 
 		// Upstream sends Ping WHILE client payload write is in progress holding writeMu.
-		_ = conn.WriteControl(websocket.PingMessage, []byte("session-ping"), time.Now().Add(time.Second))
+		_ = conn.WriteControl(websocket.PingMessage, []byte("session-ping"), time.Now().Add(5*time.Second))
 
 		// Server asserts Pong arrives while client write is still blocked in the hook.
 		select {
@@ -2695,15 +2706,25 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
 			if got != "session-ping" {
 				t.Errorf("unexpected pong payload: got %q, want session-ping", got)
 			}
-			close(pongDeliveredDuringWrite)
-		case <-time.After(2 * time.Second):
+			pongDeliveredOnce.Do(func() { close(pongDeliveredDuringWrite) })
+		case <-time.After(5 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress")
+			return
+		}
+
+		// The held client write is released together with the pong. Wait until the
+		// request frame arrives before writing the terminal event and closing.
+		select {
+		case <-payloadReceived:
+		case <-time.After(5 * time.Second):
+			t.Errorf("timed out waiting for client payload after pong")
 			return
 		}
 
 		// Now send terminal response.
 		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
 		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+		<-serverDone
 	}))
 	defer server.Close()
 
@@ -2741,13 +2762,17 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	serverPongCh := make(chan string, 1)
 	inWriteHook := make(chan struct{})
+	var inWriteHookOnce sync.Once
 	pongDeliveredDuringWrite := make(chan struct{})
+	var pongDeliveredOnce sync.Once
+	serverDone := make(chan struct{})
+	defer close(serverDone)
 
 	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
-		close(inWriteHook)
+		inWriteHookOnce.Do(func() { close(inWriteHook) })
 		select {
 		case <-pongDeliveredDuringWrite:
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 			t.Error("timed out waiting for pong delivery while payload write was held in hook")
 		}
 	}
@@ -2766,10 +2791,16 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 			return nil
 		})
 
+		payloadReceived := make(chan struct{})
 		go func() {
+			signaled := false
 			for {
 				if _, _, errRead := conn.ReadMessage(); errRead != nil {
 					return
+				}
+				if !signaled {
+					signaled = true
+					close(payloadReceived)
 				}
 			}
 		}()
@@ -2777,13 +2808,13 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 		// Wait until client has entered writeMessage on sessionless path.
 		select {
 		case <-inWriteHook:
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 			t.Errorf("timed out waiting for client write hook")
 			return
 		}
 
 		// Upstream sends Ping WHILE client payload write is in progress.
-		_ = conn.WriteControl(websocket.PingMessage, []byte("sessionless-ping"), time.Now().Add(time.Second))
+		_ = conn.WriteControl(websocket.PingMessage, []byte("sessionless-ping"), time.Now().Add(5*time.Second))
 
 		// Server asserts Pong arrives while client write is still in progress.
 		select {
@@ -2791,14 +2822,22 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
 			if got != "sessionless-ping" {
 				t.Errorf("unexpected pong payload: got %q, want sessionless-ping", got)
 			}
-			close(pongDeliveredDuringWrite)
-		case <-time.After(2 * time.Second):
+			pongDeliveredOnce.Do(func() { close(pongDeliveredDuringWrite) })
+		case <-time.After(5 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress on sessionless connection")
+			return
+		}
+
+		select {
+		case <-payloadReceived:
+		case <-time.After(5 * time.Second):
+			t.Errorf("timed out waiting for client payload after pong on sessionless connection")
 			return
 		}
 
 		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
 		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+		<-serverDone
 	}))
 	defer server.Close()
 
@@ -2833,13 +2872,17 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testi
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	serverPongCh := make(chan string, 1)
 	inWriteHook := make(chan struct{})
+	var inWriteHookOnce sync.Once
 	pongDeliveredDuringWrite := make(chan struct{})
+	var pongDeliveredOnce sync.Once
+	serverDone := make(chan struct{})
+	defer close(serverDone)
 
 	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
-		close(inWriteHook)
+		inWriteHookOnce.Do(func() { close(inWriteHook) })
 		select {
 		case <-pongDeliveredDuringWrite:
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 			t.Error("timed out waiting for pong delivery while nonstream payload write was held in hook")
 		}
 	}
@@ -2858,10 +2901,16 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testi
 			return nil
 		})
 
+		payloadReceived := make(chan struct{})
 		go func() {
+			signaled := false
 			for {
 				if _, _, errRead := conn.ReadMessage(); errRead != nil {
 					return
+				}
+				if !signaled {
+					signaled = true
+					close(payloadReceived)
 				}
 			}
 		}()
@@ -2869,13 +2918,13 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testi
 		// Wait until client has entered writeMessage on nonstream path.
 		select {
 		case <-inWriteHook:
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 			t.Errorf("timed out waiting for client write hook")
 			return
 		}
 
 		// Upstream sends Ping WHILE client payload write is in progress.
-		_ = conn.WriteControl(websocket.PingMessage, []byte("nonstream-sessionless-ping"), time.Now().Add(time.Second))
+		_ = conn.WriteControl(websocket.PingMessage, []byte("nonstream-sessionless-ping"), time.Now().Add(5*time.Second))
 
 		// Server asserts Pong arrives while client write is still in progress.
 		select {
@@ -2883,14 +2932,22 @@ func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testi
 			if got != "nonstream-sessionless-ping" {
 				t.Errorf("unexpected pong payload: got %q, want nonstream-sessionless-ping", got)
 			}
-			close(pongDeliveredDuringWrite)
-		case <-time.After(2 * time.Second):
+			pongDeliveredOnce.Do(func() { close(pongDeliveredDuringWrite) })
+		case <-time.After(5 * time.Second):
 			t.Errorf("pong was not received while payload write was in progress on nonstream sessionless connection")
+			return
+		}
+
+		select {
+		case <-payloadReceived:
+		case <-time.After(5 * time.Second):
+			t.Errorf("timed out waiting for client payload after pong on nonstream sessionless connection")
 			return
 		}
 
 		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
 		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+		<-serverDone
 	}))
 	defer server.Close()
 

@@ -7,7 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/tiktoken-go/tokenizer"
 )
 
@@ -97,7 +98,7 @@ func CountOpenAIChatTokens(enc tokenizer.Codec, payload []byte) (int64, error) {
 		return 0, nil
 	}
 
-	root := gjson.ParseBytes(payload)
+	root := util.ParseGJSONBytesNoCopy(payload)
 	segments := make([]string, 0, 32)
 
 	collectOpenAIMessages(root.Get("messages"), &segments)
@@ -128,7 +129,7 @@ func countClaudeChatTokens(enc *TokenizerWrapper, payload []byte) (int64, error)
 		return 0, nil
 	}
 
-	root := gjson.ParseBytes(payload)
+	root := ojson.ParseBytes(payload)
 	segments := make([]string, 0, 32)
 
 	// Collect system prompt (can be string or array of content blocks)
@@ -204,22 +205,22 @@ func estimateImageTokens(width, height float64) int {
 
 // collectClaudeSystem extracts text from Claude's system field.
 // System can be a string or an array of content blocks.
-func collectClaudeSystem(system gjson.Result, segments *[]string) {
+func collectClaudeSystem(system ojson.Result, segments *[]string) {
 	if !system.Exists() {
 		return
 	}
-	if system.Type == gjson.String {
+	if system.Type == ojson.String {
 		addIfNotEmpty(segments, system.String())
 		return
 	}
 	if system.IsArray() {
-		system.ForEach(func(_, block gjson.Result) bool {
+		system.ForEach(func(_, block ojson.Result) bool {
 			blockType := block.Get("type").String()
 			if blockType == "text" || blockType == "" {
 				addIfNotEmpty(segments, block.Get("text").String())
 			}
 			// Also handle plain string blocks
-			if block.Type == gjson.String {
+			if block.Type == ojson.String {
 				addIfNotEmpty(segments, block.String())
 			}
 			return true
@@ -228,11 +229,11 @@ func collectClaudeSystem(system gjson.Result, segments *[]string) {
 }
 
 // collectClaudeMessages extracts text from Claude's messages array.
-func collectClaudeMessages(messages gjson.Result, segments *[]string) {
+func collectClaudeMessages(messages ojson.Result, segments *[]string) {
 	if !messages.Exists() || !messages.IsArray() {
 		return
 	}
-	messages.ForEach(func(_, message gjson.Result) bool {
+	messages.ForEach(func(_, message ojson.Result) bool {
 		addIfNotEmpty(segments, message.Get("role").String())
 		collectClaudeContent(message.Get("content"), segments)
 		return true
@@ -242,16 +243,16 @@ func collectClaudeMessages(messages gjson.Result, segments *[]string) {
 // collectClaudeContent extracts text from Claude's content field.
 // Content can be a string or an array of content blocks.
 // For images, estimates token count based on dimensions when available.
-func collectClaudeContent(content gjson.Result, segments *[]string) {
+func collectClaudeContent(content ojson.Result, segments *[]string) {
 	if !content.Exists() {
 		return
 	}
-	if content.Type == gjson.String {
+	if content.Type == ojson.String {
 		addIfNotEmpty(segments, content.String())
 		return
 	}
 	if content.IsArray() {
-		content.ForEach(func(_, part gjson.Result) bool {
+		content.ForEach(func(_, part ojson.Result) bool {
 			partType := part.Get("type").String()
 			switch partType {
 			case "text":
@@ -286,9 +287,9 @@ func collectClaudeContent(content gjson.Result, segments *[]string) {
 				addIfNotEmpty(segments, part.Get("thinking").String())
 			default:
 				// For unknown types, try to extract any text content
-				if part.Type == gjson.String {
+				if part.Type == ojson.String {
 					addIfNotEmpty(segments, part.String())
-				} else if part.Type == gjson.JSON {
+				} else if part.Type == ojson.JSON {
 					addIfNotEmpty(segments, part.Raw)
 				}
 			}
@@ -298,11 +299,11 @@ func collectClaudeContent(content gjson.Result, segments *[]string) {
 }
 
 // collectClaudeTools extracts text from Claude's tools array.
-func collectClaudeTools(tools gjson.Result, segments *[]string) {
+func collectClaudeTools(tools ojson.Result, segments *[]string) {
 	if !tools.Exists() || !tools.IsArray() {
 		return
 	}
-	tools.ForEach(func(_, tool gjson.Result) bool {
+	tools.ForEach(func(_, tool ojson.Result) bool {
 		addIfNotEmpty(segments, tool.Get("name").String())
 		addIfNotEmpty(segments, tool.Get("description").String())
 		if inputSchema := tool.Get("input_schema"); inputSchema.Exists() {
@@ -317,11 +318,11 @@ func BuildOpenAIUsageJSON(count int64) []byte {
 	return []byte(fmt.Sprintf(`{"usage":{"prompt_tokens":%d,"completion_tokens":0,"total_tokens":%d}}`, count, count))
 }
 
-func collectOpenAIMessages(messages gjson.Result, segments *[]string) {
+func collectOpenAIMessages(messages ojson.Result, segments *[]string) {
 	if !messages.Exists() || !messages.IsArray() {
 		return
 	}
-	messages.ForEach(func(_, message gjson.Result) bool {
+	messages.ForEach(func(_, message ojson.Result) bool {
 		addIfNotEmpty(segments, message.Get("role").String())
 		addIfNotEmpty(segments, message.Get("name").String())
 		collectOpenAIContent(message.Get("content"), segments)
@@ -331,16 +332,16 @@ func collectOpenAIMessages(messages gjson.Result, segments *[]string) {
 	})
 }
 
-func collectOpenAIContent(content gjson.Result, segments *[]string) {
+func collectOpenAIContent(content ojson.Result, segments *[]string) {
 	if !content.Exists() {
 		return
 	}
-	if content.Type == gjson.String {
+	if content.Type == ojson.String {
 		addIfNotEmpty(segments, content.String())
 		return
 	}
 	if content.IsArray() {
-		content.ForEach(func(_, part gjson.Result) bool {
+		content.ForEach(func(_, part ojson.Result) bool {
 			partType := part.Get("type").String()
 			switch partType {
 			case "text", "input_text", "output_text":
@@ -357,7 +358,7 @@ func collectOpenAIContent(content gjson.Result, segments *[]string) {
 					collectOpenAIContent(part, segments)
 					return true
 				}
-				if part.Type == gjson.JSON {
+				if part.Type == ojson.JSON {
 					addIfNotEmpty(segments, part.Raw)
 					return true
 				}
@@ -367,16 +368,16 @@ func collectOpenAIContent(content gjson.Result, segments *[]string) {
 		})
 		return
 	}
-	if content.Type == gjson.JSON {
+	if content.Type == ojson.JSON {
 		addIfNotEmpty(segments, content.Raw)
 	}
 }
 
-func collectOpenAIToolCalls(calls gjson.Result, segments *[]string) {
+func collectOpenAIToolCalls(calls ojson.Result, segments *[]string) {
 	if !calls.Exists() || !calls.IsArray() {
 		return
 	}
-	calls.ForEach(func(_, call gjson.Result) bool {
+	calls.ForEach(func(_, call ojson.Result) bool {
 		addIfNotEmpty(segments, call.Get("id").String())
 		addIfNotEmpty(segments, call.Get("type").String())
 		function := call.Get("function")
@@ -392,7 +393,7 @@ func collectOpenAIToolCalls(calls gjson.Result, segments *[]string) {
 	})
 }
 
-func collectOpenAIFunctionCall(call gjson.Result, segments *[]string) {
+func collectOpenAIFunctionCall(call ojson.Result, segments *[]string) {
 	if !call.Exists() {
 		return
 	}
@@ -400,12 +401,12 @@ func collectOpenAIFunctionCall(call gjson.Result, segments *[]string) {
 	addIfNotEmpty(segments, call.Get("arguments").String())
 }
 
-func collectOpenAITools(tools gjson.Result, segments *[]string) {
+func collectOpenAITools(tools ojson.Result, segments *[]string) {
 	if !tools.Exists() {
 		return
 	}
 	if tools.IsArray() {
-		tools.ForEach(func(_, tool gjson.Result) bool {
+		tools.ForEach(func(_, tool ojson.Result) bool {
 			appendToolPayload(tool, segments)
 			return true
 		})
@@ -414,11 +415,11 @@ func collectOpenAITools(tools gjson.Result, segments *[]string) {
 	appendToolPayload(tools, segments)
 }
 
-func collectOpenAIFunctions(functions gjson.Result, segments *[]string) {
+func collectOpenAIFunctions(functions ojson.Result, segments *[]string) {
 	if !functions.Exists() || !functions.IsArray() {
 		return
 	}
-	functions.ForEach(func(_, function gjson.Result) bool {
+	functions.ForEach(func(_, function ojson.Result) bool {
 		addIfNotEmpty(segments, function.Get("name").String())
 		addIfNotEmpty(segments, function.Get("description").String())
 		if params := function.Get("parameters"); params.Exists() {
@@ -428,18 +429,18 @@ func collectOpenAIFunctions(functions gjson.Result, segments *[]string) {
 	})
 }
 
-func collectOpenAIToolChoice(choice gjson.Result, segments *[]string) {
+func collectOpenAIToolChoice(choice ojson.Result, segments *[]string) {
 	if !choice.Exists() {
 		return
 	}
-	if choice.Type == gjson.String {
+	if choice.Type == ojson.String {
 		addIfNotEmpty(segments, choice.String())
 		return
 	}
 	addIfNotEmpty(segments, choice.Raw)
 }
 
-func collectOpenAIResponseFormat(format gjson.Result, segments *[]string) {
+func collectOpenAIResponseFormat(format ojson.Result, segments *[]string) {
 	if !format.Exists() {
 		return
 	}
@@ -453,7 +454,7 @@ func collectOpenAIResponseFormat(format gjson.Result, segments *[]string) {
 	}
 }
 
-func appendToolPayload(tool gjson.Result, segments *[]string) {
+func appendToolPayload(tool ojson.Result, segments *[]string) {
 	if !tool.Exists() {
 		return
 	}

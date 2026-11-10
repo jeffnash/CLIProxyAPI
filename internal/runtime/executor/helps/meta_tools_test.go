@@ -3,7 +3,7 @@ package helps
 import (
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
 )
 
 func TestSanitizeMetaWebSearchTools_StripsSearchContentTypesFromWebSearch(t *testing.T) {
@@ -40,7 +40,7 @@ func TestSanitizeMetaWebSearchTools_StripsSearchContentTypesFromWebSearch(t *tes
 	got := SanitizeMetaWebSearchTools(input)
 
 	// web_search at index 1 must have search_content_types stripped
-	tool1 := gjson.GetBytes(got, "tools.1")
+	tool1 := ojson.GetBytes(got, "tools.1")
 	if tool1.Get("type").String() != "web_search" {
 		t.Fatalf("tools.1 type = %q, want web_search", tool1.Get("type").String())
 	}
@@ -52,7 +52,7 @@ func TestSanitizeMetaWebSearchTools_StripsSearchContentTypesFromWebSearch(t *tes
 	}
 
 	// web_search_preview at index 2 must retain search_content_types
-	tool2 := gjson.GetBytes(got, "tools.2")
+	tool2 := ojson.GetBytes(got, "tools.2")
 	if tool2.Get("type").String() != "web_search_preview" {
 		t.Fatalf("tools.2 type = %q, want web_search_preview", tool2.Get("type").String())
 	}
@@ -61,7 +61,7 @@ func TestSanitizeMetaWebSearchTools_StripsSearchContentTypesFromWebSearch(t *tes
 	}
 
 	// nested web_search in namespace at index 3 must have search_content_types stripped
-	nestedTool := gjson.GetBytes(got, "tools.3.tools.0")
+	nestedTool := ojson.GetBytes(got, "tools.3.tools.0")
 	if nestedTool.Get("type").String() != "web_search" {
 		t.Fatalf("tools.3.tools.0 type = %q, want web_search", nestedTool.Get("type").String())
 	}
@@ -70,7 +70,7 @@ func TestSanitizeMetaWebSearchTools_StripsSearchContentTypesFromWebSearch(t *tes
 	}
 
 	// function tool at index 0 must be unchanged
-	tool0 := gjson.GetBytes(got, "tools.0")
+	tool0 := ojson.GetBytes(got, "tools.0")
 	if tool0.Get("name").String() != "lookup" {
 		t.Fatalf("tools.0 name = %q, want lookup", tool0.Get("name").String())
 	}
@@ -120,7 +120,7 @@ func TestStripMetaToolSchemaKeywords_RemovesPatternRecursively(t *testing.T) {
 
 	assertNoPattern := func(path string) {
 		t.Helper()
-		if gjson.GetBytes(got, path).Exists() {
+		if ojson.GetBytes(got, path).Exists() {
 			t.Errorf("%s still exists in %s", path, got)
 		}
 	}
@@ -130,23 +130,23 @@ func TestStripMetaToolSchemaKeywords_RemovesPatternRecursively(t *testing.T) {
 	assertNoPattern("tools.1.parameters.properties.items.items.pattern")
 
 	// Every other key/value is unchanged.
-	query := gjson.GetBytes(got, "tools.0.input_schema.properties.query")
+	query := ojson.GetBytes(got, "tools.0.input_schema.properties.query")
 	if query.Get("type").String() != "string" || query.Get("minLength").Int() != 1 || query.Get("maxLength").Int() != 1024 {
 		t.Errorf("query schema changed unexpectedly: %s", query.Raw)
 	}
-	filter := gjson.GetBytes(got, "tools.0.input_schema.properties.options.properties.filter")
+	filter := ojson.GetBytes(got, "tools.0.input_schema.properties.options.properties.filter")
 	if filter.Get("type").String() != "string" || len(filter.Get("enum").Array()) != 2 {
 		t.Errorf("filter schema changed unexpectedly: %s", filter.Raw)
 	}
-	if d := gjson.GetBytes(got, "tools.0.input_schema.properties.options.anyOf.0.description").String(); d != "starts with x" {
+	if d := ojson.GetBytes(got, "tools.0.input_schema.properties.options.anyOf.0.description").String(); d != "starts with x" {
 		t.Errorf("anyOf description changed: %q", d)
 	}
 	// A property NAMED pattern is an argument definition, not the keyword.
-	namedArg := gjson.GetBytes(got, "tools.0.input_schema.properties.pattern")
+	namedArg := ojson.GetBytes(got, "tools.0.input_schema.properties.pattern")
 	if !namedArg.Exists() || namedArg.Get("type").String() != "string" {
 		t.Errorf("argument named pattern was removed: %s", got)
 	}
-	if m := gjson.GetBytes(got, "model").String(); m != "muse-wonder-full-1.0-contributor" {
+	if m := ojson.GetBytes(got, "model").String(); m != "muse-wonder-full-1.0-contributor" {
 		t.Errorf("model changed: %q", m)
 	}
 }

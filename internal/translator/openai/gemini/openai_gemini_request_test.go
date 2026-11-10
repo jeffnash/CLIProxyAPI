@@ -4,17 +4,17 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
 )
 
 // collectToolCallIDs returns, in order, the ids of every assistant tool_call and
 // the tool_call_id of every role:tool message in the converted OpenAI request.
 func collectToolCallIDs(t *testing.T, out []byte) (callIDs []string, respIDs []string) {
 	t.Helper()
-	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+	ojson.GetBytes(out, "messages").ForEach(func(_, msg ojson.Result) bool {
 		switch msg.Get("role").String() {
 		case "assistant":
-			msg.Get("tool_calls").ForEach(func(_, tc gjson.Result) bool {
+			msg.Get("tool_calls").ForEach(func(_, tc ojson.Result) bool {
 				callIDs = append(callIDs, tc.Get("id").String())
 				return true
 			})
@@ -233,9 +233,9 @@ func TestGeminiSanitizesNonAlnumNameInMintedID(t *testing.T) {
 }
 
 // lastMessage returns the final entry of the converted OpenAI `messages` array.
-func lastMessage(t *testing.T, out []byte) gjson.Result {
+func lastMessage(t *testing.T, out []byte) ojson.Result {
 	t.Helper()
-	msgs := gjson.GetBytes(out, "messages").Array()
+	msgs := ojson.GetBytes(out, "messages").Array()
 	if len(msgs) == 0 {
 		t.Fatalf("expected at least one message, got none: %s", out)
 	}
@@ -245,7 +245,7 @@ func lastMessage(t *testing.T, out []byte) gjson.Result {
 // countRole returns how many messages in the converted OpenAI body carry the role.
 func countRole(out []byte, role string) int {
 	n := 0
-	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+	ojson.GetBytes(out, "messages").ForEach(func(_, msg ojson.Result) bool {
 		if msg.Get("role").String() == role {
 			n++
 		}
@@ -320,7 +320,7 @@ func TestGeminiMixedToolResultPlusTextStillEmitsUserMessage(t *testing.T) {
 		t.Fatalf("expected the trailing user text to be emitted as one user message, got %d: %s", got, out)
 	}
 	var userText string
-	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+	ojson.GetBytes(out, "messages").ForEach(func(_, msg ojson.Result) bool {
 		if msg.Get("role").String() == "user" {
 			userText = msg.Get("content").String()
 		}
@@ -398,11 +398,11 @@ func TestGeminiAllowedFunctionNamesAnySingleMapsToSpecific(t *testing.T) {
 
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 
-	if tc := gjson.GetBytes(out, "tool_choice").String(); tc != "specific:get_current_temperature" {
+	if tc := ojson.GetBytes(out, "tool_choice").String(); tc != "specific:get_current_temperature" {
 		t.Fatalf("expected tool_choice=specific:get_current_temperature, got %q: %s", tc, out)
 	}
 	// A single forced tool does not also need an allowed_tools list.
-	if gjson.GetBytes(out, "allowed_tools").Exists() {
+	if ojson.GetBytes(out, "allowed_tools").Exists() {
 		t.Fatalf("did not expect allowed_tools for a single forced tool: %s", out)
 	}
 }
@@ -420,10 +420,10 @@ func TestGeminiAllowedFunctionNamesAnyMultipleMapsToRequiredPlusAllowed(t *testi
 
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 
-	if tc := gjson.GetBytes(out, "tool_choice").String(); tc != "required" {
+	if tc := ojson.GetBytes(out, "tool_choice").String(); tc != "required" {
 		t.Fatalf("expected tool_choice=required for ANY with multiple allowed names, got %q: %s", tc, out)
 	}
-	at := gjson.GetBytes(out, "allowed_tools")
+	at := ojson.GetBytes(out, "allowed_tools")
 	if !at.Exists() {
 		t.Fatalf("expected allowed_tools object for multiple allowed names: %s", out)
 	}
@@ -431,7 +431,7 @@ func TestGeminiAllowedFunctionNamesAnyMultipleMapsToRequiredPlusAllowed(t *testi
 		t.Fatalf("allowed_tools.type = %q, want allowed_tools: %s", at.Get("type").String(), out)
 	}
 	names := []string{}
-	at.Get("tools").ForEach(func(_, tr gjson.Result) bool {
+	at.Get("tools").ForEach(func(_, tr ojson.Result) bool {
 		if tr.Get("type").String() != "function" {
 			t.Fatalf("allowed_tools tool ref must be type=function, got %q", tr.Get("type").String())
 		}
@@ -455,10 +455,10 @@ func TestGeminiAllowedFunctionNamesAutoSingleIsAllowNotForce(t *testing.T) {
 
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 
-	if tc := gjson.GetBytes(out, "tool_choice").String(); tc != "auto" {
+	if tc := ojson.GetBytes(out, "tool_choice").String(); tc != "auto" {
 		t.Fatalf("expected tool_choice=auto (AUTO does not force), got %q: %s", tc, out)
 	}
-	at := gjson.GetBytes(out, "allowed_tools")
+	at := ojson.GetBytes(out, "allowed_tools")
 	if !at.Exists() || at.Get("tools.0.name").String() != "Read" {
 		t.Fatalf("expected allowed_tools restricting to [Read] under AUTO, got: %s", out)
 	}
@@ -474,10 +474,10 @@ func TestGeminiNoneModeIgnoresAllowedNames(t *testing.T) {
 
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 
-	if tc := gjson.GetBytes(out, "tool_choice").String(); tc != "none" {
+	if tc := ojson.GetBytes(out, "tool_choice").String(); tc != "none" {
 		t.Fatalf("expected tool_choice=none, got %q: %s", tc, out)
 	}
-	if gjson.GetBytes(out, "allowed_tools").Exists() {
+	if ojson.GetBytes(out, "allowed_tools").Exists() {
 		t.Fatalf("NONE must not carry allowed_tools: %s", out)
 	}
 }
@@ -493,10 +493,10 @@ func TestGeminiModeOnlyNoAllowedNamesUnchanged(t *testing.T) {
 			"toolConfig": {"functionCallingConfig": {"mode": "` + mode + `"}}
 		}`
 		out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
-		if tc := gjson.GetBytes(out, "tool_choice").String(); tc != want {
+		if tc := ojson.GetBytes(out, "tool_choice").String(); tc != want {
 			t.Fatalf("mode %s: expected tool_choice=%q, got %q", mode, want, tc)
 		}
-		if gjson.GetBytes(out, "allowed_tools").Exists() {
+		if ojson.GetBytes(out, "allowed_tools").Exists() {
 			t.Fatalf("mode %s: did not expect allowed_tools without allowedFunctionNames: %s", mode, out)
 		}
 	}
@@ -504,10 +504,10 @@ func TestGeminiModeOnlyNoAllowedNamesUnchanged(t *testing.T) {
 
 // lastUserContentParts returns the content array of the last role:"user" message in the
 // converted OpenAI request. Used by the ADD-54 fileData tests.
-func lastUserContentParts(t *testing.T, out []byte) gjson.Result {
+func lastUserContentParts(t *testing.T, out []byte) ojson.Result {
 	t.Helper()
-	var found gjson.Result
-	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+	var found ojson.Result
+	ojson.GetBytes(out, "messages").ForEach(func(_, msg ojson.Result) bool {
 		if msg.Get("role").String() == "user" {
 			found = msg.Get("content")
 		}
@@ -536,7 +536,7 @@ func TestGeminiFileDataImageBecomesImageURL(t *testing.T) {
 		t.Fatalf("expected structured content array (image present), got: %s", out)
 	}
 	var gotImageURL string
-	content.ForEach(func(_, p gjson.Result) bool {
+	content.ForEach(func(_, p ojson.Result) bool {
 		if p.Get("type").String() == "image_url" {
 			gotImageURL = p.Get("image_url.url").String()
 		}
@@ -590,7 +590,7 @@ func TestGeminiFileDataNonImageNotSilentlyDropped(t *testing.T) {
 		t.Fatalf("expected structured content array, got: %s", out)
 	}
 	var markerSeen bool
-	content.ForEach(func(_, p gjson.Result) bool {
+	content.ForEach(func(_, p ojson.Result) bool {
 		if p.Get("type").String() == "text" {
 			txt := p.Get("text").String()
 			if strings.Contains(txt, "doc.pdf") && strings.Contains(txt, "application/pdf") {
@@ -648,7 +648,7 @@ func TestGeminiFileDataMissingURIMarker(t *testing.T) {
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 
 	content := lastUserContentParts(t, out)
-	content.ForEach(func(_, p gjson.Result) bool {
+	content.ForEach(func(_, p ojson.Result) bool {
 		if p.Get("type").String() == "image_url" {
 			if p.Get("image_url.url").String() == "" {
 				t.Fatalf("missing-URI fileData must not produce an empty image_url: %s", out)
@@ -657,7 +657,7 @@ func TestGeminiFileDataMissingURIMarker(t *testing.T) {
 		return true
 	})
 	var markerSeen bool
-	content.ForEach(func(_, p gjson.Result) bool {
+	content.ForEach(func(_, p ojson.Result) bool {
 		if p.Get("type").String() == "text" && strings.Contains(p.Get("text").String(), "missing file URI") {
 			markerSeen = true
 		}
@@ -681,12 +681,12 @@ func TestGeminiFileDataInSystemInstruction(t *testing.T) {
 
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 
-	sys := gjson.GetBytes(out, "messages.0")
+	sys := ojson.GetBytes(out, "messages.0")
 	if sys.Get("role").String() != "system" {
 		t.Fatalf("expected first message to be system, got: %s", out)
 	}
 	var gotURL string
-	sys.Get("content").ForEach(func(_, p gjson.Result) bool {
+	sys.Get("content").ForEach(func(_, p ojson.Result) bool {
 		if p.Get("type").String() == "image_url" {
 			gotURL = p.Get("image_url.url").String()
 		}
@@ -711,24 +711,24 @@ func TestGeminiSamplingFieldsStillMapped(t *testing.T) {
 
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 
-	if got := gjson.GetBytes(out, "temperature").Float(); got != 0.3 {
+	if got := ojson.GetBytes(out, "temperature").Float(); got != 0.3 {
 		t.Fatalf("expected temperature=0.3 mapped, got %v: %s", got, out)
 	}
-	if got := gjson.GetBytes(out, "top_p").Float(); got != 0.9 {
+	if got := ojson.GetBytes(out, "top_p").Float(); got != 0.9 {
 		t.Fatalf("expected top_p=0.9 mapped, got %v: %s", got, out)
 	}
-	if got := gjson.GetBytes(out, "n").Int(); got != 2 {
+	if got := ojson.GetBytes(out, "n").Int(); got != 2 {
 		t.Fatalf("expected candidateCount->n=2 mapped, got %v: %s", got, out)
 	}
 }
 
-// lastToolContent returns the raw `content` field (as a gjson.Result against the
+// lastToolContent returns the raw `content` field (as a ojson.Result against the
 // converted body) of the final role:"tool" message. Used by the ADD-85 tests so they
 // can distinguish a string content ("hello") from an embedded JSON value.
-func lastToolContent(t *testing.T, out []byte) gjson.Result {
+func lastToolContent(t *testing.T, out []byte) ojson.Result {
 	t.Helper()
-	var found gjson.Result
-	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+	var found ojson.Result
+	ojson.GetBytes(out, "messages").ForEach(func(_, msg ojson.Result) bool {
 		if msg.Get("role").String() == "tool" {
 			found = msg.Get("content")
 		}
@@ -773,7 +773,7 @@ func TestGeminiFunctionResponseContentTypes(t *testing.T) {
 			out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 			content := lastToolContent(t, out)
 			// The OpenAI tool content field is always a JSON string.
-			if content.Type != gjson.String {
+			if content.Type != ojson.String {
 				t.Fatalf("content type = %v, want String (OpenAI tool content is a string): raw=%s: %s", content.Type, content.Raw, out)
 			}
 			if content.String() != tc.wantContentValue {
@@ -804,7 +804,7 @@ func TestGeminiFunctionResponseStringResponseNoContentField(t *testing.T) {
 	}`
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 	content := lastToolContent(t, out)
-	if content.Type != gjson.String || content.String() != "plain" {
+	if content.Type != ojson.String || content.String() != "plain" {
 		t.Fatalf("expected unquoted string response content \"plain\", got type=%v value=%q: %s", content.Type, content.String(), out)
 	}
 }
@@ -822,11 +822,11 @@ func TestGeminiFunctionResponseObjectResponseNoContentField(t *testing.T) {
 	}`
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 	content := lastToolContent(t, out)
-	if content.Type != gjson.String {
+	if content.Type != ojson.String {
 		t.Fatalf("expected tool content to be a string, got type=%v raw=%s: %s", content.Type, content.Raw, out)
 	}
 	// The string value is the raw JSON object; re-parse it and confirm the fields survive.
-	inner := gjson.Parse(content.String())
+	inner := ojson.Parse(content.String())
 	if inner.Get("ok").Bool() != true || inner.Get("n").Int() != 5 {
 		t.Fatalf("expected object fields preserved in raw-JSON content string, got %q: %s", content.String(), out)
 	}
@@ -869,7 +869,7 @@ func TestGeminiThinkingBudgetMapsToReasoningEffort(t *testing.T) {
 		"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}
 	}`
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
-	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "medium" {
+	if got := ojson.GetBytes(out, "reasoning_effort").String(); got != "medium" {
 		t.Fatalf("expected thinkingBudget=8192 -> reasoning_effort=medium, got %q: %s", got, out)
 	}
 }
@@ -883,7 +883,7 @@ func TestGeminiThinkingBudgetSnakeCaseMapsToReasoningEffort(t *testing.T) {
 	}`
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 	// budget 0 -> "none" per ConvertBudgetToLevel.
-	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "none" {
+	if got := ojson.GetBytes(out, "reasoning_effort").String(); got != "none" {
 		t.Fatalf("expected thinking_budget=0 -> reasoning_effort=none, got %q: %s", got, out)
 	}
 }
@@ -931,7 +931,7 @@ func TestGeminiOmittedRoleWithFunctionCallDefaultsToAssistant(t *testing.T) {
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
 	// The assistant tool_call message must carry role:"assistant" and the tool_call.
 	var assistantWithToolCall bool
-	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+	ojson.GetBytes(out, "messages").ForEach(func(_, msg ojson.Result) bool {
 		if msg.Get("role").String() == "assistant" && msg.Get("tool_calls.0.id").String() == "c1" {
 			assistantWithToolCall = true
 		}
@@ -941,7 +941,7 @@ func TestGeminiOmittedRoleWithFunctionCallDefaultsToAssistant(t *testing.T) {
 		t.Fatalf("expected role-less functionCall content to become an assistant tool_call message: %s", out)
 	}
 	// And it must NOT have been emitted as a user message.
-	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+	ojson.GetBytes(out, "messages").ForEach(func(_, msg ojson.Result) bool {
 		if msg.Get("role").String() == "user" && msg.Get("tool_calls").Exists() {
 			t.Fatalf("functionCall content must not be a user tool_call message: %s", out)
 		}
@@ -958,7 +958,7 @@ func TestGeminiResponseMimeTypeOnlyMapsToJSONObject(t *testing.T) {
 		"generationConfig": {"responseMimeType": "application/json"}
 	}`
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
-	rf := gjson.GetBytes(out, "response_format")
+	rf := ojson.GetBytes(out, "response_format")
 	if !rf.Exists() {
 		t.Fatalf("expected response_format to be emitted: %s", out)
 	}
@@ -982,7 +982,7 @@ func TestGeminiResponseMimeTypeWithSchemaMapsToJSONSchema(t *testing.T) {
 		}
 	}`
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
-	rf := gjson.GetBytes(out, "response_format")
+	rf := ojson.GetBytes(out, "response_format")
 	if rf.Get("type").String() != "json_schema" {
 		t.Fatalf("expected response_format.type=json_schema, got %q: %s", rf.Get("type").String(), out)
 	}
@@ -1009,7 +1009,7 @@ func TestGeminiResponseMimeTypeSnakeCaseAliases(t *testing.T) {
 		}
 	}`
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
-	rf := gjson.GetBytes(out, "response_format")
+	rf := ojson.GetBytes(out, "response_format")
 	if rf.Get("type").String() != "json_schema" {
 		t.Fatalf("expected snake_case aliases -> json_schema, got %q: %s", rf.Get("type").String(), out)
 	}
@@ -1026,7 +1026,7 @@ func TestGeminiNonJSONResponseMimeTypeNoResponseFormat(t *testing.T) {
 		"generationConfig": {"responseMimeType": "text/plain"}
 	}`
 	out, _ := ConvertGeminiRequestToOpenAI("m", []byte(req), false)
-	if gjson.GetBytes(out, "response_format").Exists() {
+	if ojson.GetBytes(out, "response_format").Exists() {
 		t.Fatalf("text/plain responseMimeType must not emit response_format: %s", out)
 	}
 }
@@ -1054,9 +1054,9 @@ func TestConvertGeminiRequestToOpenAI_FunctionResponsesConsumeToolCallIDsFIFO(t 
 	}`)
 
 	out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-	firstID := gjson.GetBytes(out, "messages.0.tool_calls.0.id").String()
-	secondID := gjson.GetBytes(out, "messages.0.tool_calls.1.id").String()
-	thirdID := gjson.GetBytes(out, "messages.0.tool_calls.2.id").String()
+	firstID := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.0.id").String()
+	secondID := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.1.id").String()
+	thirdID := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.2.id").String()
 
 	if firstID == "" || secondID == "" || thirdID == "" {
 		t.Fatalf("expected all assistant tool call IDs to be set. Output: %s", string(out))
@@ -1064,13 +1064,13 @@ func TestConvertGeminiRequestToOpenAI_FunctionResponsesConsumeToolCallIDsFIFO(t 
 	if firstID == secondID || secondID == thirdID || firstID == thirdID {
 		t.Fatalf("expected distinct assistant tool call IDs, got %q, %q, %q", firstID, secondID, thirdID)
 	}
-	if got := gjson.GetBytes(out, "messages.1.tool_call_id").String(); got != firstID {
+	if got := ojson.GetBytesNoCopy(out, "messages.1.tool_call_id").String(); got != firstID {
 		t.Fatalf("messages.1.tool_call_id = %q, want %q. Output: %s", got, firstID, string(out))
 	}
-	if got := gjson.GetBytes(out, "messages.2.tool_call_id").String(); got != secondID {
+	if got := ojson.GetBytesNoCopy(out, "messages.2.tool_call_id").String(); got != secondID {
 		t.Fatalf("messages.2.tool_call_id = %q, want %q. Output: %s", got, secondID, string(out))
 	}
-	if got := gjson.GetBytes(out, "messages.3.tool_call_id").String(); got != thirdID {
+	if got := ojson.GetBytesNoCopy(out, "messages.3.tool_call_id").String(); got != thirdID {
 		t.Fatalf("messages.3.tool_call_id = %q, want %q. Output: %s", got, thirdID, string(out))
 	}
 }
@@ -1088,7 +1088,7 @@ func TestConvertGeminiRequestToOpenAI_FunctionResponseWithoutPriorCallGetsFallba
 	}`)
 
 	out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-	toolCallID := gjson.GetBytes(out, "messages.0.tool_call_id").String()
+	toolCallID := ojson.GetBytesNoCopy(out, "messages.0.tool_call_id").String()
 	if !strings.HasPrefix(toolCallID, "call_") {
 		t.Fatalf("fallback tool_call_id = %q, want call_ prefix. Output: %s", toolCallID, string(out))
 	}
@@ -1114,9 +1114,9 @@ func TestConvertGeminiRequestToOpenAI_ExtraFunctionResponsesUseFallbackID(t *tes
 	}`)
 
 	out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-	callID := gjson.GetBytes(out, "messages.0.tool_calls.0.id").String()
-	firstResponseID := gjson.GetBytes(out, "messages.1.tool_call_id").String()
-	extraResponseID := gjson.GetBytes(out, "messages.2.tool_call_id").String()
+	callID := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.0.id").String()
+	firstResponseID := ojson.GetBytesNoCopy(out, "messages.1.tool_call_id").String()
+	extraResponseID := ojson.GetBytesNoCopy(out, "messages.2.tool_call_id").String()
 
 	if firstResponseID != callID {
 		t.Fatalf("messages.1.tool_call_id = %q, want %q. Output: %s", firstResponseID, callID, string(out))
@@ -1166,10 +1166,10 @@ func TestConvertGeminiRequestToOpenAI_PreservesExplicitFunctionCallIDs(t *testin
 			}`)
 
 			out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-			if got := gjson.GetBytes(out, "messages.0.tool_calls.0.id").String(); got != tt.want {
+			if got := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.0.id").String(); got != tt.want {
 				t.Fatalf("tool call id = %q, want %q. Output: %s", got, tt.want, string(out))
 			}
-			if got := gjson.GetBytes(out, "messages.1.tool_call_id").String(); got != tt.want {
+			if got := ojson.GetBytesNoCopy(out, "messages.1.tool_call_id").String(); got != tt.want {
 				t.Fatalf("tool response id = %q, want %q. Output: %s", got, tt.want, string(out))
 			}
 		})
@@ -1178,7 +1178,7 @@ func TestConvertGeminiRequestToOpenAI_PreservesExplicitFunctionCallIDs(t *testin
 
 func TestConvertGeminiRequestToOpenAI_AcceptsSnakeInlineData(t *testing.T) {
 	out, _ := ConvertGeminiRequestToOpenAI("gpt-test", []byte(`{"contents":[{"role":"user","parts":[{"inline_data":{"mime_type":"image/png","data":"aGVsbG8="}}]}]}`), false)
-	if got := gjson.GetBytes(out, "messages.0.content.0.image_url.url").String(); got != "data:image/png;base64,aGVsbG8=" {
+	if got := ojson.GetBytesNoCopy(out, "messages.0.content.0.image_url.url").String(); got != "data:image/png;base64,aGVsbG8=" {
 		t.Fatalf("image url = %q, want data:image/png;base64,aGVsbG8=. Output: %s", got, string(out))
 	}
 }
@@ -1186,16 +1186,16 @@ func TestConvertGeminiRequestToOpenAI_AcceptsSnakeInlineData(t *testing.T) {
 func TestConvertGeminiRequestToOpenAI_SplitsNonImageInlineDataByMIME(t *testing.T) {
 	out, _ := ConvertGeminiRequestToOpenAI("gpt-test", []byte(`{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"audio/wav","data":"UklGRg=="}},{"inlineData":{"mimeType":"video/mp4","data":"AAAAIGZ0eXA="}},{"inlineData":{"mimeType":"application/pdf","data":"JVBERi0="}}]}]}`), false)
 
-	if got := gjson.GetBytes(out, "messages.0.content.0.type").String(); got != "input_audio" {
+	if got := ojson.GetBytesNoCopy(out, "messages.0.content.0.type").String(); got != "input_audio" {
 		t.Fatalf("audio content type = %q, want input_audio. Output: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "messages.0.content.1.type").String(); got != "video_url" {
+	if got := ojson.GetBytesNoCopy(out, "messages.0.content.1.type").String(); got != "video_url" {
 		t.Fatalf("video content type = %q, want video_url. Output: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "messages.0.content.2.type").String(); got != "file" {
+	if got := ojson.GetBytesNoCopy(out, "messages.0.content.2.type").String(); got != "file" {
 		t.Fatalf("document content type = %q, want file. Output: %s", got, string(out))
 	}
-	if gjson.GetBytes(out, "messages.0.content.#(type==\"image_url\")").Exists() {
+	if ojson.GetBytesNoCopy(out, "messages.0.content.#(type==\"image_url\")").Exists() {
 		t.Fatalf("non-image inlineData must not be converted to image_url. Output: %s", string(out))
 	}
 }
@@ -1209,7 +1209,7 @@ func TestConvertGeminiRequestToOpenAI_DropsHiddenThoughtParts(t *testing.T) {
 			]
 		}`), false)
 
-		messages := gjson.GetBytes(out, "messages").Array()
+		messages := ojson.GetBytesNoCopy(out, "messages").Array()
 		if len(messages) != 1 || messages[0].Get("role").String() != "user" || messages[0].Get("content").String() != "continue" {
 			t.Fatalf("hidden thought turn was not dropped. Output: %s", string(out))
 		}
@@ -1223,7 +1223,7 @@ func TestConvertGeminiRequestToOpenAI_DropsHiddenThoughtParts(t *testing.T) {
 			]}]
 		}`), false)
 
-		messages := gjson.GetBytes(out, "messages").Array()
+		messages := ojson.GetBytesNoCopy(out, "messages").Array()
 		if len(messages) != 1 || messages[0].Get("role").String() != "assistant" || messages[0].Get("content").String() != "visible answer" {
 			t.Fatalf("hidden thought was not dropped independently of visible text. Output: %s", string(out))
 		}
@@ -1251,10 +1251,10 @@ func TestConvertGeminiRequestToOpenAI_DeterministicToolCallIDs(t *testing.T) {
 	}`)
 
 	firstOut, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-	firstCall0 := gjson.GetBytes(firstOut, "messages.0.tool_calls.0.id").String()
-	firstCall1 := gjson.GetBytes(firstOut, "messages.0.tool_calls.1.id").String()
-	firstResp0 := gjson.GetBytes(firstOut, "messages.1.tool_call_id").String()
-	firstResp1 := gjson.GetBytes(firstOut, "messages.2.tool_call_id").String()
+	firstCall0 := ojson.GetBytesNoCopy(firstOut, "messages.0.tool_calls.0.id").String()
+	firstCall1 := ojson.GetBytesNoCopy(firstOut, "messages.0.tool_calls.1.id").String()
+	firstResp0 := ojson.GetBytesNoCopy(firstOut, "messages.1.tool_call_id").String()
+	firstResp1 := ojson.GetBytesNoCopy(firstOut, "messages.2.tool_call_id").String()
 
 	if !strings.HasPrefix(firstCall0, "call_") || !strings.HasPrefix(firstCall1, "call_") {
 		t.Fatalf("expected tool call IDs to have call_ prefix, got %q, %q", firstCall0, firstCall1)
@@ -1268,16 +1268,16 @@ func TestConvertGeminiRequestToOpenAI_DeterministicToolCallIDs(t *testing.T) {
 
 	for i := 0; i < 100; i++ {
 		out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-		if got := gjson.GetBytes(out, "messages.0.tool_calls.0.id").String(); got != firstCall0 {
+		if got := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.0.id").String(); got != firstCall0 {
 			t.Fatalf("iteration %d: tool_calls.0.id = %q, want %q", i, got, firstCall0)
 		}
-		if got := gjson.GetBytes(out, "messages.0.tool_calls.1.id").String(); got != firstCall1 {
+		if got := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.1.id").String(); got != firstCall1 {
 			t.Fatalf("iteration %d: tool_calls.1.id = %q, want %q", i, got, firstCall1)
 		}
-		if got := gjson.GetBytes(out, "messages.1.tool_call_id").String(); got != firstResp0 {
+		if got := ojson.GetBytesNoCopy(out, "messages.1.tool_call_id").String(); got != firstResp0 {
 			t.Fatalf("iteration %d: messages.1.tool_call_id = %q, want %q", i, got, firstResp0)
 		}
-		if got := gjson.GetBytes(out, "messages.2.tool_call_id").String(); got != firstResp1 {
+		if got := ojson.GetBytesNoCopy(out, "messages.2.tool_call_id").String(); got != firstResp1 {
 			t.Fatalf("iteration %d: messages.2.tool_call_id = %q, want %q", i, got, firstResp1)
 		}
 	}
@@ -1304,15 +1304,15 @@ func TestConvertGeminiRequestToOpenAI_SameNameCallsInSameMessageDistinct(t *test
 	}`)
 
 	out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-	id0 := gjson.GetBytes(out, "messages.0.tool_calls.0.id").String()
-	id1 := gjson.GetBytes(out, "messages.0.tool_calls.1.id").String()
+	id0 := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.0.id").String()
+	id1 := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.1.id").String()
 
 	if id0 == id1 {
 		t.Fatalf("expected distinct IDs for same-name calls in same message, got both %q", id0)
 	}
 
-	resp0 := gjson.GetBytes(out, "messages.1.tool_call_id").String()
-	resp1 := gjson.GetBytes(out, "messages.2.tool_call_id").String()
+	resp0 := ojson.GetBytesNoCopy(out, "messages.1.tool_call_id").String()
+	resp1 := ojson.GetBytesNoCopy(out, "messages.2.tool_call_id").String()
 
 	if resp0 != id0 {
 		t.Fatalf("expected first response to match first call ID %q, got %q", id0, resp0)
@@ -1349,26 +1349,26 @@ func TestConvertGeminiRequestToOpenAI_InterleavedPerNameFIFOMatching(t *testing.
 	}`)
 
 	out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-	callA1 := gjson.GetBytes(out, "messages.0.tool_calls.0.id").String()
-	callB1 := gjson.GetBytes(out, "messages.0.tool_calls.1.id").String()
-	callA2 := gjson.GetBytes(out, "messages.0.tool_calls.2.id").String()
-	callB2 := gjson.GetBytes(out, "messages.0.tool_calls.3.id").String()
+	callA1 := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.0.id").String()
+	callB1 := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.1.id").String()
+	callA2 := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.2.id").String()
+	callB2 := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.3.id").String()
 
 	// Responses:
 	// messages[1] = tool_b (step 1) -> should match callB1
 	// messages[2] = tool_a (step 1) -> should match callA1
 	// messages[3] = tool_b (step 2) -> should match callB2
 	// messages[4] = tool_a (step 2) -> should match callA2
-	if got := gjson.GetBytes(out, "messages.1.tool_call_id").String(); got != callB1 {
+	if got := ojson.GetBytesNoCopy(out, "messages.1.tool_call_id").String(); got != callB1 {
 		t.Fatalf("first response (tool_b) = %q, want callB1 %q", got, callB1)
 	}
-	if got := gjson.GetBytes(out, "messages.2.tool_call_id").String(); got != callA1 {
+	if got := ojson.GetBytesNoCopy(out, "messages.2.tool_call_id").String(); got != callA1 {
 		t.Fatalf("second response (tool_a) = %q, want callA1 %q", got, callA1)
 	}
-	if got := gjson.GetBytes(out, "messages.3.tool_call_id").String(); got != callB2 {
+	if got := ojson.GetBytesNoCopy(out, "messages.3.tool_call_id").String(); got != callB2 {
 		t.Fatalf("third response (tool_b) = %q, want callB2 %q", got, callB2)
 	}
-	if got := gjson.GetBytes(out, "messages.4.tool_call_id").String(); got != callA2 {
+	if got := ojson.GetBytesNoCopy(out, "messages.4.tool_call_id").String(); got != callA2 {
 		t.Fatalf("fourth response (tool_a) = %q, want callA2 %q", got, callA2)
 	}
 }
@@ -1386,14 +1386,14 @@ func TestConvertGeminiRequestToOpenAI_DeterministicFallbackOrphanResponse(t *tes
 	}`)
 
 	firstOut, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-	firstID := gjson.GetBytes(firstOut, "messages.0.tool_call_id").String()
+	firstID := ojson.GetBytesNoCopy(firstOut, "messages.0.tool_call_id").String()
 	if !strings.HasPrefix(firstID, "call_") {
 		t.Fatalf("expected fallback tool_call_id with call_ prefix, got %q", firstID)
 	}
 
 	for i := 0; i < 100; i++ {
 		out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-		if got := gjson.GetBytes(out, "messages.0.tool_call_id").String(); got != firstID {
+		if got := ojson.GetBytesNoCopy(out, "messages.0.tool_call_id").String(); got != firstID {
 			t.Fatalf("iteration %d: orphan fallback tool_call_id = %q, want %q", i, got, firstID)
 		}
 	}
@@ -1418,10 +1418,10 @@ func TestConvertGeminiRequestToOpenAI_ExplicitCallInheritedByImplicitResponse(t 
 	}`)
 
 	out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-	if got := gjson.GetBytes(out, "messages.0.tool_calls.0.id").String(); got != "explicit_call_1" {
+	if got := ojson.GetBytesNoCopy(out, "messages.0.tool_calls.0.id").String(); got != "explicit_call_1" {
 		t.Fatalf("tool call ID = %q, want explicit_call_1", got)
 	}
-	if got := gjson.GetBytes(out, "messages.1.tool_call_id").String(); got != "explicit_call_1" {
+	if got := ojson.GetBytesNoCopy(out, "messages.1.tool_call_id").String(); got != "explicit_call_1" {
 		t.Fatalf("tool response ID = %q, want explicit_call_1", got)
 	}
 }
@@ -1452,9 +1452,9 @@ func TestConvertGeminiRequestToOpenAI_OutOrderExplicitResponseDoesNotDuplicateID
 	}`)
 
 	out, _ := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
-	resp1 := gjson.GetBytes(out, "messages.1.tool_call_id").String()
-	resp2 := gjson.GetBytes(out, "messages.2.tool_call_id").String()
-	resp3 := gjson.GetBytes(out, "messages.3.tool_call_id").String()
+	resp1 := ojson.GetBytesNoCopy(out, "messages.1.tool_call_id").String()
+	resp2 := ojson.GetBytesNoCopy(out, "messages.2.tool_call_id").String()
+	resp3 := ojson.GetBytesNoCopy(out, "messages.3.tool_call_id").String()
 
 	if resp1 != "call_2" {
 		t.Fatalf("first response = %q, want call_2", resp1)
@@ -1497,10 +1497,63 @@ func TestConvertGeminiRequestToOpenAI_PreservesFunctionCallThoughtSignature(t *t
 	if err != nil {
 		t.Fatalf("ConvertGeminiRequestToOpenAI() error = %v", err)
 	}
-	if got := gjson.GetBytes(out, "messages.1.tool_calls.0.extra_content.google.thought_signature").String(); got != "SIG_PARIS" {
+	if got := ojson.GetBytesNoCopy(out, "messages.1.tool_calls.0.extra_content.google.thought_signature").String(); got != "SIG_PARIS" {
 		t.Fatalf("messages.1.tool_calls.0.extra_content.google.thought_signature = %q, want SIG_PARIS; out=%s", got, string(out))
 	}
-	if gjson.GetBytes(out, "messages.1.tool_calls.1.extra_content").Exists() {
+	if ojson.GetBytesNoCopy(out, "messages.1.tool_calls.1.extra_content").Exists() {
 		t.Fatalf("expected unsigned sibling tool call not to have extra_content; out=%s", string(out))
+	}
+}
+
+func TestConvertGeminiRequestToOpenAI_FunctionResponseDoesNotAppendTrailingEmptyFunctionMessage(t *testing.T) {
+	inputJSON := []byte(`{
+		"contents": [
+			{"parts": [{"text": "What is the weather?"}]},
+			{"parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Tokyo"}}}]},
+			{"role": "function", "parts": [{"functionResponse": {"name": "get_weather", "response": {"result": "Sunny"}}}]}
+		]
+	}`)
+
+	out, err := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
+	if err != nil {
+		t.Fatalf("ConvertGeminiRequestToOpenAI() error = %v", err)
+	}
+	messages := ojson.GetBytesNoCopy(out, "messages").Array()
+	if len(messages) != 3 {
+		t.Fatalf("len(messages) = %d, want 3 (user, assistant, tool); out=%s", len(messages), string(out))
+	}
+	if got := messages[0].Get("role").String(); got != "user" {
+		t.Fatalf("messages[0].role = %q, want user; out=%s", got, string(out))
+	}
+	if got := messages[1].Get("role").String(); got != "assistant" {
+		t.Fatalf("messages[1].role = %q, want assistant; out=%s", got, string(out))
+	}
+	if got := messages[2].Get("role").String(); got != "tool" {
+		t.Fatalf("messages[2].role = %q, want tool; out=%s", got, string(out))
+	}
+}
+
+func TestConvertGeminiRequestToOpenAI_DefaultsOmittedContentRoleToUser(t *testing.T) {
+	inputJSON := []byte(`{"contents":[{"parts":[{"text":"Reply with exactly: OK"}]},{"role":"invalid","parts":[{"text":"OK"}]},{"parts":[{"function_call":{"name":"ping","args":{"x":1}}}]},{"parts":[{"function_response":{"name":"ping","response":{"result":"pong"}}}]}]}`)
+
+	out, err := ConvertGeminiRequestToOpenAI("test-model", inputJSON, false)
+	if err != nil {
+		t.Fatalf("ConvertGeminiRequestToOpenAI() error = %v", err)
+	}
+	messages := ojson.GetBytesNoCopy(out, "messages").Array()
+	if len(messages) != 4 {
+		t.Fatalf("len(messages) = %d, want 4; out=%s", len(messages), string(out))
+	}
+	if got := messages[0].Get("role").String(); got != "user" {
+		t.Fatalf("messages[0].role = %q, want user; out=%s", got, string(out))
+	}
+	if got := messages[1].Get("role").String(); got != "assistant" {
+		t.Fatalf("messages[1].role = %q, want assistant (alternated after user); out=%s", got, string(out))
+	}
+	if got := messages[2].Get("role").String(); got != "assistant" || messages[2].Get("tool_calls.0.function.name").String() != "ping" {
+		t.Fatalf("messages[2] = %s, want assistant tool_call ping", messages[2].Raw)
+	}
+	if got := messages[3].Get("role").String(); got != "tool" {
+		t.Fatalf("messages[3].role = %q, want tool; out=%s", got, string(out))
 	}
 }

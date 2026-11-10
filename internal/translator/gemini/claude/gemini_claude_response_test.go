@@ -7,7 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
 func TestConvertGeminiResponseToClaude_VertexStreamingPartialArgs(t *testing.T) {
@@ -32,8 +33,8 @@ func TestConvertGeminiResponseToClaude_VertexStreamingPartialArgs(t *testing.T) 
 				continue
 			}
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if gjson.Get(payload, "type").String() == "content_block_delta" && gjson.Get(payload, "delta.type").String() == "input_json_delta" {
-				piece := gjson.Get(payload, "delta.partial_json").String()
+			if ojson.Get(payload, "type").String() == "content_block_delta" && ojson.Get(payload, "delta.type").String() == "input_json_delta" {
+				piece := ojson.Get(payload, "delta.partial_json").String()
 				partialJSON.WriteString(piece)
 				if chunkIdx == 0 {
 					firstChunkDelta += piece
@@ -66,18 +67,18 @@ func TestConvertGeminiResponseToClaude_VertexStreamingPartialArgs(t *testing.T) 
 					continue
 				}
 				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				switch gjson.Get(payload, "type").String() {
+				switch ojson.Get(payload, "type").String() {
 				case "content_block_start":
-					if gjson.Get(payload, "content_block.type").String() == "tool_use" {
-						toolIDs = append(toolIDs, gjson.Get(payload, "content_block.id").String())
+					if ojson.Get(payload, "content_block.type").String() == "tool_use" {
+						toolIDs = append(toolIDs, ojson.Get(payload, "content_block.id").String())
 					}
 				case "content_block_delta":
-					if gjson.Get(payload, "delta.type").String() == "input_json_delta" {
-						idx := gjson.Get(payload, "index").Int()
+					if ojson.Get(payload, "delta.type").String() == "input_json_delta" {
+						idx := ojson.Get(payload, "index").Int()
 						if byBlock[idx] == nil {
 							byBlock[idx] = &strings.Builder{}
 						}
-						byBlock[idx].WriteString(gjson.Get(payload, "delta.partial_json").String())
+						byBlock[idx].WriteString(ojson.Get(payload, "delta.partial_json").String())
 					}
 				}
 			}
@@ -123,24 +124,24 @@ func TestConvertGeminiResponseToClaude_VertexStreamingPartialArgs(t *testing.T) 
 					continue
 				}
 				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				switch gjson.Get(payload, "type").String() {
+				switch ojson.Get(payload, "type").String() {
 				case "content_block_delta":
-					if gjson.Get(payload, "delta.type").String() == "input_json_delta" {
-						if gotIdx := gjson.Get(payload, "index").Int(); gotIdx != 0 {
+					if ojson.Get(payload, "delta.type").String() == "input_json_delta" {
+						if gotIdx := ojson.Get(payload, "index").Int(); gotIdx != 0 {
 							t.Fatalf("input_json_delta index = %d, want 0; payload=%s", gotIdx, payload)
 						}
 						if toolStopped {
 							t.Fatalf("input_json_delta emitted after tool block stopped: %s", payload)
 						}
-						block0JSON.WriteString(gjson.Get(payload, "delta.partial_json").String())
-					} else if gjson.Get(payload, "delta.type").String() == "signature_delta" {
+						block0JSON.WriteString(ojson.Get(payload, "delta.partial_json").String())
+					} else if ojson.Get(payload, "delta.type").String() == "signature_delta" {
 						if !toolStopped {
 							t.Fatalf("signature_delta emitted before tool block finished: %s", payload)
 						}
-						deferredSigs = append(deferredSigs, gjson.Get(payload, "delta.signature").String())
+						deferredSigs = append(deferredSigs, ojson.Get(payload, "delta.signature").String())
 					}
 				case "content_block_stop":
-					if gjson.Get(payload, "index").Int() == 0 {
+					if ojson.Get(payload, "index").Int() == 0 {
 						toolStopped = true
 					}
 				}
@@ -174,8 +175,8 @@ func TestConvertGeminiResponseToClaude_VertexStreamingPartialArgs(t *testing.T) 
 					continue
 				}
 				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-				if gjson.Get(payload, "type").String() == "content_block_delta" && gjson.Get(payload, "delta.type").String() == "input_json_delta" {
-					d := gjson.Get(payload, "delta.partial_json").String()
+				if ojson.Get(payload, "type").String() == "content_block_delta" && ojson.Get(payload, "delta.type").String() == "input_json_delta" {
+					d := ojson.Get(payload, "delta.partial_json").String()
 					if chunkIdx == 0 {
 						chunk0Delta += d
 					}
@@ -340,7 +341,7 @@ func TestConvertGeminiResponseToClaudeNonStream_PreservesThoughtSignature(t *tes
 
 	ctx := context.Background()
 	output := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-2.5-pro", requestJSON, requestJSON, geminiResponse, nil)
-	outputJSON := gjson.ParseBytes(output)
+	outputJSON := util.ParseGJSONBytesNoCopy(output)
 
 	blocks := outputJSON.Get("content").Array()
 	if len(blocks) != 2 {
@@ -386,7 +387,7 @@ func TestConvertGeminiResponseToClaudeNonStream_PartWithThoughtSignatureWithoutT
 
 	ctx := context.Background()
 	output := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-2.5-pro", requestJSON, requestJSON, geminiResponse, nil)
-	outputJSON := gjson.ParseBytes(output)
+	outputJSON := util.ParseGJSONBytesNoCopy(output)
 
 	blocks := outputJSON.Get("content").Array()
 	if len(blocks) != 2 {
@@ -433,7 +434,7 @@ func TestConvertGeminiResponseToClaudeNonStream_TrailingSignatureOnlyPart(t *tes
 
 	ctx := context.Background()
 	output := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-2.5-pro", requestJSON, requestJSON, geminiResponse, nil)
-	outputJSON := gjson.ParseBytes(output)
+	outputJSON := util.ParseGJSONBytesNoCopy(output)
 
 	blocks := outputJSON.Get("content").Array()
 	if len(blocks) != 2 {
@@ -489,7 +490,7 @@ func TestConvertGeminiResponseToClaude_UsageWithCachedContentTokenCount(t *testi
 	for _, line := range strings.Split(outputText, "\n") {
 		if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"type":"message_delta"`) {
 			foundMessageDelta = true
-			deltaJSON := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			deltaJSON := ojson.Parse(strings.TrimPrefix(line, "data: "))
 			inputTokens := deltaJSON.Get("usage.input_tokens").Int()
 			if inputTokens != 9 {
 				t.Fatalf("expected usage.input_tokens = 9 (100 - 91), got %d. Payload: %s", inputTokens, line)
@@ -529,7 +530,7 @@ func TestConvertGeminiResponseToClaudeNonStream_UsageWithCachedContentTokenCount
 
 	ctx := context.Background()
 	output := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-2.5-pro", requestJSON, requestJSON, geminiResponse, nil)
-	outputJSON := gjson.ParseBytes(output)
+	outputJSON := util.ParseGJSONBytesNoCopy(output)
 
 	inputTokens := outputJSON.Get("usage.input_tokens").Int()
 	if inputTokens != 9 {
@@ -583,7 +584,7 @@ func TestConvertGeminiResponseToClaudeStream_PartlessSafetyClosesMessageWithRefu
 	for _, line := range strings.Split(outputText, "\n") {
 		if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"type":"message_delta"`) {
 			foundDelta = true
-			deltaJSON := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			deltaJSON := ojson.Parse(strings.TrimPrefix(line, "data: "))
 			if got := deltaJSON.Get("delta.stop_reason").String(); got != "refusal" {
 				t.Fatalf("stop_reason = %q, want refusal. Payload: %s", got, line)
 			}
@@ -639,7 +640,7 @@ func TestConvertGeminiResponseToClaudeStream_PartlessMalformedFunctionCallCloses
 	for _, line := range strings.Split(outputText, "\n") {
 		if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"type":"error"`) {
 			foundError = true
-			errJSON := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			errJSON := ojson.Parse(strings.TrimPrefix(line, "data: "))
 			if got := errJSON.Get("error.type").String(); got != "api_error" {
 				t.Fatalf("error.type = %q, want api_error. Payload: %s", got, line)
 			}
@@ -757,7 +758,7 @@ func TestConvertGeminiResponseToClaude_MalformedFunctionCallWithToolUsePreserves
 
 	ctx := context.Background()
 	nonStream := ConvertGeminiResponseToClaudeNonStream(ctx, "claude-opus-5-5", requestJSON, requestJSON, rawJSON, nil)
-	nonStreamJSON := gjson.ParseBytes(nonStream)
+	nonStreamJSON := util.ParseGJSONBytesNoCopy(nonStream)
 	if got := nonStreamJSON.Get("stop_reason").String(); got != "tool_use" {
 		t.Fatalf("non-stream stop_reason = %q, want tool_use. Output: %s", got, string(nonStream))
 	}
@@ -812,7 +813,7 @@ func TestConvertGeminiResponseToClaudeStream_PartlessStopClosesMessageWithEndTur
 	for _, line := range strings.Split(outputText, "\n") {
 		if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"type":"message_delta"`) {
 			foundDelta = true
-			deltaJSON := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			deltaJSON := ojson.Parse(strings.TrimPrefix(line, "data: "))
 			if got := deltaJSON.Get("delta.stop_reason").String(); got != "end_turn" {
 				t.Fatalf("stop_reason = %q, want end_turn. Payload: %s", got, line)
 			}
@@ -857,7 +858,7 @@ func TestConvertGeminiResponseToClaudeNonStream_SafetyAndMalformedFunctionCallRe
 				"responseId": "resp-test"
 			}`)
 			output := ConvertGeminiResponseToClaudeNonStream(ctx, "claude-opus-5-5", requestJSON, requestJSON, rawJSON, nil)
-			outputJSON := gjson.ParseBytes(output)
+			outputJSON := util.ParseGJSONBytesNoCopy(output)
 			if got := outputJSON.Get("stop_reason").String(); got != tc.wantReason {
 				t.Fatalf("stop_reason = %q, want %q. Output: %s", got, tc.wantReason, string(output))
 			}
@@ -882,7 +883,7 @@ func TestConvertGeminiResponseToClaudeNonStream_MalformedFunctionCallReturnsAPIE
 	}`)
 
 	output := ConvertGeminiResponseToClaudeNonStream(context.Background(), "claude-opus-5-5", requestJSON, requestJSON, rawJSON, nil)
-	outputJSON := gjson.ParseBytes(output)
+	outputJSON := util.ParseGJSONBytesNoCopy(output)
 	if got := outputJSON.Get("stop_reason").String(); got == "refusal" {
 		t.Fatalf("unexpected stop_reason = %q. Output: %s", got, string(output))
 	}
@@ -920,7 +921,7 @@ func TestConvertGeminiResponseToClaudeNonStream_Issue6409_SignedVisibleText(t *t
 
 	ctx := context.Background()
 	output := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-3.5-flash-lite", requestJSON, requestJSON, geminiResponse, nil)
-	outputJSON := gjson.ParseBytes(output)
+	outputJSON := util.ParseGJSONBytesNoCopy(output)
 
 	blocks := outputJSON.Get("content").Array()
 	if len(blocks) != 2 {
@@ -963,7 +964,7 @@ func TestConvertGeminiResponseToClaudeNonStream_Issue6409_ThinkingFollowedBySign
 
 	ctx := context.Background()
 	output := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-3.5-flash-lite", requestJSON, requestJSON, geminiResponse, nil)
-	outputJSON := gjson.ParseBytes(output)
+	outputJSON := util.ParseGJSONBytesNoCopy(output)
 
 	blocks := outputJSON.Get("content").Array()
 	if len(blocks) != 3 {
@@ -1000,7 +1001,7 @@ func TestConvertGeminiResponseToClaudeNonStream_Issue6409_ConsecutiveSignedVisib
 
 	ctx := context.Background()
 	output := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-3.5-flash-lite", requestJSON, requestJSON, geminiResponse, nil)
-	outputJSON := gjson.ParseBytes(output)
+	outputJSON := util.ParseGJSONBytesNoCopy(output)
 
 	blocks := outputJSON.Get("content").Array()
 	if len(blocks) != 4 {
@@ -1305,7 +1306,7 @@ func TestConvertGeminiResponseToClaudeNonStream_UniqueToolUseIDsAcrossTurns(t *t
 	var streamToolID string
 	for _, line := range strings.Split(string(streamBytes), "\n") {
 		if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"type":"tool_use"`) {
-			streamToolID = gjson.Get(strings.TrimPrefix(line, "data: "), "content_block.id").String()
+			streamToolID = ojson.Get(strings.TrimPrefix(line, "data: "), "content_block.id").String()
 			break
 		}
 	}
@@ -1314,13 +1315,13 @@ func TestConvertGeminiResponseToClaudeNonStream_UniqueToolUseIDsAcrossTurns(t *t
 	}
 
 	nonStream1 := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-4-argon", requestJSON, requestJSON, rawResponse, nil)
-	nonStreamID1 := gjson.GetBytes(nonStream1, "content.0.id").String()
+	nonStreamID1 := ojson.GetBytesNoCopy(nonStream1, "content.0.id").String()
 	if nonStreamID1 == "" {
 		t.Fatalf("expected tool_use id in first non-stream response, got: %s", string(nonStream1))
 	}
 
 	nonStream2 := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-4-argon", requestJSON, requestJSON, rawResponse, nil)
-	nonStreamID2 := gjson.GetBytes(nonStream2, "content.0.id").String()
+	nonStreamID2 := ojson.GetBytesNoCopy(nonStream2, "content.0.id").String()
 	if nonStreamID2 == "" {
 		t.Fatalf("expected tool_use id in second non-stream response, got: %s", string(nonStream2))
 	}
@@ -1341,8 +1342,8 @@ func geminiClaudeInputJSONDeltas(t *testing.T, streamText string) string {
 			continue
 		}
 		payload := strings.TrimPrefix(line, "data: ")
-		if gjson.Get(payload, "delta.type").String() == "input_json_delta" {
-			builder.WriteString(gjson.Get(payload, "delta.partial_json").String())
+		if ojson.Get(payload, "delta.type").String() == "input_json_delta" {
+			builder.WriteString(ojson.Get(payload, "delta.partial_json").String())
 		}
 	}
 	return builder.String()
@@ -1355,7 +1356,7 @@ func TestConvertGeminiResponseToClaude_SanitizesParameterlessToolArguments(t *te
 	ctx := context.Background()
 
 	nonStream := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-3-flash", origRequest, origRequest, rawResponse, nil)
-	if got := gjson.GetBytes(nonStream, "content.0.input").Raw; got != "{}" {
+	if got := ojson.GetBytesNoCopy(nonStream, "content.0.input").Raw; got != "{}" {
 		t.Fatalf("expected non-streaming input {}, got %s", got)
 	}
 
@@ -1374,10 +1375,10 @@ func TestConvertGeminiResponseToClaude_CanonicalNameCollisionKeepsExactToolArgum
 	ctx := context.Background()
 
 	nonStream := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-3-flash", origRequest, origRequest, readWithArgs, nil)
-	if got := gjson.GetBytes(nonStream, "content.0.input").Raw; got != `{"path":"/tmp/a"}` {
+	if got := ojson.GetBytesNoCopy(nonStream, "content.0.input").Raw; got != `{"path":"/tmp/a"}` {
 		t.Fatalf("expected exact read tool args preserved, got %s (%s)", got, string(nonStream))
 	}
-	if got := gjson.GetBytes(nonStream, "content.0.name").String(); got != "read" {
+	if got := ojson.GetBytesNoCopy(nonStream, "content.0.name").String(); got != "read" {
 		t.Fatalf("expected exact tool name read, got %q (%s)", got, string(nonStream))
 	}
 
@@ -1388,7 +1389,7 @@ func TestConvertGeminiResponseToClaude_CanonicalNameCollisionKeepsExactToolArgum
 	}
 
 	nonStreamParameterless := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-3-flash", origRequest, origRequest, readParameterless, nil)
-	if got := gjson.GetBytes(nonStreamParameterless, "content.0.input").Raw; got != "{}" {
+	if got := ojson.GetBytesNoCopy(nonStreamParameterless, "content.0.input").Raw; got != "{}" {
 		t.Fatalf("expected exact Read tool normalized to {}, got %s", got)
 	}
 }
@@ -1398,10 +1399,10 @@ func TestConvertGeminiResponseToClaude_AmbiguousCanonicalNameKeepsUpstreamNameAn
 	ambiguousResponse := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"READ","args":{"path":"/tmp/a"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-ambiguous"}`)
 
 	nonStream := ConvertGeminiResponseToClaudeNonStream(context.Background(), "gemini-3-flash", origRequest, origRequest, ambiguousResponse, nil)
-	if got := gjson.GetBytes(nonStream, "content.0.name").String(); got != "READ" {
+	if got := ojson.GetBytesNoCopy(nonStream, "content.0.name").String(); got != "READ" {
 		t.Fatalf("expected ambiguous upstream name READ preserved, got %q (%s)", got, string(nonStream))
 	}
-	if got := gjson.GetBytes(nonStream, "content.0.input").Raw; got != `{"path":"/tmp/a"}` {
+	if got := ojson.GetBytesNoCopy(nonStream, "content.0.input").Raw; got != `{"path":"/tmp/a"}` {
 		t.Fatalf("expected ambiguous tool args preserved, got %s", got)
 	}
 }
@@ -1416,7 +1417,7 @@ func TestConvertGeminiResponseToClaude_KeepsReasonWhenTranslatedSchemaHasNoPlace
 	rawResponse := []byte(`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"Bash","args":{"command":"ls","reason":"why"}}}],"role":"model"},"finishReason":"STOP"}],"modelVersion":"gemini-3-flash","responseId":"resp-bash-reason"}`)
 
 	nonStream := ConvertGeminiResponseToClaudeNonStream(ctx, "gemini-3-flash", origRequest, translatedRequest, rawResponse, nil)
-	if got := gjson.GetBytes(nonStream, "content.0.input").Raw; got != `{"command":"ls","reason":"why"}` {
+	if got := ojson.GetBytesNoCopy(nonStream, "content.0.input").Raw; got != `{"command":"ls","reason":"why"}` {
 		t.Fatalf("expected non-streaming input preserved, got %s (translated: %s)", got, string(translatedRequest))
 	}
 }

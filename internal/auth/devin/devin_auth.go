@@ -15,8 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -141,7 +142,7 @@ func (s *DevinAuthService) ExchangeCodeForToken(ctx context.Context, code, codeV
 		return "", fmt.Errorf("token exchange failed with status %d: %s", resp.StatusCode, string(respBytes))
 	}
 
-	token := strings.TrimSpace(gjson.GetBytes(respBytes, "token").String())
+	token := strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(respBytes, "token").String()))
 	if token == "" {
 		return "", fmt.Errorf("response did not contain a valid token: %s", string(respBytes))
 	}
@@ -208,14 +209,15 @@ func (s *DevinAuthService) FetchSelfProfile(ctx context.Context, sessionToken st
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return "", "", "", &DevinAuthError{StatusCode: resp.StatusCode, Excerpt: devinErrorExcerpt(respBytes)}
 	}
+	if resp.StatusCode == http.StatusOK {
+		root := util.ParseGJSONBytesNoCopy(respBytes)
+		userName = strings.Clone(root.Get("user_name").String())
+		userID = strings.Clone(root.Get("user_id").String())
+		orgID = strings.Clone(root.Get("org_id").String())
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", "", "", fmt.Errorf("devin profile lookup failed with status %d: %s", resp.StatusCode, devinErrorExcerpt(respBytes))
 	}
-
-	root := gjson.ParseBytes(respBytes)
-	userName = root.Get("user_name").String()
-	userID = root.Get("user_id").String()
-	orgID = root.Get("org_id").String()
 
 	return userName, userID, orgID, nil
 }

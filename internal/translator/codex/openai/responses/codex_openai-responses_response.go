@@ -5,9 +5,9 @@ import (
 	"context"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
 type codexResponsesSSEState struct {
@@ -125,12 +125,12 @@ func responsesBridge(param *any) *translatorcommon.ApplyPatchResponsesBridge {
 // it echoes the original request instructions and backfills response.model from
 // the request when the upstream event omits it.
 func enrichResponsesDataPayload(payload []byte, modelName string, originalRequestRawJSON, requestRawJSON []byte) []byte {
-	if typeResult := gjson.GetBytes(payload, "type"); typeResult.Exists() {
+	if typeResult := ojson.GetBytesNoCopy(payload, "type"); typeResult.Exists() {
 		typeStr := typeResult.String()
 		if typeStr == "response.created" || typeStr == "response.in_progress" || typeStr == "response.completed" {
-			if gjson.GetBytes(payload, "response.instructions").Exists() {
-				instructions := gjson.GetBytes(originalRequestRawJSON, "instructions").String()
-				payload, _ = sjson.SetBytes(payload, "response.instructions", instructions)
+			if ojson.GetBytesNoCopy(payload, "response.instructions").Exists() {
+				instructions := ojson.GetBytesNoCopy(originalRequestRawJSON, "instructions").String()
+				payload, _ = ojson.SetBytes(payload, "response.instructions", instructions)
 			}
 		}
 	}
@@ -138,11 +138,11 @@ func enrichResponsesDataPayload(payload []byte, modelName string, originalReques
 }
 
 func setResponsesModel(rawJSON []byte, _ string, originalRequestRawJSON, requestRawJSON []byte) []byte {
-	eventType := gjson.GetBytes(rawJSON, "type").String()
+	eventType := ojson.GetBytesNoCopy(rawJSON, "type").String()
 	if eventType != "response.created" && eventType != "response.in_progress" {
 		return rawJSON
 	}
-	if gjson.GetBytes(rawJSON, "response.model").Exists() {
+	if ojson.GetBytesNoCopy(rawJSON, "response.model").Exists() {
 		return rawJSON
 	}
 
@@ -154,7 +154,7 @@ func setResponsesModel(rawJSON []byte, _ string, originalRequestRawJSON, request
 		return rawJSON
 	}
 
-	updated, errSet := sjson.SetBytes(rawJSON, "response.model", requestModelName)
+	updated, errSet := ojson.SetBytes(rawJSON, "response.model", requestModelName)
 	if errSet != nil {
 		return rawJSON
 	}
@@ -173,7 +173,7 @@ func ConvertCodexResponseToOpenAIResponsesNonStream(_ context.Context, _ string,
 			return nil
 		}
 	}
-	rootResult := gjson.ParseBytes(converted)
+	rootResult := util.ParseGJSONBytesNoCopy(converted)
 	// Verify this is a terminal response event.
 	responseType := rootResult.Get("type").String()
 	if responseType == "" && rootResult.Get("output").IsArray() {

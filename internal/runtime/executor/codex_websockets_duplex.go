@@ -11,15 +11,15 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // codexDuplexConnectionError keeps a connection failure from cooling the shared
@@ -43,6 +43,12 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 	initialReporter *helps.UsageReporter, headers http.Header, unlock func(),
 ) *cliproxyexecutor.StreamResult {
 	streamCtx, cancel := context.WithCancel(ctx)
+	// Duplex successors bypass dispatch, including automatic steering responses.
+	followupCtx := ctx
+	if selection := coreusage.HomeSelectionFromContext(ctx); selection != nil {
+		selection.Reused = true
+		followupCtx = coreusage.WithHomeSelection(ctx, *selection)
+	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	// This first frame was successfully written by ExecuteStream before handoff.
 	log.Infof("codex websockets: request forwarded session=%s auth=%s url=%s event=response.create", sess.sessionID, auth.ID, initial.wsURL)
@@ -153,7 +159,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 		}
 		initialModel := ""
 		if initial != nil {
-			initialModel = strings.TrimSpace(gjson.GetBytes(initial.originalPayload, "model").String())
+			initialModel = strings.TrimSpace(ojson.GetBytesNoCopy(initial.originalPayload, "model").String())
 		}
 		boundModel := helps.PayloadRequestedModel(opts, initialModel)
 		if boundModel == "" {
@@ -161,9 +167,9 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 		}
 		authorizePayload := func(payload []byte, forceBoundModel bool) (allowed bool, keepOpen bool) {
 			authPayload := payload
-			explicitModel := strings.TrimSpace(gjson.GetBytes(authPayload, "model").String())
+			explicitModel := strings.TrimSpace(ojson.GetBytesNoCopy(authPayload, "model").String())
 			if boundModel != "" && json.Valid(authPayload) && (forceBoundModel || explicitModel == "" || explicitModel == req.Model) {
-				if withModel, errSet := sjson.SetBytes(bytes.Clone(authPayload), "model", boundModel); errSet == nil {
+				if withModel, errSet := ojson.SetBytes(bytes.Clone(authPayload), "model", boundModel); errSet == nil {
 					authPayload = withModel
 				}
 			}
@@ -234,7 +240,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			}
 			msg := "request terminated by plugin"
 			if len(resp.ResponseBody) > 0 {
-				if parsed := strings.TrimSpace(gjson.GetBytes(resp.ResponseBody, "error.message").String()); parsed != "" {
+				if parsed := strings.TrimSpace(ojson.GetBytesNoCopy(resp.ResponseBody, "error.message").String()); parsed != "" {
 					msg = parsed
 				} else if trimmed := strings.TrimSpace(string(resp.ResponseBody)); trimmed != "" {
 					msg = trimmed
@@ -300,11 +306,11 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				return keepOpen
 			}
 			metadataMu.Lock()
-			isAppend := gjson.GetBytes(payload, "type").String() == "response.append"
-			prevID := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String())
+			isAppend := ojson.GetBytesNoCopy(payload, "type").String() == "response.append"
+			prevID := strings.TrimSpace(ojson.GetBytesNoCopy(payload, "previous_response_id").String())
 			if isAppend && prevID == "" && responseID != "" {
 				prevID = responseID
-				payload, _ = sjson.SetBytes(payload, "previous_response_id", prevID)
+				payload, _ = ojson.SetBytes(payload, "previous_response_id", prevID)
 			}
 			wrongParent := false
 			for _, accepted := range acceptedSteers {
@@ -319,7 +325,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				}
 				return true
 			}
-			model := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+			model := strings.TrimSpace(ojson.GetBytesNoCopy(payload, "model").String())
 			if model != "" && model != req.Model && model != boundModel {
 				fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
 				return false
@@ -336,8 +342,9 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					model = boundModel
 				}
 			}
-			payload, _ = sjson.SetBytes(payload, "model", model)
-			if isAppend && !gjson.GetBytes(payload, "instructions").Exists() {
+			createDoc := ojson.NewDoc(payload)
+			_ = createDoc.Set("model", model)
+			if isAppend && !createDoc.Get("instructions").Exists() {
 				metadataMu.Lock()
 				parentSettings := responseSettings[prevID]
 				metadataMu.Unlock()
@@ -345,23 +352,24 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				if targetSettings == nil {
 					targetSettings = initial
 				}
-				var inst gjson.Result
+				var inst ojson.Result
 				if targetSettings != nil {
-					inst = gjson.GetBytes(targetSettings.clientBody, "instructions")
+					inst = ojson.GetBytesNoCopy(targetSettings.clientBody, "instructions")
 					if !inst.Exists() {
-						inst = gjson.GetBytes(targetSettings.originalPayload, "instructions")
+						inst = ojson.GetBytesNoCopy(targetSettings.originalPayload, "instructions")
 					}
 				}
 				if !inst.Exists() && initial != nil {
-					inst = gjson.GetBytes(initial.clientBody, "instructions")
+					inst = ojson.GetBytesNoCopy(initial.clientBody, "instructions")
 					if !inst.Exists() {
-						inst = gjson.GetBytes(initial.originalPayload, "instructions")
+						inst = ojson.GetBytesNoCopy(initial.originalPayload, "instructions")
 					}
 				}
 				if inst.Exists() {
-					payload, _ = sjson.SetRawBytes(payload, "instructions", []byte(inst.Raw))
+					_ = createDoc.SetRawBytes("instructions", []byte(inst.Raw))
 				}
 			}
+			payload = createDoc.Bytes()
 			nextReq, nextOpts := req, opts
 			nextReq.Payload = payload
 			nextOpts.OriginalRequest = payload
@@ -399,7 +407,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				fail(mapCodexWebsocketWriteError(sess, conn, errWrite))
 				return false
 			}
-			log.Infof("codex websockets: request forwarded session=%s auth=%s url=%s event=%s", sess.sessionID, auth.ID, initial.wsURL, gjson.GetBytes(payload, "type").String())
+			log.Infof("codex websockets: request forwarded session=%s auth=%s url=%s event=%s", sess.sessionID, auth.ID, initial.wsURL, ojson.GetBytesNoCopy(payload, "type").String())
 			return true
 		}
 		flushPendingCreates := func() bool {
@@ -453,7 +461,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					}
 					continue
 				}
-				switch gjson.GetBytes(payload, "type").String() {
+				switch ojson.GetBytesNoCopy(payload, "type").String() {
 				case "response.steer":
 					if allowed, keepOpen := authorizePayload(payload, true); !allowed {
 						if !keepOpen {
@@ -480,13 +488,16 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 						fail(statusErr{code: http.StatusBadRequest, msg: errExpand.Error()})
 						return
 					}
-					payload = steerReq.Payload
+					steerDoc := ojson.NewDoc(steerReq.Payload)
 					if codexUseSIWCForRequest(ctx, auth, steerHeaders) {
-						payload = thinking.StripConfigurationUpdates(payload)
+						thinking.StripConfigurationUpdatesDoc(steerDoc)
 					}
-					payload = helps.NewPayloadFinalizer(e.cfg, "codex-websockets", thinking.ParseSuffix(req.Model).ModelName, "codex", "", payload, steerReq, steerOpts)(payload)
-					payload, _ = sjson.SetBytes(payload, "type", "response.steer")
-					parent := gjson.GetBytes(payload, "previous_response_id").String()
+					steerCtx := helps.WithPayloadFinalizer(streamCtx, helps.NewPayloadFinalizer(e.cfg, "codex-websockets", thinking.ParseSuffix(req.Model).ModelName, "codex", "", steerReq.Payload, steerReq, steerOpts))
+					helps.FinalizePayloadDoc(steerCtx, steerDoc)
+					_ = steerDoc.Set("type", "response.steer")
+					parent := strings.Clone(steerDoc.Get("previous_response_id").String())
+					steerEventID := strings.Clone(steerDoc.Get("event_id").String())
+					payload = steerDoc.Bytes()
 					metadataMu.Lock()
 					settings := responseSettings[parent]
 					metadataMu.Unlock()
@@ -499,7 +510,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 						metadataMu.Unlock()
 					}
 					metadataMu.Lock()
-					unacknowledgedSteers = append(unacknowledgedSteers, codexSteerSubmission{parent: parent, eventID: gjson.GetBytes(payload, "event_id").String()})
+					unacknowledgedSteers = append(unacknowledgedSteers, codexSteerSubmission{parent: parent, eventID: steerEventID})
 					consumedPayload = nil
 					if settings != nil {
 						steeringSettings[parent] = settings
@@ -538,7 +549,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					continue
 
 				default:
-					if !reject(fmt.Sprintf("unsupported websocket request type: %s", gjson.GetBytes(payload, "type").String())) {
+					if !reject(fmt.Sprintf("unsupported websocket request type: %s", ojson.GetBytesNoCopy(payload, "type").String())) {
 						return
 					}
 					continue
@@ -591,10 +602,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 						idle := !firstResponse && !responseActive && len(pending) == 0 && len(unacknowledgedSteers) == 0 && len(acceptedSteers) == 0 && len(pendingCreates) == 0 && len(consumedPayload) == 0
 						turnErr := &cliproxyexecutor.UpstreamWebsocketTurnError{Cause: errRead, Idle: idle}
 						if firstResponse || responseActive {
-							turnErr.EventID = gjson.GetBytes(current.originalPayload, "event_id").String()
+							turnErr.EventID = strings.Clone(ojson.GetBytesNoCopy(current.originalPayload, "event_id").String())
 						}
 						abandon := func(payload []byte, notSent bool) {
-							if eventID := gjson.GetBytes(payload, "event_id").String(); eventID != "" {
+							if eventID := strings.Clone(ojson.GetBytesNoCopy(payload, "event_id").String()); eventID != "" {
 								turnErr.Abandoned = append(turnErr.Abandoned, &cliproxyexecutor.UpstreamWebsocketTurnError{EventID: eventID, NotSent: notSent})
 							}
 						}
@@ -648,11 +659,11 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				continue
 			}
 			payload = bytes.TrimSpace(payload)
-			eventType := gjson.GetBytes(payload, "type").String()
+			eventType := ojson.GetBytesNoCopy(payload, "type").String()
 			establishing := firstResponse && eventType == "response.created"
 			if eventType == "response.created" {
 				metadataMu.Lock()
-				parent := gjson.GetBytes(payload, "response.previous_response_id").String()
+				parent := strings.Clone(ojson.GetBytesNoCopy(payload, "response.previous_response_id").String())
 				if parent == "" {
 					parent = responseID
 				}
@@ -670,9 +681,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					}
 					current = settings
 				}
+				createdResponseID := strings.Clone(ojson.GetBytesNoCopy(payload, "response.id").String())
 				for id, accepted := range acceptedSteers {
 					if accepted.parent == parent && accepted.successorID == "" {
-						accepted.successorID = gjson.GetBytes(payload, "response.id").String()
+						accepted.successorID = createdResponseID
 						acceptedSteers[id] = accepted
 					}
 				}
@@ -681,21 +693,22 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				if len(pending) > 0 {
 					current, pending = pending[0], pending[1:]
 				}
-				responseID = gjson.GetBytes(payload, "response.id").String()
+				responseID = createdResponseID
 				// Retain response settings, not request history or authorization headers.
 				// In-flight steering pins its parent's settings independently of this window.
 				snapshot := *current
 				snapshot.originalPayload, snapshot.wsHeaders = nil, nil
-				snapshot.clientBody = []byte("{}")
-				if reasoning := gjson.GetBytes(current.clientBody, "reasoning"); reasoning.Exists() {
-					snapshot.clientBody, _ = sjson.SetRawBytes(snapshot.clientBody, "reasoning", []byte(reasoning.Raw))
+				snapshotDoc := ojson.NewDoc([]byte("{}"))
+				if reasoning := ojson.GetBytesNoCopy(current.clientBody, "reasoning"); reasoning.Exists() {
+					_ = snapshotDoc.SetRawBytes("reasoning", []byte(reasoning.Raw))
 				}
-				if inst := gjson.GetBytes(current.clientBody, "instructions"); inst.Exists() {
-					snapshot.clientBody, _ = sjson.SetRawBytes(snapshot.clientBody, "instructions", []byte(inst.Raw))
+				if inst := ojson.GetBytesNoCopy(current.clientBody, "instructions"); inst.Exists() {
+					_ = snapshotDoc.SetRawBytes("instructions", []byte(inst.Raw))
 				}
-				if serviceTier := gjson.GetBytes(current.clientBody, "service_tier"); serviceTier.Exists() {
-					snapshot.clientBody, _ = sjson.SetRawBytes(snapshot.clientBody, "service_tier", []byte(serviceTier.Raw))
+				if serviceTier := ojson.GetBytesNoCopy(current.clientBody, "service_tier"); serviceTier.Exists() {
+					_ = snapshotDoc.SetRawBytes("service_tier", []byte(serviceTier.Raw))
 				}
+				snapshot.clientBody = snapshotDoc.Bytes()
 				responseSettings[responseID] = &snapshot
 				responseOrder = append(responseOrder, responseID)
 				if len(responseOrder) > 16 {
@@ -706,7 +719,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				metadataMu.Unlock()
 				wakeWriter()
 				if !firstResponse {
-					reporter = helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
+					reporter = helps.NewExecutorUsageReporter(followupCtx, e, req.Model, auth)
 					reporter.SetTranslatedReasoningEffort(current.clientBody, current.to.String())
 					reporter.StartResponseTTFT()
 				}
@@ -721,8 +734,8 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			// Steering acknowledgements, pending notifications and failures are opaque:
 			// preserve their IDs, input, sequence numbers and event types byte-for-byte.
 			if strings.HasPrefix(eventType, "response.steer.") {
-				id := gjson.GetBytes(payload, "steer.id").String()
-				parent := gjson.GetBytes(payload, "steer.previous_response_id").String()
+				id := strings.Clone(ojson.GetBytesNoCopy(payload, "steer.id").String())
+				parent := strings.Clone(ojson.GetBytesNoCopy(payload, "steer.previous_response_id").String())
 				if parent == "" {
 					parent = responseID
 				}
@@ -779,9 +792,9 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			}
 			eventPrepared, eventReporter := current, reporter
 			if !firstResponse && (eventType == "response.failed" || eventType == "error") {
-				failedID := gjson.GetBytes(payload, "response.id").String()
+				failedID := ojson.GetBytesNoCopy(payload, "response.id").String()
 				if failedID == "" {
-					failedID = gjson.GetBytes(payload, "response_id").String()
+					failedID = ojson.GetBytesNoCopy(payload, "response_id").String()
 				}
 				metadataMu.Lock()
 				// A failure for the running response must not consume a queued create.
@@ -791,7 +804,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				ambiguous := failedID == "" && ((len(pending) > 0 && responseActive) || len(unacknowledgedSteers) > 0)
 				if len(pending) > 0 && !currentFailure && !ambiguous {
 					eventPrepared, pending = pending[0], pending[1:]
-					eventReporter = helps.NewExecutorUsageReporter(ctx, e, req.Model, auth)
+					eventReporter = helps.NewExecutorUsageReporter(followupCtx, e, req.Model, auth)
 					eventReporter.SetTranslatedReasoningEffort(eventPrepared.clientBody, eventPrepared.to.String())
 				} else if !ambiguous {
 					responseActive = false
@@ -844,9 +857,9 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				collectCodexOutputItemDone(payload, outputItems, &outputFallback)
 			}
 			if isCodexTerminalEventType(eventType) {
-				endedID := gjson.GetBytes(payload, "response.id").String()
+				endedID := ojson.GetBytesNoCopy(payload, "response.id").String()
 				if endedID == "" {
-					endedID = gjson.GetBytes(payload, "response_id").String()
+					endedID = ojson.GetBytesNoCopy(payload, "response_id").String()
 				}
 				if endedID == "" && !responseActive {
 					// An id-less failure that ended the running response.

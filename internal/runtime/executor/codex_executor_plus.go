@@ -3,6 +3,9 @@ package executor
 import (
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -169,4 +172,14 @@ func applyCodexAliasModel(body []byte, modelForUpstream, aliasEffort string) []b
 		body = setReasoningEffortByAlias(body, modelForUpstream, aliasEffort)
 	}
 	return body
+}
+
+// applyCodexAliasModelDoc is the ojson.Doc counterpart of applyCodexAliasModel
+// for executor paths that now mutate the request as a Doc.
+func applyCodexAliasModelDoc(doc *ojson.Doc, modelForUpstream, aliasEffort string) {
+	if aliasEffort == "" {
+		return
+	}
+	helps.SetStringIfDifferentDoc(doc, "model", modelForUpstream)
+	_ = doc.Set("reasoning.effort", strings.ToLower(strings.TrimSpace(aliasEffort)))
 }

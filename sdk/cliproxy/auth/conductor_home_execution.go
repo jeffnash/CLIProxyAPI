@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
-	"github.com/tidwall/sjson"
 )
 
 func (m *Manager) executeHome(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, countTokens bool) (cliproxyexecutor.Response, error) {
@@ -135,6 +135,9 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 		clearSchedulerSelectionID(opts.Metadata)
 		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 		execCtx = coreusage.WithSelectionID(execCtx, "")
+		execCtx = coreusage.WithHomeSelection(execCtx, coreusage.HomeSelection{
+			Reused: selection.Retained(), Model: routeModel, CredentialPolicy: credentialPolicyFromContext(ctx),
+		})
 		execCtx = newUpstreamAttemptContext(execCtx)
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -367,7 +370,7 @@ func sanitizeDownstreamWebsocketFallbackRequest(ctx context.Context, auth *Auth,
 	if !cliproxyexecutor.DownstreamWebsocket(ctx) || authWebsocketsEnabled(auth) || len(req.Payload) == 0 {
 		return req
 	}
-	updated, errDelete := sjson.DeleteBytes(req.Payload, "generate")
+	updated, errDelete := ojson.DeleteBytes(req.Payload, "generate")
 	if errDelete != nil {
 		return req
 	}

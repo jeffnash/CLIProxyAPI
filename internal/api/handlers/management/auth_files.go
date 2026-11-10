@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
@@ -34,7 +35,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -324,7 +324,7 @@ func matchesAuthFileLookup(auth *coreauth.Auth, name string, authIndex string) b
 func (h *Handler) lookupAuthFile(name string, authIndex string) (*coreauth.Auth, bool) {
 	name = strings.TrimSpace(name)
 	authIndex = strings.TrimSpace(authIndex)
-	if h == nil || h.authManager == nil || name == "" {
+	if h == nil || h.authManager == nil || (name == "" && authIndex == "") {
 		return nil, false
 	}
 	if authIndex == "" {
@@ -439,29 +439,31 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 		// Read file to get type field
 		full := filepath.Join(h.cfg.AuthDir, name)
 		if data, errRead := os.ReadFile(full); errRead == nil {
-			typeValue := gjson.GetBytes(data, "type").String()
-			emailValue := gjson.GetBytes(data, "email").String()
+			var fieldBuf [7]ojson.Result
+			fields := ojson.GetManyBytesNoCopy(fieldBuf[:0], data, "type", "email", "project_id", "priority", coreauth.AttributeWeight, "note", "websockets")
+			typeValue := strings.Clone(fields[0].String())
+			emailValue := strings.Clone(fields[1].String())
 			fileData["type"] = typeValue
 			fileData["email"] = emailValue
-			if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
-				fileData["project_id"] = projectID
+			if projectID := strings.TrimSpace(fields[2].String()); projectID != "" {
+				fileData["project_id"] = strings.Clone(projectID)
 			}
-			if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
+			if pv := fields[3]; pv.Exists() {
 				switch pv.Type {
-				case gjson.Number:
+				case ojson.Number:
 					fileData["priority"] = int(pv.Int())
-				case gjson.String:
+				case ojson.String:
 					if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
 						fileData["priority"] = parsed
 					}
 				}
 			}
-			if wv := gjson.GetBytes(data, coreauth.AttributeWeight); wv.Exists() {
+			if wv := fields[4]; wv.Exists() {
 				var rawWeight string
 				switch wv.Type {
-				case gjson.Number:
+				case ojson.Number:
 					rawWeight = wv.Raw
-				case gjson.String:
+				case ojson.String:
 					rawWeight = wv.String()
 				}
 				if rawWeight != "" {
@@ -470,18 +472,18 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 					}
 				}
 			}
-			if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
+			if nv := fields[5]; nv.Exists() && nv.Type == ojson.String {
 				if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
-					fileData["note"] = trimmed
+					fileData["note"] = strings.Clone(trimmed)
 				}
 			}
-			if wv := gjson.GetBytes(data, "websockets"); wv.Exists() {
+			if wv := fields[6]; wv.Exists() {
 				switch wv.Type {
-				case gjson.True:
+				case ojson.True:
 					fileData["websockets"] = true
-				case gjson.False:
+				case ojson.False:
 					fileData["websockets"] = false
-				case gjson.String:
+				case ojson.String:
 					if parsed, errParse := strconv.ParseBool(strings.TrimSpace(wv.String())); errParse == nil {
 						fileData["websockets"] = parsed
 					}
@@ -806,6 +808,11 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		entry["request_retry"] = requestRetry
 	}
 	if quota.v8 {
+		// OAuth login entry the credential was signed in through; multi-entry plugins store it
+		// next to the provider, and the deprecated v0 route keeps its frozen response shape.
+		if oauthProvider := authOAuthProvider(auth); oauthProvider != "" {
+			entry["oauth_provider"] = oauthProvider
+		}
 		nowUTC := time.Now().UTC()
 		if exp, okExp := auth.AccessTokenExpirationTime(); okExp && !exp.IsZero() && exp.Unix() > 0 {
 			entry["access_token_expires_at"] = exp.UTC().Format(time.RFC3339)
@@ -989,6 +996,27 @@ func authProjectID(auth *coreauth.Auth) string {
 	if auth.Attributes != nil {
 		if projectID := strings.TrimSpace(auth.Attributes["project_id"]); projectID != "" {
 			return projectID
+		}
+	}
+	return ""
+}
+
+func authOAuthProvider(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	for _, key := range []string{"oauth_provider", "portal"} {
+		if auth.Attributes != nil {
+			if v := strings.ToLower(strings.TrimSpace(auth.Attributes[key])); v != "" {
+				return v
+			}
+		}
+		if auth.Metadata != nil {
+			if raw, ok := auth.Metadata[key].(string); ok {
+				if v := strings.ToLower(strings.TrimSpace(raw)); v != "" {
+					return v
+				}
+			}
 		}
 	}
 	return ""
@@ -1204,7 +1232,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 			return
 		}
 
-		email := gjson.GetBytes(bodyBytes, "email").String()
+		email := util.GetGJSONBytesNoCopy(bodyBytes, "email").String()
 		if email != "" {
 			fmt.Printf("Authenticated user email: %s\n", email)
 		} else {
@@ -1676,7 +1704,7 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 
 		if resp.StatusCode == http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
-			if gjson.GetBytes(bodyBytes, "state").String() == "ENABLED" {
+			if util.GetGJSONBytesNoCopy(bodyBytes, "state").String() == "ENABLED" {
 				_ = resp.Body.Close()
 				continue
 			}
@@ -1697,7 +1725,7 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		errMessage := string(bodyBytes)
-		errMessageResult := gjson.GetBytes(bodyBytes, "error.message")
+		errMessageResult := util.GetGJSONBytesNoCopy(bodyBytes, "error.message")
 		if errMessageResult.Exists() {
 			errMessage = errMessageResult.String()
 		}

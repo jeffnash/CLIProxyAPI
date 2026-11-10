@@ -6,8 +6,8 @@ import (
 
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 
+	"github.com/MoeForge/moego/ojson"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 func TestOpenAIToCodex_PreservesBuiltinTools(t *testing.T) {
@@ -20,16 +20,16 @@ func TestOpenAIToCodex_PreservesBuiltinTools(t *testing.T) {
 
 	out := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAI, sdktranslator.FormatCodex, "gpt-5", in, false)
 
-	if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+	if got := ojson.GetBytesNoCopy(out, "tools.#").Int(); got != 1 {
 		t.Fatalf("expected 1 tool, got %d: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "web_search" {
+	if got := ojson.GetBytesNoCopy(out, "tools.0.type").String(); got != "web_search" {
 		t.Fatalf("expected tools[0].type=web_search, got %q: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "tools.0.search_context_size").String(); got != "high" {
+	if got := ojson.GetBytesNoCopy(out, "tools.0.search_context_size").String(); got != "high" {
 		t.Fatalf("expected tools[0].search_context_size=high, got %q: %s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "web_search" {
+	if got := ojson.GetBytesNoCopy(out, "tool_choice.type").String(); got != "web_search" {
 		t.Fatalf("expected tool_choice.type=web_search, got %q: %s", got, string(out))
 	}
 }
@@ -43,7 +43,7 @@ func TestOpenAIResponsesToOpenAI_IgnoresBuiltinTools(t *testing.T) {
 
 	out := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, "gpt-5", in, false)
 
-	if got := gjson.GetBytes(out, "tools.#").Int(); got != 0 {
+	if got := ojson.GetBytesNoCopy(out, "tools.#").Int(); got != 0 {
 		t.Fatalf("expected 0 tools (builtin tools not supported in Chat Completions), got %d: %s", got, string(out))
 	}
 }
@@ -64,8 +64,8 @@ func TestGeminiToCodex_DeterministicCallIDs(t *testing.T) {
 		t.Fatalf("expected deterministic translation; outputs differ\n1=%s\n2=%s", string(out1), string(out2))
 	}
 
-	callID := gjson.GetBytes(out1, `input.#(type=="function_call").call_id`).String()
-	outID := gjson.GetBytes(out1, `input.#(type=="function_call_output").call_id`).String()
+	callID := ojson.GetBytes(out1, `input.#(type=="function_call").call_id`).String()
+	outID := ojson.GetBytes(out1, `input.#(type=="function_call_output").call_id`).String()
 	if callID == "" {
 		t.Fatalf("expected function_call.call_id to be set: %s", string(out1))
 	}
@@ -93,8 +93,8 @@ func TestGeminiToCodex_DeterministicCallIDs_KeyOrderNormalization(t *testing.T) 
 	outAB := sdktranslator.TranslateRequest(sdktranslator.FormatGemini, sdktranslator.FormatCodex, "gpt-5", inKeysAB, false)
 	outBA := sdktranslator.TranslateRequest(sdktranslator.FormatGemini, sdktranslator.FormatCodex, "gpt-5", inKeysBA, false)
 
-	callIDAB := gjson.GetBytes(outAB, `input.#(type=="function_call").call_id`).String()
-	callIDBA := gjson.GetBytes(outBA, `input.#(type=="function_call").call_id`).String()
+	callIDAB := ojson.GetBytes(outAB, `input.#(type=="function_call").call_id`).String()
+	callIDBA := ojson.GetBytes(outBA, `input.#(type=="function_call").call_id`).String()
 
 	if callIDAB == "" || callIDBA == "" {
 		t.Fatalf("expected call_id to be set; AB=%q BA=%q", callIDAB, callIDBA)

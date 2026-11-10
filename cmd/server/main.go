@@ -127,6 +127,7 @@ func main() {
 	var claudeLogin bool
 	var noBrowser bool
 	var oauthCallbackPort int
+	var loginProxyURL string
 	var antigravityLogin bool
 	var kiroLogin bool
 	var kiroGoogleLogin bool
@@ -176,6 +177,7 @@ func main() {
 	flag.BoolVar(&useIncognito, "incognito", false, "Open browser in incognito/private mode for OAuth (useful for multiple accounts)")
 	flag.BoolVar(&noIncognito, "no-incognito", false, "Force disable incognito mode (uses existing browser session)")
 	flag.IntVar(&oauthCallbackPort, "oauth-callback-port", 0, "Override OAuth callback port (defaults to provider-specific port)")
+	flag.StringVar(&loginProxyURL, "login-proxy", "", "Proxy URL used for the OAuth login flow and saved as the new credential's proxy_url (http, https, socks5, socks5h)")
 	flag.BoolVar(&antigravityLogin, "antigravity-login", false, "Login to Antigravity using OAuth")
 	flag.BoolVar(&kiroLogin, "kiro-login", false, "Login to Kiro using Google OAuth")
 	flag.BoolVar(&kiroGoogleLogin, "kiro-google-login", false, "Login to Kiro using Google OAuth (same as --kiro-login)")
@@ -735,6 +737,7 @@ func main() {
 	options := &cmd.LoginOptions{
 		NoBrowser:    noBrowser,
 		CallbackPort: oauthCallbackPort,
+		ProxyURL:     loginProxyURL,
 	}
 
 	commandMode := vertexImport != "" ||

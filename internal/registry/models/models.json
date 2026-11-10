@@ -279,6 +279,35 @@
       ]
     },
     {
+      "id": "claude-fable-5-2",
+      "object": "model",
+      "created": 1794250800,
+      "owned_by": "anthropic",
+      "type": "claude",
+      "display_name": "Claude Fable 5.2",
+      "description": "Claude Fable 5.2 extends Claude Fable 5 at the same input and output prices, with cache reads at a quarter of the cost, and brings stronger long-running agentic coding, multistep research, and document, spreadsheet, and slide work.",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "zero_allowed": false,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ]
+    },
+    {
       "id": "claude-opus-5-5",
       "native_capabilities": {
         "web_search": true
@@ -1035,6 +1064,36 @@
       "native_capabilities": {
         "web_search": true
       }
+    },
+    {
+      "id": "gemini-omni-1.2-flash",
+      "object": "model",
+      "owned_by": "google",
+      "type": "gemini",
+      "display_name": "Gemini Omni 1.2 Flash",
+      "name": "models/gemini-omni-1.2-flash",
+      "version": "1.2",
+      "description": "Gemini Omni 1.2 Flash",
+      "context_length": 131072,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 128,
+        "max": 32768,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text",
+        "video"
+      ]
     }
   ],
   "vertex": [
@@ -1900,6 +1959,35 @@
           "high"
         ]
       }
+    },
+    {
+      "id": "gemini-omni-1.2-flash",
+      "object": "model",
+      "owned_by": "google",
+      "type": "gemini",
+      "display_name": "Gemini Omni 1.2 Flash",
+      "name": "gemini-omni-1.2-flash",
+      "description": "Gemini Omni 1.2 Flash",
+      "context_length": 131072,
+      "max_completion_tokens": 260640,
+      "thinking": {
+        "min": 128,
+        "max": 32768,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text",
+        "video"
+      ]
     }
   ],
   "gemini-cli": [
@@ -2734,9 +2822,74 @@
       "native_capabilities": {
         "web_search": true
       }
+    },
+    {
+      "id": "gemini-omni-1.2-flash",
+      "object": "model",
+      "owned_by": "google",
+      "type": "gemini",
+      "display_name": "Gemini Omni 1.2 Flash",
+      "name": "models/gemini-omni-1.2-flash",
+      "version": "1.2",
+      "description": "Gemini Omni 1.2 Flash",
+      "context_length": 131072,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "min": 128,
+        "max": 32768,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "high"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "supportedOutputModalities": [
+        "text",
+        "video"
+      ]
     }
   ],
   "codex-free": [
+    {
+      "id": "gpt-6-chat-thinking",
+      "object": "model",
+      "created": 1790035200,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT-6 Chat Thinking",
+      "version": "gpt-6.0",
+      "description": "GPT-6 Chat Thinking for the paid CCA experiment.",
+      "context_length": 272000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      },
+      "support_configuration_update": true
+    },
     {
       "id": "gpt-6-luna",
       "object": "model",
@@ -3088,6 +3241,41 @@
       "display_name": "GPT 6.0 Luna",
       "version": "gpt-6.0",
       "description": "GPT-6 Luna Codex model.",
+      "context_length": 272000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      },
+      "support_configuration_update": true
+    },
+    {
+      "id": "gpt-6-chat-thinking",
+      "object": "model",
+      "created": 1790035200,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT-6 Chat Thinking",
+      "version": "gpt-6.0",
+      "description": "GPT-6 Chat Thinking for the paid CCA experiment.",
       "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
@@ -3479,6 +3667,41 @@
       "support_configuration_update": true
     },
     {
+      "id": "gpt-6-chat-thinking",
+      "object": "model",
+      "created": 1790035200,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT-6 Chat Thinking",
+      "version": "gpt-6.0",
+      "description": "GPT-6 Chat Thinking for the paid CCA experiment.",
+      "context_length": 272000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      },
+      "support_configuration_update": true
+    },
+    {
       "id": "gpt-5.6-sol",
       "object": "model",
       "created": 1783616400,
@@ -3816,6 +4039,41 @@
       "display_name": "GPT 6.0 Luna",
       "version": "gpt-6.0",
       "description": "GPT-6 Luna Codex model.",
+      "context_length": 272000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "native_capabilities": {
+        "web_search": true
+      },
+      "support_configuration_update": true
+    },
+    {
+      "id": "gpt-6-chat-thinking",
+      "object": "model",
+      "created": 1790035200,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT-6 Chat Thinking",
+      "version": "gpt-6.0",
+      "description": "GPT-6 Chat Thinking for the paid CCA experiment.",
       "context_length": 272000,
       "max_completion_tokens": 128000,
       "supported_parameters": [

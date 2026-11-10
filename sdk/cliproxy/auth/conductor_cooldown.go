@@ -942,12 +942,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 		now = time.Now()
 		responseHeaders := internallogging.GetResponseHeaders(ctx)
-		modelState := existingModelState(auth, modelKey)
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
 		if trackCooldownState {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
+		if m != nil {
+			_ = m.migrateAuthAliasModelStatesLocked(auth, nil, now, false)
+			if modelKey != "" {
+				modelKey = m.resolveMarkResultModelKeyLocked(auth, modelKey, result.RouteModel)
+			}
+		}
+		modelState := existingModelState(auth, modelKey)
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
 			auth.Success++
@@ -1086,7 +1092,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						} else {
 							state.NextRetryAfter = now.Add(30 * time.Minute)
 						}
-					} else if isTransientRateLimitResultError(result.Error) && statusCode == http.StatusTooManyRequests {
+					} else if !result.CredentialScope && isTransientRateLimitResultError(result.Error) && statusCode == http.StatusTooManyRequests {
 						// Transient per-turn capacity rejection (issue 7017): cool
 						// only the reporting model until the provider retry hint.
 						// The credential quota is not exhausted, so no quota state
@@ -1388,7 +1394,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		var targetModels []string
 		if !credentialScopedResult && modelKey != "" {
 			targetModels = append(targetModels, modelKey)
-			if routeKey := canonicalModelKey(result.RouteModel); routeKey != "" && routeKey != modelKey {
+			if routeKey := canonicalModelKey(result.RouteModel); routeKey != "" && !sameCanonicalModelKey(routeKey, modelKey) {
 				targetModels = append(targetModels, routeKey)
 			}
 		}
@@ -1508,10 +1514,28 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 
 func existingModelState(auth *Auth, model string) *ModelState {
 	model = canonicalModelKey(model)
-	if auth == nil || model == "" {
+	if auth == nil || model == "" || len(auth.ModelStates) == 0 {
 		return nil
 	}
-	return auth.ModelStates[model]
+	if state, ok := auth.ModelStates[model]; ok && state != nil {
+		return state
+	}
+	lookupKey := canonicalModelLookupKey(model)
+	if lookupKey == "" {
+		return nil
+	}
+	var matched *ModelState
+	for stateModel, state := range auth.ModelStates {
+		if state == nil || canonicalModelLookupKey(stateModel) != lookupKey {
+			continue
+		}
+		if matched == nil {
+			matched = state
+		} else {
+			matched = mergeModelState(matched.Clone(), state)
+		}
+	}
+	return matched
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -1526,6 +1550,12 @@ func ensureModelState(auth *Auth, model string) *ModelState {
 	if state, ok := auth.ModelStates[model]; ok && state != nil {
 		return state
 	}
+	lookupKey := canonicalModelLookupKey(model)
+	for stateModel, state := range auth.ModelStates {
+		if canonicalModelLookupKey(stateModel) == lookupKey && state != nil {
+			return state
+		}
+	}
 	state := &ModelState{Status: StatusActive}
 	auth.ModelStates[model] = state
 	return state
@@ -1535,9 +1565,18 @@ func normalizeModelStates(auth *Auth) bool {
 	if auth == nil || len(auth.ModelStates) == 0 {
 		return false
 	}
+	keys := make([]string, 0, len(auth.ModelStates))
+	for model := range auth.ModelStates {
+		keys = append(keys, model)
+	}
+	if len(keys) > 1 {
+		sort.Strings(keys)
+	}
 	normalized := make(map[string]*ModelState, len(auth.ModelStates))
+	keyByLookup := make(map[string]string, len(auth.ModelStates))
 	changed := false
-	for model, state := range auth.ModelStates {
+	for _, model := range keys {
+		state := auth.ModelStates[model]
 		modelKey := canonicalModelKey(model)
 		if modelKey == "" {
 			modelKey = strings.TrimSpace(model)
@@ -1545,11 +1584,27 @@ func normalizeModelStates(auth *Auth) bool {
 		if modelKey != model {
 			changed = true
 		}
-		if existing, ok := normalized[modelKey]; ok {
-			normalized[modelKey] = mergeModelState(existing, state)
+		lookupKey := canonicalModelLookupKey(modelKey)
+		if lookupKey == "" {
+			lookupKey = strings.ToLower(modelKey)
+		}
+		if existingKey, ok := keyByLookup[lookupKey]; ok {
+			var existingClone *ModelState
+			if normalized[existingKey] != nil {
+				existingClone = normalized[existingKey].Clone()
+			}
+			merged := mergeModelState(existingClone, state)
+			targetKey := existingKey
+			if modelKey == lookupKey && existingKey != lookupKey {
+				delete(normalized, existingKey)
+				targetKey = modelKey
+				keyByLookup[lookupKey] = targetKey
+			}
+			normalized[targetKey] = merged
 			changed = true
 			continue
 		}
+		keyByLookup[lookupKey] = modelKey
 		normalized[modelKey] = state
 	}
 	if changed {
@@ -1692,7 +1747,7 @@ func (m *Manager) registryModelsForAuthAndModel(auth *Auth, authID, modelKey str
 		return nil
 	}
 
-	targetCanonical := canonicalModelKey(modelKey)
+	targetCanonical := canonicalModelLookupKey(modelKey)
 	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(authID)
 	if len(supportedModels) == 0 {
 		return nil
@@ -1713,7 +1768,7 @@ func (m *Manager) registryModelsForAuthAndModel(auth *Auth, authID, modelKey str
 		if stateKey == "" {
 			stateKey = canonicalModelKey(regModelID)
 		}
-		if stateKey == targetCanonical {
+		if canonicalModelLookupKey(stateKey) == targetCanonical {
 			if _, exists := seen[regModelID]; !exists {
 				seen[regModelID] = struct{}{}
 				out = append(out, regModelID)
@@ -1930,9 +1985,32 @@ func statusCodeFromError(err error) int {
 	return 0
 }
 
-func isRequestScopedError(err error) bool {
+func errorCodeFromError(err error) string {
 	if err == nil {
+		return ""
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && strings.TrimSpace(authErr.Code) != "" {
+		return strings.TrimSpace(authErr.Code)
+	}
+	type errorCoder interface {
+		ErrorCode() string
+	}
+	var ec errorCoder
+	if errors.As(err, &ec) && ec != nil {
+		return strings.TrimSpace(ec.ErrorCode())
+	}
+	return ""
+}
+
+func isRequestScopedError(err error) bool {
+	if err == nil || isCredentialScopedError(err) {
 		return false
+	}
+	// A preserved terminal response belongs to this request unless the executor
+	// explicitly classifies the rejection as safe to retry on another credential.
+	if isRequestTerminatedError(err) {
+		return true
 	}
 	requestErr, ok := errors.AsType[cliproxyexecutor.RequestScopedError](err)
 	return ok && requestErr != nil && requestErr.IsRequestScoped()
@@ -1942,7 +2020,7 @@ func isRequestScopedError(err error) bool {
 // upstream streams that ended without a terminal frame. Unlike a received
 // HTTP refusal, the generation was already submitted upstream.
 func isStreamTruncatedError(err error) bool {
-	if err == nil {
+	if err == nil || isCredentialScopedError(err) {
 		return false
 	}
 	truncatedErr, ok := errors.AsType[cliproxyexecutor.StreamTruncatedError](err)
@@ -1971,10 +2049,25 @@ func resultErrorFromError(err error) *Error {
 	} else {
 		resultErr = &Error{Message: err.Error()}
 	}
+	if resultErr.Code == "" {
+		resultErr.Code = errorCodeFromError(err)
+	}
 	if resultErr.HTTPStatus == 0 {
 		resultErr.HTTPStatus = statusCodeFromError(err)
 	}
 	switch {
+	case isCredentialScopedError(err):
+		// A credential-scoped failure always stays on the credential quota path;
+		// normalize conflicting model-only or cooldown-skipping codes so MarkResult
+		// cannot downgrade whole-credential exhaustion.
+		switch strings.ToLower(strings.TrimSpace(resultErr.Code)) {
+		case transientRateLimitErrorCode,
+			requestScopedErrorCode,
+			streamTruncatedErrorCode,
+			connectionLifecycleErrorCode,
+			transientTransportErrorCode:
+			resultErr.Code = credentialQuotaErrorCode
+		}
 	case isStreamTruncatedError(err):
 		// Preserve the local truncation classification alongside the public
 		// 502 status so MarkResult can skip credential cooldown.
@@ -2269,7 +2362,8 @@ var (
 
 func isKnownSafeOAuthErrorCode(code string) bool {
 	switch strings.ToLower(strings.TrimSpace(code)) {
-	case "refresh_token_reused",
+	case "refresh_outcome_unknown",
+		"refresh_token_reused",
 		"refresh_token_expired",
 		"refresh_token_invalidated",
 		"token_revoked",
@@ -2329,6 +2423,7 @@ func sanitizeRenewalMessage(raw string) string {
 func isTerminalRefreshGrantMessage(message string) bool {
 	lower := strings.ToLower(message)
 	for _, token := range []string{
+		"refresh_outcome_unknown",
 		"refresh_token_reused",
 		"refresh_token_expired",
 		"refresh_token_invalidated",
@@ -2370,6 +2465,7 @@ func isTerminalRefreshError(auth *Auth, err error) bool {
 func terminalRefreshErrorCode(message string, statusCode int) string {
 	lower := strings.ToLower(message)
 	for _, code := range []string{
+		"refresh_outcome_unknown",
 		"refresh_token_reused",
 		"refresh_token_expired",
 		"refresh_token_invalidated",
@@ -2524,7 +2620,10 @@ func isCredentialScopedError(err error) bool {
 		IsCredentialScoped() bool
 	}
 	var csp credentialScopedProvider
-	return errors.As(err, &csp) && csp != nil && csp.IsCredentialScoped()
+	if errors.As(err, &csp) && csp != nil && csp.IsCredentialScoped() {
+		return true
+	}
+	return strings.EqualFold(errorCodeFromError(err), credentialQuotaErrorCode)
 }
 
 func statusCodeFromResult(err *Error) int {
@@ -2716,11 +2815,43 @@ func isRequestScopedResultError(err *Error) bool {
 }
 
 func isCountTokensEndpointNotFoundError(err error, requestedModel string) bool {
-	if err == nil || statusCodeFromError(err) != http.StatusNotFound {
+	if err == nil {
 		return false
 	}
 	baseModel := thinking.ParseSuffix(requestedModel).ModelName
-	return !isExplicitModelNotFoundError(err, baseModel)
+	if isExplicitModelNotFoundError(err, baseModel) {
+		return false
+	}
+	status := statusCodeFromError(err)
+	if status == http.StatusNotFound {
+		return true
+	}
+	if isCredentialScopedError(err) || isCloudflareChallengeError(err) || isInvalidGrantError(err) || isCreditBalanceTooLowError(err) || isModelSupportErrorMessage(err.Error()) {
+		return false
+	}
+	switch status {
+	case http.StatusNotImplemented:
+		return true
+	case 0:
+		return isCountTokensUnsupportedErrorCode(errorCodeFromError(err)) || errors.Is(err, errors.ErrUnsupported)
+	default:
+		return false
+	}
+}
+
+func isCountTokensUnsupportedErrorCode(value string) bool {
+	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(strings.TrimSpace(value)))
+	switch normalized {
+	case "not_implemented",
+		"count_tokens_unsupported",
+		"count_tokens_not_supported",
+		"unsupported_operation",
+		"unsupported_capability",
+		"method_not_implemented":
+		return true
+	default:
+		return false
+	}
 }
 
 func isResponsesCompactRequest(opts cliproxyexecutor.Options) bool {
@@ -2778,6 +2909,9 @@ func isResponsesCompactAvailabilityNeutralError(opts cliproxyexecutor.Options, e
 func isExplicitModelNotFoundError(err error, requestedModel string) bool {
 	if err == nil {
 		return false
+	}
+	if isModelNotFoundIdentifier(errorCodeFromError(err)) {
+		return true
 	}
 	var authErr *Error
 	if errors.As(err, &authErr) && authErr != nil {
